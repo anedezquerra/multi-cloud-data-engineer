@@ -1,0 +1,793 @@
+\chapter{The Multi-Cluster Shared Data Architecture and Storage Engine}
+\index{Snowflake}\index{multi-cluster shared data}\index{storage engine}\index{virtual warehouse}\index{micro-partitions}\index{Week 1}%
+\begin{objectives}
+\begin{itemize}
+    \item Explain Snowflake's three-layer architecture: Database Storage, Query Processing, and Cloud Services.
+    \item Compare shared-disk, shared-nothing, and multi-cluster shared-data database architectures.
+    \item Describe micro-partitions, columnar storage, immutable files, metadata, partition pruning, and clustering depth.
+    \item Choose data types and table designs that improve compression, pruning, and downstream maintainability.
+    \item Evaluate when custom clustering keys and Automatic Clustering are worth their credit cost.
+    \item Deploy a hands-on Snowflake lab that creates a synthetic 10-million-row table and inspects clustering metadata.
+    \item Design a global telecom storage layout for 5 TB per day of Call Detail Record logs.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+Although this book teaches \textbf{Snowflake}, its micro-partitions ultimately rest on the cloud object stores below, which map almost one-to-one across providers---learn one mental model and carry it everywhere.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{2.8cm}p{3.0cm}p{3.0cm}p{3.0cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{AWS} & \textbf{Azure} & \textbf{GCP} \\
+\midrule
+Object storage & Amazon S3 & ADLS Gen2 / Blob & Cloud Storage \\
+Hot tier & S3 Standard & Hot & Standard \\
+Infrequent access & S3 Standard-IA & Cool / Cold & Nearline \\
+Archive (instant) & Glacier Instant Retrieval & Cold & Coldline \\
+Deep archive & Glacier Deep Archive & Archive & Archive \\
+Lifecycle rules & Lifecycle policies & Lifecycle management & Object Lifecycle Mgmt \\
+Versioning & S3 Versioning & Blob versioning & Object Versioning \\
+Immutability (WORM) & Object Lock & Immutable blob storage & Bucket Lock \\
+Cross-region copy & CRR / SRR & Object replication (GRS) & Dual/multi-region + Transfer \\
+Online transfer & DataSync & AzCopy & Storage Transfer Service \\
+Offline transfer & Snow Family & Data Box & Transfer Appliance \\
+\addlinespace
+Design durability & 11 nines & 11 nines (LRS) / 16 (GRS) & 11 nines \\
+Availability SLA & 99.9\% (Standard) & 99.9\% (RA-GRS read 99.99\%) & 99.95\% (multi-region) \\
+Encryption at rest & SSE-S3 / SSE-KMS / SSE-C & SSE + CMK via Key Vault & Google-managed / CMEK / CSEK \\
+Access control & IAM \& bucket policies, ACLs & Azure RBAC, SAS, POSIX ACLs & IAM, ACLs, signed URLs \\
+Pricing levers & Storage + requests + egress + retrieval & Storage + operations + egress + retrieval & Storage + operations + egress + retrieval \\
+Consistency & Strong read-after-write & Strong read-after-write & Strong (global) \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+Beyond raw object storage, the same layer reappears as a managed abstraction: \textbf{Fabric OneLake} is a tenant-wide lake built on ADLS Gen2 (Delta--Parquet), \textbf{Snowflake} persists data as immutable micro-partitions on the provider's object store, and \textbf{MongoDB}'s WiredTiger is a node-local engine rather than object storage---the contrast is itself instructive.
+\end{crosscloud}
+
+\section{Week 1 Roadmap}
+The first week of the Snowflake Master Data Engineer program is about the physical and logical foundation underneath every later milestone. Snowflake is often marketed as a cloud data warehouse, but senior data engineers must be more precise: Snowflake is an elastic data platform whose architecture separates persistent storage, query compute, and coordination services while presenting SQL tables, transactions, governance, and data sharing as managed services \cite{dageville2016snowflake,snowflakeArchitectureDocs}. The separation is why a reporting warehouse can be resized without copying tables, why a data-science warehouse can run beside an ELT warehouse, and why cloning a large schema can be nearly instantaneous.
+
+The week is organized as five engineering questions. Monday asks how Snowflake differs from classic shared-disk and shared-nothing systems. Tuesday studies micro-partitions, the storage unit that makes metadata pruning possible. Wednesday connects data types, compression, and Automatic Clustering to cost. Thursday turns the theory into a real lab. Friday uses an enterprise telecom scenario to design a storage strategy under daily-scale pressure.
+
+\begin{keyterms}
+\textbf{Cloud Services}: Snowflake's control plane for authentication, metadata, optimization, transactions, access control, and coordination.\quad
+\textbf{Virtual warehouse}: an independent MPP compute cluster that executes queries.\quad
+\textbf{Micro-partition}: an immutable, compressed, columnar storage unit that stores table data and metadata.\quad
+\textbf{Partition pruning}: skipping micro-partitions whose metadata proves they cannot satisfy a query predicate.\quad
+\textbf{Clustering depth}: a measure of how many overlapping micro-partitions Snowflake must scan for a clustering dimension.
+\end{keyterms}
+
+\section{Monday: Snowflake's Three-Layer Architecture}
+\index{three-layer architecture}\index{Cloud Services}\index{Database Storage}\index{Query Processing}
+Snowflake's architecture has three conceptual layers. The \textbf{Database Storage layer} persists table data as compressed columnar micro-partitions in cloud object storage. The \textbf{Query Processing layer} consists of virtual warehouses: independent compute clusters that read storage, execute SQL, maintain local caches, and scale without moving table ownership. The \textbf{Cloud Services layer} coordinates the system by storing metadata, authenticating users, compiling and optimizing queries, enforcing governance rules, and managing transactions.
+
+\begin{definitionbox}
+\textbf{Multi-cluster shared data} means that many independent compute clusters can access the same centralized durable data without owning or moving that data. Storage is shared at the durable layer, while compute is isolated into separately sized virtual warehouses.
+\end{definitionbox}
+
+This model differs from traditional database deployments. In a \emph{shared-disk} system, multiple compute nodes coordinate access to common storage, which simplifies data visibility but can bottleneck on coordination and storage contention. In a \emph{shared-nothing} system, each node owns a slice of data and compute; this can scale well, but resizing and rebalancing data become operationally difficult. Snowflake combines cloud object storage with elastic compute and a managed metadata service so that storage remains durable and centralized while compute can be provisioned, suspended, resumed, and resized independently \cite{dageville2016snowflake}.
+
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[
+        layer/.style={rectangle, draw=primary, fill=primary!5, rounded corners, minimum height=3.2em, text width=12.5cm, align=center, font=\small\bfseries},
+        wh/.style={rectangle, draw=magenta, fill=magenta!10, rounded corners, minimum height=2.6em, text width=3.0cm, align=center, font=\small\bfseries},
+        meta/.style={rectangle, draw=codegreen!60!black, fill=green!8, rounded corners, minimum height=2.4em, text width=2.8cm, align=center, font=\scriptsize\bfseries},
+        arrow/.style={draw, thick, -Latex, draw=primary},
+        biarrow/.style={draw, thick, Latex-Latex, draw=primary}
+    ]
+        \node[layer] (cloud) at (7, 0) {Cloud Services Layer\\Authentication, metadata catalog, query optimizer, transactions, governance, sharing};
+        \node[wh] (load) at (2.2, -2.3) {LOAD\_WH\\COPY and Snowpipe};
+        \node[wh] (elt) at (5.4, -2.3) {ELT\_WH\\Transformations};
+        \node[wh] (bi) at (8.6, -2.3) {BI\_WH\\Dashboards};
+        \node[wh] (ds) at (11.8, -2.3) {DS\_WH\\Snowpark};
+        \node[layer] (compute) at (7, -4.0) {Query Processing Layer\\Independent virtual warehouses execute MPP scans, joins, aggregations, and writes};
+        \node[layer] (storage) at (7, -6.2) {Database Storage Layer\\Immutable compressed micro-partitions on cloud object storage};
+        \node[meta] (mp1) at (2.3, -7.5) {CDR\\day 1};
+        \node[meta] (mp2) at (4.2, -7.5) {CDR\\day 2};
+        \node[meta] (mp3) at (6.1, -7.5) {CDR\\day 3};
+        \node[meta] (mp4) at (8.0, -7.5) {Billing\\facts};
+        \node[meta] (mp5) at (9.9, -7.5) {Device\\dims};
+        \node[meta] (mp6) at (11.8, -7.5) {Secure\\shares};
+        \draw[arrow] (cloud) -- node[right,font=\scriptsize\itshape,text=primary]{plans and policies} (compute);
+        \draw[biarrow] (compute) -- node[right,font=\scriptsize\itshape,text=primary]{scan, prune, write, cache} (storage);
+        \foreach \x in {load,elt,bi,ds}{\draw[arrow] (\x) -- (compute);}
+    \end{tikzpicture}%
+    }
+    \caption{Snowflake's three-layer architecture separates coordination, compute, and storage while allowing multiple warehouses to access the same data.}
+    \label{fig:chapter1-three-layer-architecture}
+\end{figure}
+
+\subsection{Why Separation of Storage and Compute Matters}
+\index{separation of storage and compute}\index{elasticity}
+Separating storage and compute creates operational independence. A loading warehouse can ingest files all night, a transformation warehouse can run scheduled ELT jobs, a business-intelligence warehouse can serve dashboards, and a Snowpark warehouse can run Python feature engineering without forcing those workloads onto the same cluster. If one workload spikes, it consumes its warehouse credits and queueing capacity rather than stealing CPU from every other workload. This is the architectural premise behind warehouse-per-workload design.
+
+\begin{notebox}
+Snowflake storage is not free, but the dominant variable cost for active analytics is often compute credits. A data engineer who treats virtual warehouses as workload boundaries can reason about chargeback, performance isolation, and incident blast radius.
+\end{notebox}
+
+The Cloud Services layer is equally important. Query compilation depends on metadata that Snowflake maintains automatically: table statistics, micro-partition ranges, object definitions, privileges, and transaction state. The optimizer can use that metadata before a warehouse reads data. The system therefore uses information from the storage layer without requiring the user to manually create traditional indexes.
+
+\subsection{Shared-Disk, Shared-Nothing, and Shared-Data}
+\index{shared disk}\index{shared nothing}\index{shared data}
+Classic database architecture debates often start with two extremes. A shared-disk design gives every node access to common storage, which reduces data movement but requires careful concurrency coordination. A shared-nothing design partitions data across nodes, which improves local autonomy but makes scaling, skew, and data redistribution central concerns. Snowflake's design is closer to a multi-cluster shared-data model: persistent data lives in cloud storage, and compute clusters attach to it when needed.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.0cm}p{4.1cm}p{4.1cm}p{3.2cm}@{}}
+\toprule
+\textbf{Architecture} & \textbf{Strength} & \textbf{Typical pain} & \textbf{Snowflake relevance} \\
+\midrule
+Shared disk & All nodes can see the same durable data & Coordination and storage contention & Cloud Services coordinates metadata and transactions \\
+Shared nothing & Compute and data locality scale together & Resizing and skew require redistribution & Warehouses execute MPP work, but do not own durable table partitions \\
+Multi-cluster shared data & Independent compute accesses shared storage & Metadata quality and pruning become critical & Snowflake's core model for elastic analytics \\
+\bottomrule
+\end{tabular}
+\caption{Architectural trade-offs behind Snowflake's multi-cluster shared-data design.}
+\label{tab:chapter1-architecture-comparison}
+\end{table}
+
+\begin{tipbox}
+When explaining Snowflake in an interview, avoid saying only ``storage and compute are separate.'' Add the third layer: Cloud Services. Without metadata, optimization, and transaction coordination, independent warehouses would not behave like one governed database platform.
+\end{tipbox}
+
+\section{Tuesday: Micro-Partitions, Metadata, and Pruning}
+\index{micro-partitions}\index{columnar storage}\index{partition pruning}\index{metadata}
+Snowflake tables are stored as immutable micro-partitions. A micro-partition is a contiguous set of rows stored in a compressed columnar format, typically around 50--500 MB of uncompressed data (Snowflake stores it compressed internally) according to Snowflake documentation \cite{snowflakeTablesDocs}. The exact size is managed by Snowflake, not by a user-specified partition boundary. When data is inserted or loaded, Snowflake automatically groups rows into micro-partitions and records metadata about each partition.
+
+\begin{definitionbox}
+A \textbf{micro-partition} is Snowflake's internal storage unit for table data: immutable, compressed, columnar, and accompanied by per-column metadata such as value ranges and null counts. Users query tables; Snowflake decides which micro-partitions must be read.
+\end{definitionbox}
+
+Columnar storage is not unique to Snowflake. C-Store and later column-store work showed how analytic queries benefit when systems read only the columns needed by a query and compress values column by column \cite{stonebraker2005cstore,abadi2009columnstores}. Dremel similarly demonstrated interactive nested-data analysis at web scale with columnar representation and distributed execution \cite{melnik2010dremel}. Snowflake uses cloud object storage and micro-partition metadata to bring those principles into an elastic managed warehouse.
+
+\subsection{Automatic Partitioning}
+\index{automatic partitioning}
+Snowflake does not ask the engineer to define range partitions in DDL. Instead, it creates micro-partitions automatically during load and DML operations. This reduces administration and prevents many classic mistakes, such as choosing too many tiny partitions or failing to maintain partition definitions as data volume grows. The trade-off is that engineers must understand \emph{ordering} and \emph{clustering} rather than explicit partition files. If incoming data is sorted by event date and region, micro-partitions will tend to have tight ranges for those columns. If incoming data is randomized, many partitions may overlap.
+
+\begin{pitfall}
+\textbf{Assuming automatic means irrelevant.} Snowflake automatically creates micro-partitions, but it cannot make randomized data magically local for every query pattern. Load order, transformation order, and clustering keys still affect pruning.
+\end{pitfall}
+
+\subsection{Per-Column Metadata}
+\index{metadata!micro-partition}
+For each micro-partition, Snowflake maintains metadata such as minimum and maximum values, distinct-value information, and null counts for columns. The optimizer uses this metadata to eliminate partitions before scanning. Suppose a query filters \texttt{event\_date = '2026-07-30'} and a micro-partition's date range is from \texttt{2026-06-01} through \texttt{2026-06-02}. That partition cannot contain qualifying rows, so the warehouse skips it. This is partition pruning.
+
+\begin{notebox}
+Partition pruning is metadata-driven. It is not the same as an index lookup. Snowflake is not jumping to one row; it is proving that many storage units are irrelevant and excluding them from the scan.
+\end{notebox}
+
+\begin{figure}[H]
+    \centering
+    \resizebox{0.95\textwidth}{!}{%
+    \begin{tikzpicture}[
+        part/.style={rectangle, rounded corners, draw=primary, thick, minimum width=2.3cm, minimum height=1.2cm, align=center, font=\scriptsize\bfseries},
+        keep/.style={part, fill=green!12, draw=codegreen!60!black},
+        skip/.style={part, fill=red!8, draw=red!60!black},
+        meta/.style={font=\scriptsize, align=center},
+        arrow/.style={draw, thick, -Latex, draw=primary}
+    ]
+        \node[font=\small\bfseries] (q) at (5.8, 1.4) {Query predicate: event\_date = 2026-07-30 and region = WEST};
+        \node[skip] (p1) at (0, 0) {MP1\\Jul 01--Jul 03\\EAST};
+        \node[skip] (p2) at (2.7, 0) {MP2\\Jul 10--Jul 12\\WEST};
+        \node[keep] (p3) at (5.4, 0) {MP3\\Jul 29--Jul 31\\WEST};
+        \node[skip] (p4) at (8.1, 0) {MP4\\Jul 30--Jul 30\\EAST};
+        \node[keep] (p5) at (10.8, 0) {MP5\\Jul 30--Aug 02\\WEST};
+        \node[meta] at (5.4, -1.3) {Only MP3 and MP5 survive metadata pruning; the warehouse scans fewer bytes and fewer columns.};
+        \draw[arrow] (q) -- (p3);
+        \draw[arrow] (q) -- (p5);
+    \end{tikzpicture}%
+    }
+    \caption{Micro-partition metadata lets Snowflake prune storage units whose date and region ranges cannot satisfy the predicate.}
+    \label{fig:chapter1-micro-partition-pruning}
+\end{figure}
+
+\subsection{Clustering Keys and Clustering Depth}
+\index{clustering key}\index{clustering depth}\index{SYSTEM\textdollar CLUSTERING\_INFORMATION}
+A clustering key is an expression that tells Snowflake which dimensions matter for micro-partition locality. It does not create a B-tree index. It guides reclustering so that rows with similar key values are colocated in fewer overlapping micro-partitions. Clustering depth summarizes how much overlap exists for the chosen dimensions. Lower average depth generally means better pruning for predicates aligned to the clustering key.
+
+\begin{definitionbox}
+\textbf{Clustering depth} is a Snowflake metric that approximates how many micro-partitions overlap for clustering-key values. High depth means a predicate may need to inspect many partitions even when the filter is selective.
+\end{definitionbox}
+
+Clustering is most valuable when a table is large, query filters are predictable, predicates are selective, and natural load order does not already cluster the data. A fact table loaded by day may already prune well on \texttt{event\_date}. The same table might prune poorly for \texttt{account\_id} if rows for each account arrive throughout the day. A custom clustering key such as \texttt{(event\_date, region, account\_id)} could improve common queries, but it also introduces maintenance cost.
+
+\section{Wednesday: Data Types, Compression, and Automatic Clustering}
+\index{data types}\index{compression}\index{Automatic Clustering}
+Snowflake's storage efficiency depends partly on the data types and distribution patterns engineers choose. Columnar systems compress best when adjacent values have repetition, narrow ranges, or predictable encodings. Numeric identifiers stored as numbers usually compress better and compare faster than string identifiers. Dates and timestamps allow clean range pruning. Semi-structured \texttt{VARIANT} columns are powerful, but frequently filtered attributes often deserve typed relational columns or materialized projections.
+
+\subsection{Choosing Data Types for Pruning and Compression}
+\index{NUMBER}\index{VARCHAR}\index{TIMESTAMP\_NTZ}\index{VARIANT}
+A data type is an architectural commitment. If call timestamps are stored as strings, every filter must parse text or rely on lexical ordering. If numeric customer identifiers are stored as \texttt{VARCHAR}, comparisons may cost more and metadata may be less useful. If a high-cardinality JSON payload is stored entirely in \texttt{VARIANT}, Snowflake can still query it, but governance, statistics, and developer understanding may suffer.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.2cm}p{5.2cm}p{5.2cm}@{}}
+\toprule
+\textbf{Design area} & \textbf{Good Snowflake habit} & \textbf{Why it matters} \\
+\midrule
+Timestamps & Use \texttt{TIMESTAMP\_NTZ} or the correct timezone-aware type & Enables range predicates and avoids string parsing \\
+IDs & Use numeric types when identifiers are numeric and stable & Improves comparison, compression, and semantic clarity \\
+Flags and enums & Normalize repeated values or use short controlled strings & Repetition improves compression and statistics \\
+JSON payloads & Keep raw \texttt{VARIANT}, but project hot attributes into typed columns & Balances landing flexibility with query performance \\
+Dates & Derive explicit \texttt{DATE} columns for common partition-like filters & Improves pruning and simplifies clustering keys \\
+\bottomrule
+\end{tabular}
+\caption{Data-type choices that support Snowflake storage and pruning behavior.}
+\label{tab:chapter1-data-types}
+\end{table}
+
+\begin{tipbox}
+For large event tables, include an explicit event date column even if the source has a timestamp. Many workloads filter by date, and a compact date column is easier to cluster and reason about than repeated timestamp casts.
+\end{tipbox}
+
+\subsection{Storage Optimization and Compression}
+\index{storage optimization}
+Snowflake automatically compresses data and chooses internal encodings. The engineer does not tune compression codecs directly. Instead, the engineer influences compressibility through schema design, load ordering, column selection, and transformation patterns. For example, sorting or batching data by date and region before loading can create micro-partitions with tight metadata ranges and repeated values. Removing unused columns from curated tables reduces scan width. Splitting raw landing tables from curated analytic tables allows each layer to optimize for a different purpose.
+
+\begin{pitfall}
+\textbf{Optimizing only the raw table.} Raw tables should preserve lineage and replayability. Curated tables should optimize the serving pattern. Trying to make one table satisfy every purpose often produces poor governance and poor performance.
+\end{pitfall}
+
+\subsection{Automatic Clustering Mechanics}
+\index{Automatic Clustering!mechanics}\index{credits}
+Automatic Clustering is a Snowflake-managed service that reclusters tables with clustering keys as data changes \cite{snowflakeAutomaticClusteringDocs}. Reclustering rewrites micro-partitions to reduce overlap for the specified key. That background maintenance consumes credits. It can be worth the cost when it prevents repeated expensive scans on business-critical workloads, but it can be wasteful on small tables, low-value queries, or columns that are already naturally ordered.
+
+\begin{definitionbox}
+\textbf{Automatic Clustering} is Snowflake's managed background process for maintaining clustering quality on tables with clustering keys. It improves pruning for aligned predicates by rewriting micro-partitions, and it consumes credits for that maintenance work.
+\end{definitionbox}
+
+A practical decision rule has four parts. First, measure query patterns: which filters appear in expensive recurring queries? Second, inspect current clustering information. Third, estimate value: how many credits and user minutes would improved pruning save? Fourth, monitor reclustering cost after enabling a key. Clustering is a production feedback loop, not a one-time DDL flourish.
+
+\begin{notebox}
+Custom clustering keys are most defensible on very large tables, repeatedly queried with stable selective predicates, where natural ingest order does not preserve locality. They are least defensible on small tables or exploratory data whose access pattern is unknown.
+\end{notebox}
+
+\section{Thursday Hands-On Project: Build and Inspect a 10-Million-Row Table}
+\index{hands-on project}\index{SYSTEM\textdollar CLUSTERING\_INFORMATION}\index{synthetic data}
+The lab creates a database, schema, warehouse, and synthetic Call Detail Record table. The row count is intentionally large enough to produce meaningful micro-partition behavior while remaining adjustable for training accounts. If your account has strict credit limits, start with 1 million rows, validate the workflow, then scale to 10 million.
+
+\begin{pitfall}
+\textbf{Credit safety.} The SQL below creates a 10-million-row table and can consume warehouse credits. Use a training account, set a resource monitor in production environments, and suspend or drop the lab warehouse when finished.
+\end{pitfall}
+
+\begin{lstlisting}[language=SQL,caption={Creating a Snowflake lab database, warehouse, and 10-million-row synthetic CDR table.},label={lst:chapter1-sql-lab}]
+-- Run in a Snowflake worksheet with a role allowed to create warehouses,
+-- databases, schemas, and tables. Adjust sizes for your training account.
+USE ROLE SYSADMIN;
+
+CREATE OR REPLACE WAREHOUSE DE_TRAINING_WH
+  WAREHOUSE_SIZE = 'XSMALL'
+  AUTO_SUSPEND = 60
+  AUTO_RESUME = TRUE
+  INITIALLY_SUSPENDED = TRUE;
+
+CREATE OR REPLACE DATABASE SNOWFLAKE_DE_BOOK;
+CREATE OR REPLACE SCHEMA SNOWFLAKE_DE_BOOK.WEEK1_ARCHITECTURE;
+
+USE WAREHOUSE DE_TRAINING_WH;
+USE DATABASE SNOWFLAKE_DE_BOOK;
+USE SCHEMA WEEK1_ARCHITECTURE;
+
+CREATE OR REPLACE TABLE CDR_EVENTS_RAW AS
+SELECT
+    SEQ4() AS cdr_id,
+    DATEADD('second', UNIFORM(0, 60 * 60 * 24 * 30, RANDOM()),
+            '2026-07-01'::TIMESTAMP_NTZ) AS event_ts,
+    TO_DATE(event_ts) AS event_date,
+    LPAD(UNIFORM(1, 1000000, RANDOM())::VARCHAR, 10, '0') AS subscriber_id,
+    ARRAY_CONSTRUCT('NORTH', 'SOUTH', 'EAST', 'WEST')[UNIFORM(0, 4, RANDOM())]::VARCHAR AS region,
+    ARRAY_CONSTRUCT('VOICE', 'SMS', 'DATA')[UNIFORM(0, 3, RANDOM())]::VARCHAR AS service_type,
+    UNIFORM(1, 3600, RANDOM()) AS duration_seconds,
+    ROUND(UNIFORM(0, 500000, RANDOM()) / 1000, 3) AS bytes_mb,
+    OBJECT_CONSTRUCT(
+      'tower_id', 'T' || UNIFORM(1000, 9999, RANDOM())::VARCHAR,
+      'device', ARRAY_CONSTRUCT('ios', 'android', 'iot')[UNIFORM(0, 3, RANDOM())]
+    ) AS network_context
+FROM TABLE(GENERATOR(ROWCOUNT => 10000000));
+
+SELECT COUNT(*) AS row_count FROM CDR_EVENTS_RAW;
+
+-- Baseline clustering metadata without a custom clustering key.
+SELECT SYSTEM$CLUSTERING_INFORMATION(
+  'CDR_EVENTS_RAW',
+  '(event_date, region)'
+) AS clustering_info;
+
+-- Add a custom key aligned to common telecom query predicates.
+ALTER TABLE CDR_EVENTS_RAW CLUSTER BY (event_date, region, subscriber_id);
+
+-- After Snowflake has had time to recluster, inspect the table again.
+SELECT SYSTEM$CLUSTERING_INFORMATION('CDR_EVENTS_RAW') AS clustering_info_after_key;
+
+-- Representative query that should benefit from date and region pruning.
+SELECT
+    event_date,
+    region,
+    service_type,
+    COUNT(*) AS calls,
+    SUM(duration_seconds) AS total_duration_seconds,
+    SUM(bytes_mb) AS total_bytes_mb
+FROM CDR_EVENTS_RAW
+WHERE event_date BETWEEN '2026-07-15' AND '2026-07-16'
+  AND region = 'WEST'
+GROUP BY event_date, region, service_type
+ORDER BY event_date, service_type;
+\end{lstlisting}
+
+The lab demonstrates three ideas. First, Snowflake can create large tables from generated rows without external files, which is useful for architecture drills. Second, \texttt{SYSTEM\textdollar CLUSTERING\_INFORMATION} can evaluate clustering expressions even before you set a key. Third, adding a clustering key is not free performance; it is a request for Snowflake to maintain locality for future queries.
+
+\begin{tipbox}
+Read the JSON returned by \texttt{SYSTEM\textdollar CLUSTERING\_INFORMATION}. Focus on average depth, partition counts, and notes about constant partitions. Then compare those values with query profile bytes scanned for representative queries.
+\end{tipbox}
+
+\subsection{Python Connector Inspection}
+\index{Python connector}\index{Snowpark}
+Python is useful for repeatable experiments, metadata collection, and DataOps checks. The following snippet uses the Snowflake Connector for Python \cite{snowflakeConnectorPythonDocs}. Store credentials in environment variables or your organization's secret manager; do not hardcode passwords in notebooks or scripts.
+
+\begin{lstlisting}[language=Python,caption={Collecting Snowflake clustering metadata with the Python connector.},label={lst:chapter1-python-clustering}]
+import json
+import os
+
+import snowflake.connector
+
+connection = snowflake.connector.connect(
+    account=os.environ["SNOWFLAKE_ACCOUNT"],
+    user=os.environ["SNOWFLAKE_USER"],
+    password=os.environ["SNOWFLAKE_PASSWORD"],
+    role="SYSADMIN",
+    warehouse="DE_TRAINING_WH",
+    database="SNOWFLAKE_DE_BOOK",
+    schema="WEEK1_ARCHITECTURE",
+)
+
+try:
+    with connection.cursor() as cursor:
+        cursor.execute("""
+            SELECT SYSTEM$CLUSTERING_INFORMATION('CDR_EVENTS_RAW')
+        """)
+        raw_json = cursor.fetchone()[0]
+        clustering = json.loads(raw_json)
+
+    print("cluster_by_keys:", clustering.get("cluster_by_keys"))
+    print("total_partition_count:", clustering.get("total_partition_count"))
+    print("average_depth:", clustering.get("average_depth"))
+    print("average_overlaps:", clustering.get("average_overlaps"))
+finally:
+    connection.close()
+\end{lstlisting}
+
+\begin{notebox}
+The same experiment can be expressed with Snowpark Python \cite{snowflakeSnowparkPythonDocs}. Snowpark becomes especially valuable when metadata checks, feature engineering, or stored procedures should run inside Snowflake-managed execution rather than on a client workstation.
+\end{notebox}
+
+\subsection{What to Observe in the Query Profile}
+\index{query profile}
+After running the representative query, open the Snowflake query profile. Look for scan bytes, partitions scanned, partitions total, spill, and warehouse time. If the query scans most partitions even for a narrow date and region, the table is poorly localized for that access path. If it scans a small fraction, pruning is effective. Combine the profile with clustering metadata; neither view alone is sufficient.
+
+\section{Friday Use Case: Global Telecom CDR Storage Architecture}
+\index{telecom}\index{Call Detail Record}\index{CDR}\index{enterprise architecture}
+Consider a global telecom that receives 5 TB of compressed or semi-compressed Call Detail Record logs per day from mobile, fixed-line, roaming, and IoT networks. The business needs fraud detection within minutes, billing reconciliation every night, customer-care search for recent calls, regulatory retention, and executive dashboards. The data platform must balance fast predicates on recent records against the credit cost of continuous reclustering.
+
+\subsection{Workload Requirements}
+A telecom CDR record typically contains event timestamp, subscriber, device, cell tower or switch, originating and terminating numbers, region, service type, roaming status, duration, bytes, charge class, and network attributes. Common filters include event date, region, subscriber, service type, and fraud indicators. Some queries are narrow and urgent, such as customer-care lookup by subscriber and date. Others are broad aggregations, such as daily data usage by region.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.4cm}p{4.8cm}p{4.7cm}@{}}
+\toprule
+\textbf{Workload} & \textbf{Typical predicate} & \textbf{Storage implication} \\
+\midrule
+Fraud detection & Recent minutes, region, tower, subscriber & Maintain a hot recent table clustered by time and region \\
+Billing & Daily event date, service type, account & Batch curated facts by date and account dimensions \\
+Customer care & Subscriber and recent date range & Consider search optimization or a subscriber-focused serving table \\
+Regulatory retention & Month or legal hold criteria & Separate immutable raw retention from curated performance layer \\
+Executive dashboards & Date, region, product hierarchy & Cluster curated aggregates by date and region \\
+\bottomrule
+\end{tabular}
+\caption{Telecom workloads drive different clustering and serving-table choices.}
+\label{tab:chapter1-telecom-workloads}
+\end{table}
+
+\subsection{Proposed Storage Structure}
+The architecture should not put every requirement on one enormous table. Use a layered model.
+\begin{enumerate}
+    \item \textbf{Raw landing:} append-only external or internal stage ingestion into raw CDR tables. Preserve source files, ingestion time, source system, and raw payload for replay.
+    \item \textbf{Bronze normalized:} parse mandatory attributes into typed columns while retaining \texttt{VARIANT} for less common network attributes.
+    \item \textbf{Silver serving facts:} create date-bounded fact tables with explicit \texttt{event\_date}, \texttt{region}, \texttt{subscriber\_id}, \texttt{service\_type}, and billing dimensions.
+    \item \textbf{Gold aggregates:} maintain daily or hourly aggregates for dashboards and billing reconciliation.
+    \item \textbf{Specialized lookup:} for customer care or fraud, maintain recent narrow tables or dynamic tables optimized for subscriber and time lookup.
+\end{enumerate}
+
+\begin{definitionbox}
+A \textbf{serving table} is a curated table designed for a known query pattern, even when it duplicates data from a canonical fact table. In Snowflake, duplication may be cheaper than forcing one table to support incompatible pruning patterns.
+\end{definitionbox}
+
+\subsection{Balancing Auto-Clustering Cost Against Query Speed}
+\index{cost optimization}\index{auto-clustering cost}
+For 5 TB per day, every design choice becomes a credit decision. Clustering the full raw table on many dimensions is usually wasteful because raw data is primarily for replay and audit. Instead, cluster curated tables whose query savings are measurable. A good first key for the silver fact table might be \texttt{(event\_date, region)} because most reporting and reconciliation filters include date and geography. If customer-care lookup by subscriber is frequent and latency-sensitive, create a separate recent table clustered by \texttt{(subscriber\_id, event\_date)} rather than adding subscriber to every large-table clustering key.
+
+\begin{tipbox}
+Separate hot and cold data. The most recent 7--30 days may justify aggressive clustering or specialized serving tables. Older data often benefits from date organization and aggregate tables rather than continuous reclustering.
+\end{tipbox}
+
+\begin{pitfall}
+\textbf{One clustering key cannot optimize every question.} Date-region dashboards, subscriber lookups, and tower-level fraud searches have different locality needs. Use workload-specific serving structures when the business value justifies duplicate storage and pipeline complexity.
+\end{pitfall}
+
+\subsection{Reference Architecture}
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[
+        box/.style={rectangle, draw=primary, fill=primary!5, rounded corners, minimum height=2.7em, text width=2.8cm, align=center, font=\scriptsize\bfseries},
+        hot/.style={rectangle, draw=red!60!black, fill=red!8, rounded corners, minimum height=2.7em, text width=2.9cm, align=center, font=\scriptsize\bfseries},
+        cold/.style={rectangle, draw=codegreen!60!black, fill=green!8, rounded corners, minimum height=2.7em, text width=2.9cm, align=center, font=\scriptsize\bfseries},
+        wh/.style={rectangle, draw=magenta, fill=magenta!10, rounded corners, minimum height=2.7em, text width=2.6cm, align=center, font=\scriptsize\bfseries},
+        arrow/.style={draw, thick, -Latex, draw=primary}
+    ]
+        \node[box] (stage) at (0, 0) {Cloud stage\\5 TB CDR daily};
+        \node[box] (raw) at (3.2, 0) {Raw landing\\append-only};
+        \node[box] (bronze) at (6.4, 0) {Bronze typed\\parsed CDR};
+        \node[hot] (hot) at (9.8, 1.1) {Hot serving\\7--30 days\\subscriber + date};
+        \node[cold] (silver) at (9.8, -1.1) {Silver fact\\event date + region};
+        \node[cold] (gold) at (13.0, -1.1) {Gold aggregates\\billing + BI};
+        \node[wh] (fraud) at (13.0, 1.1) {Fraud WH\\near-real time};
+        \node[wh] (bi) at (16.2, -1.1) {BI WH\\dashboards};
+        \node[wh] (care) at (16.2, 1.1) {Care WH\\lookup};
+        \draw[arrow] (stage) -- (raw);
+        \draw[arrow] (raw) -- (bronze);
+        \draw[arrow] (bronze) -- (hot);
+        \draw[arrow] (bronze) -- (silver);
+        \draw[arrow] (silver) -- (gold);
+        \draw[arrow] (hot) -- (fraud);
+        \draw[arrow] (hot) -- (care);
+        \draw[arrow] (gold) -- (bi);
+    \end{tikzpicture}%
+    }
+    \caption{A telecom CDR architecture separates raw retention, typed facts, hot lookup tables, and aggregate serving layers.}
+    \label{fig:chapter1-telecom-architecture}
+\end{figure}
+
+\subsection{Operational Controls}
+A production design needs controls beyond DDL. Use resource monitors to cap warehouse spend. Track Automatic Clustering credit usage per table. Build daily checks for clustering depth and query bytes scanned on representative workloads. Use Time Travel retention deliberately: critical billing tables may need longer retention than transient staging tables. Use zero-copy clones for test transformations against realistic data volume, but drop them when experiments finish.
+
+\begin{notebox}
+Snowflake's architecture makes experimentation cheap compared with copying terabytes, but it does not make experimentation free. Clones share storage until changes occur; warehouses still consume credits when experiments run.
+\end{notebox}
+
+\section{Interview Q\&A}
+\subsection{Architecture and Storage}
+\begin{enumerate}
+    \item \textbf{Q: What are Snowflake's three layers?}\\
+    A: Database Storage persists compressed micro-partitions, Query Processing executes SQL in virtual warehouses, and Cloud Services handles metadata, optimization, security, transactions, and coordination.
+    \item \textbf{Q: Why does separating compute and storage matter?}\\
+    A: It allows independent workload scaling, warehouse isolation, elastic suspension and resume, and shared access to the same durable data without copying tables for each compute cluster.
+    \item \textbf{Q: Are micro-partitions user-defined partitions?}\\
+    A: No. Snowflake creates them automatically. Engineers influence their usefulness through load order, schema design, clustering keys, and curated serving tables.
+    \item \textbf{Q: Is a clustering key an index?}\\
+    A: No. It guides Snowflake's micro-partition organization. Query speed improves when predicates let metadata prune partitions, not because Snowflake performs a row-level index seek.
+    \item \textbf{Q: When should Automatic Clustering be enabled?}\\
+    A: When a large table has stable, selective, valuable query predicates and current clustering metrics show overlap that causes excessive scans. The saved query credits and latency should justify reclustering credits.
+\end{enumerate}
+
+\section{Further Reading}
+Snowflake's original SIGMOD paper explains the elastic data warehouse design and the separation of storage, compute, and services \cite{dageville2016snowflake}. Snowflake's architecture and table-structure documentation describe current concepts for warehouses, micro-partitions, clustering keys, and Automatic Clustering \cite{snowflakeArchitectureDocs,snowflakeTablesDocs,snowflakeClusteringDocs,snowflakeAutomaticClusteringDocs}. For columnar storage foundations, read C-Store \cite{stonebraker2005cstore}, the row-store versus column-store comparison \cite{abadi2009columnstores}, and Dremel's distributed columnar execution model \cite{melnik2010dremel}. Lakehouse architecture work provides useful contrast for teams comparing warehouse, lake, and hybrid designs \cite{armbrust2021lakehouse}.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item Snowflake's core design has three layers: Database Storage, Query Processing through virtual warehouses, and Cloud Services.
+    \item Multi-cluster shared-data architecture lets independent warehouses access the same durable data while preserving workload isolation.
+    \item Micro-partitions are immutable, compressed, columnar storage units with metadata that enables partition pruning.
+    \item Clustering quality depends on data order, query predicates, overlap, and table size; automatic partitioning does not remove design responsibility.
+    \item Data types and curated table design influence compression, pruning, governance, and developer clarity.
+    \item Automatic Clustering can improve large-table query speed, but it consumes credits and must be justified with workload evidence.
+    \item Enterprise designs often use multiple serving structures because one clustering key cannot optimize every workload.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Compare shared-disk, shared-nothing, and multi-cluster shared-data systems. Explain which operational problem Snowflake is trying to reduce with each layer.
+    \item \textbf{(Conceptual)} Why is partition pruning not the same as row-level indexing? Use micro-partition metadata in your answer.
+    \item \textbf{(Conceptual)} A table is loaded randomly across dates and regions. Predict how that affects clustering depth and query scan bytes for date-region predicates.
+    \item \textbf{(Hands-on)} Run the SQL lab with 1 million rows, then with 10 million rows if your account budget allows. Record total partitions, average depth, and query bytes scanned.
+    \item \textbf{(Hands-on)} Modify the clustering key to \texttt{(subscriber\_id, event\_date)}. Compare a subscriber lookup query with the date-region aggregation query. Which workload improves and which may degrade?
+    \item \textbf{(Design)} For a 5 TB per day telecom workload, decide which tables should be permanent, transient, or temporary. Justify your choices using recovery, retention, and cost.
+    \item \textbf{(Design)} Propose a resource-monitor strategy for the warehouses in \cref{fig:chapter1-telecom-architecture}. Include alert thresholds and shutdown thresholds.
+    \item \textbf{(Data modeling)} Identify five attributes from a raw CDR JSON payload that should become typed columns in a curated table. Explain how each supports pruning, governance, or downstream joins.
+    \item \textbf{(Operations)} Write a daily DataOps check that stores clustering information for critical tables. What trend would trigger investigation?
+    \item \textbf{(Interview)} Explain to a non-specialist executive why Snowflake can run a dashboard workload and a data-science workload at the same time without copying the same table twice.
+\end{enumerate}
+
+\section{Capstone Project: CDR Storage and Micro-Partition Clustering Optimization}\label{sec:ch1-capstone}
+\index{capstone project}\index{CDR}\index{Automatic Clustering!capstone}\index{partition pruning!capstone}
+
+\begin{capstonebox}
+\textbf{Mission.} Design, build, measure, and defend a Snowflake storage strategy for a Friday telecom Call Detail Record scenario. You will create a 10-million-row synthetic CDR fact table, inspect micro-partition clustering quality, apply a custom clustering key, measure pruning on a selective time-and-region query, and decide whether Automatic Clustering is worth its credit cost for a 5 TB-per-day production workload.
+
+\textbf{Estimated time.} 3--5 hours. Use an XSMALL or SMALL warehouse in a training account, start with fewer rows if credits are constrained, and scale to 10 million rows only after the workflow is validated.
+
+\textbf{What you'll practice.}
+\begin{itemize}
+    \item Mapping Snowflake's Cloud Services, virtual warehouse compute, and micro-partitioned storage layers to an enterprise telecom workload.
+    \item Reading \texttt{SYSTEM\textdollar CLUSTERING\_INFORMATION} before and after a clustering-key change.
+    \item Connecting clustering depth, partition overlap, query profile partitions scanned, bytes scanned, and elapsed time.
+    \item Comparing the credit cost of Automatic Clustering with repeated speedups on business-critical CDR queries.
+    \item Writing an evidence-based recommendation instead of assuming that every large table should be reclustered.
+\end{itemize}
+\end{capstonebox}
+
+\subsection*{Scenario}
+A global telecom ingests roughly 5 TB of Call Detail Records each day from mobile switches, fixed-line systems, roaming partners, IoT gateways, and packet-core network probes. The CDR feed powers fraud detection, customer-care lookup, billing reconciliation, regulatory retention, and executive traffic dashboards. Most users filter by event time, region, service type, subscriber, or tower. The engineering team has noticed that some date-and-region queries scan far more data than expected, while a proposal to enable aggressive clustering on every CDR table may create a large background credit bill.
+
+Your role is to prove the storage design with measurements. You must show how Snowflake's three-layer architecture supports the workload: Cloud Services stores metadata and optimizes pruning decisions, a virtual warehouse performs the scans and aggregations, and immutable micro-partitions in the storage layer either help or hurt pruning depending on data order and clustering. The final recommendation must balance query speed, Automatic Clustering maintenance cost, and operational simplicity.
+
+\subsection*{Requirements}
+Complete the following requirements in a Snowflake training account:
+\begin{enumerate}
+    \item Create a dedicated database, schema, and warehouse for the capstone so the lab can be dropped safely.
+    \item Create a synthetic CDR table with 10 million rows. The table must include an event timestamp, event date, region, subscriber identifier, service type, cell tower, roaming flag, duration, bytes transferred, and a semi-structured network attributes column.
+    \item Inspect \texttt{SYSTEM\textdollar CLUSTERING\_INFORMATION} against a candidate expression before defining a table clustering key. Save the JSON output as the baseline.
+    \item Run a selective query filtered by a narrow time window and one region. Capture elapsed time, bytes scanned, partitions scanned, partitions total, and the query identifier from the Snowflake query profile or query history.
+    \item Define a custom clustering key aligned to the selective access path, wait for reclustering or run enough load-order experiments to make the difference visible, and inspect \texttt{SYSTEM\textdollar CLUSTERING\_INFORMATION} again.
+    \item Rerun the same selective query from a cold-enough cache or with a clearly documented cache caveat. Compare pruning and runtime before and after.
+    \item Estimate Automatic Clustering credit cost versus query speedup. Use the observed improvement, expected query frequency, and the production rate of 5 TB per day.
+    \item Deliver a recommendation: keep natural clustering only, use \texttt{(event\_date, region)}, use a different serving table, enable Automatic Clustering for only a hot window, or reject clustering because the cost is not justified.
+\end{enumerate}
+
+\subsection*{Reference Architecture}
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[
+        svc/.style={rectangle, draw=primary, fill=primary!6, rounded corners, minimum height=3.0em, text width=3.4cm, align=center, font=\scriptsize\bfseries},
+        wh/.style={rectangle, draw=magenta, fill=magenta!10, rounded corners, minimum height=3.0em, text width=3.1cm, align=center, font=\scriptsize\bfseries},
+        mp/.style={rectangle, draw=codegreen!60!black, fill=green!8, rounded corners, minimum height=2.4em, text width=2.1cm, align=center, font=\scriptsize},
+        skip/.style={rectangle, draw=red!60!black, fill=red!8, rounded corners, minimum height=2.4em, text width=2.1cm, align=center, font=\scriptsize},
+        loop/.style={draw, thick, -Latex, draw=red!65!black},
+        arrow/.style={draw, thick, -Latex, draw=primary}
+    ]
+        \node[svc] (cloud) at (5.0, 2.0) {Cloud Services\\catalog, optimizer, access control, clustering metadata};
+        \node[wh] (loadwh) at (0.5, 0.0) {LOAD\_WH\\CDR ingest};
+        \node[wh] (querywh) at (5.0, 0.0) {ANALYTICS\_WH\\selective CDR query};
+        \node[wh] (cluster) at (9.5, 0.0) {Automatic Clustering\\background maintenance};
+        \node[mp] (mp1) at (0.2, -2.0) {MP1\\Jul 01\\EAST};
+        \node[skip] (mp2) at (2.6, -2.0) {MP2\\Jul 10\\WEST\\pruned};
+        \node[mp] (mp3) at (5.0, -2.0) {MP3\\Jul 15\\WEST\\scanned};
+        \node[skip] (mp4) at (7.4, -2.0) {MP4\\Jul 20\\NORTH\\pruned};
+        \node[mp] (mp5) at (9.8, -2.0) {MP5\\Jul 15\\WEST\\scanned};
+        \node[svc] (storage) at (5.0, -3.7) {Micro-partitioned CDR storage\\immutable columnar files plus min/max metadata};
+        \draw[arrow] (cloud) -- node[right,font=\scriptsize,text=primary]{plans from metadata} (querywh);
+        \draw[arrow] (loadwh) -- (mp1);
+        \draw[arrow] (querywh) -- node[right,font=\scriptsize,text=primary]{scan only surviving partitions} (mp3);
+        \draw[arrow] (querywh) -- (mp5);
+        \draw[loop] (cluster) to[out=-70,in=10] node[right,font=\scriptsize,text=red!65!black]{recluster by key} (storage);
+        \draw[arrow] (mp1) -- (storage);
+        \draw[arrow] (mp2) -- (storage);
+        \draw[arrow] (mp3) -- (storage);
+        \draw[arrow] (mp4) -- (storage);
+        \draw[arrow] (mp5) -- (storage);
+    \end{tikzpicture}%
+    }
+    \caption{Capstone CDR architecture connecting Cloud Services metadata, virtual warehouse compute, pruning, and a clustering maintenance loop.}
+    \label{fig:chapter1-capstone-cdr-architecture}
+\end{figure}
+
+\subsection*{Implementation Steps}
+\begin{enumerate}
+    \item Run the setup script in \cref{lst:chapter1-capstone-sql}. If 10 million rows is too expensive for your account, first replace the generator row count with 1 million and repeat the final run at the required scale.
+    \item Copy each \texttt{SYSTEM\textdollar CLUSTERING\_INFORMATION} result into a notes file or metrics table. Record \texttt{total\_partition\_count}, \texttt{average\_depth}, \texttt{average\_overlaps}, and the clustering key reported by Snowflake.
+    \item Open the query profile for the selective query. Record partitions scanned, partitions total, bytes scanned, percentage scanned, elapsed time, and warehouse size.
+    \item Apply the clustering key. Automatic Clustering is asynchronous; for a lab, allow time for maintenance and recheck the table. If the table is still unchanged, document that the scale or account state did not trigger visible reclustering yet.
+    \item Use the Python measurement script in \cref{lst:chapter1-capstone-python} to repeat the selective query several times and store comparable timings. Treat result-cache hits separately from warehouse execution time.
+\end{enumerate}
+
+\begin{lstlisting}[language=SQL,caption={Capstone SQL for creating, measuring, clustering, and profiling synthetic CDR storage.},label={lst:chapter1-capstone-sql}]
+USE ROLE SYSADMIN;
+
+CREATE OR REPLACE WAREHOUSE CDR_CAPSTONE_WH
+  WAREHOUSE_SIZE = 'XSMALL'
+  AUTO_SUSPEND = 60
+  AUTO_RESUME = TRUE
+  INITIALLY_SUSPENDED = TRUE;
+
+CREATE OR REPLACE DATABASE CDR_CAPSTONE_DB;
+CREATE OR REPLACE SCHEMA CDR_CAPSTONE_DB.WEEK1_STORAGE;
+
+USE WAREHOUSE CDR_CAPSTONE_WH;
+USE DATABASE CDR_CAPSTONE_DB;
+USE SCHEMA WEEK1_STORAGE;
+
+CREATE OR REPLACE TABLE CDR_EVENTS AS
+WITH generated AS (
+  SELECT
+      SEQ4() AS cdr_id,
+      DATEADD('second', UNIFORM(0, 60 * 60 * 24 * 30, RANDOM()),
+              '2026-07-01'::TIMESTAMP_NTZ) AS event_ts,
+      UNIFORM(1, 5000000, RANDOM()) AS subscriber_num,
+      UNIFORM(1000, 9999, RANDOM()) AS tower_num,
+      UNIFORM(0, 100, RANDOM()) AS roaming_roll
+  FROM TABLE(GENERATOR(ROWCOUNT => 10000000))
+)
+SELECT
+    cdr_id,
+    event_ts,
+    TO_DATE(event_ts) AS event_date,
+    LPAD(subscriber_num::VARCHAR, 12, '0') AS subscriber_id,
+    ARRAY_CONSTRUCT('NORTH_AMERICA', 'LATAM', 'EMEA', 'APAC')[UNIFORM(0, 4, RANDOM())]::VARCHAR AS region,
+    ARRAY_CONSTRUCT('VOICE', 'SMS', 'DATA', 'IOT')[UNIFORM(0, 4, RANDOM())]::VARCHAR AS service_type,
+    'CELL-' || tower_num::VARCHAR AS cell_tower_id,
+    IFF(roaming_roll < 12, TRUE, FALSE) AS roaming_flag,
+    UNIFORM(1, 7200, RANDOM()) AS duration_seconds,
+    ROUND(UNIFORM(0, 5000000, RANDOM()) / 1000, 3) AS bytes_mb,
+    OBJECT_CONSTRUCT(
+      'switch_id', 'SW-' || UNIFORM(100, 999, RANDOM())::VARCHAR,
+      'network_slice', ARRAY_CONSTRUCT('consumer', 'enterprise', 'iot')[UNIFORM(0, 3, RANDOM())],
+      'quality_score', UNIFORM(1, 100, RANDOM())
+    ) AS network_attributes
+FROM generated;
+
+SELECT COUNT(*) AS row_count FROM CDR_EVENTS;
+
+SELECT SYSTEM$CLUSTERING_INFORMATION(
+  'CDR_EVENTS',
+  '(event_date, region)'
+) AS clustering_info_before;
+
+ALTER SESSION SET USE_CACHED_RESULT = FALSE;
+
+SELECT
+    event_date,
+    region,
+    service_type,
+    COUNT(*) AS cdr_count,
+    SUM(duration_seconds) AS total_duration_seconds,
+    SUM(bytes_mb) AS total_bytes_mb
+FROM CDR_EVENTS
+WHERE event_date BETWEEN '2026-07-15' AND '2026-07-16'
+  AND region = 'EMEA'
+GROUP BY event_date, region, service_type
+ORDER BY event_date, service_type;
+
+SELECT LAST_QUERY_ID() AS selective_query_id_before;
+
+ALTER TABLE CDR_EVENTS CLUSTER BY (event_date, region);
+
+SELECT SYSTEM$CLUSTERING_INFORMATION('CDR_EVENTS') AS clustering_info_after;
+
+SELECT
+    event_date,
+    region,
+    service_type,
+    COUNT(*) AS cdr_count,
+    SUM(duration_seconds) AS total_duration_seconds,
+    SUM(bytes_mb) AS total_bytes_mb
+FROM CDR_EVENTS
+WHERE event_date BETWEEN '2026-07-15' AND '2026-07-16'
+  AND region = 'EMEA'
+GROUP BY event_date, region, service_type
+ORDER BY event_date, service_type;
+
+SELECT LAST_QUERY_ID() AS selective_query_id_after;
+
+SELECT
+    query_id,
+    warehouse_size,
+    bytes_scanned,
+    partitions_scanned,
+    partitions_total,
+    total_elapsed_time
+FROM TABLE(INFORMATION_SCHEMA.QUERY_HISTORY_BY_SESSION(RESULT_LIMIT => 20))
+WHERE query_text ILIKE '%FROM CDR_EVENTS%'
+ORDER BY start_time DESC;
+\end{lstlisting}
+
+\begin{lstlisting}[language=Python,caption={Python connector measurement loop for CDR pruning experiments.},label={lst:chapter1-capstone-python}]
+import json
+import os
+import time
+
+import snowflake.connector
+
+QUERY = """
+SELECT
+    event_date,
+    region,
+    service_type,
+    COUNT(*) AS cdr_count,
+    SUM(duration_seconds) AS total_duration_seconds,
+    SUM(bytes_mb) AS total_bytes_mb
+FROM CDR_EVENTS
+WHERE event_date BETWEEN '2026-07-15' AND '2026-07-16'
+  AND region = 'EMEA'
+GROUP BY event_date, region, service_type
+ORDER BY event_date, service_type
+"""
+
+connection = snowflake.connector.connect(
+    account=os.environ["SNOWFLAKE_ACCOUNT"],
+    user=os.environ["SNOWFLAKE_USER"],
+    password=os.environ["SNOWFLAKE_PASSWORD"],
+    role="SYSADMIN",
+    warehouse="CDR_CAPSTONE_WH",
+    database="CDR_CAPSTONE_DB",
+    schema="WEEK1_STORAGE",
+)
+
+try:
+    with connection.cursor() as cursor:
+        cursor.execute("ALTER SESSION SET USE_CACHED_RESULT = FALSE")
+
+        cursor.execute("SELECT SYSTEM$CLUSTERING_INFORMATION('CDR_EVENTS')")
+        clustering = json.loads(cursor.fetchone()[0])
+        print("average_depth", clustering.get("average_depth"))
+        print("average_overlaps", clustering.get("average_overlaps"))
+
+        for run_number in range(1, 4):
+            started = time.perf_counter()
+            cursor.execute(QUERY)
+            rows = cursor.fetchall()
+            elapsed = time.perf_counter() - started
+            query_id = cursor.sfqid
+            print({
+                "run_number": run_number,
+                "query_id": query_id,
+                "rows_returned": len(rows),
+                "client_elapsed_seconds": round(elapsed, 3),
+            })
+finally:
+    connection.close()
+\end{lstlisting}
+
+\subsection*{Deliverables}
+Submit a compact engineering packet with the following artifacts:
+\begin{itemize}
+    \item \textbf{SQL scripts:} setup, baseline measurement, clustering-key change, after measurement, and cleanup commands.
+    \item \textbf{Generator or measurement script:} a Python connector or Snowpark script that reruns the selective query and prints query identifiers for profile lookup.
+    \item \textbf{Before/after metrics table:} include row count, warehouse size, clustering key, total partitions, average depth, average overlaps, partitions scanned, partitions total, bytes scanned, elapsed time, and notes about cache state.
+    \item \textbf{Recommendation memo:} one page explaining whether the production design should use natural load order, \texttt{(event\_date, region)} clustering, a subscriber-focused hot serving table, Search Optimization Service, or no additional optimization.
+\end{itemize}
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{2.4cm}p{2.0cm}p{2.0cm}p{2.0cm}p{2.0cm}p{2.0cm}@{}}
+\toprule
+\textbf{Run} & \textbf{Cluster key} & \textbf{Avg depth} & \textbf{Partitions scanned} & \textbf{Bytes scanned} & \textbf{Elapsed time} \\
+\midrule
+Before & Candidate only & & & & \\
+After & \texttt{event\_date, region} & & & & \\
+Production estimate & Final choice & & & & \\
+\bottomrule
+\end{tabular}
+\caption{Template for before-and-after pruning metrics in the CDR capstone.}
+\label{tab:chapter1-capstone-pruning-metrics}
+\end{table}
+
+\subsection*{Acceptance Criteria}
+Your capstone is complete when the submission satisfies this rubric:
+\begin{itemize}
+    \item The Snowflake objects are isolated in a capstone database, schema, and warehouse, and the cleanup path is documented.
+    \item The CDR table contains 10 million rows or a clearly justified smaller training-account run plus a scale-up plan.
+    \item Baseline and after-change \texttt{SYSTEM\textdollar CLUSTERING\_INFORMATION} outputs are captured and interpreted correctly.
+    \item The same selective time-and-region query is measured before and after the clustering decision.
+    \item The before/after table reports partition pruning metrics rather than runtime alone.
+    \item Result-cache effects, warehouse size, and asynchronous reclustering timing are disclosed.
+    \item The clustering recommendation is justified by workload frequency, latency value, expected 5 TB-per-day growth, and Automatic Clustering credit cost.
+    \item The conclusion recognizes that one clustering key may not serve dashboards, customer care, fraud detection, and regulatory workloads equally well.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Compare \texttt{(event\_date, region)} clustering with Search Optimization Service for subscriber lookup on a recent hot table.
+    \item Build a materialized view or aggregate table for daily region-and-service traffic summaries and compare it with scanning the base CDR table.
+    \item Model production cost at 5 TB per day: storage growth, warehouse credits for recurring queries, Automatic Clustering credits, and duplicate serving-table storage.
+    \item Add a hot/cold design in which the latest 30 days use stronger clustering and older CDR data is retained with simpler date organization.
+    \item Capture query profile screenshots or exported metrics and annotate exactly where pruning improved or failed to improve.
+\end{itemize}

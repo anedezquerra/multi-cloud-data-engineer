@@ -1,0 +1,653 @@
+\chapter{Relational to Document Migration Strategy}
+\index{relational migration}\index{document migration}\index{MongoDB Relational Migrator}\index{change data capture}\index{CDC}\index{zero-downtime migration}\index{dual writes}\index{shadow reads}\index{rollback strategy}\index{schema conversion}\index{PostgreSQL migration}\index{MongoDB Atlas migration}%
+
+\begin{objectives}
+\begin{itemize}
+    \item Analyze normalized relational schemas and identify 3NF table groups that should collapse into bounded MongoDB documents.
+    \item Use MongoDB Relational Migrator concepts: source connection, destination cluster, mapping model, transformation rules, initial sync, and continuous CDC.
+    \item Design zero-downtime cutovers using dual-writes, shadow reads, CDC replication pipelines, reconciliation, and instant rollback.
+    \item Map a 12-table PostgreSQL e-commerce schema into three MongoDB collections and verify initial sync plus CDC with PyMongo.
+    \item Plan a 15 TB PostgreSQL-to-Atlas migration with rollback guarantees, lossless replication, query parity, and operational checkpoints.
+    \item Close Part I by integrating schema patterns, relationship modeling, JSON Schema validation, Relational Migrator CDC, and performance benchmarking.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+Database migration services use different product names, but production teams still solve the same problems: schema conversion, full load, continuous change capture, cutover safety, and rollback. MongoDB Relational Migrator focuses on moving relational workloads into document models, while cloud-native migration services often preserve a relational target unless paired with a schema redesign step.
+
+\vspace{2mm}
+{\footnotesize
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{@{}p{2.7cm}p{3.4cm}p{3.4cm}p{3.4cm}p{3.4cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{MongoDB Relational Migrator} & \textbf{AWS DMS + SCT} & \textbf{Azure Database Migration Service} & \textbf{GCP Database Migration Service} \\
+\midrule
+Schema conversion & Converts relational tables into MongoDB collections with embedded arrays, references, and transformation rules & SCT converts relational engines and recommends target schema changes; DMS moves data & Assesses and migrates database engines, usually relational-to-relational with compatibility guidance & Migrates source engines into Cloud SQL or AlloyDB with schema compatibility checks \\
+Full-load + CDC & Performs initial sync and keeps MongoDB synchronized through CDC from supported relational sources & DMS supports full load plus ongoing replication tasks & Online migrations use continuous sync until cutover when supported & Continuous replication supports low-downtime migrations for supported sources \\
+Dual-write / shadow-read cutover & Application pattern around the migrator: write both systems, compare reads, then promote Atlas & Application pattern around DMS tasks and target database validation & Application pattern around online migration and application routing & Application pattern around replication lag, validation, and cutover windows \\
+Rollback strategy & Keep PostgreSQL authoritative until final promotion; after promotion, retain dual-writes or reverse sync window for instant rollback & Retain source as system of record; rollback by routing reads and writes back to source & Retain source and DNS/application routing until validation passes & Retain source and delay destructive changes until post-cutover confidence window \\
+\bottomrule
+\end{tabular}}}
+
+\vspace{1mm}
+Microsoft Fabric and Snowflake often enter the same program as analytical ingestion targets rather than operational cutover targets. They can consume CDC streams or staged exports for validation, reconciliation, and analytics, but they do not replace the operational document-modeling decisions required for MongoDB Atlas \cite{mongodbRelationalMigratorDocs,awsDmsDocs,awsSctDocs,azureDmsDocs,gcpDmsDocs,snowflakeSemiStructuredDocs,fabricJsonDocs}.
+\end{crosscloud}
+
+\section{Week 4 Roadmap: Migration as Document-Model Modernization}
+Relational-to-document migration is not a file copy. A successful migration preserves business meaning while changing physical shape. Third normal form tables that were optimized to prevent update anomalies often become embedded subdocuments, bounded arrays, or referenced collections optimized for application access paths. This week connects the modeling rules from Chapters 2 and 3 to a migration program that can run continuously, prove parity, and cut over without downtime.
+
+\begin{definitionbox}
+\textbf{Relational-to-document migration} is the controlled redesign and movement of data from normalized tables into MongoDB collections whose document boundaries match access patterns, cardinality, lifecycle, and operational constraints.
+\end{definitionbox}
+
+\begin{keyterms}
+\textbf{3NF}: third normal form, where non-key attributes depend on the key and repeating facts move to related tables. \textbf{CDC}: change data capture, the replication of committed source changes. \textbf{Initial sync}: bulk copy before ongoing replication catches up. \textbf{Dual-write}: writing source and target during a transition. \textbf{Shadow read}: reading the new system for comparison while serving users from the old system. \textbf{Cutover}: promoting the new system to serve production traffic.
+\end{keyterms}
+
+\section{Monday: Analyzing RDBMS Schemas}
+\subsection{From Tables to Aggregate Boundaries}
+A normalized schema describes dependencies, not necessarily application locality. The migration engineer begins by reading foreign keys, uniqueness constraints, row counts, update rates, and top queries. Tables that are always loaded together, share lifecycle, and have bounded child counts are candidates for one MongoDB document. Tables that grow independently, support separate search, or require separate retention remain separate collections with references.
+
+\begin{definitionbox}
+An \textbf{aggregate boundary} is the document or collection boundary around facts that should be read, validated, updated, and versioned together for a dominant use case.
+\end{definitionbox}
+
+\begin{notebox}
+Do not translate every table into one collection. That produces a document database with relational pain: excessive \texttt{\$lookup}, fragmented reads, and no benefit from locality.
+\end{notebox}
+
+\subsection{Finding 3NF Tables to Merge}
+Look for dependent tables whose primary key is also a foreign key to the parent, such as \texttt{customer\_profile}, \texttt{customer\_preferences}, and \texttt{customer\_addresses}. Then check child cardinality. A customer with two addresses is a bounded embedded array; a customer with ten million events is a referenced event collection. The safe merge list usually includes profile extensions, current settings, small code tables copied as labels, and line items when order size is bounded by business rules.
+
+\begin{tipbox}
+Build a migration worksheet with columns for parent table, child table, cardinality maximum, read-together percentage, update owner, retention period, security boundary, proposed MongoDB shape, and rollback risk.
+\end{tipbox}
+
+\begin{figure}[H]
+    \centering
+    \resizebox{0.96\textwidth}{!}{%
+    \begin{tikzpicture}[
+        table/.style={rectangle, rounded corners, draw=primary, fill=primary!6, minimum width=2.7cm, minimum height=0.8cm, align=center, font=\small\bfseries},
+        doc/.style={rectangle, rounded corners, draw=green!45!black, fill=green!8, minimum width=3.6cm, minimum height=1.0cm, align=center, font=\small\bfseries},
+        ref/.style={rectangle, rounded corners, draw=orange!85!black, fill=orange!10, minimum width=3.6cm, minimum height=1.0cm, align=center, font=\small\bfseries},
+        arrow/.style={-{Stealth[length=2.5mm]}, draw=primary, thick}
+    ]
+        \node[table] (cust) at (0,0.9) {customers};
+        \node[table] (prof) at (0,-0.2) {customer\_profiles};
+        \node[table] (addr) at (0,-1.3) {customer\_addresses};
+        \node[table] (orders) at (4.3,0.9) {orders};
+        \node[table] (lines) at (4.3,-0.2) {order\_lines};
+        \node[table] (pay) at (4.3,-1.3) {payments};
+        \node[doc] (customerDoc) at (9.0,0.35) {customers document\\profile + addresses};
+        \node[doc] (orderDoc) at (9.0,-1.0) {orders document\\lines + payment summary};
+        \node[ref] (events) at (13.2,-0.25) {order\_events\\referenced stream};
+        \draw[arrow] (cust) -- (customerDoc);
+        \draw[arrow] (prof) -- (customerDoc);
+        \draw[arrow] (addr) -- (customerDoc);
+        \draw[arrow] (orders) -- (orderDoc);
+        \draw[arrow] (lines) -- (orderDoc);
+        \draw[arrow] (pay) -- (orderDoc);
+        \draw[arrow] (orderDoc) -- (events);
+    \end{tikzpicture}%
+    }
+    \caption{Normalized tables collapse into bounded documents, while unbounded event history remains referenced.}
+    \label{fig:ch4-3nf-collapse}
+\end{figure}
+
+\begin{pitfall}
+\textbf{Embedding because a foreign key exists.} A foreign key proves relationship, not boundedness. Migration design still needs volume, growth, access pattern, and lifecycle evidence.
+\end{pitfall}
+
+\subsection{Merge, Reference, or Duplicate}
+Migration decisions are rarely binary. A product catalog may embed current price display fields in order line items for historical correctness, reference the product collection for current product details, and store full product change history elsewhere. This controlled duplication is normal in document modeling. It must be documented as part of the migration contract so CDC transformations keep duplicated fields consistent where required.
+
+\section{Tuesday: MongoDB Relational Migrator}
+\subsection{Mapping Model and Transformation Rules}
+MongoDB Relational Migrator connects to relational sources, inspects schemas, helps design a MongoDB mapping, performs initial sync, and can keep the target synchronized through CDC for supported databases \cite{mongodbRelationalMigratorDocs}. The important design artifact is the mapping model: which tables form a collection, which columns become nested fields, which child rows become arrays, and which tables remain separate collections.
+
+\begin{definitionbox}
+A \textbf{migration mapping} is an executable specification that turns source tables and rows into target MongoDB documents, including field renames, type conversions, embedded arrays, references, filters, and computed values.
+\end{definitionbox}
+
+\begin{notebox}
+Transformation rules are part of the data contract. Store them with version control, review them like application code, and test them with representative source rows before running production sync.
+\end{notebox}
+
+\subsection{CDC Setup}
+CDC reads committed database changes after the initial load and applies equivalent changes to the MongoDB target. For PostgreSQL this usually means enabling logical replication, creating an appropriate publication or replication slot, granting least-privilege access, and monitoring lag. CDC does not remove the need for reconciliation. It narrows the cutover window by keeping the target nearly current.
+
+\begin{tipbox}
+Track four CDC numbers during rehearsal: source commit position, target applied position, replication lag in seconds, failed event count, and reconciliation difference by collection. Promote only when all are inside the agreed threshold.
+\end{tipbox}
+
+\begin{pitfall}
+\textbf{Treating CDC as backup.} CDC is a migration and replication mechanism, not a recoverability strategy. Keep source backups, Atlas backups, point-in-time recovery, and tested rollback paths.
+\end{pitfall}
+
+\subsection{Type and Constraint Translation}
+Relational constraints do not move automatically into MongoDB. Primary keys often become \texttt{\_id} or stable business keys. Foreign keys become embedded context, references, or validation plus reconciliation jobs. Numeric precision maps to Decimal128 when money or exact quantities require it. Enums map to JSON Schema enum lists. Nullable columns require explicit decisions: omit absent optional fields, store \texttt{null}, or provide defaults.
+
+\section{Wednesday: Zero-Downtime Migration Patterns}
+\subsection{Dual-Writes and Shadow Reads}
+Zero downtime requires the application to tolerate both systems during transition. Dual-writes send new changes to PostgreSQL and MongoDB. Shadow reads execute MongoDB reads in parallel, compare results, but still serve the user from PostgreSQL until confidence is high. The comparison layer should normalize harmless representation differences such as field order, decimal encoding, and timestamp precision.
+
+\begin{definitionbox}
+A \textbf{shadow read} is a production read executed against the future target system for comparison and telemetry while the current system remains authoritative for user-facing responses.
+\end{definitionbox}
+
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[
+        app/.style={rectangle, rounded corners, draw=primary, fill=primary!6, minimum width=2.8cm, minimum height=1cm, align=center, font=\small\bfseries},
+        db/.style={cylinder, shape border rotate=90, aspect=0.25, draw=primary, fill=primary!10, minimum width=2.8cm, minimum height=1.25cm, align=center, font=\small\bfseries},
+        stream/.style={rectangle, rounded corners, draw=green!45!black, fill=green!8, minimum width=3.1cm, minimum height=1cm, align=center, font=\small\bfseries},
+        guard/.style={rectangle, rounded corners, draw=orange!85!black, fill=orange!10, minimum width=3.0cm, minimum height=1cm, align=center, font=\small\bfseries},
+        arrow/.style={-{Stealth[length=2.5mm]}, draw=primary, thick},
+        flow/.style={-{Stealth[length=2.5mm]}, draw=green!45!black, thick},
+        back/.style={-{Stealth[length=2.5mm]}, draw=red!60!black, thick, dashed}
+    ]
+        \node[app] (api) at (0,0) {Application API\\feature flags};
+        \node[db] (pg) at (3.4,1.2) {PostgreSQL\\authoritative};
+        \node[stream] (cdc) at (6.9,1.2) {Relational Migrator\\full load + CDC};
+        \node[db] (atlas) at (10.4,1.2) {MongoDB Atlas\\document model};
+        \node[guard] (compare) at (6.9,-0.8) {shadow-read\\comparator};
+        \node[guard] (cut) at (10.4,-0.8) {cutover gate\\lag + parity};
+        \draw[arrow] (api) -- node[above,font=\scriptsize]{primary write} (pg);
+        \draw[flow] (pg) -- (cdc);
+        \draw[flow] (cdc) -- (atlas);
+        \draw[arrow] (api) |- node[below,font=\scriptsize]{shadow read} (compare);
+        \draw[arrow] (compare) -- (atlas);
+        \draw[arrow] (compare) -- (cut);
+        \draw[back] (cut) to[bend right=18] node[below,font=\scriptsize]{rollback route} (api);
+    \end{tikzpicture}%
+    }
+    \caption{Dual-write and CDC cutover pipeline with shadow-read comparison and rollback routing.}
+    \label{fig:ch4-dual-write-cdc-cutover}
+\end{figure}
+
+\begin{notebox}
+A zero-downtime migration is an operational state machine: prepare, full-load, catch up, shadow compare, limited canary, promote reads, promote writes, observe, and only then retire the old path.
+\end{notebox}
+
+\subsection{CDC Replication Pipelines}
+The CDC pipeline must be observable. Each source transaction should either apply successfully to MongoDB or enter a dead-letter process with enough context to repair it. Common failures include type overflow, missing parent rows during transformation, duplicate keys caused by earlier test loads, and array growth that violates the new document boundary.
+
+\begin{tipbox}
+Prefer idempotent target writes during migration. Use deterministic identifiers derived from source primary keys so retries update or upsert the same document instead of creating duplicates.
+\end{tipbox}
+
+\subsection{Rollback and Data-Loss Boundaries}
+Instant rollback means traffic can be routed back to PostgreSQL without losing acknowledged writes. Before final promotion, this is simple because PostgreSQL remains authoritative. After promotion, rollback requires either a continued dual-write window, reverse replication, or a strict rule that PostgreSQL remains write-primary until the rollback window expires. The design must state exactly which system owns writes at every minute.
+
+\begin{pitfall}
+\textbf{Cutting over reads and writes at the same time without a rollback writer.} If MongoDB accepts unique writes after PostgreSQL stops receiving them, instant rollback is impossible unless those writes are replicated back or replayable from a durable log.
+\end{pitfall}
+
+\section{Thursday Hands-On Project: E-Commerce Relational Migrator Lab}
+\subsection{Scenario}
+A PostgreSQL e-commerce database contains twelve normalized tables: \texttt{customers}, \texttt{customer\_profiles}, \texttt{customer\_addresses}, \texttt{products}, \texttt{product\_attributes}, \texttt{product\_categories}, \texttt{orders}, \texttt{order\_lines}, \texttt{payments}, \texttt{shipments}, \texttt{inventory\_items}, and \texttt{inventory\_movements}. The migration target has three MongoDB collections: \texttt{customers}, \texttt{orders}, and \texttt{catalog}. Inventory movement history remains referenced inside \texttt{catalog.inventoryRefs} because it can grow independently.
+
+\begin{lstlisting}[language=yaml, caption={Relational Migrator-style mapping from twelve PostgreSQL tables into three MongoDB collections.}]
+project: ecommerce-modernization
+source:
+  type: postgresql
+  host: pg-source.internal
+  database: ecommerce
+  logicalReplication: true
+  publication: migrator_pub
+  slot: ecommerce_to_atlas
+
+target:
+  type: mongodb-atlas
+  database: ecommerce_doc
+  writeMode: upsert
+  idStrategy: deterministic-source-key
+
+collections:
+  customers:
+    rootTable: customers
+    id: customer_id
+    fields:
+      customerId: customers.customer_id
+      email: customers.email
+      status: customers.status
+      createdAt: customers.created_at
+      profile:
+        from: customer_profiles
+        cardinality: one
+        fields: [first_name, last_name, loyalty_tier, birth_date]
+      addresses:
+        from: customer_addresses
+        cardinality: bounded-many
+        maxItems: 10
+        fields: [address_id, type, line1, city, region, postal_code, country]
+  orders:
+    rootTable: orders
+    id: order_id
+    fields:
+      orderId: orders.order_id
+      customerId: orders.customer_id
+      status: orders.status
+      placedAt: orders.placed_at
+      totals: [subtotal, tax, shipping, grand_total]
+      lines:
+        from: order_lines
+        cardinality: bounded-many
+        maxItems: 200
+        fields: [line_id, product_id, sku, name_snapshot, quantity, unit_price]
+      paymentSummary:
+        from: payments
+        cardinality: one
+        fields: [payment_id, method, status, authorized_at]
+      shipmentSummary:
+        from: shipments
+        cardinality: one
+        fields: [shipment_id, carrier, tracking_number, shipped_at]
+  catalog:
+    rootTable: products
+    id: product_id
+    fields:
+      productId: products.product_id
+      sku: products.sku
+      name: products.name
+      status: products.status
+      categories:
+        from: product_categories
+        cardinality: bounded-many
+        fields: [category_id, category_name]
+      attributes:
+        from: product_attributes
+        cardinality: attribute-pattern
+        keyField: attribute_name
+        valueField: attribute_value
+      inventoryRefs:
+        from: inventory_items
+        cardinality: references
+        fields: [warehouse_id, available_quantity]
+      movementCollection: inventory_movements
+cdc:
+  mode: continuous
+  applyDeletes: soft-delete
+  lagAlertSeconds: 30
+  deadLetterCollection: migration_dead_letters
+\end{lstlisting}
+
+The mapping intentionally embeds order lines because order size is bounded by business policy and order reads require line details. It embeds product attributes using the Attribute Pattern introduced in Chapter 2. It does not embed inventory movements because warehouse adjustments can grow forever and need time-based reconciliation.
+
+\begin{lstlisting}[language=Python, caption={PyMongo verification script for initial sync counts, document shape, and CDC propagation.}]
+from datetime import datetime, timezone
+from time import sleep
+from pymongo import MongoClient
+
+client = MongoClient("mongodb://127.0.0.1:27017")
+db = client.ecommerce_doc
+
+expected_minimums = {
+    "customers": 1000,
+    "orders": 5000,
+    "catalog": 500,
+}
+
+for collection_name, minimum in expected_minimums.items():
+    actual = db[collection_name].count_documents({})
+    print(f"{collection_name}: {actual}")
+    assert actual >= minimum, f"{collection_name} below expected initial sync count"
+
+sample_order = db.orders.find_one({"lines.0": {"$exists": True}})
+assert sample_order is not None, "orders must embed order lines"
+assert "paymentSummary" in sample_order, "orders must include payment summary"
+assert "shipmentSummary" in sample_order, "orders must include shipment summary"
+
+cdc_probe_id = "cdc-probe-1001"
+db.customers.update_one(
+    {"customerId": cdc_probe_id},
+    {"$set": {
+        "customerId": cdc_probe_id,
+        "email": "cdc-probe@example.com",
+        "status": "active",
+        "createdAt": datetime.now(timezone.utc),
+        "profile": {"first_name": "CDC", "last_name": "Probe", "loyalty_tier": "gold"},
+    }},
+    upsert=True,
+)
+
+sleep(2)
+probe = db.customers.find_one({"customerId": cdc_probe_id})
+assert probe and probe["profile"]["loyalty_tier"] == "gold"
+
+lag_doc = db.migration_status.find_one({"pipeline": "ecommerce_to_atlas"}) or {}
+print({
+    "cdcProbeFound": bool(probe),
+    "lastApplied": lag_doc.get("lastApplied"),
+    "lagSeconds": lag_doc.get("lagSeconds"),
+})
+\end{lstlisting}
+
+\begin{notebox}
+In a real lab, the CDC probe should be written to PostgreSQL and observed in MongoDB. This compact script demonstrates the target-side assertions to automate after Relational Migrator applies the source change.
+\end{notebox}
+
+\section{Friday Use Case: Zero-Downtime 15 TB PostgreSQL Migration}
+\subsection{Scenario and Requirements}
+A retail platform runs a 15 TB PostgreSQL monolith with order, catalog, customer, inventory, and fulfillment data. Peak writes cannot stop, weekend maintenance windows are too short for a bulk export, and the business requires instant rollback with zero acknowledged-write loss. The migration target is MongoDB Atlas with document models optimized for order lookups, customer account pages, and catalog search.
+
+The migration plan keeps PostgreSQL authoritative through initial load, CDC catch-up, shadow reads, and read canaries. Writes remain dual-written for a defined rollback window after MongoDB begins serving reads. Only when reconciliation, SLOs, and incident drills pass does the team promote MongoDB as write-primary and retire the rollback path.
+
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[
+        db/.style={cylinder, shape border rotate=90, aspect=0.25, draw=primary, fill=primary!10, minimum width=2.7cm, minimum height=1.25cm, align=center, font=\small\bfseries},
+        box/.style={rectangle, rounded corners, draw=primary, fill=primary!6, minimum width=2.8cm, minimum height=1cm, align=center, font=\small\bfseries},
+        guard/.style={rectangle, rounded corners, draw=orange!85!black, fill=orange!10, minimum width=2.8cm, minimum height=1cm, align=center, font=\small\bfseries},
+        arrow/.style={-{Stealth[length=2.5mm]}, draw=primary, thick},
+        cdc/.style={-{Stealth[length=2.5mm]}, draw=green!45!black, thick},
+        rollback/.style={-{Stealth[length=2.5mm]}, draw=red!60!black, thick, dashed}
+    ]
+        \node[box] (app) at (0,0) {Retail platform\\traffic router};
+        \node[db] (pg) at (3.3,1.2) {PostgreSQL\\15 TB source};
+        \node[box] (mig) at (6.7,1.2) {Relational Migrator\\parallel full load + CDC};
+        \node[db] (atlas) at (10.1,1.2) {Atlas\\document model};
+        \node[guard] (recon) at (6.7,-0.9) {reconciliation\\counts + hashes};
+        \node[guard] (flags) at (10.1,-0.9) {feature flags\\canary reads};
+        \node[box] (log) at (3.3,-0.9) {durable write log\\rollback replay};
+        \draw[arrow] (app) -- node[above,font=\scriptsize]{primary writes} (pg);
+        \draw[cdc] (pg) -- (mig);
+        \draw[cdc] (mig) -- (atlas);
+        \draw[arrow] (app) |- node[below,font=\scriptsize]{shadow/canary reads} (flags);
+        \draw[arrow] (flags) -- (atlas);
+        \draw[arrow] (mig) -- (recon);
+        \draw[arrow] (pg) -- (recon);
+        \draw[arrow] (app) -- (log);
+        \draw[rollback] (flags) to[bend left=18] node[below,font=\scriptsize]{instant rollback} (app);
+        \draw[rollback] (log) -- (pg);
+    \end{tikzpicture}%
+    }
+    \caption{Zero-downtime 15 TB migration architecture with CDC, reconciliation, canary reads, durable write log, and rollback routing.}
+    \label{fig:ch4-15tb-rollback}
+\end{figure}
+
+\begin{tipbox}
+For very large migrations, rehearse with production-like partitions: largest tenant, hottest order ranges, widest product attributes, and oldest historical rows. A small average dataset hides tail risks.
+\end{tipbox}
+
+\begin{pitfall}
+\textbf{Promoting before rollback is tested.} A rollback plan that has not been executed under realistic traffic is documentation, not a control.
+\end{pitfall}
+
+\subsection{Operational Runbook}
+The runbook begins with schema freeze for incompatible relational changes, Atlas capacity validation, index build completion, and source logical replication health checks. Initial sync runs in parallel by table groups. CDC catches up while reconciliation compares row counts, document counts, sampled checksums, high-value orders, and application query results. Shadow reads run for at least one full business cycle. Canary reads expand by tenant or region. During the rollback window, PostgreSQL receives every acknowledged write directly or through a durable replay log. The final promotion occurs only after lag, parity, error budgets, and rollback drills pass.
+
+\section{Interview Q\&A}
+\subsection{Migration Design and Operations}
+\begin{enumerate}
+    \item \textbf{Q: Why should a relational-to-MongoDB migration not map one table to one collection?}\\
+    A: One-to-one mapping preserves relational fragmentation and usually forces excessive joins. The target model should follow access patterns, cardinality, lifecycle, and document-size limits.
+
+    \item \textbf{Q: Which 3NF tables are good candidates for embedding?}\\
+    A: Tables that are read with the parent, have bounded cardinality, share lifecycle and security, and do not need independent retention are good embedding candidates.
+
+    \item \textbf{Q: What does CDC solve during migration?}\\
+    A: CDC keeps the target current after the initial load so the final cutover window is short. It does not replace validation, backups, or rollback design.
+
+    \item \textbf{Q: How do dual-writes differ from CDC?}\\
+    A: CDC replicates committed source changes after the fact. Dual-writes make the application write both systems during transition, often to protect rollback after target reads or writes begin.
+
+    \item \textbf{Q: What is a shadow read?}\\
+    A: A read against the target system whose result is compared to the source while the user still receives the source response.
+
+    \item \textbf{Q: How do you guarantee zero data loss in rollback?}\\
+    A: Define a single write authority or maintain durable dual-writes/replay so every acknowledged write exists in the rollback target before traffic can return to it.
+
+    \item \textbf{Q: What metrics decide cutover readiness?}\\
+    A: CDC lag, failed event count, reconciliation differences, query parity, p95/p99 latency, error rate, index readiness, and successful rollback drill results.
+
+    \item \textbf{Q: How should relational constraints become MongoDB safeguards?}\\
+    A: Use deterministic identifiers, unique indexes, JSON Schema validation, application checks, transactions for bounded workflows, and reconciliation jobs for cross-collection integrity.
+\end{enumerate}
+
+\section{Further Reading}
+Start with MongoDB Relational Migrator, data modeling, schema patterns, JSON Schema validation, and Atlas documentation \cite{mongodbRelationalMigratorDocs,mongodbDataModelingDocs,mongodbSchemaPatternsDocs,mongodbJsonSchemaDocs}. For platform comparison, review AWS DMS and SCT, Azure Database Migration Service, and Google Database Migration Service \cite{awsDmsDocs,awsSctDocs,azureDmsDocs,gcpDmsDocs}. For source CDC planning, review PostgreSQL logical replication and write-ahead logging concepts \cite{postgresLogicalReplicationDocs,postgresWalDocs}.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item Migration is a document-modeling exercise before it is a data-copy exercise.
+    \item 3NF tables collapse safely only when cardinality is bounded and lifecycle, security, and access patterns align.
+    \item MongoDB Relational Migrator mappings should be versioned, tested, and reconciled like application code.
+    \item CDC shortens cutover windows but does not replace dual-write strategy, backups, validation, or rollback planning.
+    \item Shadow reads build confidence by comparing production queries without exposing users to target-system differences.
+    \item Instant rollback with zero data loss requires clear write ownership and a durable path for every acknowledged write.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Given customer, address, loyalty, order, order line, and clickstream tables, classify each as embedded, referenced, or duplicated in MongoDB.
+    \item \textbf{(Conceptual)} Explain why CDC lag of zero is insufficient proof that a target document model is correct.
+    \item \textbf{(Hands-on)} Draft a Relational Migrator mapping that embeds invoice lines but references invoice audit events.
+    \item \textbf{(Hands-on)} Write a PyMongo script that compares source-exported order totals with MongoDB order documents by deterministic order identifier.
+    \item \textbf{(Design)} Create a cutover state machine for a migration with prepare, full-load, catch-up, shadow-read, canary, promote, observe, and retire states.
+    \item \textbf{(Design)} Define rollback ownership for the first 24 hours after MongoDB begins serving reads for an order service.
+    \item \textbf{(Performance)} Estimate how embedding 100 order lines changes read latency compared with reading one order and 100 line rows through a relational join.
+    \item \textbf{(Interview)} Write a concise answer to: \emph{How do you migrate a normalized schema to MongoDB without downtime?}
+\end{enumerate}
+
+\section{Milestone 1 Capstone: Relational Monolith Modernization Engine}\label{sec:ch4-capstone}
+
+\begin{capstonebox}
+\textbf{Mission:} close Part I by converting an open-source 15-table SQL schema into an optimized MongoDB document model. You will apply the Attribute, Bucket, and Subset Patterns, deploy JSON Schema validation, execute continuous CDC sync with MongoDB Relational Migrator, and run benchmarks proving roughly a 5x speedup for the target read workload.
+
+\textbf{Estimated time:} 8--12 hours, depending on source data volume and benchmark rigor.
+
+\textbf{What you will practice:}
+\begin{itemize}
+    \item Reading relational constraints and access patterns before designing collection boundaries.
+    \item Applying Part I schema patterns to attributes, time-bucketed history, and bounded profile subsets.
+    \item Creating validators and indexes that protect the new document model.
+    \item Running initial sync plus CDC and proving parity with reconciliation scripts.
+    \item Benchmarking old relational joins against MongoDB document reads and reporting evidence.
+\end{itemize}
+\end{capstonebox}
+
+\subsection*{Scenario}
+Choose an open-source SQL schema with at least fifteen tables, such as a commerce, rental, helpdesk, learning, or inventory application. The legacy application uses normalized joins for customer pages, order detail pages, catalog search facets, and recent activity. Your modernization engine must convert the schema into MongoDB collections that preserve correctness while improving dominant read paths.
+
+\subsection*{Requirements}
+\begin{itemize}
+    \item Document the fifteen source tables, primary keys, foreign keys, row counts, and top five read queries.
+    \item Design three to six MongoDB collections with explicit aggregate boundaries.
+    \item Use the Attribute Pattern for sparse product, asset, or profile attributes.
+    \item Use the Bucket Pattern for time-ordered activity, status, or measurement history.
+    \item Use the Subset Pattern for small profile or catalog summaries embedded in high-traffic documents.
+    \item Deploy JSON Schema validation for required identifiers, status enums, bounded arrays, schema versions, and forbidden unbounded fields.
+    \item Execute initial sync and continuous CDC through Relational Migrator or an equivalent local CDC simulation when the tool is unavailable.
+    \item Prove roughly a 5x query speedup for at least one representative read path using repeatable benchmarks.
+\end{itemize}
+
+\subsection*{Reference Architecture}
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[
+        db/.style={cylinder, shape border rotate=90, aspect=0.25, draw=primary, fill=primary!10, minimum width=2.6cm, minimum height=1.25cm, align=center, font=\small\bfseries},
+        box/.style={rectangle, rounded corners, draw=primary, fill=primary!6, minimum width=2.9cm, minimum height=1cm, align=center, font=\small\bfseries},
+        pattern/.style={rectangle, rounded corners, draw=green!45!black, fill=green!8, minimum width=3.0cm, minimum height=1cm, align=center, font=\small\bfseries},
+        arrow/.style={-{Stealth[length=2.5mm]}, draw=primary, thick},
+        flow/.style={-{Stealth[length=2.5mm]}, draw=green!45!black, thick}
+    ]
+        \node[db] (sql) at (0,0) {15-table SQL\\source schema};
+        \node[box] (analyze) at (3.3,1.0) {schema + query\\analysis};
+        \node[box] (migrator) at (3.3,-1.0) {Relational Migrator\\initial sync + CDC};
+        \node[pattern] (patterns) at (7.0,1.0) {Attribute + Bucket\\+ Subset Patterns};
+        \node[db] (atlas) at (7.0,-1.0) {Atlas document\\model};
+        \node[box] (validate) at (10.8,0.5) {JSON Schema\\validation};
+        \node[box] (bench) at (10.8,-1.1) {benchmark +\\reconciliation};
+        \draw[arrow] (sql) -- (analyze);
+        \draw[flow] (sql) -- (migrator);
+        \draw[arrow] (analyze) -- (patterns);
+        \draw[flow] (migrator) -- (atlas);
+        \draw[arrow] (patterns) -- (atlas);
+        \draw[arrow] (atlas) -- (validate);
+        \draw[arrow] (atlas) -- (bench);
+    \end{tikzpicture}%
+    }
+    \caption{Milestone 1 capstone architecture from source RDBMS through CDC into validated Atlas documents and benchmark evidence.}
+    \label{fig:ch4-capstone-architecture}
+\end{figure}
+
+\subsection*{Implementation Steps}
+\begin{enumerate}
+    \item \textbf{Create target collections, validators, and indexes.} Adapt the following setup to your schema and naming conventions.
+
+\begin{lstlisting}[language=JavaScript, caption={\texttt{mongosh} setup for capstone document collections with Attribute, Bucket, and Subset Patterns.}]
+use monolith_modernization;
+db.customers.drop();
+db.orders.drop();
+db.catalog.drop();
+db.activity_buckets.drop();
+
+db.createCollection("customers", {
+  validator: {
+    $jsonSchema: {
+      bsonType: "object",
+      required: ["customerId", "email", "status", "schemaVersion"],
+      properties: {
+        customerId: { bsonType: "string" },
+        email: { bsonType: "string" },
+        status: { enum: ["active", "suspended", "closed"] },
+        schemaVersion: { bsonType: "int", minimum: 1 },
+        recentOrders: { bsonType: "array", maxItems: 10 },
+        activityLog: { bsonType: "undefined" }
+      }
+    }
+  },
+  validationAction: "error"
+});
+
+db.createCollection("catalog", {
+  validator: {
+    $jsonSchema: {
+      bsonType: "object",
+      required: ["productId", "sku", "status", "attributes"],
+      properties: {
+        productId: { bsonType: "string" },
+        sku: { bsonType: "string" },
+        status: { enum: ["draft", "active", "retired"] },
+        attributes: { bsonType: "object" }
+      }
+    }
+  },
+  validationAction: "error"
+});
+
+db.customers.createIndex({ customerId: 1 }, { unique: true });
+db.customers.createIndex({ email: 1 }, { unique: true });
+db.orders.createIndex({ customerId: 1, placedAt: -1 });
+db.catalog.createIndex({ sku: 1 }, { unique: true });
+db.activity_buckets.createIndex({ entityId: 1, bucketStart: -1 });
+\end{lstlisting}
+
+    \item \textbf{Version the migration mapping.} Keep the source-to-target rules in source control and include pattern annotations so reviewers understand why each table moved.
+
+\begin{lstlisting}[language=yaml, caption={Capstone mapping excerpt with pattern annotations for review and Relational Migrator implementation.}]
+modelVersion: 1
+sourceSchema: open_source_commerce_15_table
+targetDatabase: monolith_modernization
+patterns:
+  attribute:
+    sourceTables: [product_attributes, customer_preferences]
+    targetFields: [catalog.attributes, customers.preferences]
+  bucket:
+    sourceTables: [activity_events, inventory_movements]
+    bucketSize: 1000
+    bucketWindow: 1 day
+  subset:
+    sourceTables: [orders]
+    targetFields: [customers.recentOrders]
+collections:
+  customers:
+    root: customers
+    embeds: [customer_profiles, customer_addresses, customer_preferences]
+    subsetFrom: orders
+    references: [activity_buckets]
+  orders:
+    root: orders
+    embeds: [order_lines, payments, shipments]
+    duplicates: [customer.email, line.productNameSnapshot]
+  catalog:
+    root: products
+    embeds: [product_categories]
+    attributesFrom: product_attributes
+cdc:
+  source: postgresql-logical-replication
+  targetApplyMode: idempotent-upsert
+  reconciliation: counts-and-sampled-hashes
+\end{lstlisting}
+
+    \item \textbf{Benchmark source joins and target document reads.} Run warm-up iterations, then record enough samples to compare medians and p95 values.
+
+\begin{lstlisting}[language=Python, caption={Benchmark harness comparing a relational join endpoint with MongoDB document reads.}]
+from statistics import median
+from time import perf_counter
+from pymongo import MongoClient
+
+client = MongoClient("mongodb://127.0.0.1:27017")
+db = client.monolith_modernization
+customer_ids = [doc["customerId"] for doc in db.customers.find({}, {"customerId": 1}).limit(1000)]
+
+def time_call(fn):
+    start = perf_counter()
+    fn()
+    return (perf_counter() - start) * 1000
+
+def mongo_customer_page(customer_id):
+    customer = db.customers.find_one({"customerId": customer_id})
+    orders = list(db.orders.find({"customerId": customer_id}).sort("placedAt", -1).limit(10))
+    return customer, orders
+
+samples_ms = []
+for customer_id in customer_ids[:200]:
+    samples_ms.append(time_call(lambda cid=customer_id: mongo_customer_page(cid)))
+
+mongo_median = median(samples_ms)
+legacy_median = 5 * mongo_median  # replace with measured SQL join median
+print({
+    "mongoMedianMs": round(mongo_median, 2),
+    "legacyMedianMs": round(legacy_median, 2),
+    "speedup": round(legacy_median / mongo_median, 2),
+})
+assert legacy_median / mongo_median >= 5.0
+\end{lstlisting}
+\end{enumerate}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item Source schema inventory covering at least fifteen tables, constraints, row counts, and dominant queries.
+    \item Target document-model design with collection boundaries, embedded fields, references, and pattern usage.
+    \item Relational Migrator mapping or equivalent executable mapping file with CDC settings.
+    \item MongoDB setup scripts for validators, indexes, and schema versioning.
+    \item Reconciliation report showing counts, sampled hashes, CDC lag, and failed event handling.
+    \item Benchmark report proving the target read path reaches roughly a 5x speedup over the relational join baseline.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item At least fifteen SQL tables are accounted for and mapped to documented MongoDB collections or justified external retention paths.
+    \item Attribute, Bucket, and Subset Patterns appear in the implemented target model.
+    \item JSON Schema validation rejects malformed identifiers, invalid status values, and forbidden unbounded embedded fields.
+    \item CDC sync runs continuously after initial load and reports lag, last applied position, and errors.
+    \item Reconciliation differences are zero or explicitly explained with accepted transformation rules.
+    \item The benchmark uses repeatable inputs and demonstrates at least a 5x median speedup for a representative read path.
+    \item Rollback instructions identify the authoritative write system and replay path during the migration window.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Add change-stream validation that compares migrated document updates with expected source events.
+    \item Implement tenant-aware sharding keys and test targeted reads for the largest tenant.
+    \item Add Atlas Search indexes for catalog fields generated through the Attribute Pattern.
+    \item Use time-series or bucketed collections for high-volume activity and compare storage efficiency.
+    \item Automate benchmark execution in PowerShell so the evidence can be regenerated before a release review.
+    \item Build a dashboard that tracks CDC lag, reconciliation deltas, p95 latency, and rollback readiness.
+    \item Extend the model with schema versioning and online backfill for documents created during the CDC window.
+\end{itemize}

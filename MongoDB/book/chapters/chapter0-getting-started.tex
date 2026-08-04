@@ -1,0 +1,430 @@
+\chapter{Getting Started: MongoDB Atlas, Local Deployment, and Tooling}
+\index{MongoDB Atlas}\index{Atlas M0}\index{MongoDB Community Server}\index{mongosh}\index{MongoDB Compass}\index{PyMongo}\index{Windows}\index{PowerShell}\index{WiredTiger}\index{SCRAM}\index{IP access list}%
+
+\lstdefinelanguage{PowerShell}{
+    keywords={Get-Service,Start-Service,Stop-Service,Restart-Service,Set-ExecutionPolicy,New-Item,Test-Path,Get-Content,Select-String,Where-Object,ForEach-Object,python,py,mongosh,mongodump,mongorestore,mongoimport},
+    keywordstyle=\color{magenta}\bfseries,
+    sensitive=false,
+    comment=[l]{\#},
+    morestring=[b]',
+    morestring=[b]"
+}
+
+\begin{objectives}
+\begin{itemize}
+    \item Create a MongoDB Atlas account, organization, project, and forever-free M0 shared cluster without supplying a credit card.
+    \item Secure Atlas before the first connection by creating a SCRAM database user, adding a narrow IP access-list entry, and retrieving a \texttt{mongodb+srv} connection string.
+    \item Install MongoDB Community Server on Windows as a service and locate the default \texttt{dbPath}, log path, and \texttt{mongod.cfg} configuration file used by the local WiredTiger labs.
+    \item Install and verify \texttt{mongosh}, MongoDB Compass, MongoDB Database Tools, and the PyMongo Python driver in a Windows and PowerShell environment.
+    \item Connect to both Atlas and \texttt{localhost}, run a health check, insert and query a document, and confirm the active storage engine with \texttt{db.serverStatus()}.
+    \item Apply cost and quota guardrails so free-tier learning environments do not become accidental paid deployments.
+\end{itemize}
+\end{objectives}
+
+\section{Why Chapter 0 Exists}
+Chapter 1 begins inside the MongoDB server, following documents through the \texttt{mongod} process and the WiredTiger storage engine. Before that analysis is useful, every reader needs two working environments. The first is \textbf{MongoDB Atlas}, MongoDB's managed cloud database platform. Atlas is the easiest place to practice database users, network access, connection strings, Compass, drivers, and cloud-style operational controls. The second is a \textbf{local MongoDB Community Server} on Windows. Local deployment is necessary for storage-engine labs because it exposes the server configuration file, service lifecycle, local logs, data directory, and WiredTiger files that managed Atlas intentionally hides from customers.
+
+These two paths are complementary rather than competing. Atlas teaches managed service thinking: project boundaries, access lists, credentials, cluster tiers, monitoring, and cost controls. Local Community Server teaches node-level thinking: \texttt{mongod.cfg}, \texttt{dbPath}, Windows services, log files, local disks, and storage-engine behavior. Senior data engineers need both. A managed platform removes toil, but it does not remove the need to understand the database engine's behavior; a local server reveals internals, but it does not replace managed production governance.
+
+\begin{keyterms}
+\textbf{Atlas}: MongoDB's managed cloud database platform. \textbf{M0}: Atlas's forever-free shared cluster tier, limited to 512 MB of storage and shared RAM. \textbf{SCRAM}: Salted Challenge Response Authentication Mechanism, the username/password authentication mechanism used for MongoDB database users. \textbf{IP access list}: Atlas network rule that permits connections only from configured source IP addresses or CIDR ranges. \textbf{SRV URI}: A \texttt{mongodb+srv://} connection string that uses DNS SRV records to discover cluster hosts.
+\end{keyterms}
+
+\section{Two Complementary Setup Paths}
+\subsection{Path A: Atlas for Managed Cloud Practice}
+Atlas is the fastest path to a real MongoDB deployment. It provides a web console, managed backups on paid tiers, monitoring, cloud-provider placement, connection helpers, database-user management, and network access controls. The free M0 shared cluster is appropriate for this book's introductory driver, shell, Compass, and CRUD exercises. It is not appropriate for high-volume performance testing, production workloads, or experiments that require direct access to the host operating system.
+
+For Chapter 0, Atlas provides three capabilities that matter immediately. First, it gives you a stable remote MongoDB endpoint that looks like production from a client perspective. Second, it requires explicit security setup before a connection is allowed, which builds the correct habit early. Third, it makes cost and quota choices visible through cluster tiers, project settings, and billing controls.
+
+\subsection{Path B: Local Community Server for Engine Labs}
+MongoDB Community Server on Windows runs a local \texttt{mongod.exe} process, usually installed as a Windows service. It stores database files under the default data directory and writes logs to a local log file. This path is used throughout the WiredTiger chapters because students can inspect service state, stop and start the server, read configuration, change lab-only settings, and observe how local storage responds.
+
+A local server is not automatically safer than Atlas. It can still store sensitive data, consume disk, bind to network interfaces, and run with overly broad permissions. For this book, keep the local server bound to \texttt{localhost}, use synthetic lab data, and avoid importing customer data or secrets.
+
+\begin{definitionbox}
+Use \textbf{Atlas} when the exercise is about managed connectivity, credentials, Compass, drivers, cloud monitoring, or operational guardrails. Use \textbf{local Community Server} when the exercise is about the Windows service, \texttt{mongod.cfg}, local files, WiredTiger storage behavior, logs, or controlled restarts.
+\end{definitionbox}
+
+\section{Creating a Free MongoDB Atlas Environment}
+\subsection{Sign Up Without a Credit Card}
+Start at the MongoDB Atlas sign-up page and create an account with an email address, Google account, or GitHub account. The exact screen order can change, but the required decisions are stable. Choose the free path, verify your email if prompted, and continue into the Atlas console. Atlas does not require a credit card to create an M0 free cluster. If a screen offers a paid plan, trial upgrade, or sales-assisted path, choose the free shared-cluster option instead.
+
+After sign-up, Atlas organizes resources in two levels. An \textbf{Organization} is the top-level administrative boundary. A \textbf{Project} is the operational boundary that contains clusters, database users, network access rules, alerts, and integrations. For this book, use one organization and one project named something recognizable, such as \texttt{MongoDB Book Labs}. Keep names boring and descriptive; the name will appear in connection helpers and console navigation.
+
+\begin{enumerate}
+    \item Open Atlas and sign in.
+    \item Create or select an Organization.
+    \item Create a Project for this book's labs.
+    \item Confirm that you are in the intended Project before creating any cluster.
+\end{enumerate}
+
+\begin{notebox}
+Atlas documentation and console labels evolve, but the security model remains consistent: a project owns clusters, database users, IP access-list entries, and connection helpers. If a console page does not match this chapter exactly, search within the Atlas UI for \texttt{Database}, \texttt{Database Access}, and \texttt{Network Access}.
+\end{notebox}
+
+\subsection{Deploy an M0 Shared Cluster}
+Within the project, choose to build or deploy a database. Select the \textbf{M0 Free} shared tier. The M0 tier is free forever for qualifying accounts and projects, but it has important limits: it provides 512 MB of storage and shared RAM on shared infrastructure. This is enough for command-line practice, small sample datasets, Compass exploration, and driver tests. It is not a performance benchmark environment.
+
+Atlas asks for a cloud provider and region. Choose the provider and region nearest to you or nearest to the environment where your applications will run. For this book, the choice does not affect the concepts. What matters is that you can identify where the cluster lives and that you avoid accidentally selecting a paid dedicated tier. The console may recommend AWS, Azure, or Google Cloud regions depending on availability.
+
+\begin{enumerate}
+    \item Select \textbf{M0 Free} or \textbf{Free Shared} as the cluster tier.
+    \item Choose a cloud provider such as AWS, Azure, or Google Cloud.
+    \item Choose a nearby region that supports M0.
+    \item Keep optional paid features disabled unless explicitly required by a later lab.
+    \item Give the cluster a simple name such as \texttt{Cluster0} or \texttt{book-m0}.
+    \item Create the cluster and wait for provisioning to complete.
+\end{enumerate}
+
+\begin{pitfall}
+\textbf{Accidentally choosing a paid tier.} The Atlas cluster creation screen can show multiple tiers near each other. Verify that the selected tier is \texttt{M0}, the price shows free, and no credit-card step is required. If the page asks you to configure cluster size, disk scaling, backup policy, or dedicated hardware, re-check the tier before continuing.
+\end{pitfall}
+
+\subsection{Understand M0 Limits}
+The M0 tier is intentionally small. Its most important constraints for this book are 512 MB of storage and shared RAM. Shared RAM means the environment is suitable for functional learning, not reliable performance measurement. Some Atlas features are unavailable or limited on M0 compared with paid tiers. Treat M0 as a notebook-sized lab environment: excellent for learning connection behavior, CRUD syntax, simple indexes, basic aggregation, and driver setup; inappropriate for sustained load, production data, sensitive workloads, or engine-level experiments.
+
+If a later exercise asks you to reason about cache pressure, checkpoint I/O, local storage files, or service restart behavior, use the local Community Server path. Atlas M0 hides those details because MongoDB operates the underlying hosts.
+
+\section{Securing Atlas Before Connecting}
+Atlas requires two independent security decisions before a client can connect: \textbf{who} is allowed to authenticate and \textbf{where} connections are allowed to originate. The database user answers the first question. The IP access list answers the second.
+
+\subsection{Create a SCRAM Database User}
+Open \textbf{Database Access} in the Atlas project and create a database user. Choose password authentication, which uses MongoDB's SCRAM mechanism. Use a username dedicated to these labs, such as \texttt{bookUser}. Generate a strong password and store it in your password manager. Do not reuse your Atlas console password, operating-system password, or source-control password.
+
+For privileges, choose the smallest role that still supports the lab. Early chapters need read and write access to a lab database. A practical choice is \texttt{readWrite} on a database named \texttt{booklabs}. Avoid \texttt{Atlas Admin} and broad administrative roles for routine work. You can create separate users later for monitoring, backup, or application tests.
+
+\begin{definitionbox}
+\textbf{SCRAM authentication} stores salted verifier material rather than a plaintext password. Clients prove knowledge of the password through a challenge-response exchange. This is the standard username/password path for MongoDB database users.
+\end{definitionbox}
+
+\subsection{Configure Network Access}
+Open \textbf{Network Access} and add an IP access-list entry. For a personal workstation lab, use \textbf{Add Current IP Address}. Atlas detects your public source IP and creates a rule for that address, usually as a single-address CIDR entry. Add a short comment such as \texttt{home workstation} or \texttt{training laptop}. If your ISP changes your address, you may need to update this entry later.
+
+Corporate VPNs, hotel networks, mobile hotspots, and cloud-hosted development environments may change the apparent source IP. If a connection worked yesterday and fails today with a network timeout, check the current public IP and compare it with the Atlas Network Access page before changing code.
+
+\begin{pitfall}
+\textbf{Avoid \texttt{0.0.0.0/0} for normal labs.} This CIDR range allows connections from the entire IPv4 internet. A database user and password are still required, but exposing the cluster broadly increases attack surface and makes password hygiene more critical. Use a narrow current-IP rule for this book unless a controlled corporate or cloud environment requires a documented CIDR range.
+\end{pitfall}
+
+\subsection{Retrieve the Connection String}
+After the cluster is running and security is configured, open the cluster's \textbf{Connect} workflow. Choose \textbf{Shell}, \textbf{Compass}, or \textbf{Drivers}; each option shows a connection string. For modern Atlas clusters, the string usually starts with \texttt{mongodb+srv://}. It contains a username placeholder, a cluster DNS name, options such as \texttt{retryWrites=true}, and an application name.
+
+A typical Atlas shell URI looks like this, with placeholders for credentials and cluster name:
+
+\begin{lstlisting}[language=bash, caption={Atlas SRV URI pattern; replace placeholders before use.}]
+mongodb+srv://bookUser:<password>@cluster0.example.mongodb.net/booklabs?retryWrites=true&w=majority&appName=BookLabs
+\end{lstlisting}
+
+In PowerShell, wrap the URI in double quotes when passing it to \texttt{mongosh}. If your password contains reserved URI characters such as \texttt{@}, \texttt{:}, \texttt{/}, \texttt{?}, or \texttt{\#}, either let the Atlas helper generate the full command or URL-encode the password. Do not paste a real password into notes, screenshots, source files, or shared chat messages.
+
+\section{Installing Local MongoDB Community Server on Windows}
+\subsection{Choose the MSI Installer and Service Option}
+Download MongoDB Community Server for Windows from MongoDB's official download page. Choose the current stable Community Server version that matches this book's timeframe unless a class environment specifies a version. Use the MSI installer. During installation, choose \textbf{Complete} unless you need a custom path, and keep the option to install MongoDB as a Windows service enabled.
+
+The service installation creates a managed \texttt{mongod.exe} process that Windows can start automatically. It also creates a configuration file and default directories. The common defaults on Windows are:
+
+\begin{itemize}
+    \item Program files: \texttt{C:\textbackslash Program Files\textbackslash MongoDB\textbackslash Server\textbackslash <version>\textbackslash bin}
+    \item Configuration file: \texttt{C:\textbackslash Program Files\textbackslash MongoDB\textbackslash Server\textbackslash <version>\textbackslash bin\textbackslash mongod.cfg}
+    \item Data path: \texttt{C:\textbackslash Program Files\textbackslash MongoDB\textbackslash Server\textbackslash <version>\textbackslash data}
+    \item Log path: \texttt{C:\textbackslash Program Files\textbackslash MongoDB\textbackslash Server\textbackslash <version>\textbackslash log\textbackslash mongod.log}
+\end{itemize}
+
+Some installer versions and older manual-install guides use \texttt{C:\textbackslash data\textbackslash db} as the data directory. Trust the installed \texttt{mongod.cfg} for your machine. This book's commands assume the service is installed and bound to localhost.
+
+\subsection{Inspect and Manage the Windows Service}
+Open PowerShell as a normal user for read-only checks. Use an elevated PowerShell session only when starting, stopping, or changing service configuration requires administrator rights. The service is usually named \texttt{MongoDB}.
+
+\begin{lstlisting}[language=PowerShell, caption={Checking the local MongoDB Windows service with PowerShell.}]
+Get-Service -Name MongoDB
+Start-Service -Name MongoDB
+Get-Service -Name MongoDB
+\end{lstlisting}
+
+Expected service output includes a status such as \texttt{Running}. If the service fails to start, read the log path listed in \texttt{mongod.cfg}; configuration mistakes, missing directories, and permission problems usually appear there before they appear in client tools.
+
+\subsection{Understand \texttt{mongod.cfg}}
+The Windows MSI installer writes a YAML configuration file. Your exact version path may differ, but the shape is similar to Listing~\ref{lst:chapter0-mongod-conf}. The most important early settings are \texttt{storage.dbPath}, \texttt{systemLog.path}, \texttt{net.bindIp}, and \texttt{net.port}. Keep \texttt{bindIp} on \texttt{127.0.0.1} for local labs unless a later chapter explicitly discusses secured remote access.
+
+\begin{lstlisting}[language=yaml, caption={Representative Windows \texttt{mongod.cfg} for local labs.}, label={lst:chapter0-mongod-conf}]
+# mongod.cfg
+storage:
+  dbPath: C:\Program Files\MongoDB\Server\8.0\data
+
+systemLog:
+  destination: file
+  logAppend: true
+  path: C:\Program Files\MongoDB\Server\8.0\log\mongod.log
+
+net:
+  port: 27017
+  bindIp: 127.0.0.1
+
+processManagement:
+  windowsService:
+    serviceName: MongoDB
+    displayName: MongoDB Server
+    description: MongoDB Server
+\end{lstlisting}
+
+\begin{notebox}
+MongoDB configuration is YAML, so indentation matters. Use spaces, not tabs. If \texttt{mongod} rejects the file, check indentation, path spelling, and whether Windows backslashes were copied exactly.
+\end{notebox}
+
+\subsection{When to Use Local Instead of Atlas}
+Use local Community Server when you need to restart the server repeatedly, inspect logs without a web console, alter lab-only server settings, observe data files, or test \texttt{db.serverStatus().storageEngine} against a known host. Use Atlas when you need managed connectivity from Compass or a driver, shared cloud access for class, or realistic project-level security controls.
+
+Do not use local Community Server as a production substitute merely because it is easy to install. Production systems need backups, monitoring, patching, least-privilege access, TLS, authentication, auditing where required, tested recovery, and usually replica sets. Atlas provides many of those operational layers as managed services; a local single-node server does not.
+
+\section{Installing Client and Data Tools}
+\subsection{Install \texttt{mongosh}}
+\texttt{mongosh} is the modern MongoDB Shell. It is the primary command-line tool for this book. Install it from MongoDB's download page or through an approved package manager if your environment provides one. On Windows, verify that \texttt{mongosh.exe} is on your \texttt{PATH}; otherwise, open it from its installation directory or add the bin directory to the user \texttt{PATH}.
+
+\begin{lstlisting}[language=PowerShell, caption={Verifying \texttt{mongosh} from PowerShell.}]
+mongosh --version
+mongosh "mongodb://localhost:27017/booklabs"
+\end{lstlisting}
+
+\subsection{Install MongoDB Compass}
+MongoDB Compass is the graphical desktop client. It is useful for inspecting collections, sampling documents, building simple aggregations, viewing indexes, and confirming that shell or driver changes created the expected data. Install Compass from MongoDB's official download page. Use the Atlas connection helper to copy a Compass URI, paste it into Compass, and save it with a lab-specific name. Do not save production passwords in shared desktop profiles.
+
+Compass is not a replacement for \texttt{mongosh}. The shell is better for repeatable exercises, exact commands, and transcript-based troubleshooting. Compass is better for visual inspection and quick exploration.
+
+\subsection{Install MongoDB Database Tools}
+MongoDB Database Tools are separate command-line utilities that include \texttt{mongodump}, \texttt{mongorestore}, \texttt{mongoimport}, and \texttt{mongoexport}. Install them from MongoDB's Database Tools download page and add their \texttt{bin} directory to \texttt{PATH}. They are intentionally separate from \texttt{mongosh}; installing the shell does not guarantee that dump, restore, import, and export tools are available.
+
+\begin{lstlisting}[language=PowerShell, caption={Verifying MongoDB Database Tools.}]
+mongodump --version
+mongorestore --version
+mongoimport --version
+\end{lstlisting}
+
+This book uses these tools for controlled import and recovery exercises. Keep dumps in a project lab folder, not beside source code unless the repository explicitly allows sample data. Dumps can contain sensitive data, so treat them as database backups.
+
+\subsection{Install Python and PyMongo}
+The Python driver, PyMongo, lets Python applications talk to MongoDB. Use a virtual environment for labs so driver versions are isolated from system Python packages. In a Windows PowerShell environment, create the environment inside your working folder, activate it, install PyMongo, and run a short test script.
+
+\begin{lstlisting}[language=PowerShell, caption={Creating a Python virtual environment and installing PyMongo.}]
+py -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+python -m pip install pymongo
+python -m pip show pymongo
+\end{lstlisting}
+
+If PowerShell blocks script activation, use the organization's approved execution-policy approach. For a one-user training workstation, a common choice is \texttt{Set-ExecutionPolicy -Scope CurrentUser RemoteSigned}; use institutional guidance when working on a managed machine.
+
+\section{Connecting from Shell, Compass, and Python}
+\subsection{Connect to Atlas with \texttt{mongosh}}
+Use the Atlas connection helper to copy the shell command. It should look like Listing~\ref{lst:chapter0-mongosh-atlas}, with your actual cluster hostname and username. PowerShell quotes are important because the URI contains characters such as \texttt{?} and \texttt{\&} that should be passed to \texttt{mongosh} as part of one argument.
+
+\begin{lstlisting}[language=PowerShell, caption={Connecting to Atlas from PowerShell with \texttt{mongosh}.}, label={lst:chapter0-mongosh-atlas}]
+mongosh "mongodb+srv://bookUser:<password>@cluster0.example.mongodb.net/booklabs?retryWrites=true&w=majority&appName=BookLabs"
+\end{lstlisting}
+
+After connection, the prompt changes to show the current database context. Select the lab database explicitly before inserting data.
+
+\begin{lstlisting}[language=JavaScript, caption={Basic Atlas verification commands in \texttt{mongosh}.}]
+use booklabs
+db.runCommand({ ping: 1 })
+db.chapter0.insertOne({
+  environment: "atlas",
+  chapter: 0,
+  verifiedAt: new Date()
+})
+db.chapter0.find({ environment: "atlas" }).pretty()
+\end{lstlisting}
+
+Expected output for the ping is a document containing \texttt{ok: 1}. The insert result should include \texttt{acknowledged: true} and an \texttt{insertedId}. The find command should print the document you inserted.
+
+\subsection{Connect to Localhost with \texttt{mongosh}}
+For the local Windows service, use the standard localhost URI. The default port is \texttt{27017}. If the service is running and bound to \texttt{127.0.0.1}, the shell connects without Atlas network rules.
+
+\begin{lstlisting}[language=PowerShell, caption={Connecting to local MongoDB Community Server.}]
+mongosh "mongodb://localhost:27017/booklabs"
+\end{lstlisting}
+
+Run the same functional test locally, changing the environment label so you can distinguish records.
+
+\begin{lstlisting}[language=JavaScript, caption={Local insert, find, and storage-engine check.}]
+use booklabs
+db.runCommand({ ping: 1 })
+db.chapter0.insertOne({
+  environment: "local",
+  chapter: 0,
+  verifiedAt: new Date()
+})
+db.chapter0.find({ environment: "local" }).pretty()
+db.serverStatus().storageEngine
+\end{lstlisting}
+
+On a standard modern local MongoDB Community Server, the storage-engine output should identify \texttt{wiredTiger}. Atlas also runs MongoDB with WiredTiger, but Atlas does not expose the host-level files and service controls used in the local labs. The \texttt{serverStatus} command is documented by MongoDB and becomes a recurring diagnostic source in later chapters \cite{mongodbServerStatusDocs}.
+
+\subsection{Connect with PyMongo}
+Create a file such as \texttt{chapter0\_pymongo\_check.py} in a lab folder, not in the book source directory unless your instructor requests it. For Atlas, replace the URI with your SRV string. For local testing, use \texttt{mongodb://localhost:27017}. The snippet in Listing~\ref{lst:chapter0-pymongo} inserts one document and reads it back.
+
+\begin{lstlisting}[language=Python, caption={Minimal PyMongo insert and find check.}, label={lst:chapter0-pymongo}]
+from datetime import datetime, timezone
+from pymongo import MongoClient
+
+uri = "mongodb://localhost:27017"
+client = MongoClient(uri, serverSelectionTimeoutMS=5000)
+
+# Force connection now so setup errors fail before the insert.
+client.admin.command("ping")
+
+db = client["booklabs"]
+result = db.chapter0.insert_one({
+    "environment": "python-local",
+    "chapter": 0,
+    "verifiedAt": datetime.now(timezone.utc),
+})
+
+found = db.chapter0.find_one({"_id": result.inserted_id})
+print(found)
+client.close()
+\end{lstlisting}
+
+For Atlas, do not hardcode the password in source control. In a later production-oriented chapter, credentials move into environment variables or a secrets manager. For Chapter 0, the immediate habit is simpler: never commit a real URI containing credentials, never paste it into public notes, and rotate the database user's password if it leaks.
+
+\begin{pitfall}
+\textbf{Confusing Atlas login with database authentication.} Your Atlas console account manages projects and billing. A MongoDB database user authenticates to the database endpoint. They are separate identities with separate passwords and separate permissions.
+\end{pitfall}
+
+\section{Cost and Quota Guardrails}
+\subsection{Keep the Free Tier Free}
+Atlas M0 is free forever but limited. The safest learning posture is to create exactly one M0 cluster for the book, load only small synthetic datasets, and resist upgrade prompts unless a later chapter explicitly requires paid capacity. M0 storage is limited to 512 MB, and RAM is shared. When you hit a limit, the correct Chapter 0 response is not to upgrade immediately; it is to remove unnecessary test data, drop unused collections, or switch to a local lab where appropriate.
+
+Avoid enabling paid features casually. Dedicated clusters, larger storage, advanced backup settings, private networking, and some integrations can create cost. Read the cluster tier and price summary before clicking create or modify. If a lab ever requires a paid feature, document the expected cost, duration, cleanup step, and owner before enabling it.
+
+\subsection{Pause, Terminate, or Scale Down Deliberately}
+Atlas free clusters are intended to remain available, but paid clusters should be paused or terminated when not needed. Pausing preserves configuration while stopping compute charges where the tier supports it. Terminating deletes the cluster and its data after confirmation. For training projects, prefer disposable data and scripted reloads so cleanup is easy.
+
+Local servers have their own quota risks. A local import can fill a workstation disk. Database dumps can duplicate data unexpectedly. Large log files can grow if a noisy workload repeats. Use small datasets and clean up after each chapter's exercises.
+
+\subsection{Set Billing Alerts Before Scaling Up}
+If you ever add a payment method or move beyond M0, configure Atlas billing alerts immediately. Alerts should notify you before monthly spend exceeds the intended lab budget. In an enterprise environment, connect the project to the organization's normal cost-management process rather than relying on one student's email inbox.
+
+\begin{tipbox}
+\textbf{Measure it.} Before scaling an Atlas cluster or changing a local server setting, record the current dataset size, operation latency, storage metrics, and reason for the change. After the change, measure again. If the metric did not improve, scale back down and fix the workload instead of keeping unnecessary capacity.
+\end{tipbox}
+
+\section{Cross-Cloud Setup Equivalence}
+\begin{crosscloud}
+{\footnotesize
+\begin{tabular}{@{}p{2.9cm}p{3.0cm}p{3.0cm}p{3.0cm}@{}}
+\toprule
+\textbf{Setup step} & \textbf{AWS} & \textbf{Azure} & \textbf{GCP} \\
+\midrule
+Free offer & Free Tier (12 mo + always free) & Free account (\$200/30 days + always free) & Free trial (\$300/90 days + Always Free) \\
+Sign-up guard & Card + root email & Card + Microsoft account & Card + Google account \\
+Identity model & IAM / IAM Identity Center & Microsoft Entra ID + RBAC & Cloud IAM \\
+Admin isolation & Never use root daily & Avoid Global Admin daily & Avoid Owner; least privilege \\
+CLI & AWS CLI v2 (\texttt{aws configure}) & Azure CLI (\texttt{az login}) & gcloud CLI (\texttt{gcloud init}) \\
+Browser shell & AWS CloudShell & Azure Cloud Shell & Cloud Shell \\
+Cost guardrail & AWS Budgets + alerts & Cost Management budgets & Budgets \& alerts \\
+Console & AWS Management Console & Azure Portal & Google Cloud Console \\
+\bottomrule
+\end{tabular}}
+
+THIS book's platform, MongoDB, is used two ways — a forever-free Atlas M0 cluster (no card) secured by a database user and an IP allowlist, and a local Community Server for storage-engine labs; by contrast Microsoft Fabric uses a Microsoft 365/Power BI work account plus a Fabric trial capacity (no card), and Snowflake uses a 30-day/\$400 trial (no card) guarded by Resource Monitors.
+\end{crosscloud}
+
+\section{Verification Checklist}
+A setup is complete only when both paths have been tested. Do not proceed to Chapter 1 with an unverified install. The minimum successful state is: Atlas accepts a shell connection, local MongoDB accepts a shell connection, a test document can be inserted and found in both places, and the local server reports WiredTiger as the storage engine.
+
+\subsection{Atlas Verification}
+Run the Atlas connection command copied from the Atlas helper.
+
+\begin{lstlisting}[language=PowerShell, caption={Atlas setup verification from PowerShell.}]
+mongosh "mongodb+srv://bookUser:<password>@cluster0.example.mongodb.net/booklabs?retryWrites=true&w=majority&appName=BookLabs"
+\end{lstlisting}
+
+Then run:
+
+\begin{lstlisting}[language=JavaScript, caption={Expected Atlas verification sequence.}]
+use booklabs
+db.runCommand({ ping: 1 })
+db.chapter0.insertOne({ environment: "atlas", ok: true })
+db.chapter0.findOne({ environment: "atlas" })
+\end{lstlisting}
+
+Expected output pattern:
+
+\begin{lstlisting}[language=JavaScript, caption={Representative successful Atlas output.}]
+{ ok: 1 }
+{
+  acknowledged: true,
+  insertedId: ObjectId('...')
+}
+{
+  _id: ObjectId('...'),
+  environment: 'atlas',
+  ok: true
+}
+\end{lstlisting}
+
+If ping fails with an authentication error, re-check the database username, password, and password encoding. If it fails with a timeout, re-check the IP access list and current public IP. If DNS resolution fails for \texttt{mongodb+srv}, verify internet access and local DNS settings.
+
+\subsection{Local Verification}
+Confirm the Windows service is running, then connect locally.
+
+\begin{lstlisting}[language=PowerShell, caption={Local service and shell verification.}]
+Get-Service -Name MongoDB
+mongosh "mongodb://localhost:27017/booklabs"
+\end{lstlisting}
+
+Inside \texttt{mongosh}, run:
+
+\begin{lstlisting}[language=JavaScript, caption={Expected local verification sequence.}]
+use booklabs
+db.runCommand({ ping: 1 })
+db.chapter0.insertOne({ environment: "local", ok: true })
+db.chapter0.findOne({ environment: "local" })
+db.serverStatus().storageEngine
+\end{lstlisting}
+
+Representative storage-engine output:
+
+\begin{lstlisting}[language=JavaScript, caption={Representative WiredTiger storage-engine output.}]
+{
+  name: 'wiredTiger',
+  supportsCommittedReads: true,
+  readOnly: false,
+  persistent: true
+}
+\end{lstlisting}
+
+The exact fields can vary by MongoDB version, but the \texttt{name} should be \texttt{wiredTiger}. If the local connection fails, check whether the service is running, whether \texttt{mongod.cfg} binds to \texttt{127.0.0.1}, and whether another process is already using port \texttt{27017}.
+
+\section{Further Reading}
+\begin{itemize}
+    \item MongoDB Manual: Architecture and Components \cite{mongodbArchitectureDocs}.
+    \item MongoDB Manual: WiredTiger Storage Engine \cite{mongodbWiredTigerDocs}.
+    \item MongoDB Manual: \texttt{serverStatus} command \cite{mongodbServerStatusDocs}.
+    \item MongoDB Atlas documentation for cluster creation, database users, network access, and connection strings.
+    \item MongoDB installation documentation for Windows Community Server, \texttt{mongosh}, Compass, and Database Tools.
+    \item PyMongo driver documentation for connection strings, authentication options, and client lifecycle.
+\end{itemize}
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item Chapter 0 requires two environments: Atlas M0 for managed cloud practice and local Community Server for Windows and WiredTiger labs.
+    \item Atlas connections require both a SCRAM database user and a matching IP access-list entry before \texttt{mongosh}, Compass, or PyMongo can connect.
+    \item The Atlas M0 tier is free forever but limited to 512 MB of storage and shared RAM, so it is for learning rather than benchmarking or production.
+    \item The Windows MSI installer normally creates a MongoDB service, a YAML \texttt{mongod.cfg}, a local \texttt{dbPath}, and a log path; these are essential for Chapter 1's storage-engine work.
+    \item \texttt{mongosh}, Compass, Database Tools, and PyMongo solve different jobs and should all be installed before continuing.
+    \item A setup is not complete until \texttt{db.runCommand(\{ ping: 1 \})}, insert, find, and \texttt{db.serverStatus().storageEngine} have been verified where applicable.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{Atlas account and project checklist.} Create an Atlas account, organization, and project for this book. Record only non-secret metadata: organization name, project name, cloud provider, region, and cluster tier. Do not record passwords or full credentialed URIs.
+    \item \textbf{M0 cluster checklist.} Deploy one M0 shared cluster. Confirm that the tier is free, storage is limited to 512 MB, and the cluster shows as available in the Atlas console.
+    \item \textbf{Security checklist.} Create a SCRAM database user with \texttt{readWrite} on \texttt{booklabs}. Add your current IP address to the Atlas IP access list. Explain in two sentences why \texttt{0.0.0.0/0} is not acceptable for ordinary labs.
+    \item \textbf{Tooling checklist.} Install \texttt{mongosh}, Compass, Database Tools, and PyMongo. Capture the version output for \texttt{mongosh --version}, \texttt{mongodump --version}, and \texttt{python -m pip show pymongo}.
+    \item \textbf{Atlas verification.} Connect with \texttt{mongosh} to Atlas, run \texttt{db.runCommand(\{ ping: 1 \})}, insert one document into \texttt{booklabs.chapter0}, and find it. Save the transcript with secrets removed.
+    \item \textbf{Local verification.} Install MongoDB Community Server on Windows as a service. Confirm \texttt{Get-Service -Name MongoDB} reports \texttt{Running}, connect to \texttt{mongodb://localhost:27017/booklabs}, insert one document, find it, and run \texttt{db.serverStatus().storageEngine}.
+    \item \textbf{Configuration inspection.} Open the local \texttt{mongod.cfg} and identify \texttt{storage.dbPath}, \texttt{systemLog.path}, \texttt{net.port}, and \texttt{net.bindIp}. Explain why \texttt{bindIp: 127.0.0.1} is the correct default for this book's local labs.
+    \item \textbf{Cost guardrail.} Write a one-paragraph cleanup plan for this book's MongoDB resources. Include what you will delete, what you will keep, and what alert or review you would configure before moving beyond M0.
+\end{enumerate}

@@ -1,0 +1,692 @@
+\chapter{Virtual Warehouses and Compute Scaling}
+\index{virtual warehouse}\index{compute scaling}\index{warehouse sizing}\index{multi-cluster warehouse}\index{Week 2}%
+\begin{objectives}
+\begin{itemize}
+    \item Explain how Snowflake virtual warehouses provide isolated, elastic compute over shared data.
+    \item Choose warehouse sizes from XSMALL through 6XLARGE based on workload shape, concurrency, latency, and credit budget.
+    \item Describe credit consumption, per-second billing after the minimum charge, local SSD cache behavior, and result-cache boundaries.
+    \item Configure auto-suspend, auto-resume, and warehouse state management for predictable cost control.
+    \item Design multi-cluster warehouses with Standard or Economy scaling policies and appropriate minimum and maximum cluster counts.
+    \item Build a hands-on lab that creates a multi-cluster warehouse, simulates concurrent Python queries, and observes scaling in Snowsight.
+    \item Design workload-isolated compute for BI dashboards, ETL batch processing, and ad-hoc data-science exploration.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+Snowflake's virtual warehouse model is one implementation of a broader cloud analytics idea: separate durable data from elastic compute, then assign compute capacity to workloads according to latency and cost goals. The names differ across platforms, but the engineering questions are similar: how much compute is allocated, who shares it, when does it scale, and who pays for it?
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{2.8cm}p{3.0cm}p{3.0cm}p{3.0cm}p{3.0cm}@{}}
+\toprule
+\textbf{Concept} & \textbf{Snowflake} & \textbf{AWS Redshift} & \textbf{Azure Synapse} & \textbf{GCP BigQuery} \\
+\midrule
+Primary compute unit & Virtual warehouse size, XSMALL--6XLARGE & RA3 provisioned clusters or Redshift Serverless RPUs & Dedicated SQL pool DWUs or serverless SQL & Slots, reservations, editions, or on-demand processing \\
+Storage separation & Centralized Snowflake storage on cloud object storage & RA3 managed storage separates hot compute from durable storage & Dedicated SQL pool storage and compute scale together more visibly; serverless reads lake files & Managed columnar storage and external lake data queried by service compute \\
+Concurrency relief & Multi-cluster warehouses, query queues, scaling policies & Concurrency Scaling and serverless workgroups & Workload groups, resource classes, multiple pools, serverless endpoint separation & Reservations, assignments, autoscaling slots, or on-demand shared capacity \\
+Pause or suspend & Auto-suspend and auto-resume per warehouse & Pause or resize provisioned clusters; serverless scales by usage & Pause dedicated SQL pools; serverless has no persistent pool to pause & Reservations are capacity commitments; on-demand has no warehouse to suspend \\
+Cost meter & Credits per warehouse size and running time & Node-hours, RPUs, managed storage, concurrency scaling credits & DWU-hours for dedicated pools and TB scanned for serverless & Slot commitments, capacity compute, or bytes processed on demand \\
+Isolation boundary & Warehouse per workload, team, SLA, or environment & Cluster/workgroup per workload or WLM queues & Pool, workspace, workload group, or serverless endpoint & Reservation assignment, project, folder, or workload identity \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+\textbf{Microsoft Fabric} expresses similar capacity thinking through Capacity Units (CU): teams buy or assign capacity and workloads consume that capacity under throttling and bursting rules. \textbf{MongoDB Atlas} is a useful contrast: fixed cluster tiers and Atlas auto-scaling resize database nodes, but they do not expose Snowflake-style independent SQL warehouses over one shared analytic storage layer. When reading Snowflake system functions such as \texttt{SYSTEM\textdollar WAREHOUSE\_METERING\_HISTORY}, remember that source SQL uses \texttt{SYSTEM\$...}; the dollar sign must be escaped in LaTeX prose.
+\end{crosscloud}
+
+\section{Week 2 Roadmap}
+Week 2 moves from storage architecture to the compute layer that actually executes queries. In Chapter 1, virtual warehouses appeared as the Query Processing layer in Snowflake's multi-cluster shared-data architecture. This chapter treats warehouses as first-class engineering objects: sized, suspended, resumed, monitored, scaled, isolated, and governed. The central lesson is that a warehouse is not merely a place to run SQL. It is the cost, concurrency, and blast-radius boundary for a workload \cite{snowflakeVirtualWarehouseDocs,snowflakeWarehouseConsiderationsDocs}.
+
+The week follows five operational questions. Monday asks how to size a warehouse and why bigger is not always cheaper or faster. Tuesday studies lifecycle controls: auto-suspend, auto-resume, manual state changes, and cache effects. Wednesday introduces multi-cluster warehouses for concurrency scaling. Thursday implements the pattern with SQL and a Python connector script that simulates 100 concurrent queries. Friday turns the mechanics into an enterprise compute-isolation strategy for dashboards, ETL, and data science.
+
+\begin{keyterms}
+\textbf{Virtual warehouse}: an independent Snowflake compute cluster that executes queries and maintains local cache while attached to shared storage.\quad
+\textbf{Warehouse size}: the relative compute capacity assigned to a warehouse, from XSMALL through 6XLARGE.\quad
+\textbf{Credit}: Snowflake's unit of compute consumption, charged according to warehouse size and running time.\quad
+\textbf{Auto-suspend}: a warehouse setting that stops compute after inactivity.\quad
+\textbf{Multi-cluster warehouse}: a warehouse that can add clusters to serve concurrent queries without forcing unrelated workloads onto one queue.
+\end{keyterms}
+
+\section{Monday: Virtual Warehouse Sizing, Credits, and Cache}
+\index{warehouse sizing}\index{credits}\index{local SSD cache}\index{result cache}
+A Snowflake virtual warehouse is an MPP compute cluster provisioned independently of table storage. It reads micro-partitions from shared storage, executes SQL, writes results, and caches data locally while it remains running. Warehouse sizes range from XSMALL to 6XLARGE. Each step roughly doubles compute resources and credit consumption relative to the previous size. The exact physical node count is managed by Snowflake, so engineers should reason in terms of observable workload behavior: elapsed time, queueing, partitions scanned, spill, cache hit rate, and credits consumed \cite{snowflakeWarehouseOverviewDocs}.
+
+\begin{definitionbox}
+\textbf{Warehouse sizing} is the process of matching Snowflake compute capacity to a workload's scan volume, join complexity, concurrency, latency target, and cost guardrails. It is an empirical process: choose a starting size, run representative queries, inspect profiles, and adjust.
+\end{definitionbox}
+
+For many analytic queries, an XSMALL warehouse is an excellent starting point. It keeps experiments inexpensive and exposes whether pruning, clustering, and SQL design are healthy. A larger warehouse may help when a query is CPU-bound, needs more parallelism, performs large joins or aggregations, spills to remote storage, or must meet a strict service-level objective. A larger warehouse may not help much when the query scans unnecessary data because predicates cannot prune, when result-cache reuse dominates, or when a single query has limited parallelism.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{2.6cm}p{3.0cm}p{4.0cm}p{4.2cm}@{}}
+\toprule
+\textbf{Size family} & \textbf{Relative credits} & \textbf{Good starting workloads} & \textbf{Sizing caution} \\
+\midrule
+XSMALL / SMALL & Lowest interactive cost & Development, metadata checks, small BI dashboards, light ELT & May queue or spill under heavy joins and broad scans \\
+MEDIUM / LARGE & Moderate production capacity & Scheduled transforms, recurring dashboards, medium fact-table scans & Validate that runtime drops enough to justify doubled credits \\
+XLARGE / 2XLARGE & High throughput & Large batch windows, wide aggregations, expensive Snowpark jobs & Can hide inefficient SQL while increasing spend quickly \\
+3XLARGE--6XLARGE & Very high capacity & Rare enterprise-scale batch, migration, or peak SLA workloads & Requires strong monitoring, resource monitors, and rollback plan \\
+\bottomrule
+\end{tabular}
+\caption{Warehouse sizes should be selected by workload evidence rather than naming convention alone.}
+\label{tab:chapter2-sizing-guidance}
+\end{table}
+
+\subsection{Credit Consumption and the Doubling Rule}
+\index{credit consumption}\index{per-second billing}
+Snowflake warehouses consume credits while running. Larger sizes consume more credits per hour, and each size step roughly doubles the rate. That does not mean a larger warehouse is always more expensive for one job. If a MEDIUM warehouse consumes twice the credits per hour of a SMALL warehouse but finishes a query in less than half the time, it can reduce both latency and total credits. If it finishes only slightly faster, it costs more. The only trustworthy answer comes from measurement against representative data.
+
+\begin{tipbox}
+Benchmark with the same cache assumptions, same warehouse state, same SQL text, and the same data volume. Record elapsed time and credits, not elapsed time alone. A fast query that costs four times as much may be a poor trade for a background job and a good trade for an executive dashboard.
+\end{tipbox}
+
+A common approach is to establish a baseline on a small warehouse, then test one size up and one size down when possible. Capture query IDs, query profile metrics, and warehouse metering. For batch ETL, measure the entire task graph or orchestration window, not just one favorable query. For dashboards, measure concurrent refreshes and tail latency because user experience is often defined by the slowest tile.
+
+\subsection{Local SSD Cache and Result Cache}
+\index{cache}\index{local disk cache}\index{result cache}
+Snowflake has multiple cache layers. The persisted result cache can return identical query results without executing warehouse work when eligibility rules are met. The warehouse local disk cache, often described as local SSD cache, stores data read from remote storage while a warehouse is running. This cache can make repeated scans faster, but it is tied to the running warehouse and can be lost when the warehouse is suspended, resized, or replaced. Cloud Services metadata also helps the optimizer prune and plan before data is read.
+
+\begin{figure}[H]
+    \centering
+    \resizebox{0.95\textwidth}{!}{%
+    \begin{tikzpicture}[
+        box/.style={rectangle, draw=primary, fill=primary!5, rounded corners, minimum height=2.8em, text width=3.0cm, align=center, font=\scriptsize\bfseries},
+        cache/.style={rectangle, draw=codegreen!60!black, fill=green!8, rounded corners, minimum height=2.8em, text width=3.1cm, align=center, font=\scriptsize\bfseries},
+        wh/.style={rectangle, draw=magenta, fill=magenta!10, rounded corners, minimum height=3.0em, text width=3.2cm, align=center, font=\scriptsize\bfseries},
+        arrow/.style={draw, thick, -Latex, draw=primary},
+        biarrow/.style={draw, thick, Latex-Latex, draw=codegray}
+    ]
+        \node[box] (client) at (0, 1.0) {Client query\\SQL text + role};
+        \node[cache] (result) at (3.6, 1.0) {Persisted result cache\\eligible identical results};
+        \node[box] (cloud) at (7.2, 1.0) {Cloud Services\\metadata, plan, privileges};
+        \node[wh] (wh) at (7.2, -1.4) {Virtual warehouse\\CPU, memory, local SSD cache};
+        \node[cache] (ssd) at (3.6, -1.4) {Warehouse local cache\\recent micro-partition data};
+        \node[box] (storage) at (10.8, -1.4) {Remote storage\\durable micro-partitions};
+        \draw[arrow] (client) -- (result);
+        \draw[arrow] (result) -- node[above,font=\scriptsize,text=primary]{miss or ineligible} (cloud);
+        \draw[arrow] (cloud) -- (wh);
+        \draw[biarrow] (wh) -- (ssd);
+        \draw[arrow] (wh) -- node[above,font=\scriptsize,text=primary]{read on cache miss} (storage);
+        \draw[arrow] (storage) to[out=-150,in=-30] (ssd);
+    \end{tikzpicture}%
+    }
+    \caption{Snowflake query execution can benefit from result cache, metadata pruning, and warehouse-local cache, but each cache has different eligibility and lifecycle rules.}
+    \label{fig:chapter2-cache-layers}
+\end{figure}
+
+\begin{pitfall}
+\textbf{Benchmarking on accidental cache.} A second run may be faster because the result cache or local SSD cache helped. That is valuable in production, but it can mislead sizing decisions. Disable cached results for tests when you need warehouse execution metrics and document whether the warehouse was warm or cold.
+\end{pitfall}
+
+\section{Tuesday: Auto-Suspend, Auto-Resume, and State Management}
+\index{auto-suspend}\index{auto-resume}\index{warehouse state management}
+A warehouse has lifecycle states such as started, suspended, resizing, and resuming. State management is where Snowflake cost discipline becomes visible. Auto-suspend stops compute after a configurable period of inactivity. Auto-resume starts a suspended warehouse when a query arrives. Manual \texttt{ALTER WAREHOUSE ... SUSPEND} and \texttt{ALTER WAREHOUSE ... RESUME} commands are useful for labs, incidents, and controlled benchmarks.
+
+\begin{definitionbox}
+\textbf{Auto-suspend} is a cost-control setting that suspends an idle warehouse after a specified number of seconds. \textbf{Auto-resume} is a usability setting that starts the warehouse automatically when a statement needs compute.
+\end{definitionbox}
+
+The best auto-suspend value depends on query cadence. For an analyst warehouse with sporadic work, 60 or 120 seconds can prevent idle burn. For a dashboard warehouse refreshing every few minutes, an overly short suspend interval can force repeated resume latency and local-cache loss. For batch ETL, the orchestration tool may explicitly resume before the job and suspend after the last step. In every case, the setting should reflect workload rhythm rather than a universal default.
+
+\begin{notebox}
+A suspended warehouse does not consume warehouse compute credits, but it also loses local cache warmth. The persistent result cache and table data remain available because they are not stored inside the suspended compute cluster.
+\end{notebox}
+
+\subsection{Warehouse State Commands}
+\index{ALTER WAREHOUSE}\index{SHOW WAREHOUSES}
+Operational runbooks should include simple state commands. \texttt{SHOW WAREHOUSES} reveals current state, size, auto-suspend, auto-resume, resource monitor assignment, and scaling settings. \texttt{ALTER WAREHOUSE} changes size, suspension, scaling policy, and cluster limits. Resizing is powerful, but it should be treated as a production change when shared workloads depend on that warehouse.
+
+\begin{lstlisting}[language=SQL,caption={Common warehouse state management commands for operations and benchmarking.},label={lst:chapter2-state-management-sql}]
+SHOW WAREHOUSES LIKE 'BI_%';
+
+ALTER WAREHOUSE BI_DASHBOARD_WH SUSPEND;
+ALTER WAREHOUSE BI_DASHBOARD_WH RESUME;
+
+ALTER WAREHOUSE BI_DASHBOARD_WH SET
+  WAREHOUSE_SIZE = 'MEDIUM'
+  AUTO_SUSPEND = 120
+  AUTO_RESUME = TRUE;
+
+SELECT *
+FROM TABLE(INFORMATION_SCHEMA.WAREHOUSE_METERING_HISTORY(
+  DATE_RANGE_START => DATEADD('day', -7, CURRENT_DATE()),
+  WAREHOUSE_NAME => 'BI_DASHBOARD_WH'
+));
+\end{lstlisting}
+
+\begin{tipbox}
+For benchmark runs, record whether the warehouse was resumed immediately before the test. A cold start, warm local cache, and result-cache hit answer different questions. All three can be legitimate, but mixing them invalidates the comparison.
+\end{tipbox}
+
+\subsection{Operational Guardrails}
+\index{resource monitor}\index{cost governance}
+Auto-suspend is necessary but not sufficient. Production accounts should pair warehouses with resource monitors, naming conventions, ownership tags, and alerting. A data engineer should know which team owns a warehouse, which workload it serves, what latency or completion target it supports, and what action occurs when credit thresholds are reached. Cost surprises are often caused by warehouses left running, temporary size increases never reverted, or exploratory users sharing a critical dashboard warehouse.
+
+\begin{pitfall}
+\textbf{One shared warehouse for convenience.} A shared warehouse may appear cheaper until dashboard refreshes, ad-hoc notebooks, and ETL merges collide. Queueing, unpredictable cache churn, and unclear chargeback are symptoms that compute boundaries are too coarse.
+\end{pitfall}
+
+\section{Wednesday: Multi-Cluster Warehouses and Scaling Policies}
+\index{multi-cluster warehouse}\index{scaling policy}\index{Standard scaling}\index{Economy scaling}\index{min clusters}\index{max clusters}
+A single warehouse cluster can execute multiple statements, but high concurrency eventually creates queues. A multi-cluster warehouse solves this by adding clusters under the same warehouse name. Each cluster has the same size, reads the same shared data, and serves queued or concurrent work. Multi-cluster warehouses are especially useful for many similar queries, such as BI dashboards, where concurrency rather than one huge query is the bottleneck \cite{snowflakeMultiClusterDocs}.
+
+\begin{definitionbox}
+A \textbf{multi-cluster warehouse} is a Snowflake warehouse that can run more than one compute cluster at the same size. \texttt{MIN\_CLUSTER\_COUNT} controls the floor, \texttt{MAX\_CLUSTER\_COUNT} controls the ceiling, and the scaling policy controls how eagerly Snowflake adds or removes clusters.
+\end{definitionbox}
+
+Minimum and maximum cluster settings express the service objective. A minimum of 1 and maximum of 5 keeps cost low at idle while allowing scale-out during bursts. A minimum greater than 1 pre-warms parallel clusters but increases steady-state cost. A maximum too low preserves budget but allows queues. A maximum too high protects latency but can surprise FinOps teams if many dashboard refreshes arrive together.
+
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[
+        user/.style={circle, draw=primary, fill=primary!5, minimum size=0.85cm, font=\scriptsize\bfseries},
+        queue/.style={rectangle, draw=codegray, fill=backcolour, rounded corners, minimum height=1.0cm, text width=2.4cm, align=center, font=\scriptsize\bfseries},
+        wh/.style={rectangle, draw=magenta, fill=magenta!10, rounded corners, minimum height=1.1cm, text width=2.5cm, align=center, font=\scriptsize\bfseries},
+        data/.style={rectangle, draw=codegreen!60!black, fill=green!8, rounded corners, minimum height=1.0cm, text width=3.4cm, align=center, font=\scriptsize\bfseries},
+        arrow/.style={draw, thick, -Latex, draw=primary}
+    ]
+        \foreach \x/\n in {0/U1,0.8/U2,1.6/U3,2.4/U4,3.2/U5}{\node[user] (\n) at (\x, 1.4) {\n};}
+        \node[queue] (q) at (1.6, 0) {BI query burst\\dashboard tiles};
+        \node[wh] (c1) at (5.1, 1.8) {Cluster 1\\running};
+        \node[wh] (c2) at (5.1, 0.6) {Cluster 2\\added};
+        \node[wh] (c3) at (5.1, -0.6) {Cluster 3\\added};
+        \node[wh] (c4) at (5.1, -1.8) {Up to max 5\\if queues remain};
+        \node[data] (data) at (9.0, 0) {Shared Snowflake data\\same tables, separate compute};
+        \foreach \n in {U1,U2,U3,U4,U5}{\draw[arrow] (\n) -- (q);}
+        \foreach \c in {c1,c2,c3,c4}{\draw[arrow] (q) -- (\c); \draw[arrow] (\c) -- (data);}
+    \end{tikzpicture}%
+    }
+    \caption{A multi-cluster warehouse scales out by adding same-size clusters to absorb concurrent queued work over shared data.}
+    \label{fig:chapter2-multicluster-scaleout}
+\end{figure}
+
+\subsection{Standard vs. Economy Scaling}
+\index{Standard scaling policy}\index{Economy scaling policy}
+Snowflake supports Standard and Economy scaling policies. \textbf{Standard} favors reducing queue time by starting additional clusters more eagerly. It is appropriate when interactive users or dashboards have tight latency goals. \textbf{Economy} favors credit efficiency by waiting longer before starting additional clusters and keeping clusters busier. It is appropriate when queueing is acceptable and budget matters more than immediate response.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.0cm}p{4.8cm}p{4.8cm}@{}}
+\toprule
+\textbf{Policy} & \textbf{Best fit} & \textbf{Trade-off} \\
+\midrule
+Standard & Interactive BI, executive dashboards, user-facing applications, SLA-sensitive reporting & More responsive scale-out can consume more credits during bursts \\
+Economy & Batch workloads, lower-priority analysis, predictable background reporting & Better utilization but users may experience longer queues \\
+\bottomrule
+\end{tabular}
+\caption{Scaling policy choice should reflect whether latency or credit efficiency is the primary objective.}
+\label{tab:chapter2-scaling-policy}
+\end{table}
+
+\begin{notebox}
+Multi-cluster scaling increases concurrency capacity; it does not make one individual query run across multiple clusters. If one query is slow because it scans too much data or spills, investigate SQL design, pruning, warehouse size, and data layout before assuming multi-cluster scaling will fix it.
+\end{notebox}
+
+\section{Thursday Hands-On Project: Configure Multi-Cluster Auto-Scaling}
+\index{hands-on project}\index{Snowflake Connector for Python}\index{concurrency simulation}\index{Snowsight}
+The lab creates a multi-cluster warehouse with a minimum of 1 cluster and maximum of 5 clusters, then uses Python to issue 100 concurrent queries through the Snowflake Connector for Python \cite{snowflakeConnectorPythonDocs}. The objective is not to overload a production account. The objective is to observe queueing, cluster count, elapsed time, and credit behavior in Snowsight and query history.
+
+\begin{pitfall}
+\textbf{Credit safety.} A 100-query concurrency test can consume credits quickly. Run this in a training account, start with a SMALL warehouse only if XSMALL does not create observable queueing, set auto-suspend, and suspend the warehouse immediately after the lab.
+\end{pitfall}
+
+\begin{lstlisting}[language=SQL,caption={Creating a multi-cluster warehouse with min 1, max 5, and auto-scaling enabled.},label={lst:chapter2-multicluster-sql}]
+USE ROLE SYSADMIN;
+
+CREATE OR REPLACE WAREHOUSE BI_CONCURRENCY_WH
+  WAREHOUSE_SIZE = 'XSMALL'
+  MIN_CLUSTER_COUNT = 1
+  MAX_CLUSTER_COUNT = 5
+  SCALING_POLICY = 'STANDARD'
+  AUTO_SUSPEND = 60
+  AUTO_RESUME = TRUE
+  INITIALLY_SUSPENDED = TRUE;
+
+CREATE OR REPLACE DATABASE SNOWFLAKE_DE_BOOK;
+CREATE OR REPLACE SCHEMA SNOWFLAKE_DE_BOOK.WEEK2_WAREHOUSES;
+
+USE WAREHOUSE BI_CONCURRENCY_WH;
+USE DATABASE SNOWFLAKE_DE_BOOK;
+USE SCHEMA WEEK2_WAREHOUSES;
+
+CREATE OR REPLACE TABLE CONCURRENCY_FACT AS
+SELECT
+    SEQ4() AS id,
+    DATEADD('second', UNIFORM(0, 60 * 60 * 24 * 14, RANDOM()),
+            '2026-07-01'::TIMESTAMP_NTZ) AS event_ts,
+    TO_DATE(event_ts) AS event_date,
+    ARRAY_CONSTRUCT('NORTH', 'SOUTH', 'EAST', 'WEST')[UNIFORM(0, 4, RANDOM())]::VARCHAR AS region,
+    UNIFORM(1, 1000000, RANDOM()) AS customer_id,
+    ROUND(UNIFORM(0, 1000000, RANDOM()) / 100, 2) AS revenue_amount
+FROM TABLE(GENERATOR(ROWCOUNT => 5000000));
+
+ALTER SESSION SET USE_CACHED_RESULT = FALSE;
+
+SELECT
+    event_date,
+    region,
+    COUNT(*) AS events,
+    SUM(revenue_amount) AS revenue
+FROM CONCURRENCY_FACT
+WHERE event_date BETWEEN '2026-07-03' AND '2026-07-10'
+GROUP BY event_date, region
+ORDER BY event_date, region;
+
+SHOW WAREHOUSES LIKE 'BI_CONCURRENCY_WH';
+\end{lstlisting}
+
+After the SQL setup, open Snowsight and keep the warehouse monitoring view available. During the Python run, watch the current clusters, queued statements, running statements, and credit consumption. Depending on account edition, workload shape, and query duration, Snowflake may add clusters only when queues persist long enough. If the query is too fast to queue, increase row count in a controlled way or add a heavier aggregation for the lab.
+
+\begin{lstlisting}[language=Python,caption={Python connector script that simulates 100 concurrent Snowflake queries.},label={lst:chapter2-python-concurrency}]
+import concurrent.futures
+import os
+import time
+
+import snowflake.connector
+
+QUERY = """
+SELECT
+    event_date,
+    region,
+    COUNT(*) AS events,
+    SUM(revenue_amount) AS revenue,
+    APPROX_COUNT_DISTINCT(customer_id) AS customers
+FROM CONCURRENCY_FACT
+WHERE event_date BETWEEN '2026-07-03' AND '2026-07-10'
+GROUP BY event_date, region
+ORDER BY event_date, region
+"""
+
+CONNECT_ARGS = {
+    "account": os.environ["SNOWFLAKE_ACCOUNT"],
+    "user": os.environ["SNOWFLAKE_USER"],
+    "password": os.environ["SNOWFLAKE_PASSWORD"],
+    "role": "SYSADMIN",
+    "warehouse": "BI_CONCURRENCY_WH",
+    "database": "SNOWFLAKE_DE_BOOK",
+    "schema": "WEEK2_WAREHOUSES",
+}
+
+
+def run_query(run_number: int) -> dict:
+    started = time.perf_counter()
+    connection = snowflake.connector.connect(**CONNECT_ARGS)
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute("ALTER SESSION SET USE_CACHED_RESULT = FALSE")
+            cursor.execute(QUERY)
+            rows = cursor.fetchall()
+            elapsed = time.perf_counter() - started
+            return {
+                "run_number": run_number,
+                "query_id": cursor.sfqid,
+                "rows_returned": len(rows),
+                "elapsed_seconds": round(elapsed, 3),
+            }
+    finally:
+        connection.close()
+
+
+def main() -> None:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=100) as executor:
+        futures = [executor.submit(run_query, n) for n in range(1, 101)]
+        for future in concurrent.futures.as_completed(futures):
+            print(future.result())
+
+
+if __name__ == "__main__":
+    main()
+\end{lstlisting}
+
+\begin{tipbox}
+Store credentials in environment variables or a secret manager. Never paste passwords into scripts, notebooks, tickets, screenshots, or Git commits. The connector script is intentionally parameterized through \texttt{SNOWFLAKE\_ACCOUNT}, \texttt{SNOWFLAKE\_USER}, and \texttt{SNOWFLAKE\_PASSWORD}.
+\end{tipbox}
+
+\subsection{What to Observe in Snowsight}
+\index{Snowsight}\index{query history}
+During the run, collect three types of evidence. First, note whether the warehouse scales beyond one cluster and how quickly. Second, compare running and queued statements. Third, inspect query history for elapsed time, queued provisioning time, queued overload time, bytes scanned, and partitions scanned. If Standard scaling adds clusters and Economy does not under the same test, explain the latency and credit trade-off rather than declaring one universally better.
+
+\section{Friday Use Case: Enterprise Compute Isolation Without Contention}
+\index{compute isolation}\index{BI dashboards}\index{ETL batch}\index{data science}\index{workload isolation}
+Consider an enterprise where three workloads run concurrently. BI dashboards refresh every few minutes for executives and customer-facing teams. ETL batch pipelines load, merge, and aggregate data after source-system cutoffs. Data scientists run ad-hoc feature exploration, model-training extracts, and Snowpark notebooks. All three need the same governed data, but they should not compete for the same compute queue.
+
+\subsection{Isolation Strategy}
+The simplest defensible strategy is warehouse-per-workload with explicit ownership and guardrails. Give BI a multi-cluster warehouse with Standard scaling because many dashboard tiles arrive together and user-facing latency matters. Give ETL a separate warehouse sized for the batch window; it may use Economy scaling or a larger single cluster depending on whether concurrency or individual query runtime is the bottleneck. Give data science a separate exploratory warehouse with strict auto-suspend, resource monitor alerts, and possibly a lower maximum size.
+
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[
+        team/.style={rectangle, draw=primary, fill=primary!5, rounded corners, minimum height=1.1cm, text width=2.8cm, align=center, font=\scriptsize\bfseries},
+        wh/.style={rectangle, draw=magenta, fill=magenta!10, rounded corners, minimum height=1.2cm, text width=3.2cm, align=center, font=\scriptsize\bfseries},
+        data/.style={rectangle, draw=codegreen!60!black, fill=green!8, rounded corners, minimum height=1.4cm, text width=4.2cm, align=center, font=\scriptsize\bfseries},
+        policy/.style={rectangle, draw=codegray, fill=backcolour, rounded corners, minimum height=1.0cm, text width=3.0cm, align=center, font=\scriptsize},
+        arrow/.style={draw, thick, -Latex, draw=primary}
+    ]
+        \node[team] (biusers) at (0, 2.2) {BI users\\dashboards};
+        \node[team] (etlusers) at (0, 0) {Data engineering\\batch ELT};
+        \node[team] (dsusers) at (0, -2.2) {Data science\\notebooks};
+        \node[wh] (biwh) at (4.0, 2.2) {BI\_DASHBOARD\_WH\\multi-cluster\\Standard};
+        \node[wh] (etlwh) at (4.0, 0) {ETL\_BATCH\_WH\\right-sized batch};
+        \node[wh] (dswh) at (4.0, -2.2) {DS\_EXPLORE\_WH\\strict suspend\\resource monitor};
+        \node[data] (shared) at (8.4, 0) {Shared governed data\\databases, schemas, tables, views};
+        \node[policy] (cost) at (12.0, 1.2) {Chargeback\\owner tags\\alerts};
+        \node[policy] (sec) at (12.0, -1.2) {RBAC\\masking\\row access};
+        \draw[arrow] (biusers) -- (biwh);
+        \draw[arrow] (etlusers) -- (etlwh);
+        \draw[arrow] (dsusers) -- (dswh);
+        \foreach \w in {biwh,etlwh,dswh}{\draw[arrow] (\w) -- (shared);}
+        \draw[arrow] (shared) -- (cost);
+        \draw[arrow] (shared) -- (sec);
+    \end{tikzpicture}%
+    }
+    \caption{Per-team warehouse isolation lets BI, ETL, and data science share governed data without sharing the same compute queue.}
+    \label{fig:chapter2-workload-isolation}
+\end{figure}
+
+\begin{notebox}
+Isolation does not require copying data. Warehouses are compute boundaries over the same governed tables. RBAC, masking policies, row access policies, and views still determine what each team can see.
+\end{notebox}
+
+\subsection{Cost and Performance Trade-Offs}
+A workload-isolated platform can use more named warehouses than a minimal design, but it is often cheaper operationally. It prevents a runaway notebook from delaying executive dashboards, keeps ETL incidents from consuming analyst capacity, and makes chargeback possible. The key is to avoid oversized always-on warehouses. Use short auto-suspend for exploratory workloads, dashboard-aware suspend settings for BI, and explicit batch windows for ETL. Monitor utilization: a warehouse that is idle most of the day may be healthy if it protects a high-value SLA, but it should not remain running when unused.
+
+\begin{pitfall}
+\textbf{Confusing isolation with unlimited capacity.} Separate warehouses prevent contention across workloads, but each warehouse still needs sizing, queue monitoring, resource monitors, and owner accountability.
+\end{pitfall}
+
+\section{Interview Q\&A}
+\subsection{Virtual Warehouses and Scaling}
+\begin{enumerate}
+    \item \textbf{Q: What is a Snowflake virtual warehouse?}\\
+    A: It is an independent compute cluster that executes SQL over shared Snowflake data. It can be sized, suspended, resumed, monitored, and isolated from other warehouses.
+    \item \textbf{Q: Does a larger warehouse always reduce total cost?}\\
+    A: No. It consumes more credits per hour. It reduces cost only when the runtime improvement is large enough to offset the higher rate, so representative benchmarking is required.
+    \item \textbf{Q: What is the difference between result cache and local SSD cache?}\\
+    A: Result cache can return eligible identical query results without warehouse execution. Local SSD cache belongs to a running warehouse and accelerates repeated reads of data already fetched from storage.
+    \item \textbf{Q: When should auto-suspend be short?}\\
+    A: For sporadic or exploratory workloads where idle cost matters more than warm-cache reuse or resume latency. Very frequent dashboards may need a longer setting.
+    \item \textbf{Q: What problem does a multi-cluster warehouse solve?}\\
+    A: It reduces concurrency queues by adding same-size clusters under one warehouse. It does not make a single query run across multiple clusters.
+    \item \textbf{Q: Standard or Economy scaling for dashboards?}\\
+    A: Usually Standard, because user-facing latency matters. Economy is better when credit efficiency matters more than immediate queue reduction.
+\end{enumerate}
+
+\section{Further Reading}
+Snowflake's virtual warehouse documentation explains warehouse sizing, lifecycle controls, and compute concepts \cite{snowflakeVirtualWarehouseDocs,snowflakeWarehouseOverviewDocs}. Snowflake's multi-cluster warehouse documentation describes minimum and maximum clusters, Standard and Economy scaling policies, and concurrency behavior \cite{snowflakeMultiClusterDocs}. Snowflake's cost and warehouse considerations documentation gives practical guidance for auto-suspend, monitoring, and workload design \cite{snowflakeWarehouseConsiderationsDocs,snowflakeCostManagementDocs}. For cross-platform context, review Redshift concurrency scaling and serverless workgroups \cite{awsRedshiftConcurrencyScalingDocs}, Synapse dedicated and serverless SQL pool guidance \cite{azureSynapseSqlDocs}, and BigQuery slots and reservations \cite{googleBigQuerySlotsDocs}.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item Virtual warehouses are Snowflake's compute, cost, and workload-isolation boundary.
+    \item Warehouse size should be chosen by representative measurements: elapsed time, queueing, spill, bytes scanned, and credits.
+    \item Result cache, metadata pruning, and warehouse-local SSD cache can all improve performance, but they have different lifecycles.
+    \item Auto-suspend and auto-resume control idle cost and usability; aggressive suspend settings can sacrifice cache warmth.
+    \item Multi-cluster warehouses scale out for concurrency by adding clusters, not by splitting one query across clusters.
+    \item Standard scaling favors lower queue time; Economy scaling favors credit efficiency.
+    \item Enterprise platforms should isolate BI, ETL, and data-science workloads with separate warehouses, monitors, and ownership.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Explain why a warehouse is both a compute boundary and a cost boundary in Snowflake.
+    \item \textbf{(Conceptual)} A query runs 40\% faster on a MEDIUM warehouse than on a SMALL warehouse. If the MEDIUM costs twice as many credits per hour, is it cheaper? Explain.
+    \item \textbf{(Conceptual)} Describe how result cache and local SSD cache can distort benchmark results.
+    \item \textbf{(Operations)} Propose auto-suspend values for a dashboard warehouse, an ETL warehouse, and an exploratory data-science warehouse. Justify each.
+    \item \textbf{(Hands-on)} Create the warehouse in \cref{lst:chapter2-multicluster-sql}, run the Python script, and record whether the cluster count increases under load.
+    \item \textbf{(Hands-on)} Repeat the concurrency test with \texttt{SCALING\_POLICY = 'ECONOMY'}. Compare queued time, elapsed time, and credits with Standard.
+    \item \textbf{(Design)} Build a workload-to-warehouse matrix for BI, ETL, and data science that includes owner, size, auto-suspend, max clusters, and resource monitor.
+    \item \textbf{(Interview)} Explain why multi-cluster scaling does not necessarily improve one slow query, and list three things you would inspect first.
+\end{enumerate}
+
+\section{Capstone Project: Workload-Isolated Multi-Warehouse Compute Platform}\label{sec:ch2-capstone}
+\index{capstone project}\index{workload isolation!capstone}\index{multi-cluster warehouse!capstone}\index{credit optimization!capstone}
+
+\begin{capstonebox}
+\textbf{Mission.} Design and benchmark a workload-isolated Snowflake compute platform that balances credit cost against concurrency for BI dashboards, ETL batch processing, and ad-hoc data-science queries. You will define separate warehouses, configure scaling and suspension policies, simulate concurrent workloads, collect query and metering evidence, and defend a production recommendation.
+
+\textbf{Estimated time.} 4--6 hours. Use XSMALL warehouses in a training account first, then scale only the workload that needs stronger evidence. Set resource monitors or manual stop points before running concurrency tests.
+
+\textbf{What you'll practice.}
+\begin{itemize}
+    \item Translating workload SLAs into warehouse sizes, auto-suspend values, and multi-cluster limits.
+    \item Comparing Standard and Economy scaling under concurrent query pressure.
+    \item Measuring cost through warehouse metering and performance through query history.
+    \item Separating BI, ETL, and data-science compute without duplicating governed data.
+    \item Producing an evidence-based FinOps recommendation instead of relying on warehouse-size folklore.
+\end{itemize}
+\end{capstonebox}
+
+\subsection*{Scenario}
+A multinational retailer runs three high-value Snowflake workloads on the same governed sales and customer data. The BI team refreshes executive dashboards every five minutes during business hours. The data engineering team runs nightly ELT jobs that merge order, inventory, and shipment facts. The data-science team explores product affinity and demand signals through notebooks and Python queries. The current shared warehouse causes dashboard queues during ETL and unpredictable credit spikes during exploratory analysis.
+
+Your task is to design a compute platform that isolates these workloads while keeping total spend defensible. The platform must preserve one shared data model, assign warehouses by workload, use multi-cluster scaling only where concurrency requires it, and provide a benchmark plan that compares credit cost with observed latency.
+
+\subsection*{Requirements}
+Complete the following requirements in a Snowflake training account or as an implementation-ready design if account permissions are limited:
+\begin{enumerate}
+    \item Create or specify three warehouses: \texttt{BI\_DASHBOARD\_WH}, \texttt{ETL\_BATCH\_WH}, and \texttt{DS\_EXPLORATION\_WH}.
+    \item Configure \texttt{BI\_DASHBOARD\_WH} as a multi-cluster warehouse with minimum 1 and maximum 5 clusters. Test both Standard and Economy scaling.
+    \item Configure ETL and data-science warehouses with auto-suspend values and sizes justified by workload shape.
+    \item Generate or reuse a synthetic fact table large enough to make concurrency and scan behavior visible.
+    \item Run at least one BI-style concurrent workload, one ETL-style aggregation or merge workload, and one ad-hoc data-science query set.
+    \item Capture query IDs, elapsed time, queued time where available, bytes scanned, cluster counts, and warehouse metering.
+    \item Estimate the monthly cost of the isolated design compared with the former shared-warehouse design.
+    \item Produce a recommendation that identifies when to resize, when to add clusters, when to split warehouses further, and when to reject extra capacity.
+\end{enumerate}
+
+\subsection*{Reference Architecture}
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[
+        src/.style={rectangle, draw=primary, fill=primary!5, rounded corners, minimum height=1.0cm, text width=2.6cm, align=center, font=\scriptsize\bfseries},
+        wh/.style={rectangle, draw=magenta, fill=magenta!10, rounded corners, minimum height=1.1cm, text width=3.0cm, align=center, font=\scriptsize\bfseries},
+        data/.style={rectangle, draw=codegreen!60!black, fill=green!8, rounded corners, minimum height=1.4cm, text width=3.7cm, align=center, font=\scriptsize\bfseries},
+        mon/.style={rectangle, draw=red!60!black, fill=red!7, rounded corners, minimum height=1.0cm, text width=2.8cm, align=center, font=\scriptsize},
+        arrow/.style={draw, thick, -Latex, draw=primary}
+    ]
+        \node[src] (dash) at (0, 2.4) {Dashboard burst\\100 tiles};
+        \node[src] (batch) at (0, 0) {Nightly ELT\\merge + aggregate};
+        \node[src] (notebook) at (0, -2.4) {Data science\\ad-hoc notebooks};
+        \node[wh] (bi) at (4.0, 2.4) {BI\_DASHBOARD\_WH\\XSMALL\\min 1 max 5};
+        \node[wh] (etl) at (4.0, 0) {ETL\_BATCH\_WH\\MEDIUM\\scheduled};
+        \node[wh] (ds) at (4.0, -2.4) {DS\_EXPLORATION\_WH\\SMALL\\short suspend};
+        \node[data] (model) at (8.4, 0) {Shared curated model\\facts, dimensions, secure views};
+        \node[mon] (meter) at (12.0, 1.2) {Metering\\credits by warehouse};
+        \node[mon] (history) at (12.0, -1.2) {Query history\\queue + elapsed};
+        \draw[arrow] (dash) -- (bi);
+        \draw[arrow] (batch) -- (etl);
+        \draw[arrow] (notebook) -- (ds);
+        \foreach \w in {bi,etl,ds}{\draw[arrow] (\w) -- (model);}
+        \draw[arrow] (model) -- (meter);
+        \draw[arrow] (model) -- (history);
+    \end{tikzpicture}%
+    }
+    \caption{Capstone architecture for measuring isolated BI, ETL, and data-science compute against one shared governed data model.}
+    \label{fig:chapter2-capstone-reference}
+\end{figure}
+
+\subsection*{Implementation Steps}
+\begin{enumerate}
+    \item Run the setup SQL in \cref{lst:chapter2-capstone-sql}. Adjust warehouse sizes downward if your training account has strict credit limits.
+    \item Execute the BI Python workload in \cref{lst:chapter2-capstone-python} with Standard scaling, then repeat after changing \texttt{SCALING\_POLICY} to \texttt{ECONOMY}.
+    \item Run a separate ETL aggregation or merge while BI queries are active. Confirm that it uses \texttt{ETL\_BATCH\_WH} and does not queue behind dashboard statements.
+    \item Run several ad-hoc data-science queries on \texttt{DS\_EXPLORATION\_WH}; verify that auto-suspend stops the warehouse after inactivity.
+    \item Query warehouse metering and query history. Compare elapsed time, queue time, and credit usage by warehouse.
+\end{enumerate}
+
+\begin{lstlisting}[language=SQL,caption={Capstone SQL for workload-isolated warehouses and benchmark data.},label={lst:chapter2-capstone-sql}]
+USE ROLE SYSADMIN;
+
+CREATE OR REPLACE WAREHOUSE BI_DASHBOARD_WH
+  WAREHOUSE_SIZE = 'XSMALL'
+  MIN_CLUSTER_COUNT = 1
+  MAX_CLUSTER_COUNT = 5
+  SCALING_POLICY = 'STANDARD'
+  AUTO_SUSPEND = 120
+  AUTO_RESUME = TRUE
+  INITIALLY_SUSPENDED = TRUE;
+
+CREATE OR REPLACE WAREHOUSE ETL_BATCH_WH
+  WAREHOUSE_SIZE = 'MEDIUM'
+  AUTO_SUSPEND = 300
+  AUTO_RESUME = TRUE
+  INITIALLY_SUSPENDED = TRUE;
+
+CREATE OR REPLACE WAREHOUSE DS_EXPLORATION_WH
+  WAREHOUSE_SIZE = 'SMALL'
+  AUTO_SUSPEND = 60
+  AUTO_RESUME = TRUE
+  INITIALLY_SUSPENDED = TRUE;
+
+CREATE OR REPLACE DATABASE COMPUTE_CAPSTONE_DB;
+CREATE OR REPLACE SCHEMA COMPUTE_CAPSTONE_DB.WORKLOADS;
+
+USE WAREHOUSE ETL_BATCH_WH;
+USE DATABASE COMPUTE_CAPSTONE_DB;
+USE SCHEMA WORKLOADS;
+
+CREATE OR REPLACE TABLE SALES_FACT AS
+SELECT
+    SEQ4() AS sale_id,
+    DATEADD('second', UNIFORM(0, 60 * 60 * 24 * 30, RANDOM()),
+            '2026-07-01'::TIMESTAMP_NTZ) AS sale_ts,
+    TO_DATE(sale_ts) AS sale_date,
+    ARRAY_CONSTRUCT('WEB', 'STORE', 'PARTNER')[UNIFORM(0, 3, RANDOM())]::VARCHAR AS channel,
+    ARRAY_CONSTRUCT('NORTH', 'SOUTH', 'EAST', 'WEST')[UNIFORM(0, 4, RANDOM())]::VARCHAR AS region,
+    UNIFORM(1, 250000, RANDOM()) AS customer_id,
+    UNIFORM(1, 50000, RANDOM()) AS product_id,
+    ROUND(UNIFORM(100, 500000, RANDOM()) / 100, 2) AS sales_amount
+FROM TABLE(GENERATOR(ROWCOUNT => 10000000));
+
+USE WAREHOUSE BI_DASHBOARD_WH;
+ALTER SESSION SET USE_CACHED_RESULT = FALSE;
+
+SELECT sale_date, region, channel, SUM(sales_amount) AS revenue
+FROM SALES_FACT
+WHERE sale_date BETWEEN '2026-07-10' AND '2026-07-20'
+GROUP BY sale_date, region, channel
+ORDER BY sale_date, region, channel;
+
+USE WAREHOUSE ETL_BATCH_WH;
+CREATE OR REPLACE TABLE DAILY_SALES_SUMMARY AS
+SELECT sale_date, region, channel, COUNT(*) AS orders, SUM(sales_amount) AS revenue
+FROM SALES_FACT
+GROUP BY sale_date, region, channel;
+
+USE WAREHOUSE DS_EXPLORATION_WH;
+SELECT product_id, APPROX_COUNT_DISTINCT(customer_id) AS customers, SUM(sales_amount) AS revenue
+FROM SALES_FACT
+WHERE sale_date >= '2026-07-15'
+GROUP BY product_id
+ORDER BY revenue DESC
+LIMIT 100;
+\end{lstlisting}
+
+\begin{lstlisting}[language=Python,caption={Capstone Python workload driver for comparing BI concurrency policies.},label={lst:chapter2-capstone-python}]
+import concurrent.futures
+import os
+import statistics
+import time
+
+import snowflake.connector
+
+QUERY = """
+SELECT sale_date, region, channel, SUM(sales_amount) AS revenue
+FROM SALES_FACT
+WHERE sale_date BETWEEN '2026-07-10' AND '2026-07-20'
+GROUP BY sale_date, region, channel
+ORDER BY sale_date, region, channel
+"""
+
+CONNECT_ARGS = {
+    "account": os.environ["SNOWFLAKE_ACCOUNT"],
+    "user": os.environ["SNOWFLAKE_USER"],
+    "password": os.environ["SNOWFLAKE_PASSWORD"],
+    "role": "SYSADMIN",
+    "warehouse": "BI_DASHBOARD_WH",
+    "database": "COMPUTE_CAPSTONE_DB",
+    "schema": "WORKLOADS",
+}
+
+
+def timed_query(run_number: int) -> dict:
+    started = time.perf_counter()
+    connection = snowflake.connector.connect(**CONNECT_ARGS)
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute("ALTER SESSION SET USE_CACHED_RESULT = FALSE")
+            cursor.execute(QUERY)
+            cursor.fetchall()
+            return {
+                "run_number": run_number,
+                "query_id": cursor.sfqid,
+                "elapsed_seconds": round(time.perf_counter() - started, 3),
+            }
+    finally:
+        connection.close()
+
+
+with concurrent.futures.ThreadPoolExecutor(max_workers=50) as executor:
+    results = list(executor.map(timed_query, range(1, 51)))
+
+elapsed = [row["elapsed_seconds"] for row in results]
+print("runs", len(results))
+print("min", min(elapsed))
+print("median", statistics.median(elapsed))
+print("max", max(elapsed))
+for row in results:
+    print(row)
+\end{lstlisting}
+
+\subsection*{Deliverables}
+Submit a concise platform design packet:
+\begin{itemize}
+    \item \textbf{Warehouse matrix:} workload, owner, size, auto-suspend, auto-resume, min clusters, max clusters, scaling policy, resource monitor, and rationale.
+    \item \textbf{Benchmark evidence:} query IDs, elapsed time, queued time, bytes scanned, cluster count observations, and warehouse metering for each workload.
+    \item \textbf{Cost model:} estimated monthly credits for BI, ETL, and data science under expected schedules and burst patterns.
+    \item \textbf{Recommendation memo:} final design, expected concurrency, cost risks, monitoring plan, and rollback criteria.
+\end{itemize}
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{2.2cm}p{2.0cm}p{2.0cm}p{2.0cm}p{2.2cm}p{2.2cm}@{}}
+\toprule
+\textbf{Workload} & \textbf{Warehouse} & \textbf{Policy} & \textbf{Max clusters} & \textbf{Median latency} & \textbf{Daily credits} \\
+\midrule
+BI dashboards & & & & & \\
+ETL batch & & & & & \\
+Data science & & & & & \\
+Shared baseline & & & & & \\
+\bottomrule
+\end{tabular}
+\caption{Template for comparing workload isolation against a shared-warehouse baseline.}
+\label{tab:chapter2-capstone-comparison}
+\end{table}
+
+\subsection*{Acceptance Criteria}
+Your capstone is complete when the submission satisfies this rubric:
+\begin{itemize}
+    \item Three workloads are mapped to separate warehouses with clear ownership and cost controls.
+    \item BI concurrency is tested with a minimum of 1 and maximum of 5 clusters.
+    \item Standard and Economy scaling policies are compared with measured queue or latency evidence.
+    \item ETL and data-science work run on their own warehouses and do not contend with BI queries.
+    \item Query history and warehouse metering are used; conclusions do not rely on client stopwatch timing alone.
+    \item Result-cache effects, warehouse warmup, and training-account scale limitations are disclosed.
+    \item The final recommendation balances concurrency, monthly credits, operational simplicity, and business SLA.
+    \item A cleanup script or teardown plan is included for all capstone objects.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Add resource monitors with alert and suspend thresholds for each warehouse.
+    \item Use query tags to separate BI, ETL, and data-science measurements in query history.
+    \item Compare a larger single-cluster BI warehouse with a smaller multi-cluster BI warehouse under the same 100-query burst.
+    \item Model business-hour BI bursts separately from overnight ETL and unpredictable notebook exploration.
+    \item Add a governance layer that maps roles to warehouses and prevents analysts from using ETL compute by mistake.
+\end{itemize}

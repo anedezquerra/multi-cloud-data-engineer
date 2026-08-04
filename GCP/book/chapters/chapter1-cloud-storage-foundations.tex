@@ -1,0 +1,788 @@
+\chapter{Cloud Storage and Transfer Services}
+\index{Cloud Storage}\index{object storage}\index{Storage Transfer Service}\index{Transfer Appliance}\index{data lake}\index{disaster recovery}
+
+\begin{objectives}
+\begin{itemize}
+    \item Explain the object storage model and why Cloud Storage is the default durable landing zone for many Google Cloud data platforms.
+    \item Compare Standard, Nearline, Coldline, and Archive storage classes using access frequency, recovery expectations, and total cost.
+    \item Choose among regional, dual-region, and multi-region bucket locations for analytics, availability, sovereignty, and disaster recovery requirements.
+    \item Design lifecycle, versioning, soft delete, retention, and Bucket Lock controls that protect data without creating uncontrolled storage growth.
+    \item Evaluate Storage Transfer Service, Transfer Appliance, \texttt{gcloud storage}, and \texttt{gsutil} for online and offline migrations.
+    \item Implement a hands-on Cloud Storage bucket, lifecycle rule, transfer job, and Python client workflow.
+    \item Design a multi-region disaster recovery architecture for ten petabytes of media assets with encryption, lifecycle policy, and cost governance.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+Although this book teaches \textbf{GCP}, the Week~1 storage foundations map almost one-to-one onto the other clouds---learn one mental model and carry it everywhere.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{2.8cm}p{3.0cm}p{3.0cm}p{3.0cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{AWS} & \textbf{Azure} & \textbf{GCP} \\
+\midrule
+Object storage & Amazon S3 & ADLS Gen2 / Blob & Cloud Storage \\
+Hot tier & S3 Standard & Hot & Standard \\
+Infrequent access & S3 Standard-IA & Cool / Cold & Nearline \\
+Archive (instant) & Glacier Instant Retrieval & Cold & Coldline \\
+Deep archive & Glacier Deep Archive & Archive & Archive \\
+Lifecycle rules & Lifecycle policies & Lifecycle management & Object Lifecycle Mgmt \\
+Versioning & S3 Versioning & Blob versioning & Object Versioning \\
+Immutability (WORM) & Object Lock & Immutable blob storage & Bucket Lock \\
+Cross-region copy & CRR / SRR & Object replication (GRS) & Dual/multi-region + Transfer \\
+Online transfer & DataSync & AzCopy & Storage Transfer Service \\
+Offline transfer & Snow Family & Data Box & Transfer Appliance \\
+\addlinespace
+Design durability & 11 nines & 11 nines (LRS) / 16 (GRS) & 11 nines \\
+Availability SLA & 99.9\% (Standard) & 99.9\% (RA-GRS read 99.99\%) & 99.95\% (multi-region) \\
+Encryption at rest & SSE-S3 / SSE-KMS / SSE-C & SSE + CMK via Key Vault & Google-managed / CMEK / CSEK \\
+Access control & IAM \& bucket policies, ACLs & Azure RBAC, SAS, POSIX ACLs & IAM, ACLs, signed URLs \\
+Pricing levers & Storage + requests + egress + retrieval & Storage + operations + egress + retrieval & Storage + operations + egress + retrieval \\
+Consistency & Strong read-after-write & Strong read-after-write & Strong (global) \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+Beyond raw object storage, the same layer reappears as a managed abstraction: \textbf{Fabric OneLake} is a tenant-wide lake built on ADLS Gen2 (Delta--Parquet), \textbf{Snowflake} persists data as immutable micro-partitions on the provider's object store, and \textbf{MongoDB}'s WiredTiger is a node-local engine rather than object storage---the contrast is itself instructive.
+\end{crosscloud}
+
+\begin{keyterms}
+\textbf{Object}: immutable byte payload plus metadata addressed by bucket and object name.
+\textbf{Bucket}: globally unique namespace, location boundary, and policy container for objects.
+\textbf{Storage class}: pricing and retrieval behavior profile such as Standard, Nearline, Coldline, or Archive.
+\textbf{Lifecycle rule}: policy that transitions, deletes, or otherwise manages objects based on age, version, prefix, or state.
+\textbf{Retention policy}: minimum retention period that prevents deletion or replacement before a compliance deadline.
+\textbf{Storage Transfer Service}: managed service for scheduled, online transfers among clouds, URLs, file systems, and Cloud Storage.
+\end{keyterms}
+
+\section{Week 1 Roadmap}
+This chapter is the first week of the GCP Master Data Engineer program. It begins with object storage fundamentals, then adds governance and protection controls, then compares migration mechanisms, and closes with hands-on deployment and an architecture case. Cloud Storage appears simple because its core API is small: create a bucket, write objects, read objects, list objects, apply metadata, and delete objects. In production data engineering, however, that small API becomes the root of ingestion, data lake zoning, recovery, retention, compliance, and cost management. A poorly designed bucket hierarchy can leak data, strand objects in expensive classes, slow downstream pipelines, or make disaster recovery impossible to test.
+
+Cloud Storage is also the service where many engineers first encounter the design style of Google Cloud: global control plane, strong durability claims, location choices, uniform IAM, customer-managed encryption keys, event integration, and policy automation. The same architectural concerns reappear later in BigQuery, Dataflow, Dataproc, Pub/Sub, Dataplex, and Vertex AI. Therefore, the storage decisions made in Week 1 are not introductory trivia; they are the foundation of the rest of the book.
+
+\begin{definitionbox}
+\textbf{Cloud Storage} is Google Cloud's managed object storage service for durable, highly available storage of immutable objects. It is commonly used for data lakes, backups, media assets, application artifacts, analytical staging, model artifacts, and cross-system exchange \cite{googlecloudstorageoverview}.
+\end{definitionbox}
+
+\section{Monday: Object Storage Fundamentals}
+\index{object storage!fundamentals}\index{bucket}\index{metadata}
+
+\subsection{Objects, Buckets, and Namespaces}
+Object storage differs from block storage and file storage. A block device gives an operating system addressable blocks. A file system gives applications hierarchical directories, permissions, and partial file operations. Object storage gives applications objects in buckets. Each object has a name, bytes, metadata, generation, checksum information, and access controls inherited or assigned through the surrounding policy model. The name may contain slashes, but those slashes are part of a flat object key rather than true directories.
+
+This distinction matters in data engineering. Data lake paths such as \texttt{raw/events/date=2026-07-30/hour=21/file-0001.json} are conventions over object names. Query engines and pipeline code interpret prefixes as partitions, but Cloud Storage itself stores named objects. A rename is usually implemented as copy plus delete. A large recursive move is not a cheap metadata operation; it can be a large data movement.
+
+\begin{notebox}
+A bucket is both a namespace and an administrative boundary. Location, uniform bucket-level access, public access prevention, retention policy, lifecycle policy, default encryption behavior, and labels are bucket-level design choices. Object prefixes can organize data, but they do not replace careful bucket design.
+\end{notebox}
+
+The object model is well suited to analytical systems because files are normally written once and read many times. Pipeline tasks write immutable outputs, downstream engines scan them, and governance services catalog them. The model is less suited to workloads that require low-latency random updates to small records. Later chapters use Spanner and Bigtable for those patterns, reflecting lessons from Google's distributed storage systems \cite{corbett2012spanner,chang2008bigtable}. The broader history of distributed storage includes the Google File System, which framed large-file storage for data processing at scale \cite{ghemawat2003gfs}.
+
+\subsection{Consistency, Durability, and Availability}
+\index{durability}\index{availability}\index{consistency}
+Cloud Storage is designed for very high durability through redundant storage of object data and metadata. Durability is the probability that stored data will not be lost. Availability is the probability that the service can successfully serve requests when clients need it. A system can be durable but temporarily unavailable; data still exists, but an outage or network problem can prevent access. A data engineer must design for both.
+
+\begin{definitionbox}
+\textbf{Durability} protects against data loss. \textbf{Availability} protects access to data during a time window. \textbf{Recovery time objective} (RTO) describes how quickly service must be restored; \textbf{recovery point objective} (RPO) describes how much data loss is acceptable.
+\end{definitionbox}
+
+Cloud Storage supports strong read-after-write and list consistency for object operations. That consistency simplifies ingestion workflows: once a writer receives success for a new object, downstream processes can discover and read it. Still, correctness requires idempotent pipeline design. A producer can retry after a network timeout and create duplicate names if names are not deterministic. A consumer can process the same object twice if its checkpointing is weak. Storage guarantees are necessary but not sufficient for exactly-once data engineering.
+
+\subsection{Storage Classes}
+\index{Storage Classes}\index{Standard}\index{Nearline}\index{Coldline}\index{Archive}
+Cloud Storage classes express access frequency and recovery economics. They are not merely labels. A class controls storage price, retrieval cost, minimum storage duration, and the operational expectation for how often objects are accessed. The four general-purpose classes are Standard, Nearline, Coldline, and Archive \cite{googlecloudstorageoverview}.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{2.4cm}p{3.2cm}p{3.6cm}p{4.4cm}@{}}
+\toprule
+\textbf{Class} & \textbf{Typical access} & \textbf{Design intent} & \textbf{Data engineering examples} \\
+\midrule
+Standard & Frequent or low-latency & Active data and hot analytical staging & Current raw zone, active feature data, recent media assets \\
+Nearline & About monthly & Infrequently accessed but occasionally restored & Monthly audit extracts, older raw partitions, warm backups \\
+Coldline & About quarterly & Disaster recovery and rarely read archives & Quarterly compliance snapshots, DR copies \\
+Archive & About yearly & Lowest-cost long-term preservation & Legal hold exports, historical video masters, deep archive \\
+\bottomrule
+\end{tabular}
+\caption{Cloud Storage classes and common data engineering uses.}
+\label{tab:storage-classes}
+\end{table}
+
+\begin{pitfall}
+Choosing a colder class too early can increase total cost. Storage price may fall, but retrieval charges, operation charges, minimum storage duration, and pipeline delay can dominate if data is unexpectedly reprocessed. Model total cost using realistic replay scenarios, not only steady-state storage volume.
+\end{pitfall}
+
+\subsection{Location Types}
+\index{location types}\index{regional bucket}\index{dual-region bucket}\index{multi-region bucket}
+A bucket location controls where object data is stored. Region buckets keep data in one Google Cloud region. Dual-region buckets store data in two specific regions. Multi-region buckets place data across a broad geographic area. The correct choice depends on the consuming compute location, regulatory requirements, disaster recovery targets, and data egress patterns.
+
+Regional buckets are often best for pipelines whose compute is regional: a Dataflow job in \texttt{us-central1}, a Dataproc cluster in \texttt{us-central1}, or a BigQuery dataset in a compatible location. Dual-region buckets are useful when an organization wants explicit geographic redundancy and control over the participating regions. Multi-region buckets simplify global availability for content distribution and cross-region analytics, but they can be the wrong fit when strict locality or predictable co-location with compute matters.
+
+\begin{tipbox}
+Pick the narrowest location that meets durability, availability, sovereignty, and recovery requirements. Wider geography can improve resilience and read locality for global consumers, but it may complicate compliance, downstream dataset location choices, and cost attribution.
+\end{tipbox}
+
+\subsection{Bucket Architecture for Data Lakes}
+A common pattern separates zones by trust and processing state: \texttt{raw}, \texttt{validated}, \texttt{curated}, and \texttt{sandbox}. The raw zone preserves source fidelity. The validated zone enforces schema and quality checks. The curated zone exposes analytics-ready data. The sandbox zone supports experiments with stricter expiration. In small projects, these zones can be prefixes in a bucket. In regulated or multi-team platforms, they often become separate buckets with separate IAM, retention, encryption, and lifecycle controls.
+
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[
+        zone/.style={rectangle, rounded corners, draw=primary, thick, fill=primary!5, text width=3.0cm, minimum height=1.2cm, align=center, font=\small\bfseries},
+        cold/.style={rectangle, rounded corners, draw=codegray, thick, fill=backcolour, text width=3.0cm, minimum height=1.2cm, align=center, font=\small\bfseries},
+        arrow/.style={-{Stealth[length=2.5mm]}, draw=primary, thick},
+        down/.style={-{Stealth[length=2.5mm]}, draw=codegray, thick, dashed}
+    ]
+        \node[zone] (raw) at (0,0) {Raw Zone\\Standard};
+        \node[zone] (valid) at (4,0) {Validated Zone\\Standard};
+        \node[zone] (curated) at (8,0) {Curated Zone\\Standard};
+        \node[cold] (near) at (0,-2.6) {Older Raw\\Nearline};
+        \node[cold] (cold) at (4,-2.6) {Audit Copy\\Coldline};
+        \node[cold] (arch) at (8,-2.6) {Legal Archive\\Archive};
+        \draw[arrow] (raw) -- node[above, font=\footnotesize]{validate} (valid);
+        \draw[arrow] (valid) -- node[above, font=\footnotesize]{model} (curated);
+        \draw[down] (raw) -- node[left, font=\footnotesize]{30 days} (near);
+        \draw[down] (valid) -- node[left, font=\footnotesize]{90 days} (cold);
+        \draw[down] (curated) -- node[right, font=\footnotesize]{365 days} (arch);
+    \end{tikzpicture}%
+    }
+    \caption{A storage-class lifecycle for a lakehouse-style Cloud Storage landing zone.}
+    \label{fig:storage-class-lifecycle}
+\end{figure}
+
+\section{Tuesday: Lifecycle, Versioning, Retention, and Soft Delete}
+\index{Object Lifecycle Management}\index{Object Versioning}\index{Retention Policies}\index{Bucket Lock}\index{soft delete}
+
+\subsection{Object Lifecycle Management}
+Object Lifecycle Management automates storage hygiene. A lifecycle policy contains rules. Each rule has a condition and an action. Conditions can match age, creation date, storage class, object prefix or suffix, number of newer versions, and live or noncurrent state. Actions can change storage class or delete objects. Lifecycle policies are essential because manual cleanup does not scale to billions of objects.
+
+For data platforms, lifecycle rules should be tied to data semantics. Raw event files may transition to Archive after they are outside the normal replay window. Temporary Dataflow staging files may be deleted after a few days. Curated analytical extracts may remain Standard for a quarter because business users frequently run year-to-date reports. A single global rule such as ``archive everything after thirty days'' is rarely correct for all prefixes.
+
+\begin{notebox}
+Lifecycle management is policy-as-code for storage economics. Review lifecycle rules with the same rigor as pipeline code: version them, test them in a non-production bucket, and connect each rule to a retention, recovery, or cost requirement.
+\end{notebox}
+
+\subsection{Object Versioning}
+Object Versioning keeps noncurrent generations when a live object is overwritten or deleted. This protects against accidental replacement and application bugs, but it also increases storage consumption. Versioning is especially valuable for configuration files, small reference datasets, model artifacts, and high-value manifests. It is less attractive for high-volume append-only event files where object names are unique and overwrites should never happen.
+
+\begin{pitfall}
+Versioning without lifecycle controls can create hidden cost growth. Noncurrent versions are easy to forget because normal list operations emphasize live objects. Pair versioning with lifecycle rules that delete old noncurrent versions after the recovery window.
+\end{pitfall}
+
+\subsection{Retention Policies and Bucket Lock}
+A retention policy sets a minimum age before objects can be deleted or replaced. It can support compliance rules, audit preservation, and ransomware-resistant backups. Bucket Lock makes a retention policy permanent for the bucket. Once locked, the policy cannot be shortened or removed. This is intentionally irreversible because it is designed for compliance use cases.
+
+\begin{definitionbox}
+\textbf{Bucket Lock} is an irreversible action that locks a retention policy on a bucket. It should be used only after legal, compliance, platform, and operations teams agree on the retention period and test the policy in a non-production environment.
+\end{definitionbox}
+
+Retention and lifecycle policies can interact. A lifecycle rule may attempt to delete an object, but retention can prevent deletion until the minimum period has passed. This is desirable when retention expresses a higher-priority compliance control. Engineers should document the expected precedence so that cost forecasts and cleanup jobs do not assume deletion will occur earlier.
+
+\subsection{Soft Delete}
+Soft delete provides a recovery window for deleted Cloud Storage objects. It is a safety mechanism against accidental or malicious deletion, distinct from object versioning and retention. Versioning preserves generations when objects change. Retention prevents deletion before a deadline. Soft delete allows recovery of deleted objects within a configured interval. The right combination depends on threat model and operational goals.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.0cm}p{4.7cm}p{5.0cm}@{}}
+\toprule
+\textbf{Control} & \textbf{Protects against} & \textbf{Primary caution} \\
+\midrule
+Lifecycle policy & Cost drift and unmanaged old data & Incorrect rules can move or delete data before business users expect it \\
+Object Versioning & Accidental overwrite or delete of important objects & Noncurrent versions create hidden storage growth \\
+Retention policy & Premature deletion before compliance deadline & Can block cleanup and increase storage cost \\
+Bucket Lock & Tamper-resistant compliance retention & Irreversible; test before locking \\
+Soft delete & Recent accidental or malicious deletion & Recovery window is not a substitute for full backup and DR design \\
+\bottomrule
+\end{tabular}
+\caption{Storage protection and governance controls.}
+\label{tab:protection-controls}
+\end{table}
+
+\section{Wednesday: Data Migration and Transfer Choices}
+\index{data migration}\index{online transfer}\index{offline transfer}\index{gcloud storage}\index{gsutil}
+
+\subsection{Storage Transfer Service}
+Storage Transfer Service is a managed service for online transfers. It supports scheduled and one-time movement from sources such as Amazon S3, Azure Blob Storage, HTTP or HTTPS lists, POSIX file systems through agents, and Cloud Storage buckets \cite{googlecloudstoragetransfer}. It is preferable when data can move over the network within the migration window, when repeat synchronization is needed, or when the team wants managed retries, scheduling, logging, and incremental behavior.
+
+For a data engineer, the important design questions are not only source and destination. Ask whether object metadata must be preserved, whether deletes should propagate, whether prefixes must be remapped, how credentials are scoped, how transfer logs are monitored, and what happens if the source changes during migration. A transfer job should have a reconciliation plan: expected object count, expected byte count, sample checksums, and a sign-off method.
+
+\subsection{Transfer Appliance}
+Transfer Appliance is for offline migration of large data volumes when network transfer is too slow, too costly, or operationally impossible \cite{googlecloudtransferappliance}. Google ships a secure appliance, the customer loads data locally, and the appliance is shipped back for ingestion. Offline transfer changes the risk profile. It reduces dependence on wide-area bandwidth, but it introduces logistics, physical chain of custody, export scheduling, and a cutover plan for changed data.
+
+\begin{definitionbox}
+\textbf{Online transfer} moves data over a network connection. \textbf{Offline transfer} moves data by physically shipping encrypted storage hardware. Online transfer favors repeatability and lower logistics; offline transfer favors very large initial loads when network time is unacceptable.
+\end{definitionbox}
+
+\subsection{CLI Tools: \texttt{gcloud storage} and \texttt{gsutil}}
+Google Cloud provides both \texttt{gcloud storage} and \texttt{gsutil} workflows. \texttt{gcloud storage} is the modern Google Cloud CLI surface for storage operations. \texttt{gsutil} remains widely used in scripts and documentation, especially for advanced or legacy workflows. A professional data engineer should be able to read both, but new automation should prefer the supported direction for the organization and be explicit about tool versions.
+
+\begin{tipbox}
+For migrations, do not benchmark with a tiny file. Use representative object sizes, compression, count distribution, and network path. Millions of small objects often stress listing and per-object overhead more than raw bytes.
+\end{tipbox}
+
+\subsection{Migration Decision Matrix}
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.1cm}p{4.7cm}p{4.9cm}@{}}
+\toprule
+\textbf{Option} & \textbf{Best fit} & \textbf{Watch for} \\
+\midrule
+\texttt{gcloud storage cp} & Small to medium ad hoc copies, scripted deployment, developer workflows & Local bandwidth, retries, local credentials, shell portability \\
+\texttt{gsutil rsync} & Legacy sync scripts and operational parity checks & Semantics of delete propagation and metadata differences \\
+Storage Transfer Service & Managed cloud-to-cloud or scheduled transfers & Credential scope, source mutation during transfer, monitoring \\
+Transfer Appliance & Very large initial loads with poor network feasibility & Logistics, chain of custody, final delta sync \\
+Partner tools & Specialized enterprise migrations & Licensing, support boundaries, auditability \\
+\bottomrule
+\end{tabular}
+\caption{Choosing a Cloud Storage migration mechanism.}
+\label{tab:migration-matrix}
+\end{table}
+
+\section{Thursday Hands-On Project: Bucket, Lifecycle, Transfer, and Client Code}
+\index{hands-on project}\index{lifecycle JSON}\index{google-cloud-storage}
+This project creates a Cloud Storage bucket, applies a lifecycle policy that transitions objects to Archive after thirty days, and demonstrates a Storage Transfer Service job from a public Amazon S3 bucket. The commands are realistic, but names and project identifiers must be changed before execution. Use a sandbox project, confirm billing expectations, and delete test resources after the lab.
+
+\begin{notebox}
+The placeholders \texttt{PROJECT\_ID}, \texttt{BUCKET\_NAME}, \texttt{REGION}, and \texttt{TRANSFER\_JOB\_NAME} are intentionally explicit. Replace them with values that satisfy your organization's naming and location standards.
+\end{notebox}
+
+\subsection{PowerShell Preparation}
+The following commands use environment variables in a PowerShell-friendly form. The \texttt{gcloud storage} commands themselves can also be run in Cloud Shell with minor syntax changes.
+
+\begin{lstlisting}[language=bash,caption={Creating a bucket and uploading a sample object with the Google Cloud CLI.}]
+# Replace these values before running.
+$env:PROJECT_ID = "my-gcp-data-engineering-lab"
+$env:BUCKET_NAME = "my-gcp-data-engineering-lab-raw"
+$env:REGION = "US"
+
+gcloud config set project $env:PROJECT_ID
+
+gcloud storage buckets create gs://$env:BUCKET_NAME `
+  --location=$env:REGION `
+  --uniform-bucket-level-access
+
+"event_id,event_ts,customer_id" | Set-Content -Path .\sample-events.csv
+"1,2026-07-30T21:35:44Z,c001" | Add-Content -Path .\sample-events.csv
+
+gcloud storage cp .\sample-events.csv gs://$env:BUCKET_NAME/raw/events/sample-events.csv
+
+gcloud storage ls --long gs://$env:BUCKET_NAME/raw/events/
+\end{lstlisting}
+
+\subsection{Lifecycle JSON}
+The lifecycle rule below transitions objects under selected prefixes to Archive after thirty days. In real platforms, use separate rules for raw, curated, temporary, and compliance prefixes.
+
+\begin{lstlisting}[language=json,caption={Lifecycle policy that transitions matching objects to Archive after thirty days.}]
+{
+  "rule": [
+    {
+      "action": {
+        "type": "SetStorageClass",
+        "storageClass": "ARCHIVE"
+      },
+      "condition": {
+        "age": 30,
+        "matchesPrefix": [
+          "raw/",
+          "landing/"
+        ]
+      }
+    }
+  ]
+}
+\end{lstlisting}
+
+\begin{lstlisting}[language=bash,caption={Applying and verifying the lifecycle policy.}]
+@'
+{
+  "rule": [
+    {
+      "action": {
+        "type": "SetStorageClass",
+        "storageClass": "ARCHIVE"
+      },
+      "condition": {
+        "age": 30,
+        "matchesPrefix": ["raw/", "landing/"]
+      }
+    }
+  ]
+}
+'@ | Set-Content -Path .\lifecycle-archive-30-days.json
+
+gcloud storage buckets update gs://$env:BUCKET_NAME `
+  --lifecycle-file=.\lifecycle-archive-30-days.json
+
+gcloud storage buckets describe gs://$env:BUCKET_NAME `
+  --format="yaml(location,storageClass,uniformBucketLevelAccess,lifecycle_config)"
+\end{lstlisting}
+
+\subsection{Storage Transfer Job from Public S3}
+Public S3 sources change over time. Treat the bucket name and prefix below as lab placeholders and confirm that the source permits public reads before running. In production, use scoped credentials and a dedicated service account for the transfer job.
+
+\begin{lstlisting}[language=bash,caption={Creating a Storage Transfer Service job from a public Amazon S3 bucket.}]
+$env:TRANSFER_JOB_NAME = "public-s3-to-gcs-lab"
+$env:SOURCE_S3_BUCKET = "commoncrawl"
+$env:SOURCE_PREFIX = "crawl-data/CC-MAIN-2024-10/warc.paths.gz"
+
+gcloud transfer jobs create `
+  s3://$env:SOURCE_S3_BUCKET/$env:SOURCE_PREFIX `
+  gs://$env:BUCKET_NAME/transfers/commoncrawl/ `
+  --name=$env:TRANSFER_JOB_NAME `
+  --description="Lab transfer from public S3 object to Cloud Storage" `
+  --source-creds-file="" `
+  --schedule-starts=$(Get-Date -Format yyyy-MM-dd) `
+  --schedule-repeats-every=1d
+
+gcloud transfer jobs list --filter="name:$env:TRANSFER_JOB_NAME"
+\end{lstlisting}
+
+If the CLI version in your environment does not allow an empty credentials file for a public S3 source, create the job through the Google Cloud console or use the Storage Transfer Service API with an empty AWS credentials block according to the current documentation. The architectural lesson is the same: use a managed transfer job when the source, schedule, retry behavior, and monitoring should be controlled by a service rather than a laptop shell.
+
+\subsection{Python Client Snippet}
+The Python client library is useful for applications and tests that need to create objects, read metadata, or assert bucket policy. Install \texttt{google-cloud-storage} in an isolated environment and authenticate with Application Default Credentials.
+
+\begin{lstlisting}[language=Python,caption={Uploading an object and reading metadata with the Python Cloud Storage client.}]
+from google.cloud import storage
+
+
+def upload_text(project_id: str, bucket_name: str, object_name: str, text: str) -> None:
+    client = storage.Client(project=project_id)
+    bucket = client.bucket(bucket_name)
+    blob = bucket.blob(object_name)
+    blob.upload_from_string(text, content_type="text/csv")
+    blob.reload()
+    print({
+        "bucket": bucket.name,
+        "object": blob.name,
+        "generation": blob.generation,
+        "storage_class": blob.storage_class,
+        "size": blob.size,
+    })
+
+
+if __name__ == "__main__":
+    upload_text(
+        project_id="my-gcp-data-engineering-lab",
+        bucket_name="my-gcp-data-engineering-lab-raw",
+        object_name="raw/events/python-client-sample.csv",
+        text="event_id,event_ts\n2,2026-07-30T21:40:00Z\n",
+    )
+\end{lstlisting}
+
+\subsection{Validation Checklist}
+A completed lab should show the bucket exists, uniform bucket-level access is enabled, the lifecycle configuration is attached, the sample object exists, the transfer job is visible, and the Python client can upload or inspect an object. For production change control, add labels such as \texttt{env=lab}, \texttt{owner=data-engineering}, and \texttt{cost-center=training}. Labels make cost reports and cleanup safer.
+
+\section{Friday Use Case and Architecture: Multi-Region DR for Media Streaming}
+\index{disaster recovery}\index{multi-region architecture}\index{CMEK}\index{media streaming}
+
+\subsection{Scenario}
+A media streaming company stores ten petabytes of video assets. The library contains raw mezzanine files, encoded renditions, thumbnails, subtitles, manifests, and analytical logs. Customers stream globally. Editors and encoding pipelines are regionally concentrated. The company wants low risk of data loss, fast recovery from regional disruption, encryption with customer-managed keys, lifecycle-based cost control, and evidence that disaster recovery works.
+
+The architecture must separate content serving from archival preservation. Hot renditions used by active customers should remain in Standard class and close to content delivery paths. Original masters may transition to colder classes after quality control and contractual windows. Temporary transcoding outputs should expire quickly. Compliance and rights-management records may require retention policies. Analytics logs should land in Cloud Storage and flow to BigQuery, whose Dremel roots explain its analytical execution model \cite{melnik2010dremel,googlecloudbigquerydocs}.
+
+\subsection{Design}
+Use a multi-region or dual-region bucket strategy for serving assets, with explicit replication requirements for masters. For example, active assets can live in a US multi-region bucket when customer demand is broad and regulatory constraints permit it. A dual-region bucket pairing two selected regions can provide clearer DR placement. Use customer-managed encryption keys (CMEK) with Cloud KMS keys in appropriate locations, and define key rotation and incident procedures. Use separate buckets for masters, encoded renditions, temporary work, logs, and public delivery integration rather than one universal bucket.
+
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[
+        sys/.style={rectangle, rounded corners, draw=primary, thick, fill=primary!5, text width=2.9cm, minimum height=1.0cm, align=center, font=\small\bfseries},
+        sec/.style={rectangle, rounded corners, draw=magenta, thick, fill=magenta!8, text width=2.8cm, minimum height=1.0cm, align=center, font=\small\bfseries},
+        storex/.style={cylinder, draw=primary, shape border rotate=90, aspect=0.25, fill=primary!10, minimum height=1.25cm, text width=2.7cm, align=center, font=\small\bfseries},
+        arrow/.style={-{Stealth[length=2.5mm]}, draw=primary, thick},
+        drlink/.style={-{Stealth[length=2.5mm]}, draw=codegray, thick, dashed}
+    ]
+        \node[sys] (upload) at (0,0) {Studios +\\Partners};
+        \node[storex] (landing) at (3.5,0) {Regional\\Landing\\Bucket};
+        \node[sys] (transcode) at (7.0,0) {Transcode\\Pipeline};
+        \node[storex] (active) at (10.8,0) {Multi-Region\\Renditions\\Standard};
+        \node[sys] (cdn) at (14.2,0) {Media CDN\\Playback};
+
+        \node[storex] (masters) at (3.5,-3.0) {Dual-Region\\Masters\\Standard};
+        \node[storex] (archive) at (7.0,-3.0) {Archive\\Copies\\Coldline / Archive};
+        \node[sec] (kms) at (10.8,-3.0) {Cloud KMS\\CMEK};
+        \node[sys] (ops) at (14.2,-3.0) {DR Runbook +\\Monitoring};
+
+        \draw[arrow] (upload) -- (landing);
+        \draw[arrow] (landing) -- (transcode);
+        \draw[arrow] (transcode) -- (active);
+        \draw[arrow] (active) -- (cdn);
+        \draw[arrow] (landing) -- (masters);
+        \draw[arrow] (masters) -- node[above, font=\footnotesize]{lifecycle} (archive);
+        \draw[drlink] (kms) -- (active);
+        \draw[drlink] (kms) -- (masters);
+        \draw[drlink] (ops) -- (active);
+        \draw[drlink] (ops) -- (archive);
+    \end{tikzpicture}%
+    }
+    \caption{A multi-region disaster recovery architecture for ten petabytes of media assets.}
+    \label{fig:media-dr-architecture}
+\end{figure}
+
+\subsection{Cost and Operations}
+Ten petabytes changes every decision. A one percent mistake is one hundred terabytes. Lifecycle rules should be simulated against inventory reports before rollout. Archive transitions should consider contractual replay requirements, re-encoding probability, content popularity, and legal hold. For active renditions, cache and CDN strategy may reduce object read pressure, but it does not remove the need for source-of-truth storage durability. For masters, DR tests should restore a statistically meaningful sample and verify checksums, metadata, KMS permissions, and downstream playback or transcoding compatibility.
+
+\begin{tipbox}
+Use labels, bucket inventory, access logs, and billing export to BigQuery for storage FinOps. A weekly report should identify top buckets by bytes, operation count, retrieval fees, old temporary prefixes, noncurrent versions, and lifecycle exceptions.
+\end{tipbox}
+
+\begin{pitfall}
+A multi-region bucket is not a complete disaster recovery plan. DR also requires IAM continuity, key availability, tested restore procedures, pipeline redeployment, DNS or delivery failover, monitoring, and people who know the runbook.
+\end{pitfall}
+
+\section{Governance and Security Design Notes}
+\index{IAM}\index{uniform bucket-level access}\index{public access prevention}\index{Cloud KMS}\index{Dataplex}
+Cloud Storage security begins with identity and access management. Prefer uniform bucket-level access for most data engineering buckets so that IAM is the policy model. Avoid object ACLs unless a legacy integration requires them. Enable public access prevention for private data. Use service accounts with least privilege for Dataflow jobs, Dataproc clusters, Composer environments, transfer jobs, and application writers. Separate writer, reader, operator, and auditor roles. For sensitive data, combine CMEK, restricted networks, audit logs, and governance with Dataplex where appropriate \cite{googleclouddataplexdocs}.
+
+Data classification should be visible in bucket names, labels, and catalog metadata. A bucket named for a raw ingestion zone should not also host public assets. A bucket containing regulated data should have explicit retention, access review cadence, and incident response owner. The Google Cloud Architecture Framework provides a useful structure for reviewing reliability, security, cost, performance, and operations across these decisions \cite{googlecloudarchitectureframework}.
+
+\begin{notebox}
+Storage architecture is a socio-technical system. The bucket policy may be correct, but if naming, ownership, documentation, and monitoring are unclear, teams will create unsafe workarounds.
+\end{notebox}
+
+\section{Operational Runbook for Week 1 Buckets}
+\index{runbook}\index{operations}\index{monitoring}\index{cost governance}
+Every production bucket should have an operational runbook before it receives critical data. The runbook does not need to be long, but it must answer who owns the bucket, what data classification it contains, which systems write to it, which systems read from it, which lifecycle rules are expected to fire, and how incidents are handled. A bucket with no owner becomes a landfill. A bucket with no deletion policy becomes a cost risk. A bucket with no restore test becomes a false sense of safety.
+
+\begin{tipbox}
+For each important bucket, keep a one-page record: purpose, owner, location, storage class strategy, CMEK status, lifecycle rules, retention controls, service accounts, expected monthly growth, recovery procedure, and last restore-test date.
+\end{tipbox}
+
+The simplest useful monitoring pattern exports Cloud Audit Logs and billing data to BigQuery, then builds a weekly review. The review should flag sudden growth, unusual write principals, public-access changes, lifecycle failures, objects stuck in temporary prefixes, high retrieval fees from cold classes, and buckets with no labels. Later chapters will connect these signals to Cloud Monitoring, Dataplex data quality, and FinOps dashboards.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.4cm}p{5.1cm}p{4.2cm}@{}}
+\toprule
+\textbf{Signal} & \textbf{Question it answers} & \textbf{Possible response} \\
+\midrule
+Bytes by bucket and prefix & Is storage growing as forecast? & Investigate source volume, lifecycle rules, or duplicate writes \\
+Operations by principal & Who is reading or writing data? & Review IAM, service accounts, and unexpected clients \\
+Cold-class retrieval fees & Are archived objects being restored too often? & Reconsider class transition timing or replay design \\
+Lifecycle action counts & Are policies firing as expected? & Test rule conditions and retention interactions \\
+Unlabeled buckets & Can costs and ownership be assigned? & Enforce labels through provisioning policy \\
+\bottomrule
+\end{tabular}
+\caption{Operational signals for Cloud Storage runbooks.}
+\label{tab:storage-runbook-signals}
+\end{table}
+
+\section{Interview Q\&A}
+\subsection{Concepts and Trade-offs}
+\begin{enumerate}
+    \item \textbf{Q: When would you choose a regional bucket over a multi-region bucket?}\\
+    A: Choose a regional bucket when compute and analytics are regional, data residency requires a specific region, or lower locality complexity matters more than broad geographic availability. Choose wider geography only when it satisfies a concrete availability or access requirement.
+
+    \item \textbf{Q: Why can Archive storage be more expensive than Standard for some workloads?}\\
+    A: Archive reduces storage price but adds retrieval and minimum-duration considerations. If data is frequently restored, reprocessed, or migrated, the total cost can exceed Standard or Nearline.
+
+    \item \textbf{Q: How do versioning, retention, and soft delete differ?}\\
+    A: Versioning preserves older generations, retention prevents premature deletion or overwrite, and soft delete provides a recovery window after deletion. They solve related but distinct failure modes.
+
+    \item \textbf{Q: How would you validate a petabyte-scale transfer?}\\
+    A: Compare expected and actual bytes, object counts, sampled checksums, metadata, prefix coverage, transfer logs, and downstream readability. Also test incremental synchronization for changed source data.
+\end{enumerate}
+
+\section{Further Reading}
+Read the Cloud Storage overview for the current behavior of buckets, locations, classes, lifecycle, retention, and soft delete \cite{googlecloudstorageoverview}. Review the Google Cloud Architecture Framework for reliability, security, cost, performance, and operations review prompts \cite{googlecloudarchitectureframework}. Study Storage Transfer Service and Transfer Appliance documentation before designing migrations \cite{googlecloudstoragetransfer,googlecloudtransferappliance}. For distributed-storage context, read the Google File System paper \cite{ghemawat2003gfs}. For the analytical systems that often consume Cloud Storage data, read Dremel and BigQuery documentation \cite{melnik2010dremel,googlecloudbigquerydocs}. For governance direction, consult Dataplex documentation \cite{googleclouddataplexdocs}. Dataflow documentation is useful when object storage becomes the source or sink for Apache Beam pipelines \cite{googleclouddataflowdocs}.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item Cloud Storage is the durable object foundation for many GCP data platforms, but bucket design is an architectural decision, not a default checkbox.
+    \item Storage class selection must account for retrieval, operations, minimum duration, and replay probability, not only monthly storage price.
+    \item Location type should be chosen from compute locality, sovereignty, availability, and disaster recovery requirements.
+    \item Lifecycle policies, versioning, retention, Bucket Lock, and soft delete each protect against different risks and can interact.
+    \item Storage Transfer Service is the default managed option for online transfer; Transfer Appliance is for large offline migrations where network transfer is not feasible.
+    \item A working DR architecture includes IAM, KMS, lifecycle rules, monitoring, restore tests, and runbooks in addition to replicated storage.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Explain the difference between durability and availability. Give one example of a system that is durable but temporarily unavailable.
+    \item \textbf{(Conceptual)} A team wants to store all raw data in Archive immediately after ingestion. Identify three questions you would ask before approving the design.
+    \item \textbf{(Hands-on)} Create a lab bucket with uniform bucket-level access and upload three sample objects under \texttt{raw/}, \texttt{validated/}, and \texttt{tmp/}. Add labels for owner, environment, and cost center.
+    \item \textbf{(Hands-on)} Write a lifecycle policy that deletes \texttt{tmp/} objects after seven days, transitions \texttt{raw/} objects to Nearline after thirty days, and deletes noncurrent versions after fourteen days.
+    \item \textbf{(Hands-on)} Use \texttt{gcloud storage} or \texttt{gsutil} to compare object listings before and after enabling versioning. Document what changes in the output.
+    \item \textbf{(Design)} Choose regional, dual-region, or multi-region locations for a healthcare analytics platform with strict residency requirements and explain the trade-off.
+    \item \textbf{(Design)} Create a migration plan for two hundred terabytes in S3 and ten petabytes in an on-premises NAS. Decide which transfer mechanisms you would use and how you would validate completion.
+    \item \textbf{(Architecture)} Extend the media streaming DR design with BigQuery billing export, alerting, and a quarterly restore test. Define the evidence you would present in an architecture review.
+\end{enumerate}
+
+\section{Capstone Project: A Resilient Global Media Asset Store on Cloud Storage}\label{sec:ch1-capstone}
+\index{capstone project}\index{media asset store}\index{Bucket Lock}\index{CMEK}\index{Storage Transfer Service!capstone}
+
+\begin{capstonebox}
+\textbf{Mission:} Design and prototype a resilient Cloud Storage foundation for a global media-streaming company. Your solution must ingest source assets from another cloud, protect irreplaceable video masters, serve globally distributed consumers, and control the cost of a ten-petabyte library without weakening disaster recovery.
+
+\textbf{Estimated time:} 4--6 hours.
+
+\textbf{What you'll practice:}
+\begin{itemize}
+    \item Choosing a multi-region location and storage classes for hot, warm, cold, and archive media assets.
+    \item Implementing lifecycle transitions from Standard to Nearline, Coldline, and Archive.
+    \item Enabling Object Versioning, a retention policy, and Bucket Lock for WORM-style protection.
+    \item Applying CMEK encryption and least-privilege IAM for operators, transfer jobs, and viewers.
+    \item Creating a Storage Transfer Service design that imports from a public Amazon S3 source into Cloud Storage.
+    \item Producing an architecture diagram, runbook evidence, and acceptance criteria that an architecture review board can evaluate.
+\end{itemize}
+\end{capstonebox}
+
+\subsection*{Scenario}
+StreamForge Media operates a global streaming platform with roughly 10~PB of video assets. The library includes mezzanine source files from studios, encoded renditions for adaptive bitrate playback, captions, thumbnails, manifests, quality-control reports, and rights-management metadata. Customer playback is global, while encoding teams and editorial workflows are concentrated in North America. The company wants a storage design that keeps popular assets close to serving paths, preserves masters against accidental deletion and ransomware, and provides a tested disaster recovery story for regional disruption.
+
+The business problem is not simply ``store 10~PB cheaply.'' The active catalog must remain available during high-traffic premieres. Older content must transition to colder classes only when retrieval cost and restore time remain acceptable. Legal and licensing records must be immutable for the required period. Source assets arrive from partners, including a public AWS S3 bucket used for this lab. Security leadership also requires customer-managed encryption keys, public access prevention, auditability, and service accounts with narrow permissions.
+
+\subsection*{Requirements}
+Your capstone design must include the following controls and explain the trade-offs behind each one:
+\begin{itemize}
+    \item Create a Cloud Storage bucket in a multi-region location for globally resilient media assets.
+    \item Use a lifecycle policy that transitions objects from Standard to Nearline, then Coldline, then Archive based on age and prefix.
+    \item Enable Object Versioning so accidental overwrites and deletes can be recovered within an operational window.
+    \item Configure a retention policy and lock it with Bucket Lock after validation, creating a WORM control for protected masters.
+    \item Use CMEK encryption with a Cloud KMS key whose location is compatible with the bucket location.
+    \item Define a Storage Transfer Service job that imports selected objects from a public AWS S3 bucket into the destination bucket.
+    \item Apply least-privilege IAM: separate transfer, media-operator, auditor, and serving identities rather than granting broad project roles.
+    \item Document cost controls for 10~PB, including labels, lifecycle review, noncurrent-version cleanup, and cold-class retrieval assumptions.
+\end{itemize}
+
+\subsection*{Reference Architecture}
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[
+        source/.style={rectangle, rounded corners, draw=codegray, thick, fill=white, text width=2.7cm, minimum height=1.0cm, align=center, font=\small\bfseries},
+        svc/.style={rectangle, rounded corners, draw=primary, thick, fill=primary!6, text width=3.0cm, minimum height=1.1cm, align=center, font=\small\bfseries},
+        bucket/.style={cylinder, shape border rotate=90, aspect=0.25, draw=primary, thick, fill=primary!10, text width=3.2cm, minimum height=1.5cm, align=center, font=\small\bfseries},
+        policy/.style={rectangle, rounded corners, draw=magenta, thick, fill=magenta!8, text width=3.0cm, minimum height=1.0cm, align=center, font=\small\bfseries},
+        class/.style={rectangle, rounded corners, draw=codegreen!60!black, thick, fill=green!7, text width=2.7cm, minimum height=0.9cm, align=center, font=\footnotesize\bfseries},
+        arrow/.style={-{Stealth[length=2.5mm]}, draw=primary, thick},
+        dasharrow/.style={-{Stealth[length=2.5mm]}, draw=codegray, thick, dashed}
+    ]
+        \node[source] (studios) at (0,1.2) {Studios\\Partner Uploads};
+        \node[source] (s3) at (0,-1.2) {Public AWS S3\\Source Bucket};
+        \node[svc] (sts) at (3.7,-1.2) {Storage Transfer\\Service Job};
+        \node[bucket] (gcs) at (7.6,0) {Multi-Region Bucket\\CMEK\\Versioned\\Retention Lock};
+        \node[class] (standard) at (11.6,1.8) {Standard\\Hot Catalog};
+        \node[class] (nearline) at (11.6,0.6) {Nearline\\Warm Replay};
+        \node[class] (coldline) at (11.6,-0.6) {Coldline\\DR Copy};
+        \node[class] (archive) at (11.6,-1.8) {Archive\\Deep Preserve};
+        \node[svc] (cdn) at (15.0,0.9) {CDN \&\\Serving Layer};
+        \node[policy] (iam) at (15.0,-1.2) {Least-Privilege IAM\\Audit Logs\\Runbook};
+
+        \draw[arrow] (studios) -- (gcs);
+        \draw[arrow] (s3) -- (sts);
+        \draw[arrow] (sts) -- (gcs);
+        \draw[arrow] (gcs) -- node[above, font=\footnotesize]{lifecycle} (standard);
+        \draw[arrow] (standard) -- (nearline);
+        \draw[arrow] (nearline) -- (coldline);
+        \draw[arrow] (coldline) -- (archive);
+        \draw[arrow] (standard) -- (cdn);
+        \draw[dasharrow] (iam) -- (gcs);
+        \draw[dasharrow] (iam) -- (cdn);
+    \end{tikzpicture}%
+    }
+    \caption{Capstone reference architecture for a resilient global media asset store on Cloud Storage.}
+    \label{fig:ch1-capstone-media-asset-store}
+\end{figure}
+
+\subsection*{Implementation Steps}
+\begin{enumerate}
+    \item \textbf{Prepare project variables and create the bucket.} Use a sandbox project first. The examples are PowerShell-friendly and use a multi-region location. Replace every placeholder before execution.
+
+\begin{lstlisting}[language=bash,caption={PowerShell setup, CMEK key, bucket creation, and least-privilege IAM.}]
+$env:PROJECT_ID = "my-gcp-media-capstone"
+$env:BUCKET_NAME = "my-gcp-media-capstone-assets"
+$env:LOCATION = "US"
+$env:KMS_RING = "media-assets-ring"
+$env:KMS_KEY = "media-assets-key"
+$env:KMS_LOCATION = "us"
+$env:TRANSFER_SA = "media-transfer-sa"
+$env:OPS_GROUP = "gcs-media-operators@example.com"
+$env:AUDIT_GROUP = "gcs-media-auditors@example.com"
+
+gcloud config set project $env:PROJECT_ID
+
+gcloud kms keyrings create $env:KMS_RING `
+  --location=$env:KMS_LOCATION
+
+gcloud kms keys create $env:KMS_KEY `
+  --location=$env:KMS_LOCATION `
+  --keyring=$env:KMS_RING `
+  --purpose=encryption
+
+gcloud storage buckets create gs://$env:BUCKET_NAME `
+  --location=$env:LOCATION `
+  --uniform-bucket-level-access `
+  --public-access-prevention `
+  --default-encryption-key=projects/$env:PROJECT_ID/locations/$env:KMS_LOCATION/keyRings/$env:KMS_RING/cryptoKeys/$env:KMS_KEY `
+  --labels=env=capstone,workload=media-assets,owner=data-engineering
+
+gcloud iam service-accounts create $env:TRANSFER_SA `
+  --display-name="Media transfer service account"
+
+gcloud storage buckets add-iam-policy-binding gs://$env:BUCKET_NAME `
+  --member="serviceAccount:$env:TRANSFER_SA@$env:PROJECT_ID.iam.gserviceaccount.com" `
+  --role="roles/storage.objectCreator"
+
+gcloud storage buckets add-iam-policy-binding gs://$env:BUCKET_NAME `
+  --member="group:$env:OPS_GROUP" `
+  --role="roles/storage.objectAdmin"
+
+gcloud storage buckets add-iam-policy-binding gs://$env:BUCKET_NAME `
+  --member="group:$env:AUDIT_GROUP" `
+  --role="roles/storage.objectViewer"
+\end{lstlisting}
+
+    \item \textbf{Attach lifecycle policy and enable versioning.} Keep current active renditions in Standard, move warm objects to Nearline after 30 days, cold DR copies to Coldline after 90 days, and preserved masters to Archive after 365 days. Delete old noncurrent versions after the recovery period so versioning does not create unbounded cost.
+
+\begin{lstlisting}[language=json,caption={Lifecycle policy for hot, warm, cold, archive, and noncurrent media versions.}]
+{
+  "rule": [
+    {
+      "action": {"type": "SetStorageClass", "storageClass": "NEARLINE"},
+      "condition": {"age": 30, "matchesPrefix": ["renditions/", "masters/"]}
+    },
+    {
+      "action": {"type": "SetStorageClass", "storageClass": "COLDLINE"},
+      "condition": {"age": 90, "matchesPrefix": ["masters/", "dr/"]}
+    },
+    {
+      "action": {"type": "SetStorageClass", "storageClass": "ARCHIVE"},
+      "condition": {"age": 365, "matchesPrefix": ["masters/", "legal/"]}
+    },
+    {
+      "action": {"type": "Delete"},
+      "condition": {"isLive": false, "numNewerVersions": 3, "age": 45}
+    },
+    {
+      "action": {"type": "Delete"},
+      "condition": {"age": 7, "matchesPrefix": ["tmp/", "transcode-staging/"]}
+    }
+  ]
+}
+\end{lstlisting}
+
+\begin{lstlisting}[language=bash,caption={Applying lifecycle policy, versioning, retention policy, and Bucket Lock.}]
+@'
+{
+  "rule": [
+    {
+      "action": {"type": "SetStorageClass", "storageClass": "NEARLINE"},
+      "condition": {"age": 30, "matchesPrefix": ["renditions/", "masters/"]}
+    },
+    {
+      "action": {"type": "SetStorageClass", "storageClass": "COLDLINE"},
+      "condition": {"age": 90, "matchesPrefix": ["masters/", "dr/"]}
+    },
+    {
+      "action": {"type": "SetStorageClass", "storageClass": "ARCHIVE"},
+      "condition": {"age": 365, "matchesPrefix": ["masters/", "legal/"]}
+    },
+    {
+      "action": {"type": "Delete"},
+      "condition": {"isLive": false, "numNewerVersions": 3, "age": 45}
+    },
+    {
+      "action": {"type": "Delete"},
+      "condition": {"age": 7, "matchesPrefix": ["tmp/", "transcode-staging/"]}
+    }
+  ]
+}
+'@ | Set-Content -Path .\media-lifecycle.json
+
+gcloud storage buckets update gs://$env:BUCKET_NAME `
+  --lifecycle-file=.\media-lifecycle.json
+
+gsutil versioning set on gs://$env:BUCKET_NAME
+
+gsutil retention set 365d gs://$env:BUCKET_NAME
+
+gsutil retention get gs://$env:BUCKET_NAME
+
+# Irreversible: run only after policy review and non-production testing.
+gsutil retention lock gs://$env:BUCKET_NAME
+
+gcloud storage buckets describe gs://$env:BUCKET_NAME `
+  --format="yaml(location,defaultKmsKeyName,versioning,retentionPolicy,lifecycle_config)"
+\end{lstlisting}
+
+    \item \textbf{Define the transfer job from public AWS S3.} In a production migration, credentials should be scoped to the minimum readable prefix. This lab models a public source, imports to a restricted prefix, and avoids delete propagation from the source.
+
+\begin{lstlisting}[language=Python,caption={Storage Transfer Service job body for a public S3 source.}]
+from google.cloud import storage_transfer
+
+project_id = "my-gcp-media-capstone"
+destination_bucket = "my-gcp-media-capstone-assets"
+
+client = storage_transfer.StorageTransferServiceClient()
+
+transfer_job = {
+    "description": "Capstone public S3 media seed import",
+    "project_id": project_id,
+    "status": storage_transfer.TransferJob.Status.ENABLED,
+    "transfer_spec": {
+        "aws_s3_data_source": {
+            "bucket_name": "commoncrawl",
+            "path": "crawl-data/CC-MAIN-2024-10/"
+        },
+        "gcs_data_sink": {
+            "bucket_name": destination_bucket,
+            "path": "imports/public-s3/commoncrawl/"
+        },
+        "transfer_options": {
+            "overwrite_objects_already_existing_in_sink": False,
+            "delete_objects_unique_in_sink": False
+        }
+    },
+    "schedule": {
+        "schedule_start_date": {"year": 2026, "month": 7, "day": 31},
+        "schedule_end_date": {"year": 2026, "month": 7, "day": 31}
+    }
+}
+
+response = client.create_transfer_job(request={"transfer_job": transfer_job})
+print(response.name)
+\end{lstlisting}
+
+    \item \textbf{Validate and document operations.} Upload a small marker object under \texttt{masters/}, overwrite it once to prove versioning, verify retention status, inspect lifecycle configuration, and record the transfer job name. Do not test deletion in the locked production bucket; use a disposable bucket for destructive validation.
+\end{enumerate}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item A one-page architecture summary explaining the bucket location, lifecycle design, retention period, CMEK key location, and IAM model.
+    \item The completed reference diagram or an equivalent diagram with sources, transfer service, Cloud Storage bucket controls, lifecycle classes, and CDN or serving layer.
+    \item Command transcript or screenshots proving bucket creation, versioning, lifecycle policy, retention policy, CMEK, IAM bindings, and transfer job configuration.
+    \item A 10~PB cost model with assumptions for active catalog size, monthly growth, retrieval frequency, noncurrent versions, and Archive restore scenarios.
+    \item A DR runbook excerpt that states RTO, RPO, restore test cadence, sample-checksum process, KMS dependency, and escalation owners.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item The design uses a multi-region Cloud Storage bucket and explains why it is preferred over regional or dual-region for this scenario.
+    \item Lifecycle rules cover Standard to Nearline to Coldline to Archive transitions and include cleanup for temporary prefixes or noncurrent versions.
+    \item Object Versioning is enabled and paired with a bounded noncurrent-version policy.
+    \item The retention policy and Bucket Lock decision are documented as irreversible, reviewed, and tested before production use.
+    \item CMEK is configured with a compatible Cloud KMS location, and the operational impact of key disablement is documented.
+    \item Storage Transfer Service imports from a public AWS S3 source or equivalent lab source and writes to a controlled destination prefix.
+    \item IAM grants are least privilege and avoid broad project Owner, Editor, or Viewer roles for routine storage operations.
+    \item The cost model addresses 10~PB scale, retrieval charges, lifecycle minimum durations, and at least one DR restore event.
+    \item The runbook includes validation evidence: object counts, byte counts, sampled checksums, transfer logs, audit logs, and restore-test results.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Evaluate Autoclass for prefixes where access patterns are unpredictable, and compare it with explicit lifecycle rules.
+    \item Replace the multi-region bucket with a dual-region design that uses turbo replication, then compare RPO, cost, and sovereignty trade-offs.
+    \item Build a BigQuery billing-export dashboard that estimates monthly storage, operation, retrieval, and replication costs for 10~PB.
+    \item Add a Cloud DLP or Sensitive Data Protection scan for captions, metadata, and support files that might contain regulated information.
+    \item Create an inventory-based reconciliation job that compares expected and actual object counts, byte totals, generations, and storage classes.
+    \item Add a quarterly game-day plan that disables a non-production KMS key, restores sample media from Archive, and verifies playback through the serving layer.
+\end{itemize}

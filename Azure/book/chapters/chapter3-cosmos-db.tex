@@ -1,0 +1,641 @@
+\chapter{High-Scale NoSQL: Azure Cosmos DB}
+\index{Azure Cosmos DB}\index{NoSQL}\index{document database}\index{Request Units}\index{partition key}\index{global distribution}\index{Session consistency}\index{Change Feed}%
+\begin{objectives}
+\begin{itemize}
+    \item Explain Azure Cosmos DB core concepts: Request Units, logical partitions, physical partitions, replicas, and global distribution.
+    \item Compare the five Cosmos DB consistency levels and select the weakest level that still satisfies business correctness.
+    \item Choose between the Core (NoSQL), MongoDB, and Cassandra APIs based on application model, tooling, and portability requirements.
+    \item Use the Change Feed to connect operational NoSQL writes to streaming, lakehouse, search, and serving pipelines.
+    \item Create a Cosmos DB for NoSQL account, design a single-container forum schema, insert items with Python, and configure multi-region writes.
+    \item Design a globally distributed gaming leaderboard capable of high read and write rates with Session consistency.
+    \item Build a capstone architecture for a multi-region leaderboard with partitioning, observability, cost controls, and operational evidence.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+NoSQL and document databases look different across vendors, but data engineers ask the same questions everywhere: What is the partition key? How is throughput billed? Which consistency model is exposed? How do changes flow downstream? What happens during regional failure?
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{2.7cm}p{2.9cm}p{2.9cm}p{3.0cm}p{2.8cm}@{}}
+\toprule
+\textbf{Concept} & \textbf{Azure Cosmos DB} & \textbf{AWS DynamoDB} & \textbf{GCP Firestore / Bigtable} & \textbf{MongoDB} \\
+\midrule
+Primary partitioning & Container partition key routes items to logical partitions & Partition key, optional sort key & Firestore document paths; Bigtable row key & Shard key \\
+Throughput unit & Request Units per second (RU/s) or serverless RUs & Read / write capacity units (RCU/WCU) or on-demand & Firestore operations; Bigtable nodes and storage & Cluster tier, IOPS, and workload capacity \\
+Secondary indexes & Automatic indexing policy with included / excluded paths and composites & Global and local secondary indexes & Firestore composite indexes; Bigtable schema by row key & Secondary and compound indexes \\
+Change stream & Change Feed and Change Feed Processor & DynamoDB Streams & Firestore triggers / exports; Bigtable change streams & Change streams \\
+TTL & Item or container time-to-live & Item TTL attribute & Firestore TTL policies; Bigtable garbage collection & TTL indexes \\
+Multi-region writes & Multi-region account with write regions and conflict policy & Global tables & Multi-region Firestore; Bigtable replication & Global clusters / sharded clusters \\
+Consistency & Five tunable levels from Strong to Eventual & Strong or eventual reads, transactional options & Strong regional semantics vary by service & Read / write concern and causal consistency \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+A portable NoSQL design names its access patterns, partition strategy, indexing choices, retry behavior, and conflict rules instead of assuming one product's defaults will transfer unchanged to another cloud.
+\end{crosscloud}
+
+\begin{keyterms}
+\textbf{Request Unit (RU)}: a normalized charge for CPU, memory, and IO consumed by an operation.\quad
+\textbf{Logical partition}: all items in a container with the same partition-key value.\quad
+\textbf{Physical partition}: service-managed storage and compute that hosts one or more logical partitions.\quad
+\textbf{Consistency level}: a contract that controls read freshness and ordering.\quad
+\textbf{Change Feed}: an ordered feed of item changes used for event-driven processing.
+\end{keyterms}
+
+\section{Week 3 Overview: Why Cosmos DB Matters to Data Engineers}
+Azure Cosmos DB is a globally distributed, multi-model NoSQL database service designed for low-latency reads and writes, elastic throughput, automatic indexing, and configurable consistency \cite{microsoft2025cosmosOverview}. It appears in data platforms as an operational serving layer, user-profile store, catalog store, IoT metadata database, event-sourced projection, feature-serving database, and high-scale API backend.
+\index{serving layer}\index{operational analytics}
+
+Relational databases optimize joins, transactions, and normalized constraints. Cosmos DB optimizes predictable item access by partition key, low-latency point reads, horizontal scale, regional distribution, and flexible JSON documents. The change is not merely syntax. A Cosmos DB engineer must design containers around access patterns, choose partition keys that distribute load, estimate RU consumption, define indexing policies, and accept the consistency contract needed by the product.
+
+\begin{definitionbox}
+\textbf{Azure Cosmos DB for NoSQL} stores JSON items in containers. Every item has an \texttt{id}, belongs to one logical partition selected by a partition key, is automatically indexed by default, and consumes Request Units for reads, writes, queries, and maintenance operations.
+\end{definitionbox}
+
+\begin{notebox}
+Cosmos DB is not a replacement for every relational database. If the workload depends on multi-row joins, large ad hoc aggregations, cross-container transactions, or strict relational integrity, use Cosmos DB as a serving projection or event store rather than as the only system of record.
+\end{notebox}
+
+\section{Monday: Core Concepts --- RUs, Partitioning, and Global Distribution}
+\index{Request Units}\index{RU/s}\index{partitioning}\index{global distribution}
+
+\subsection{Request Units as the Throughput Currency}
+Every Cosmos DB operation consumes RUs. A point read of a 1 KB item is often close to 1 RU, while larger documents, complex queries, cross-partition scans, writes, indexing, and consistency choices consume more \cite{microsoft2025cosmosRequestUnits}. Provisioned throughput allocates RU/s to a database or container. Autoscale raises and lowers throughput within a configured maximum. Serverless charges per consumed RU and suits intermittent or development workloads.
+
+RUs make capacity planning explicit. Instead of asking only how many vCores a database needs, estimate operations per second multiplied by RU per operation. For example, 20,000 point reads per second at 1 RU each require roughly 20,000 RU/s before retries, spikes, consistency overhead, and regional replication are considered. Queries that scan many partitions can consume orders of magnitude more.
+
+\begin{tipbox}
+Measure RU charge from real SDK responses. Theoretical estimates are useful for sizing, but query shape, item size, index policy, consistency level, and partition fan-out determine actual cost.
+\end{tipbox}
+
+\subsection{Partition Keys and Logical Partitions}
+A container's partition key is one of the most important design decisions. Cosmos DB uses the partition-key value to group items into logical partitions and to route requests. Good partition keys have high cardinality, even distribution, and alignment with common point-read and query filters. Poor partition keys create hot partitions, cross-partition queries, throttling, and expensive migrations.
+
+For a forum container, \texttt{/forumId} may group all posts and comments for a small forum, but it can become hot if one public forum dominates traffic. \texttt{/tenantId} may work for business SaaS tenants with balanced activity. A synthetic key such as \texttt{/leaderboardBucket} or \texttt{/gameIdSeasonShard} may be necessary for gaming workloads where one game or region can receive massive writes.
+
+\begin{pitfall}
+\textbf{Choosing a partition key because it is easy to explain.} Choose it because it distributes writes, supports dominant reads, fits transaction boundaries, and avoids unbounded growth in a single logical partition.
+\end{pitfall}
+
+\subsection{Physical Partitions and Hot Keys}
+Cosmos DB manages physical partitions behind the scenes. As storage and throughput grow, the service splits data across physical partitions. Logical partition keys are still the engineer's responsibility. If one key receives most writes, the service cannot magically distribute that single logical partition across many keys. Hot partitions show up as 429 throttling, uneven RU consumption, high latency for specific key values, and queries that require fan-out.
+
+\subsection{Global Distribution}
+Cosmos DB accounts can replicate data to multiple Azure regions. A single-write-region account sends writes to one region and replicates reads elsewhere. A multi-write account allows writes in more than one region and uses conflict resolution when concurrent updates target the same item \cite{microsoft2025cosmosGlobalDistribution}. Multi-region design reduces user latency and improves resilience, but it increases operational complexity and cost.
+
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[node distance=1.35cm]
+        \node[stage] (players) {Players and\\game clients};
+        \node[tool, right=1.5cm of players] (traffic) {Azure Front Door\\or regional routing};
+        \node[store, above right=0.8cm and 1.8cm of traffic] (east) {Cosmos DB\\East US write};
+        \node[store, right=2.0cm of traffic] (west) {Cosmos DB\\West Europe write};
+        \node[store, below right=0.8cm and 1.8cm of traffic] (asia) {Cosmos DB\\Southeast Asia write};
+        \node[doc, right=2.0cm of west] (policy) {Session consistency\\conflict policy\\TTL};
+        \draw[arrow] (players) -- (traffic);
+        \draw[arrow] (traffic) -- (east);
+        \draw[arrow] (traffic) -- (west);
+        \draw[arrow] (traffic) -- (asia);
+        \draw[biarrow] (east) -- node[above,font=\scriptsize\itshape]{replication} (west);
+        \draw[biarrow] (west) -- node[below,font=\scriptsize\itshape]{replication} (asia);
+        \draw[biarrow] (east) to[bend left=18] (asia);
+        \draw[arrow] (policy) -- (west);
+    \end{tikzpicture}%
+    }
+    \caption{Cosmos DB global distribution places replicas near users while consistency and conflict policies define correctness during replication.}
+    \label{fig:cosmos-global-distribution}
+\end{figure}
+
+\section{Tuesday: The Five Consistency Levels}
+\index{consistency levels}\index{Strong consistency}\index{Bounded Staleness}\index{Session consistency}\index{Consistent Prefix}\index{Eventual consistency}
+
+Cosmos DB exposes five consistency levels: Strong, Bounded Staleness, Session, Consistent Prefix, and Eventual \cite{microsoft2025cosmosConsistency}. They form a practical spectrum between freshness, availability, latency, and cost. Strong consistency gives linearizable reads within supported regional configurations. Eventual consistency gives the weakest freshness guarantee but the lowest coordination burden.
+
+\begin{definitionbox}
+A \textbf{consistency level} is the read contract an application receives after writes. It controls whether reads must observe the latest write, a bounded lag, a user's own writes, a prefix-preserving order, or eventual convergence.
+\end{definitionbox}
+
+\subsection{Strong and Bounded Staleness}
+Strong consistency returns the most recent committed version of an item, but it limits some global distribution choices because replicas must coordinate before reads complete. Use Strong when correctness requires immediate global visibility, such as inventory reservation for scarce resources. Do not choose it reflexively for personalization, telemetry, or leaderboards where slightly stale reads are acceptable.
+
+Bounded Staleness allows reads to lag behind writes by a configured number of versions or time interval. It is useful when users can tolerate a known delay but the business wants a hard upper bound. It costs more coordination than Session or Eventual and should be justified by a measurable requirement.
+
+\subsection{Session, Consistent Prefix, and Eventual}
+Session consistency is the default for many application workloads because it provides read-your-writes within a client session while allowing global distribution. A player who submits a score should see that score immediately in their session even if other players in far regions see it after replication catches up. The SDK carries a session token to preserve that guarantee.
+
+Consistent Prefix guarantees that reads never see writes out of order. If updates were A, B, and C, a client may see A or A,B, but not A,C without B. Eventual consistency only guarantees convergence when writes stop. It can be appropriate for derived counters, telemetry summaries, caches, and recommendation signals where temporary staleness is acceptable.
+
+\begin{figure}[H]
+    \centering
+    \resizebox{0.95\textwidth}{!}{%
+    \begin{tikzpicture}[node distance=1.25cm]
+        \node[stage] (strong) {Strong\\freshest\\more coordination};
+        \node[stage, right=0.9cm of strong] (bounded) {Bounded\\Staleness};
+        \node[stage, right=0.9cm of bounded] (session) {Session\\read-your-writes};
+        \node[stage, right=0.9cm of session] (prefix) {Consistent\\Prefix};
+        \node[stage, right=0.9cm of prefix] (eventual) {Eventual\\lowest coordination};
+        \draw[arrow] (strong) -- (bounded);
+        \draw[arrow] (bounded) -- (session);
+        \draw[arrow] (session) -- (prefix);
+        \draw[arrow] (prefix) -- (eventual);
+        \node[note, below=0.8cm of bounded] {more freshness, higher coordination};
+        \node[note, below=0.8cm of prefix] {more availability and lower latency};
+    \end{tikzpicture}%
+    }
+    \caption{Cosmos DB consistency levels trade read freshness and ordering for lower coordination, latency, and regional independence.}
+    \label{fig:cosmos-consistency-spectrum}
+\end{figure}
+
+\begin{tipbox}
+Choose the weakest consistency level that satisfies the user story. For global applications, Session often gives excellent user experience because users see their own writes without forcing every region to agree before every read.
+\end{tipbox}
+
+\section{Wednesday: APIs and the Change Feed}
+\index{Cosmos DB!APIs}\index{API for NoSQL}\index{MongoDB API}\index{Cassandra API}\index{Change Feed}
+
+\subsection{Core (NoSQL), MongoDB, and Cassandra APIs}
+Cosmos DB offers several APIs over a managed distributed database service. The Core API, commonly called API for NoSQL, is the native JSON document model with SQL-like querying, automatic indexing, stored procedures, transactional batches within a partition key, SDK support, and Change Feed integration. It is the default choice when building new Azure-native document applications.
+
+The MongoDB API supports applications and tools that speak MongoDB wire protocol. It is useful for migrations or teams with MongoDB models and drivers, but compatibility level, feature support, indexing behavior, and operational differences must be tested. The Cassandra API supports Cassandra Query Language patterns and wide-column workloads. It can help teams move selected Cassandra workloads to a managed Azure service, but partitioning and query design remain mandatory.
+
+\begin{notebox}
+API compatibility does not eliminate data-model review. A MongoDB or Cassandra application moved to Cosmos DB still needs throughput estimation, partition-key validation, index review, latency testing, and failure-mode testing.
+\end{notebox}
+
+\subsection{Change Feed as the Event Bridge}
+The Change Feed emits inserts and updates in logical partition order and lets processors resume from checkpoints \cite{microsoft2025cosmosChangeFeed}. It is a foundation for event-driven data engineering: write operational items once, then project them to Azure Functions, Event Hubs, ADLS Gen2, Synapse, Databricks, search indexes, caches, and materialized views. The Change Feed Processor library manages leases across workers so processing can scale horizontally.
+
+Change Feed is not a universal audit log. Depending on mode and configuration, deletes may require soft-delete patterns or TTL awareness. Consumers should be idempotent because retries are normal. Downstream systems should store high-water marks or item versions so a processor can safely replay changes after failure.
+
+\begin{pitfall}
+\textbf{Treating Change Feed consumers as exactly-once.} Design them as at-least-once processors with idempotent writes, checkpoints, poison-message handling, and observability.
+\end{pitfall}
+
+\section{Thursday Hands-on Project: Forum Container with Python Writes and Multi-Region Writes}
+\index{hands-on lab}\index{Azure CLI}\index{Python SDK}\index{multi-region writes}
+This lab creates a Cosmos DB for NoSQL account, a database, and a single container for a forum application. The schema stores posts, comments, reactions, and moderator events in one container so common forum-page reads can use the same partition key. Run it only in a sandbox subscription and delete the resource group when finished.
+
+\begin{notebox}
+The examples are written for Windows PowerShell with Azure CLI. Use globally unique account names, avoid committing keys, and prefer managed identity for production applications.
+\end{notebox}
+
+\subsection{Single-Container Forum Schema}
+A forum page usually needs the forum metadata, recent threads, thread starter post, comments, reaction counts, and moderation state. A single-container design can store multiple item types with a shared partition key such as \texttt{/forumId}. Item IDs encode type and business key: \texttt{thread\_1001}, \texttt{post\_1001\_0001}, \texttt{reaction\_1001\_user42}. The \texttt{type} field supports filtered queries and indexing. For very large public forums, introduce a synthetic partition key such as \texttt{forumId\#bucket}.
+
+\begin{lstlisting}[language=bash,caption={Creating a Cosmos DB for NoSQL account, database, and forum container.},label={lst:ch3-cosmos-cli-create}]
+az login
+az account set --subscription "00000000-0000-0000-0000-000000000000"
+
+$rg = "rg-de-azure-book-week3"
+$primaryLocation = "eastus"
+$secondaryLocation = "westus"
+$account = "cosmos-week3-forum-001"
+$database = "forumdb"
+$container = "forumItems"
+$partitionKey = "/forumId"
+
+az group create `
+  --name $rg `
+  --location $primaryLocation
+
+az cosmosdb create `
+  --name $account `
+  --resource-group $rg `
+  --locations regionName=$primaryLocation failoverPriority=0 isZoneRedundant=False `
+  --default-consistency-level Session `
+  --enable-automatic-failover true
+
+az cosmosdb sql database create `
+  --account-name $account `
+  --resource-group $rg `
+  --name $database
+
+az cosmosdb sql container create `
+  --account-name $account `
+  --resource-group $rg `
+  --database-name $database `
+  --name $container `
+  --partition-key-path $partitionKey `
+  --throughput 1000 `
+  --ttl 2592000
+\end{lstlisting}
+
+Add a second write region only after the basic account is validated. Multi-region writes affect conflict handling, testing, and cost, so document why the application needs active-active writes instead of single-write failover.
+
+\begin{lstlisting}[language=bash,caption={Adding a second region and enabling multi-region writes for the lab account.},label={lst:ch3-cosmos-cli-multiwrite}]
+az cosmosdb update `
+  --name $account `
+  --resource-group $rg `
+  --locations regionName=$primaryLocation failoverPriority=0 isZoneRedundant=False `
+              regionName=$secondaryLocation failoverPriority=1 isZoneRedundant=False
+
+az cosmosdb update `
+  --name $account `
+  --resource-group $rg `
+  --enable-multiple-write-locations true
+
+az cosmosdb show `
+  --name $account `
+  --resource-group $rg `
+  --query "{name:name,consistency:consistencyPolicy.defaultConsistencyLevel,writeLocations:writeLocations[].locationName,enableMultiWrite:enableMultipleWriteLocations}" `
+  --output table
+\end{lstlisting}
+
+\subsection{Inserting Forum Items with Python}
+Install \texttt{azure-cosmos} in a local virtual environment for the lab. Store the endpoint and key in environment variables or use managed identity in production. The script below writes several item types and prints RU charges so students can see how writes consume throughput.
+
+\begin{lstlisting}[language=Python,caption={Writing forum items with the azure-cosmos SDK and recording RU charges.},label={lst:ch3-python-forum-insert}]
+import os
+from datetime import datetime, timezone
+from azure.cosmos import CosmosClient, PartitionKey
+
+endpoint = os.environ["COSMOS_ENDPOINT"]
+key = os.environ["COSMOS_KEY"]
+database_name = os.environ.get("COSMOS_DATABASE", "forumdb")
+container_name = os.environ.get("COSMOS_CONTAINER", "forumItems")
+
+client = CosmosClient(endpoint, credential=key)
+database = client.create_database_if_not_exists(database_name)
+container = database.create_container_if_not_exists(
+    id=container_name,
+    partition_key=PartitionKey(path="/forumId"),
+    offer_throughput=1000,
+)
+
+now = datetime.now(timezone.utc).isoformat()
+items = [
+    {
+        "id": "thread_1001",
+        "forumId": "azure-data-engineering",
+        "type": "thread",
+        "title": "How do RUs work?",
+        "authorId": "user_7",
+        "createdAt": now,
+        "lastActivityAt": now,
+    },
+    {
+        "id": "post_1001_0001",
+        "forumId": "azure-data-engineering",
+        "threadId": "thread_1001",
+        "type": "post",
+        "authorId": "user_7",
+        "body": "A point read is cheap; fan-out queries are not.",
+        "createdAt": now,
+    },
+    {
+        "id": "reaction_1001_user_42",
+        "forumId": "azure-data-engineering",
+        "threadId": "thread_1001",
+        "postId": "post_1001_0001",
+        "type": "reaction",
+        "userId": "user_42",
+        "reaction": "upvote",
+        "createdAt": now,
+    },
+]
+
+for item in items:
+    response = container.upsert_item(item)
+    charge = container.client_connection.last_response_headers.get(
+        "x-ms-request-charge"
+    )
+    print(response["id"], "RU charge", charge)
+\end{lstlisting}
+
+Query by partition key for predictable RU usage. Avoid broad scans in production APIs; use Change Feed or analytical replicas for downstream processing.
+
+\begin{lstlisting}[language=Python,caption={Reading a forum thread inside one logical partition.},label={lst:ch3-python-forum-query}]
+query = """
+SELECT c.id, c.type, c.title, c.body, c.createdAt
+FROM c
+WHERE c.forumId = @forumId AND c.threadId = @threadId
+ORDER BY c.createdAt
+"""
+parameters = [
+    {"name": "@forumId", "value": "azure-data-engineering"},
+    {"name": "@threadId", "value": "thread_1001"},
+]
+
+for item in container.query_items(
+    query=query,
+    parameters=parameters,
+    partition_key="azure-data-engineering",
+):
+    print(item)
+\end{lstlisting}
+
+\section{Friday Use Case: Global Gaming Leaderboard at 1,000,000 Reads/Writes per Second}
+\index{gaming leaderboard}\index{serving layer}\index{Session consistency}\index{multi-region writes}
+
+\subsection{Scenario}
+A global game studio runs a competitive leaderboard for tens of millions of players. During tournaments, the service must handle 1,000,000 combined reads and writes per second globally. Players submit scores from North America, Europe, and Asia. They expect to see their own score immediately after submission, but a leaderboard visible to all players may be seconds behind. The design uses Cosmos DB with multi-region writes and Session consistency.
+
+\subsection{Partitioning and Serving Strategy}
+The main container stores score submissions and current leaderboard entries. The partition key uses a synthetic value such as \texttt{/boardShard}: \texttt{gameId\#seasonId\#region\#bucket}. Buckets distribute writes for a hot tournament. A Change Feed processor maintains materialized top-N documents per game, season, region, and bucket. API reads point to precomputed leaderboard documents instead of running expensive global aggregations on every request.
+
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[node distance=1.15cm]
+        \node[stage] (clients) {Game clients\\global players};
+        \node[tool, right=1.3cm of clients] (frontdoor) {Global routing\\Front Door};
+        \node[stage, right=1.5cm of frontdoor] (api) {Regional score\\API};
+        \node[store, right=1.5cm of api] (cosmos) {Cosmos DB\\multi-write\\Session};
+        \node[tool, above right=0.7cm and 1.3cm of cosmos] (feed) {Change Feed\\processors};
+        \node[store, right=1.5cm of feed] (topn) {Materialized\\top-N items};
+        \node[stage, below right=0.7cm and 1.3cm of cosmos] (cache) {Regional cache\\read API};
+        \node[store, below=1.2cm of cosmos] (lake) {ADLS Gen2\\analytics sink};
+        \draw[arrow] (clients) -- (frontdoor);
+        \draw[arrow] (frontdoor) -- (api);
+        \draw[arrow] (api) -- node[above,font=\scriptsize]{score writes} (cosmos);
+        \draw[arrow] (cosmos) -- (feed);
+        \draw[arrow] (feed) -- (topn);
+        \draw[arrow] (topn) -- (cache);
+        \draw[arrow] (cache) -- (frontdoor);
+        \draw[arrow] (feed) -- (lake);
+    \end{tikzpicture}%
+    }
+    \caption{Global leaderboard serving architecture using Cosmos DB multi-region writes, Session consistency, Change Feed projections, and regional read paths.}
+    \label{fig:global-leaderboard-architecture}
+\end{figure}
+
+\subsection{Correctness and Cost Controls}
+Session consistency ensures a player sees their own submitted score when the SDK preserves the session token. Global top-N displays can be eventually updated through Change Feed projections. Conflict resolution should be deterministic: for example, keep the highest score for a player and use earliest timestamp as a tie breaker. The API should make score submissions idempotent by using item IDs derived from player, match, and attempt.
+
+Cost control starts with point reads and materialized views. The system should avoid cross-partition aggregation in the hot read path. Autoscale or provisioned throughput must be modeled per region and per container. Observability should track RU consumption, 429 throttling, p99 latency, conflict counts, Change Feed lag, item size, index utilization, and regional availability.
+
+\section{Architectural Decision Record Template}
+\index{architectural decision record}
+A Week 3 ADR should capture the access patterns, container strategy, partition key, consistency level, API choice, indexing policy, throughput model, multi-region write decision, conflict policy, TTL, Change Feed consumers, retry rules, and cost guardrails. It should also list rejected alternatives such as Azure SQL, Redis-only storage, Event Hubs plus lake-only storage, DynamoDB, Firestore, MongoDB Atlas, and self-managed Cassandra.
+
+\section{Operational Deep Dive: Performance, Identity, and Observability}
+\index{performance}\index{managed identity}\index{observability}\index{Azure Monitor}
+Cosmos DB performance incidents usually come from predictable causes: hot partition keys, cross-partition scans, large items, unbounded arrays, excessive indexing, missing composite indexes, overly strong consistency, retry storms, or Change Feed processors falling behind. Scaling RU/s can help, but it will not fix a partition key that sends all writes to one logical partition.
+
+Identity should prefer Microsoft Entra ID and managed identities where supported by the chosen SDK and API. Production accounts should use private endpoints, role-based access, diagnostic settings, customer-managed keys where required, and alerts on throttling and regional failover. Keys should be rotated and kept out of notebooks, source code, logs, and screenshots.
+
+\begin{pitfall}
+\textbf{Using Cosmos DB as a reporting warehouse.} Large scans and ad hoc aggregations are expensive in an operational NoSQL serving store. Use Change Feed, analytical store, Synapse Link, or lakehouse patterns for broad analytics.
+\end{pitfall}
+
+\section{Troubleshooting Patterns}
+\index{troubleshooting}\index{throttling}\index{429 errors}
+A Cosmos DB troubleshooting workflow starts with the failing access pattern. For point reads, confirm item ID, partition key, region, consistency, and retry behavior. For writes, check item size, index policy, partition hot spots, conflict rates, and 429 throttling. For queries, inspect whether the query is scoped to one partition, whether it uses an index, whether it requires a composite index, and how many RUs it consumes. For Change Feed, verify leases, checkpoint progress, poison records, and downstream idempotency.
+
+Do not hide 429 responses by adding unbounded retries. Cosmos DB SDKs already include retry policies. Applications should apply backpressure, monitor request charge, and isolate noisy tenants or hot boards before raising throughput blindly.
+
+\section{Week 3 Lab Rubric}
+\index{rubric}
+A complete Week 3 submission includes Azure CLI deployment evidence, a documented forum single-container schema, Python insert and query output with RU observations, evidence of multi-region write configuration, and an ADR explaining partitioning, consistency, and Change Feed decisions.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.0cm}p{5.0cm}p{5.0cm}@{}}
+\toprule
+\textbf{Criterion} & \textbf{Meets expectation} & \textbf{Needs improvement} \\
+\midrule
+Partitioning & Partition key matches access patterns and distributes load & Key is low-cardinality or creates hot partitions \\
+Consistency & Five levels are compared and Session is justified for user experience & Strong or Eventual is chosen without correctness analysis \\
+Hands-on & CLI creates account, database, container, and multi-region write setting; Python writes items & Portal-only steps or no RU evidence \\
+Change Feed & Consumers are idempotent and checkpointed with lag monitoring & Feed is treated as exactly-once or audit-complete by default \\
+Global design & Regional writes, conflict policy, routing, and failover behavior are documented & Multi-region writes are enabled without conflict or cost analysis \\
+\bottomrule
+\end{tabular}
+\caption{Week 3 rubric for Cosmos DB architecture, hands-on implementation, and global serving design.}
+\label{tab:week3-rubric}
+\end{table}
+
+\section{Interview Q\&A}
+\subsection{Concepts and Trade-offs}
+\begin{enumerate}
+    \item \textbf{Q: What is a Request Unit?}\\
+    A: A Request Unit is Cosmos DB's normalized measure of CPU, memory, and IO used by reads, writes, queries, and maintenance operations.
+    \item \textbf{Q: What makes a good partition key?}\\
+    A: High cardinality, even distribution, alignment with common point reads and queries, and support for transaction boundaries within a logical partition.
+    \item \textbf{Q: Why is Session consistency common for global apps?}\\
+    A: It provides read-your-writes for a user session while allowing lower latency and more regional independence than Strong consistency.
+    \item \textbf{Q: When would you avoid multi-region writes?}\\
+    A: Avoid them when the workload cannot tolerate conflict resolution complexity or when single-write failover meets latency and availability goals.
+    \item \textbf{Q: Why use Change Feed for data engineering?}\\
+    A: It turns operational item changes into scalable downstream projections for functions, streams, lakes, caches, search, and materialized views.
+    \item \textbf{Q: What is the biggest risk in a high-scale leaderboard?}\\
+    A: A hot partition or global aggregation path can throttle the system even if the total account RU/s appears high.
+\end{enumerate}
+
+\section{Further Reading}
+Start with the Azure Cosmos DB overview \cite{microsoft2025cosmosOverview}, Request Unit guidance \cite{microsoft2025cosmosRequestUnits}, partitioning guidance \cite{microsoft2025cosmosPartitioning}, consistency levels \cite{microsoft2025cosmosConsistency}, global distribution \cite{microsoft2025cosmosGlobalDistribution}, and multi-region write concepts \cite{microsoft2025cosmosMultiRegionWrites}. Review the Change Feed documentation \cite{microsoft2025cosmosChangeFeed}, API for NoSQL quickstart \cite{microsoft2025cosmosNoSqlQuickstart}, Python SDK documentation \cite{microsoft2025cosmosPythonSdk}, and the Azure Well-Architected Framework \cite{microsoft2025wellarchitected} for reliability, security, performance, operations, and cost review.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item Cosmos DB scales by partitioned item access, not by hiding poor data modeling behind more throughput.
+    \item RUs make performance and cost visible; every access pattern should be measured by request charge and latency.
+    \item Partition-key choice determines distribution, transaction scope, query efficiency, and hot-key risk.
+    \item The five consistency levels are business correctness tools, not trivia; Session is often the best global user-experience compromise.
+    \item Change Feed is the bridge from operational NoSQL writes to analytics, search, cache, and materialized-serving projections.
+    \item Multi-region writes require deterministic conflict rules, idempotent clients, observability, and explicit cost justification.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Explain RUs to a product manager and show why a cross-partition query can cost more than a point read.
+    \item \textbf{(Conceptual)} Compare Strong, Bounded Staleness, Session, Consistent Prefix, and Eventual consistency for a shopping-cart application.
+    \item \textbf{(Conceptual)} Choose a partition key for a forum with thousands of small private communities and one massive public community.
+    \item \textbf{(Hands-on)} Run the Cosmos DB account and container creation commands in a sandbox and capture the consistency and region output.
+    \item \textbf{(Hands-on)} Modify the Python script to insert comments, reactions, and moderation events, then report RU charges for each item type.
+    \item \textbf{(Hands-on)} Add a query that reads one thread by partition key and compare its RU charge with a cross-partition query.
+    \item \textbf{(Design)} Design a Change Feed consumer that writes forum events to ADLS Gen2 with idempotent replay and checkpoint evidence.
+    \item \textbf{(Design)} Write an ADR for the gaming leaderboard, including partition key, consistency, conflict policy, multi-region writes, and cost controls.
+\end{enumerate}
+
+\section{Capstone Project: Global Gaming Leaderboard on Cosmos DB}\label{sec:ch3-capstone}
+\index{capstone project}\index{gaming leaderboard}\index{Cosmos DB!capstone}\index{Session consistency}\index{multi-region writes}
+
+\begin{capstonebox}
+\textbf{Mission:} Design and prototype a global gaming leaderboard on Azure Cosmos DB that uses Session consistency, multi-region writes, synthetic partition keys, Change Feed projections, and operational evidence suitable for a launch review.
+
+\textbf{Estimated time:} 5--7 hours.
+
+\textbf{What you will practice:}
+\begin{itemize}
+    \item Modeling a high-scale NoSQL serving workload around point reads, writes, and materialized top-N views.
+    \item Selecting Session consistency and explaining the user-experience guarantee it provides.
+    \item Designing partition keys and buckets to avoid hot logical partitions during tournaments.
+    \item Enabling multi-region writes with deterministic conflict handling and idempotent score submission.
+    \item Using Change Feed to maintain leaderboard projections and analytics exports.
+\end{itemize}
+\end{capstonebox}
+
+\subsection*{Scenario}
+A game studio is launching a worldwide ranked tournament. Players submit match scores from the Americas, Europe, and Asia. The public leaderboard must update quickly, but it may lag by a few seconds. Each player must immediately see their own submitted score. The platform must support regional write paths, survive a regional outage, and export score events to the analytics lake.
+
+\subsection*{Requirements}
+\begin{itemize}
+    \item \textbf{Database:} Use Azure Cosmos DB for NoSQL with Session consistency and multi-region writes enabled.
+    \item \textbf{Partitioning:} Use a synthetic partition key such as \texttt{/boardShard} combining game, season, region, and bucket to distribute writes.
+    \item \textbf{Data model:} Store score submissions, current player-best records, leaderboard projection records, and processor checkpoints with clear item types.
+    \item \textbf{Conflict handling:} Keep the highest score per player and use earliest timestamp as a deterministic tie breaker.
+    \item \textbf{Serving:} Read public leaderboards from materialized top-N records rather than scanning raw score submissions.
+    \item \textbf{Change Feed:} Maintain projections and export immutable score events to ADLS Gen2 or a lakehouse landing zone.
+    \item \textbf{Operations:} Monitor RU consumption, 429 throttling, p95 and p99 latency, conflict count, regional health, Change Feed lag, and cost.
+\end{itemize}
+
+\subsection*{Reference Architecture}
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[node distance=1.15cm]
+        \node[stage] (clients) {Players\\mobile / PC};
+        \node[tool, right=1.2cm of clients] (routing) {Front Door\\regional routing};
+        \node[stage, above right=0.7cm and 1.4cm of routing] (api1) {Score API\\Americas};
+        \node[stage, right=1.4cm of routing] (api2) {Score API\\Europe};
+        \node[stage, below right=0.7cm and 1.4cm of routing] (api3) {Score API\\Asia};
+        \node[store, right=1.7cm of api2] (cosmos) {Cosmos DB\\multi-write\\Session};
+        \node[tool, right=1.6cm of cosmos] (feed) {Change Feed\\processor pool};
+        \node[store, above right=0.7cm and 1.4cm of feed] (topn) {Top-N\\leaderboard docs};
+        \node[store, right=1.4cm of feed] (lake) {ADLS Gen2\\score events};
+        \node[doc, below right=0.7cm and 1.4cm of feed] (monitor) {Azure Monitor\\alerts + workbook};
+        \draw[arrow] (clients) -- (routing);
+        \draw[arrow] (routing) -- (api1);
+        \draw[arrow] (routing) -- (api2);
+        \draw[arrow] (routing) -- (api3);
+        \draw[arrow] (api1) -- (cosmos);
+        \draw[arrow] (api2) -- (cosmos);
+        \draw[arrow] (api3) -- (cosmos);
+        \draw[arrow] (cosmos) -- (feed);
+        \draw[arrow] (feed) -- (topn);
+        \draw[arrow] (feed) -- (lake);
+        \draw[arrow] (monitor) -- (cosmos);
+        \draw[arrow] (monitor) -- (feed);
+    \end{tikzpicture}%
+    }
+    \caption{Capstone reference architecture for a global leaderboard using regional score APIs, Cosmos DB multi-region writes, Change Feed projections, lake export, and monitoring evidence.}
+    \label{fig:ch3-capstone-leaderboard}
+\end{figure}
+
+\subsection*{Implementation Steps}
+Use a sandbox subscription. The snippets below demonstrate the structure; production systems should use infrastructure-as-code, private endpoints, managed identity, and formal capacity tests.
+
+\begin{enumerate}
+    \item \textbf{Create a multi-region Cosmos DB account and containers.} Use one container for score items and one container for Change Feed leases if you build a processor.
+\begin{lstlisting}[language=bash,caption={PowerShell plus Azure CLI skeleton for the capstone Cosmos DB account.},label={lst:ch3-capstone-cosmos-cli}]
+$rg = "rg-cosmos-leaderboard-capstone"
+$primaryLocation = "eastus"
+$secondaryLocation = "westeurope"
+$thirdLocation = "southeastasia"
+$account = "cosmos-leaderboard-capstone-001"
+$database = "leaderboarddb"
+$scores = "scores"
+$leases = "leases"
+
+az group create --name $rg --location $primaryLocation
+
+az cosmosdb create `
+  --name $account `
+  --resource-group $rg `
+  --locations regionName=$primaryLocation failoverPriority=0 isZoneRedundant=False `
+              regionName=$secondaryLocation failoverPriority=1 isZoneRedundant=False `
+              regionName=$thirdLocation failoverPriority=2 isZoneRedundant=False `
+  --default-consistency-level Session `
+  --enable-multiple-write-locations true `
+  --enable-automatic-failover true
+
+az cosmosdb sql database create `
+  --account-name $account `
+  --resource-group $rg `
+  --name $database
+
+az cosmosdb sql container create `
+  --account-name $account `
+  --resource-group $rg `
+  --database-name $database `
+  --name $scores `
+  --partition-key-path "/boardShard" `
+  --throughput 4000
+
+az cosmosdb sql container create `
+  --account-name $account `
+  --resource-group $rg `
+  --database-name $database `
+  --name $leases `
+  --partition-key-path "/id" `
+  --throughput 400
+\end{lstlisting}
+
+    \item \textbf{Write idempotent score submissions.} The item ID combines player, match, and attempt so retries do not create duplicate submissions.
+\begin{lstlisting}[language=Python,caption={Submitting leaderboard scores with deterministic IDs and synthetic partition keys.},label={lst:ch3-capstone-python-submit}]
+import os
+from datetime import datetime, timezone
+from azure.cosmos import CosmosClient, PartitionKey
+
+client = CosmosClient(os.environ["COSMOS_ENDPOINT"], os.environ["COSMOS_KEY"])
+db = client.create_database_if_not_exists("leaderboarddb")
+scores = db.create_container_if_not_exists(
+    id="scores",
+    partition_key=PartitionKey(path="/boardShard"),
+    offer_throughput=4000,
+)
+
+def board_shard(game_id, season_id, region, player_id, buckets=64):
+    bucket = abs(hash(player_id)) % buckets
+    return f"{game_id}#{season_id}#{region}#{bucket:02d}"
+
+def submit_score(game_id, season_id, region, player_id, match_id, attempt, value):
+    timestamp = datetime.now(timezone.utc).isoformat()
+    item = {
+        "id": f"score_{player_id}_{match_id}_{attempt}",
+        "type": "scoreSubmission",
+        "gameId": game_id,
+        "seasonId": season_id,
+        "region": region,
+        "playerId": player_id,
+        "matchId": match_id,
+        "attempt": attempt,
+        "score": value,
+        "submittedAt": timestamp,
+        "boardShard": board_shard(game_id, season_id, region, player_id),
+    }
+    return scores.upsert_item(item)
+
+for i in range(10):
+    saved = submit_score("racer", "2026-summer", "americas", f"player_{i}", "m77", 1, 1000 + i)
+    print(saved["id"], saved["boardShard"])
+\end{lstlisting}
+
+    \item \textbf{Build the projection worker.} Read changes, compute player-best and bucket top-N records, and write projection items with idempotent upserts. Store checkpoints through the Change Feed Processor or an equivalent lease mechanism.
+    \item \textbf{Validate consistency and conflict behavior.} Submit a score, read it back with the same SDK session, then test concurrent submissions for the same player and confirm the deterministic winner.
+    \item \textbf{Create operational evidence.} Capture RU charge per operation, 429 count, p99 latency, regional write status, Change Feed lag, conflict count, and a cost estimate for normal and tournament traffic.
+\end{enumerate}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item Architecture diagram showing clients, routing, regional APIs, Cosmos DB regions, Change Feed processors, top-N projection items, lake export, and monitoring.
+    \item ADR explaining why Cosmos DB for NoSQL, Session consistency, multi-region writes, and the synthetic partition key were selected.
+    \item Reproducible Azure CLI or infrastructure-as-code snippets for account, database, containers, regions, consistency, throughput, and diagnostic settings.
+    \item Python scripts or pseudocode for idempotent score submission, partition-key generation, and projection updates.
+    \item Evidence pack with RU measurements, load-test assumptions, throttling behavior, conflict tests, Change Feed lag, and failover observations.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item The design explains why Session consistency satisfies player read-your-writes while allowing global leaderboard projections to lag briefly.
+    \item Partition keys distribute tournament writes across buckets and avoid a single hot logical partition.
+    \item Public leaderboard reads use materialized top-N items rather than cross-partition scans of raw score submissions.
+    \item Score submissions are idempotent and conflict resolution is deterministic.
+    \item Multi-region write behavior, failover assumptions, RPO, and regional routing are documented.
+    \item Change Feed processing is idempotent, checkpointed, monitored for lag, and safe to replay.
+    \item Security design avoids committed keys and addresses private access, managed identity or least-privilege roles, and diagnostic logging.
+    \item Operational evidence is complete enough for another engineer to reproduce the lab with different names and regions.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Add a synthetic load script that estimates RU/s for 1,000,000 combined reads and writes per second across regions.
+    \item Implement custom conflict resolution logic or an application-level merge function for player-best records.
+    \item Add Azure Functions or a containerized worker that processes Change Feed leases and writes top-N projection documents.
+    \item Export immutable score submissions to ADLS Gen2 in partitioned folders for downstream analytics.
+    \item Create an Azure Monitor workbook that displays RU charge, 429s, latency percentiles, region health, conflict counts, and Change Feed lag.
+    \item Estimate cost for provisioned throughput, autoscale, and serverless variants under normal day and tournament traffic.
+\end{itemize}

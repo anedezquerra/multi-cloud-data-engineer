@@ -1,0 +1,842 @@
+\chapter{Azure Data Lake Storage Gen2 and Storage Foundations}
+\index{Azure Data Lake Storage Gen2}\index{ADLS Gen2}\index{Azure Storage}\index{Blob Storage}\index{hierarchical namespace}\index{storage account}%
+\begin{objectives}
+\begin{itemize}
+    \item Explain the Azure Storage account abstraction and the relationship between Blob Storage and ADLS Gen2.
+    \item Distinguish flat object namespaces from hierarchical namespaces, including effects on analytics workloads, access control, and rename operations.
+    \item Select an appropriate redundancy option among LRS, ZRS, GRS, GZRS, RA-GRS, and RA-GZRS for a data-engineering workload.
+    \item Apply access tiers, lifecycle management policies, soft delete, and blob versioning to manage cost and recoverability.
+    \item Compare online and offline migration tools, including AzCopy, Azure Storage Explorer, and Azure Data Box.
+    \item Deploy an ADLS Gen2 account with Azure CLI and validate access using the \texttt{azure-storage-file-datalake} Python SDK.
+    \item Design a compliant, multi-region disaster-recovery storage architecture for large-scale healthcare imaging data.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+Although this book teaches \textbf{Azure}, the Week~1 storage foundations map almost one-to-one onto the other clouds---learn one mental model and carry it everywhere.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{2.8cm}p{3.0cm}p{3.0cm}p{3.0cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{AWS} & \textbf{Azure} & \textbf{GCP} \\
+\midrule
+Object storage & Amazon S3 & ADLS Gen2 / Blob & Cloud Storage \\
+Hot tier & S3 Standard & Hot & Standard \\
+Infrequent access & S3 Standard-IA & Cool & Nearline \\
+Archive (instant) & Glacier Instant Retrieval & Cold & Coldline \\
+Deep archive & Glacier Deep Archive & Archive & Archive \\
+Lifecycle rules & Lifecycle policies & Lifecycle management & Object Lifecycle Mgmt \\
+Versioning & S3 Versioning & Blob versioning & Object Versioning \\
+Immutability (WORM) & Object Lock & Immutable blob storage & Bucket Lock \\
+Cross-region copy & CRR / SRR & Object replication & Dual/multi-region + Transfer \\
+Online transfer & DataSync & AzCopy & Storage Transfer Service \\
+Offline transfer & Snow Family & Data Box & Transfer Appliance \\
+\addlinespace
+Design durability & 11 nines & 11 nines (LRS) / 16 (GRS) & 11 nines \\
+Availability SLA & 99.9\% (Standard) & 99.9\% (RA-GRS read 99.99\%) & 99.95\% (multi-region) \\
+Encryption at rest & SSE-S3 / SSE-KMS / SSE-C & SSE + CMK via Key Vault & Google-managed / CMEK / CSEK \\
+Access control & IAM \& bucket policies, ACLs & Azure RBAC, SAS, POSIX ACLs & IAM, ACLs, signed URLs \\
+Pricing levers & Storage + requests + egress + retrieval & Storage + operations + egress + retrieval & Storage + operations + egress + retrieval \\
+Consistency & Strong read-after-write & Strong read-after-write & Strong (global) \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+Beyond raw object storage, the same layer reappears as a managed abstraction: \textbf{Fabric OneLake} is a tenant-wide lake built on ADLS Gen2 (Delta--Parquet), \textbf{Snowflake} persists data as immutable micro-partitions on the provider's object store, and \textbf{MongoDB}'s WiredTiger is a node-local engine rather than object storage---the contrast is itself instructive.
+\end{crosscloud}
+
+\begin{keyterms}
+\textbf{Storage account}: the Azure management boundary for storage services, networking, redundancy, encryption, identity integration, and billing.\quad
+\textbf{Container}: a Blob Storage namespace that becomes a file system when hierarchical namespace is enabled.\quad
+\textbf{Hierarchical namespace}: ADLS Gen2 capability that provides directory semantics, atomic directory operations, and POSIX-like ACLs.\quad
+\textbf{Access tier}: a cost and retrieval-latency class for blob data.\quad
+\textbf{Lifecycle policy}: JSON rules that transition or delete blobs based on age, tier, prefix, and metadata.
+\end{keyterms}
+
+\section{Week 1 Overview: Storage as the Root of the Azure Data Platform}
+Azure data engineering begins with storage, not with Spark clusters, orchestration pipelines, dashboards, or machine-learning models. Storage is where raw evidence lands, where curated data products persist, where batch and streaming systems checkpoint state, and where audit trails prove what happened. If the storage layer is poorly named, weakly secured, under-protected, or expensive to operate, every downstream service inherits that fragility. Azure Data Lake Storage Gen2 (ADLS Gen2) is Microsoft Azure's primary cloud object store for analytical data lakes and lakehouses \cite{microsoft2025adlsgen2}.
+
+A storage foundation chapter is therefore a design chapter, not merely a catalog of buttons in the portal. A senior data engineer must connect data characteristics to platform controls: object size, arrival rate, regulatory retention, locality, recovery-point objective (RPO), recovery-time objective (RTO), analytics engine behavior, identity boundaries, and expected access pattern. The same storage account can host a quiet archive, a high-throughput ingestion zone, or a governed lakehouse serving hundreds of analysts; those workloads need different tiering, redundancy, namespace, and access decisions.
+\index{data lake}\index{lakehouse}\index{RPO}\index{RTO}
+
+\begin{definitionbox}
+\textbf{ADLS Gen2} is the combination of Azure Blob Storage durability and scale with a hierarchical namespace designed for big-data analytics. It supports file-system semantics, directory-level access control, and APIs used by Hadoop-compatible engines such as Spark, Synapse, and Databricks.
+\end{definitionbox}
+
+\begin{notebox}
+Throughout this chapter, ``Blob Storage'' refers to Azure's object storage service, while ``ADLS Gen2'' refers to Blob Storage accounts or containers with hierarchical namespace enabled. The same underlying platform is involved; the difference is the namespace and analytics-oriented semantics.
+\end{notebox}
+
+\section{Monday: Azure Storage Account Architecture}
+\index{storage account!architecture}\index{Azure Resource Manager}\index{management plane}\index{data plane}
+
+\subsection{The Storage Account as a Control Boundary}
+An Azure Storage account is both a management-plane resource and a data-plane endpoint. The management plane is controlled through Azure Resource Manager (ARM): resource group, location, tags, redundancy, networking rules, private endpoints, diagnostic settings, encryption settings, and identity-related configuration. The data plane is where applications create containers, upload blobs, list directories, acquire leases, read ranges, and set object metadata. Confusing those planes leads to common troubleshooting mistakes: a user may have Owner rights over the Azure resource but still be unable to read data-plane objects, or may have blob data permissions but be unable to alter firewall rules.
+\index{control plane}\index{data plane}\index{Azure RBAC}
+
+Storage accounts expose multiple service endpoints: Blob, Data Lake, Queue, Table, and File services. A data engineering lake normally depends on Blob and Data Lake endpoints. The Blob endpoint exposes flat object APIs. The Data Lake endpoint exposes file-system semantics for hierarchical namespace accounts. Many engines use ABFS or ABFSS URI forms such as \texttt{abfss://bronze@acct.dfs.core.windows.net/path/}. The \texttt{dfs.core.windows.net} endpoint is significant because it indicates the Data Lake namespace endpoint rather than the blob endpoint.
+
+\begin{definitionbox}
+A \textbf{container} is a grouping of blobs inside a storage account. In an ADLS Gen2 account, a container is also presented as a \textbf{file system}. Data lake designs often map containers to security and lifecycle boundaries such as \texttt{raw}, \texttt{bronze}, \texttt{silver}, \texttt{gold}, or domain-specific zones.
+\end{definitionbox}
+
+\begin{tipbox}
+Use separate storage accounts when you need hard isolation for networking, encryption keys, redundancy, account-level immutability, or blast-radius reduction. Use separate containers when the data shares account-level controls but needs different access, prefixes, or lifecycle rules.
+\end{tipbox}
+
+\subsection{Blob Storage vs. ADLS Gen2}
+Azure Blob Storage is optimized for massive, durable, low-cost object storage \cite{microsoft2025blobstorage}. Objects are addressed by name, metadata, and container. Traditional object stores treat the slash in \texttt{raw/year=2026/month=07/file.parquet} as part of the object name, not as a real directory tree. Tools can simulate folders by filtering names with common prefixes, but operations such as renaming a directory become many object copy-and-delete operations.
+
+ADLS Gen2 adds a hierarchical namespace. Directories become first-class metadata entries. Directory rename and delete operations can be atomic metadata operations instead of large object rewrites. POSIX-like access control lists can be attached at directory and file levels. This matters for analytics engines that produce many files and commit directory-level outputs. It also matters for governance: a lake can grant a data science group read access to \texttt{/curated/imaging/features/} without granting access to raw protected health information.
+\index{object storage}\index{directory}\index{POSIX ACL}\index{ABFS}
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.3cm}p{4.8cm}p{5.4cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{Blob Storage flat namespace} & \textbf{ADLS Gen2 hierarchical namespace} \\
+\midrule
+Namespace model & Object names with prefixes & File systems, directories, and files \\
+Rename directory & Copy and delete many objects & Metadata operation for directory path \\
+Access control & Container and blob RBAC or SAS patterns & RBAC plus POSIX-like ACLs at path level \\
+Analytics engines & Works for object reads and writes & Designed for Hadoop, Spark, Synapse, Databricks \\
+Best fit & General object storage, backups, media & Enterprise data lakes and lakehouses \\
+\bottomrule
+\end{tabular}
+\caption{Flat Blob Storage and ADLS Gen2 share durability but differ in namespace behavior and analytics ergonomics.}
+\label{tab:blob-vs-adls}
+\end{table}
+
+\begin{pitfall}
+\textbf{Retrofitting hierarchy too late.} Hierarchical namespace is a foundational account capability. Treat it as an up-front architecture decision for analytical lakes rather than a cosmetic folder setting.
+\end{pitfall}
+
+\subsection{Redundancy Options: LRS, ZRS, GRS, GZRS, and RA Variants}
+Azure Storage redundancy determines how many copies exist and where those copies reside \cite{microsoft2025redundancy}. It is a durability and availability design choice, not a substitute for backups, versioning, immutability, or application-level disaster recovery. The most common options are:
+\index{redundancy}\index{LRS}\index{ZRS}\index{GRS}\index{GZRS}\index{RA-GRS}
+
+\begin{itemize}
+    \item \textbf{Locally redundant storage (LRS):} keeps three copies within a single data center in the primary region. It is cost-effective but vulnerable to zone or regional outages.
+    \item \textbf{Zone-redundant storage (ZRS):} synchronously replicates across availability zones in the primary region. It improves availability for zone failures.
+    \item \textbf{Geo-redundant storage (GRS):} replicates from the primary region to a paired secondary region. It protects against regional disaster but secondary access is controlled by failover behavior.
+    \item \textbf{Geo-zone-redundant storage (GZRS):} combines ZRS in the primary region with asynchronous geo-replication to a secondary region.
+    \item \textbf{Read-access geo-redundant storage (RA-GRS) and RA-GZRS:} expose read-only access to secondary replicas before failover, useful for read-only DR validation and emergency analytics.
+\end{itemize}
+
+\begin{notebox}
+Asynchronous geo-replication means the secondary region may lag. For regulated workloads, document the expected RPO and validate whether the lag is acceptable for each data domain.
+\end{notebox}
+
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[node distance=1.4cm]
+        \node[stage] (source) {Sources\\Apps, IoT, Files};
+        \node[store, right=2.0cm of source] (raw) {ADLS Gen2\\Raw Zone};
+        \node[tool, right=2.0cm of raw] (quality) {Quality +\\Validation};
+        \node[store, right=2.0cm of quality] (curated) {ADLS Gen2\\Curated Zone};
+        \node[stage, right=2.0cm of curated] (serve) {Synapse + BI\\ML Features};
+        \node[doc, below=1.3cm of raw] (acl) {RBAC + ACLs};
+        \node[doc, below=1.3cm of quality] (life) {Lifecycle\\Policies};
+        \node[doc, below=1.3cm of curated] (dr) {GZRS +\\DR Runbook};
+        \draw[arrow] (source) -- (raw);
+        \draw[arrow] (raw) -- (quality);
+        \draw[arrow] (quality) -- (curated);
+        \draw[arrow] (curated) -- (serve);
+        \draw[arrow] (acl) -- (raw);
+        \draw[arrow] (life) -- (quality);
+        \draw[arrow] (dr) -- (curated);
+        \begin{scope}[on background layer]
+            \node[draw=primary!40, dashed, rounded corners, fit=(raw)(quality)(curated)(acl)(life)(dr), inner sep=10pt, label={[font=\small\bfseries\color{primary}]above:Storage foundation controls}] {};
+        \end{scope}
+    \end{tikzpicture}%
+    }
+    \caption{ADLS Gen2 as the durable foundation for ingestion, validation, curation, serving, governance, lifecycle control, and disaster recovery.}
+    \label{fig:storage-foundation-controls}
+\end{figure}
+
+\subsection{Monday Design Checklist}
+A storage account review should answer five questions. First, what data domains and environments will the account hold? Second, what identities need management-plane access versus data-plane access? Third, is hierarchical namespace required for analytics engines and path-level ACLs? Fourth, what regional failure mode is in scope for this workload? Fifth, what service endpoints must be private, public, or disabled? These questions are mundane, but they prevent expensive migration later.
+
+\section{Tuesday: Access Tiers, Lifecycle Management, and Recoverability}
+\index{access tiers}\index{lifecycle management}\index{soft delete}\index{blob versioning}
+
+\subsection{Access Tiers: Hot, Cool, Cold, and Archive}
+Azure Blob access tiers trade storage cost against access cost and retrieval latency \cite{microsoft2025accessTiers}. The \textbf{Hot} tier is designed for frequently accessed data. \textbf{Cool} is cheaper to store but more expensive to read and generally appropriate for data accessed infrequently but still online. \textbf{Cold} extends that cost profile for very infrequent online access where supported. \textbf{Archive} is the lowest-cost offline tier, but data must be rehydrated before it can be read.
+
+\begin{definitionbox}
+An \textbf{access tier} is a blob-level or account-default cost class that expresses how often data is expected to be read. It changes storage price, read price, minimum retention expectations, and retrieval latency.
+\end{definitionbox}
+
+The important design principle is that tiering should follow observed or contractually expected access patterns. Raw landing files may be hot for a few days while quality rules are fixed, cool for a month while reports are reconciled, and archived after regulatory retention begins. Curated dimensional data may stay hot because every dashboard queries it. Training snapshots may be cool or archive once a model version is approved. Tiering is therefore a data-product decision, not only an infrastructure setting.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{2.5cm}p{4.2cm}p{3.8cm}p{3.2cm}@{}}
+\toprule
+\textbf{Tier} & \textbf{Typical use} & \textbf{Access behavior} & \textbf{Caution} \\
+\midrule
+Hot & Active ingestion, current marts, daily dashboards & Frequent read/write & Higher storage cost \\
+Cool & Recently closed periods, audit extracts, occasional backfills & Infrequent reads & Higher read and early deletion costs \\
+Cold & Rarely accessed online data & Very infrequent reads & Verify regional and feature support \\
+Archive & Long-term retention, legal archive, deep history & Offline until rehydrated & Rehydration delay and operational runbook required \\
+\bottomrule
+\end{tabular}
+\caption{Access tiers should be selected by data-product usage, not by a single account-wide habit.}
+\label{tab:access-tiers}
+\end{table}
+
+\begin{pitfall}
+\textbf{Archiving without a retrieval plan.} Archive tier can save money, but an urgent investigation may wait hours for rehydration. Define who can rehydrate, where restored data lands, and which compliance approvals are required.
+\end{pitfall}
+
+\subsection{Lifecycle Management Policies}
+Lifecycle management is Azure's rule engine for moving or deleting blobs based on conditions such as age, prefix, tier, and version state \cite{microsoft2025lifecycle}. A lifecycle policy is JSON attached to the storage account. In data lakes, lifecycle rules should align with data classifications and medallion zones. For example, raw X-ray DICOM objects may transition to Cool after 30 days and Archive after 180 days, while curated ML feature tables remain Hot because they are part of active training pipelines.
+
+\begin{tipbox}
+Start lifecycle policies in report-only or narrow-prefix form when possible. Apply the first rule to a non-critical prefix, validate cost and retrieval behavior, then widen the policy. The most expensive lifecycle mistake is deleting or archiving the wrong prefix.
+\end{tipbox}
+
+Lifecycle is not a governance substitute. It does not classify data, prove legal retention, or replace immutable storage. It should be one control in a broader retention design: metadata classification, legal hold requirements, data owner approval, backup or versioning strategy, observability, and exception handling.
+
+\subsection{Soft Delete and Blob Versioning}
+Soft delete protects against accidental deletion by retaining deleted blobs or containers for a configured period. Blob soft delete covers individual blobs. Container soft delete protects deleted containers. Blob versioning keeps prior versions when an overwrite occurs. Together, these controls reduce the blast radius of human error, failed jobs, and accidental overwrites.
+
+\begin{notebox}
+Soft delete is time-bounded recoverability, not a full backup strategy. If a malicious process overwrites sensitive data and waits until retention expires, soft delete alone is insufficient. Combine it with versioning, immutable policies where required, monitoring, and least-privilege access.
+\end{notebox}
+
+A data-engineering example clarifies the distinction. Suppose an ADF pipeline writes a corrected file over \texttt{/raw/claims/2026/07/30/batch.csv}. With blob versioning enabled, the previous object can remain available as an older version. If the pipeline deletes the file entirely, soft delete can restore it during the retention window. If the entire \texttt{raw} container is deleted, container soft delete can help. Each feature covers a different failure mode.
+
+\subsection{Tuesday Design Checklist}
+For each data zone, document freshness, read frequency, minimum retention, deletion approval, recovery expectation, legal hold requirements, and expected reprocessing cost. Then map those properties to access tier, lifecycle policy, soft delete period, versioning, immutability, and monitoring. If the table is unknown, do not guess: instrument actual access before enforcing aggressive tiering.
+
+\section{Wednesday: Migration Tools and Trade-offs}
+\index{migration}\index{Azure Data Box}\index{AzCopy}\index{Azure Storage Explorer}
+
+\subsection{Online Migration with AzCopy}
+AzCopy is a command-line tool for high-performance copy operations to and from Azure Storage \cite{microsoft2025azcopy}. It supports local-to-blob, blob-to-blob, synchronization, include and exclude patterns, SAS or identity-based authentication, and job resume. It is ideal for repeatable online migrations, daily bulk loads, backfills from on-premises shares, and automation scripts.
+
+Online migration is constrained by network bandwidth, change rate, reliability, and security. A 50 TB migration over a fast enterprise link may be practical. A 10 PB imaging migration over the public internet is usually not. The engineer must estimate transfer duration, throttling, retry behavior, validation strategy, and cutover mechanics. Hash validation, manifest files, and reconciliation queries matter as much as the copy command.
+
+\begin{tipbox}
+For large online migrations, split data by stable prefixes such as date, modality, business unit, or source system. Parallel jobs are easier to resume and reconcile when each job owns a deterministic prefix.
+\end{tipbox}
+
+\subsection{Azure Storage Explorer}
+Azure Storage Explorer is a graphical tool for inspecting and managing storage accounts. It is excellent for learning, debugging access, confirming that objects landed under the expected prefix, generating SAS tokens in controlled scenarios, and performing small manual operations. It is not a substitute for infrastructure as code, automated migration scripts, or governed production operations.
+
+\begin{pitfall}
+\textbf{Manual production edits through a GUI.} Storage Explorer is useful, but manual deletes, uploads, and tier changes are hard to review and reproduce. Production storage changes should normally flow through scripted, logged, least-privilege paths.
+\end{pitfall}
+
+\subsection{Offline Migration with Azure Data Box}
+Azure Data Box is an offline transfer appliance for moving large datasets into Azure when network transfer is impractical \cite{microsoft2025databox}. Microsoft ships a ruggedized device, the customer copies data locally, ships it back, and Microsoft imports the encrypted data into the target storage account. This pattern is common when datasets are measured in hundreds of terabytes or petabytes, when a data center exit has a deadline, or when network egress is too slow.
+
+Offline transfer introduces different constraints: device capacity, shipping logistics, chain of custody, encryption keys, staging procedures, copy windows, import verification, and delta synchronization. It rarely eliminates the need for online tools. A common pattern is to seed historical data with Data Box and then use AzCopy, ADF, or custom ingestion to synchronize changed data until cutover.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.0cm}p{4.8cm}p{5.0cm}@{}}
+\toprule
+\textbf{Tool} & \textbf{Best use} & \textbf{Trade-off} \\
+\midrule
+AzCopy & Scripted online copy, recurring loads, prefix-level sync & Depends on bandwidth and identity/SAS hygiene \\
+Storage Explorer & Inspection, troubleshooting, small manual operations & Not ideal for reproducible production change \\
+Azure Data Box & Large offline seeding and data-center migration & Requires logistics, chain of custody, and later delta sync \\
+\bottomrule
+\end{tabular}
+\caption{Migration tools differ by scale, automation, observability, and operational risk.}
+\label{tab:migration-tools}
+\end{table}
+
+\section{Thursday Hands-on Project: Deploy ADLS Gen2 with Lifecycle Management}
+\index{hands-on lab}\index{Azure CLI}\index{lifecycle policy!JSON}\index{Python SDK}
+This lab deploys a storage account with hierarchical namespace enabled, creates a file system, enables recoverability controls, and applies a lifecycle policy that transitions matching blobs to Archive after 30 days. The commands assume Azure CLI is installed and that you are authenticated with sufficient permissions in a non-production subscription.
+
+\begin{notebox}
+The examples use globally unique storage account names. Replace \texttt{stdeadlsweek1demo} with a compliant name that is unique across Azure: 3--24 lowercase letters and numbers, no hyphens.
+\end{notebox}
+
+\begin{lstlisting}[language=AzureCLI,caption={Deploying an ADLS Gen2 account and basic lake file systems with Azure CLI.},label={lst:adls-cli}]
+az login
+az account set --subscription "00000000-0000-0000-0000-000000000000"
+
+$rg = "rg-de-azure-book-week1"
+$location = "eastus"
+$account = "stdeweek1adlsdemo01"
+
+az group create `
+  --name $rg `
+  --location $location
+
+az storage account create `
+  --name $account `
+  --resource-group $rg `
+  --location $location `
+  --sku Standard_GZRS `
+  --kind StorageV2 `
+  --hierarchical-namespace true `
+  --min-tls-version TLS1_2 `
+  --https-only true `
+  --allow-blob-public-access false `
+  --default-action Deny
+
+az storage account blob-service-properties update `
+  --account-name $account `
+  --resource-group $rg `
+  --enable-delete-retention true `
+  --delete-retention-days 30 `
+  --enable-container-delete-retention true `
+  --container-delete-retention-days 30 `
+  --enable-versioning true
+
+az storage fs create `
+  --account-name $account `
+  --name raw `
+  --auth-mode login
+
+az storage fs create `
+  --account-name $account `
+  --name curated `
+  --auth-mode login
+\end{lstlisting}
+
+The account uses \texttt{Standard\_GZRS}, hierarchical namespace, HTTPS-only access, TLS 1.2 minimum, and disabled public blob access. The example also sets the account firewall default action to deny. In a real lab you would add a trusted virtual network, private endpoint, or temporary client IP rule before attempting data-plane operations. If you cannot create file systems after setting \texttt{--default-action Deny}, confirm that your network path is allowed.
+
+\begin{lstlisting}[language=json,caption={Lifecycle policy that archives raw objects after 30 days.},label={lst:lifecycle-json}]
+{
+  "rules": [
+    {
+      "enabled": true,
+      "name": "raw-to-archive-after-30-days",
+      "type": "Lifecycle",
+      "definition": {
+        "filters": {
+          "blobTypes": ["blockBlob"],
+          "prefixMatch": ["raw/landing/"]
+        },
+        "actions": {
+          "baseBlob": {
+            "tierToArchive": {
+              "daysAfterModificationGreaterThan": 30
+            }
+          }
+        }
+      }
+    }
+  ]
+}
+\end{lstlisting}
+
+Save the JSON as \texttt{lifecycle-policy.json} in the book folder or pipeline workspace, then apply it with Azure CLI:
+
+\begin{lstlisting}[language=AzureCLI,caption={Applying the lifecycle management policy.},label={lst:apply-lifecycle}]
+az storage account management-policy create `
+  --account-name $account `
+  --resource-group $rg `
+  --policy .\lifecycle-policy.json
+
+az storage account management-policy show `
+  --account-name $account `
+  --resource-group $rg
+\end{lstlisting}
+
+\begin{pitfall}
+\textbf{Prefix mismatch in lifecycle policies.} In ADLS Gen2, the policy prefix is evaluated against the blob path from the container boundary. If the intended container is \texttt{raw} and the intended directory is \texttt{landing}, validate the exact prefix format in a non-production account before rollout.
+\end{pitfall}
+
+The Python SDK snippet below writes a small file through the Data Lake endpoint. In production, prefer managed identity from Azure compute. For a local lab, \texttt{DefaultAzureCredential} may use Azure CLI authentication.
+
+\begin{lstlisting}[language=Python,caption={Writing and reading a file with azure-storage-file-datalake.},label={lst:python-datalake}]
+from azure.identity import DefaultAzureCredential
+from azure.storage.filedatalake import DataLakeServiceClient
+
+account_name = "stdeweek1adlsdemo01"
+account_url = f"https://{account_name}.dfs.core.windows.net"
+credential = DefaultAzureCredential()
+
+service_client = DataLakeServiceClient(
+    account_url=account_url,
+    credential=credential,
+)
+
+file_system = service_client.get_file_system_client("raw")
+directory = file_system.get_directory_client("landing/week1")
+directory.create_directory()
+
+file_client = directory.create_file("sample-observation.txt")
+payload = b"patient_id,event_time,source\n1001,2026-07-30T21:33:37Z,xray\n"
+file_client.append_data(data=payload, offset=0, length=len(payload))
+file_client.flush_data(len(payload))
+
+read_back = file_client.download_file().readall().decode("utf-8")
+print(read_back)
+\end{lstlisting}
+
+\begin{tipbox}
+After a lab, delete the resource group if the account is not needed. GZRS storage and retained versions can create continuing charges, especially if you upload test data and lifecycle policies move it to tiers with early-deletion considerations.
+\end{tipbox}
+
+\subsection{Validation Steps}
+A complete lab validation includes the following checks: the storage account shows hierarchical namespace enabled; the account redundancy is GZRS; public blob access is disabled; soft delete and versioning are enabled; the \texttt{raw} and \texttt{curated} file systems exist; the lifecycle policy is visible; and the Python snippet can write and read a file through the DFS endpoint. Capture command output or screenshots for your engineering notebook.
+
+\section{Friday Use Case and Architecture: Healthcare X-ray Lake at 10 PB}
+\index{healthcare}\index{HIPAA}\index{HITRUST}\index{disaster recovery}\index{GZRS}\index{medical imaging}
+
+\subsection{Scenario}
+A healthcare provider processes 10 PB of X-ray images across regional hospitals. The platform must ingest new images daily, retain raw images for compliance and research, support downstream AI model development, serve governed analytics, and survive regional outages. The organization is subject to HIPAA and HITRUST-aligned controls, expects encryption at rest and in transit, requires auditability, and must control storage growth.
+
+The first architectural decision is to separate data zones and duties. Raw images are immutable evidence and should be protected from accidental overwrite. Curated derivatives such as thumbnails, de-identified metadata, and feature vectors have different access and lifecycle needs. Research sandboxes may use derived, de-identified data and should not have broad access to protected health information. Operations teams need monitoring and recovery runbooks but not unrestricted patient data access.
+
+\begin{definitionbox}
+A \textbf{compliant disaster-recovery storage architecture} defines not only where replicated bytes reside, but also who can read them, how failover is authorized, what data loss is acceptable, how recovery is tested, and how audit evidence is retained.
+\end{definitionbox}
+
+\subsection{Target Architecture}
+The proposed design uses ADLS Gen2 storage accounts in a primary Azure region with GZRS or RA-GZRS where available and appropriate. Private endpoints keep data traffic on private networks. Microsoft Entra ID, Azure RBAC, POSIX-like ACLs, and managed identities enforce least privilege. Customer-managed keys may be used when the compliance program requires key ownership and rotation evidence. Diagnostic logs flow to a security workspace. Lifecycle policies move older raw images to Cool, Cold, or Archive based on clinical and research retrieval requirements. Immutable storage policies or legal holds are considered for records that must not be altered.
+
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[
+        region/.style={rectangle, rounded corners, draw=primary, thick, fill=primary!3, minimum width=7.0cm, minimum height=6.2cm},
+        sec/.style={rectangle, rounded corners, draw=codegreen!60!black, thick, fill=green!5, minimum width=4.3cm, minimum height=1.1cm, align=center, font=\small\bfseries},
+        arr/.style={-{Latex[length=2.5mm]}, thick, draw=primary}
+    ]
+        \node[region, label={[font=\bfseries\color{primary}]above:Primary Region}] (primaryr) at (0,0) {};
+        \node[region, label={[font=\bfseries\color{primary}]above:Paired Secondary Region}] (secondaryr) at (9.2,0) {};
+
+        \node[stage] (hosp) at (-4.6, 1.8) {Hospitals\\PACS};
+        \node[tool] (ingest) at (-1.8, 1.8) {Private\\Ingestion};
+        \node[store] (raw) at (1.2, 1.8) {ADLS Raw\\GZRS};
+        \node[store] (curated) at (1.2, -0.3) {Curated\\De-ID};
+        \node[tool] (compute) at (-1.8, -0.3) {Databricks\\ADF};
+        \node[sec] (controls) at (-0.3, -2.45) {Entra ID + RBAC + ACLs + CMK + Private Endpoints};
+
+        \node[store] (raw2) at (9.2, 1.4) {Read-Access\\Secondary};
+        \node[stage] (drread) at (12.1, 1.4) {DR Analytics\\Read-Only};
+        \node[doc] (vault) at (9.2, -0.7) {Key Vault\\Break Glass};
+        \node[doc] (monitor) at (9.2, -2.45) {Monitor +\\Audit Logs};
+
+        \draw[arr] (hosp) -- (ingest);
+        \draw[arr] (ingest) -- (raw);
+        \draw[arr] (raw) -- (compute);
+        \draw[arr] (compute) -- (curated);
+        \draw[arr] (raw) -- node[above,font=\scriptsize\itshape]{asynchronous geo-replication} (raw2);
+        \draw[arr] (raw2) -- (drread);
+        \draw[arr] (controls) -- (raw);
+        \draw[arr] (controls) -- (curated);
+        \draw[arr] (monitor) -- (raw2);
+    \end{tikzpicture}%
+    }
+    \caption{Multi-region ADLS Gen2 architecture for compliant healthcare imaging with GZRS/RA-GZRS, private ingestion, governed processing, and read-access disaster recovery.}
+    \label{fig:healthcare-xray-dr}
+\end{figure}
+
+\subsection{Compliance and Security Design}
+HIPAA and HITRUST programs require administrative, technical, and physical controls; Azure services provide building blocks, but the customer owns configuration, access governance, monitoring, and operating procedures \cite{microsoft2025hipaa}. For storage, key technical controls include encryption at rest, TLS in transit, private networking, disabled public access, managed identities, least-privilege RBAC, ACL inheritance, diagnostic logging, retention controls, and incident-response evidence. Key administrative controls include data classification, role approval, periodic access reviews, backup and restore tests, and documented RPO/RTO acceptance.
+
+\begin{notebox}
+Compliance is not achieved by choosing a single service. It is achieved by configuring services, operating them consistently, collecting evidence, and proving that controls work under failure and audit conditions.
+\end{notebox}
+
+\subsection{Lifecycle and Cost Model for 10 PB}
+At 10 PB, lifecycle mistakes are material. Even small per-GB price differences become large monthly numbers. The architecture should classify images by age, clinical status, research value, and legal hold. Recent images may remain Hot for active care and model validation. Images older than 30 or 90 days may move to Cool or Cold if clinical retrieval is rare. Deep history may move to Archive if rehydration times meet policy. De-identified derivatives used for model training may remain online because recomputing them from raw archive could be slower and more expensive than storing them.
+
+Cost control also requires object sizing and file-format decisions. Medical images are naturally large binary objects, but metadata and derived features should be stored in analytics-friendly formats such as Parquet and Delta Lake. The lakehouse literature emphasizes unifying low-cost object storage with reliable table abstractions and analytics engines \cite{armbrust2021lakehouse,armbrust2020delta}. For the X-ray platform, raw DICOM objects and curated Delta tables serve different purposes and deserve different lifecycle policies.
+
+\subsection{Disaster Recovery Runbook}
+A DR design is incomplete without a runbook. The runbook should specify monitoring signals for regional outage, the decision authority for failover, how to assess replication lag, which applications can operate read-only from the secondary, when to pause writes, how to communicate expected data loss, and how to return to the primary region. For RA-GZRS, read-only secondary access can support emergency analytics and validation before account failover. For write recovery, applications must be designed to avoid split-brain writes and to reconcile any lag after failback.
+
+\begin{pitfall}
+\textbf{Assuming geo-replication equals application recovery.} Storage replication preserves data copies, but applications, identities, private endpoints, keys, DNS, orchestration jobs, and user access paths must also be recoverable.
+\end{pitfall}
+
+\section{Architectural Decision Record Template}
+\index{architectural decision record}
+Use a short architectural decision record (ADR) for storage account decisions. A useful ADR includes: context, decision, alternatives considered, consequences, security impact, cost impact, operational runbook, and validation evidence. For Chapter 1, write an ADR that states why hierarchical namespace is enabled, why GZRS or RA-GZRS is selected, what lifecycle rules apply to each prefix, and what recovery tests must pass before production.
+
+\section{Operational Deep Dive: Naming, Zones, and Evidence}
+\index{naming convention}\index{data zones}\index{audit evidence}
+A production lake is easier to operate when naming, zones, and evidence are standardized from the first week. Storage account names are globally unique and should encode organization, environment, region, workload, and purpose without exposing sensitive details. Container names should be stable because they appear in URIs, ACL rules, pipeline parameters, and documentation. Directory names should support partition pruning and operational ownership. A common pattern is \texttt{/source-system/entity/year=YYYY/month=MM/day=DD/}, but event-time and processing-time partitions must not be confused.
+
+\begin{tipbox}
+Prefer boring names that operations staff can predict. A clever naming convention that requires a lookup table will fail during an incident.
+\end{tipbox}
+
+Data zones should express quality and access expectations. The raw zone preserves source fidelity. The bronze zone may add ingestion metadata and schema capture. The silver zone standardizes, deduplicates, and validates. The gold zone serves business-ready products. Not every organization uses these exact labels, but every organization needs an explicit vocabulary for trust level. Without it, users will query whatever path is easiest to find.
+
+Evidence completes the operating model. For every storage account, retain deployment records, policy JSON, access reviews, diagnostic settings, lifecycle rules, and DR test results. These artifacts are useful during audits, but they are also useful during ordinary engineering work. When a pipeline fails after a storage firewall change, a recorded change history is faster than guessing.
+
+\section{Troubleshooting Patterns}
+\index{troubleshooting}\index{private endpoint}\index{managed identity}
+The most common ADLS Gen2 failures appear as authorization errors, network errors, path errors, or lifecycle surprises. Authorization errors require checking both RBAC and ACLs. A managed identity may have \texttt{Storage Blob Data Contributor} at the account level but still lack execute permission on an intermediate directory. Network errors require checking public network access, firewall rules, private endpoint DNS, and whether the client is using the blob or DFS endpoint. Path errors often come from case sensitivity, unexpected URL encoding, or prefix assumptions inherited from flat object storage.
+
+Lifecycle surprises are harder because they may appear days later. A report fails because a file was archived; a backfill becomes slow because historical data moved to Cool; an overwrite creates many versions and increases cost. The remedy is observability: storage metrics, inventory reports, policy reviews, and cost analysis grouped by account, container, prefix, tier, and tag.
+
+\begin{pitfall}
+\textbf{Granting broad permissions to solve a narrow error.} If a pipeline cannot read one path, do not immediately grant account-wide contributor rights. Identify whether the missing permission is RBAC, ACL execute, ACL read, firewall, private DNS, or an incorrect endpoint.
+\end{pitfall}
+
+\section{Week 1 Lab Rubric}
+\index{rubric}
+A complete Week 1 submission should include: a diagram of the proposed storage account and containers; Azure CLI output or screenshots proving the account settings; lifecycle policy JSON; a short Python SDK run log; an ADR explaining redundancy and tiering; and a cleanup note showing whether the resource group was deleted. Grade the work on correctness, reproducibility, security posture, and operational reasoning. A beautiful diagram without commands is incomplete; commands without architecture reasoning are also incomplete.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.2cm}p{5.0cm}p{5.0cm}@{}}
+\toprule
+\textbf{Criterion} & \textbf{Meets expectation} & \textbf{Needs improvement} \\
+\midrule
+Reproducibility & CLI commands create the described account and controls & Manual portal-only steps or missing parameters \\
+Security & Public access disabled, TLS enforced, identity-based access preferred & Shared keys or broad permissions used without reason \\
+Lifecycle & Policy targets a specific prefix and retention logic is explained & Policy is account-wide or prefix is unvalidated \\
+Recovery & Soft delete, versioning, redundancy, and DR assumptions documented & Replication is assumed to solve every recovery scenario \\
+Cost & Tiering and cleanup are discussed & GZRS and versions left running without cost awareness \\
+\bottomrule
+\end{tabular}
+\caption{Week 1 rubric for storage foundation deliverables.}
+\label{tab:week1-rubric}
+\end{table}
+
+\section{Interview Q\&A}
+\subsection{Concepts and Trade-offs}
+\begin{enumerate}
+    \item \textbf{Q: Why is ADLS Gen2 preferred for analytics lakes over a flat Blob Storage namespace?}\\
+    A: It adds hierarchical namespace, atomic directory operations, and path-level ACLs while retaining Blob Storage scale and durability.
+    \item \textbf{Q: When would you choose ZRS instead of GZRS?}\\
+    A: ZRS is appropriate when zone failure is in scope but cross-region replication cost or data-residency constraints make geo-replication unsuitable.
+    \item \textbf{Q: Why might Archive tier be wrong for data that is rarely read?}\\
+    A: Rare reads may still be urgent. Archive requires rehydration, so RTO and operational approval can make Cool or Cold a better fit.
+    \item \textbf{Q: What does soft delete protect that versioning does not?}\\
+    A: Soft delete protects deleted blobs or containers during a retention window; versioning primarily protects prior object states after overwrite.
+\end{enumerate}
+
+\section{Further Reading}
+Begin with Microsoft Learn's introduction to ADLS Gen2 \cite{microsoft2025adlsgen2} and Blob Storage \cite{microsoft2025blobstorage}. Review Azure Storage redundancy for regional design \cite{microsoft2025redundancy}, access tiers \cite{microsoft2025accessTiers}, and lifecycle management \cite{microsoft2025lifecycle}. For migration planning, read the Azure Data Box overview \cite{microsoft2025databox} and AzCopy documentation \cite{microsoft2025azcopy}. Use the Azure Well-Architected Framework \cite{microsoft2025wellarchitected} and Cloud Adoption Framework \cite{microsoft2025caf} to connect technical choices to reliability, security, operations, and cost governance. For lakehouse table-storage context, see Delta Lake and lakehouse architecture papers \cite{armbrust2020delta,armbrust2021lakehouse}.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item Azure Storage accounts are management, security, networking, redundancy, and billing boundaries for data workloads.
+    \item ADLS Gen2 combines Blob Storage durability with hierarchical namespace and path-level controls designed for analytics.
+    \item Redundancy choices express failure assumptions and RPO/RTO trade-offs; they do not replace backups or DR runbooks.
+    \item Access tiers and lifecycle policies should follow data-product usage, retention, and retrieval requirements.
+    \item Soft delete, container soft delete, and blob versioning address different accidental-deletion and overwrite scenarios.
+    \item AzCopy, Storage Explorer, and Azure Data Box solve different migration problems; large programs often combine offline seeding with online delta sync.
+    \item Healthcare-scale storage architecture requires private networking, least privilege, encryption, auditability, lifecycle economics, and tested recovery procedures.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Explain the difference between the management plane and data plane for an Azure Storage account. Give one permission from each category.
+    \item \textbf{(Conceptual)} Compare LRS, ZRS, GRS, and GZRS for a lake that supports daily regulatory reports. State which outage each option can tolerate.
+    \item \textbf{(Conceptual)} A dashboard reads a curated Delta table every 15 minutes. Should that table be Hot, Cool, Cold, or Archive? Justify your answer using latency and cost.
+    \item \textbf{(Hands-on)} Run the Azure CLI lab in a sandbox subscription. Capture evidence that hierarchical namespace, soft delete, versioning, and the lifecycle policy are enabled.
+    \item \textbf{(Hands-on)} Modify the lifecycle policy so that objects under \texttt{raw/landing/} move to Cool after 7 days and Archive after 90 days. Explain how you would test the policy safely.
+    \item \textbf{(Hands-on)} Use the Python SDK to create directories for \texttt{bronze}, \texttt{silver}, and \texttt{gold}. Upload a small file to each and list paths recursively.
+    \item \textbf{(Design)} Choose a migration tool for 500 TB of historical files plus 2 TB of daily changes. State whether you would use AzCopy, Data Box, both, or another service, and explain cutover.
+    \item \textbf{(Design)} Write an ADR for the healthcare X-ray architecture. Include redundancy, lifecycle, encryption, access model, monitoring, and DR validation.
+    \item \textbf{(Design)} Identify three ways a lifecycle policy could harm production data and specify a guardrail for each.
+    \item \textbf{(Interview)} Prepare a two-minute explanation of why geo-redundant storage is necessary but insufficient for disaster recovery.
+\end{enumerate}
+
+\section{Capstone Project: A Compliant Medical Imaging Archive on ADLS Gen2}\label{sec:ch1-capstone}
+\index{capstone project}\index{medical imaging archive}\index{immutable storage}\index{object replication}\index{customer-managed keys}
+
+\begin{capstonebox}
+\textbf{Mission:} Design and prototype the storage foundation for a compliant medical imaging archive on Azure Data Lake Storage Gen2. Your solution must show how a healthcare provider can ingest, protect, tier, replicate, and audit X-ray images while meeting security, disaster-recovery, and cost objectives.
+
+\textbf{Estimated time:} 4--6 hours.
+
+\textbf{What you will practice:}
+\begin{itemize}
+    \item Choosing ADLS Gen2 over a flat Blob Storage namespace when analytics, directory operations, and path-level controls are required.
+    \item Enabling hierarchical namespace, GZRS redundancy, blob versioning, blob and container soft delete, lifecycle tiering, and immutable storage.
+    \item Designing a Hot-to-Cool-to-Archive lifecycle for a 10 PB healthcare archive.
+    \item Planning object replication to a secondary region and documenting RPO, RTO, and failover assumptions.
+    \item Applying encryption with customer-managed keys, least-privilege Azure RBAC, and operational evidence for HIPAA and HITRUST-aligned controls.
+\end{itemize}
+\end{capstonebox}
+
+\subsection*{Scenario}
+A regional healthcare provider is consolidating 10 PB of X-ray images from hospital picture archiving and communication systems into Azure. The images are clinically important, legally sensitive, expensive to store, and valuable for downstream analytics. Radiologists and care teams need recent images online. Compliance officers require retention evidence and tamper resistance. Data scientists need governed access to de-identified derivatives for model development. Operations leaders require a disaster-recovery design that survives a regional outage without pretending that storage replication alone is a complete application recovery plan.
+
+The archive must support HIPAA and HITRUST-aligned operating practices. Azure supplies storage, identity, encryption, logging, and replication capabilities, but the provider remains responsible for configuration, access governance, incident response, and audit evidence \cite{microsoft2025hipaa}. The design must also be cost-aware: at 10 PB, an incorrect tiering rule, overly broad version retention, or accidental hot-tier default can become a large recurring expense. Treat this capstone as an architecture exercise and a small implementation prototype, not as a full production rollout.
+
+\subsection*{Requirements}
+Your target design must satisfy the following requirements.
+
+\begin{itemize}
+    \item \textbf{Storage foundation:} Use ADLS Gen2 with hierarchical namespace enabled so file systems, directories, atomic directory operations, and path-level ACLs support analytics workloads \cite{microsoft2025adlsgen2}.
+    \item \textbf{Redundancy:} Select \texttt{Standard\_GZRS} for the primary storage account so data is zone-redundant in the primary region and geo-replicated to a paired secondary region \cite{microsoft2025redundancy}.
+    \item \textbf{Lifecycle:} Move raw images from Hot to Cool after 30 days and to Archive after 180 days, with a separate rule for previous versions so retained versions do not grow without review \cite{microsoft2025accessTiers,microsoft2025lifecycle}.
+    \item \textbf{Recoverability:} Enable blob versioning, blob soft delete, and container soft delete. Document restore procedures for accidental overwrite, accidental blob deletion, and accidental container deletion.
+    \item \textbf{WORM retention:} Configure immutable storage with a time-based retention policy and legal hold capability for records that must be preserved in write-once, read-many form.
+    \item \textbf{Replication:} Configure object replication from the primary account to a secondary-region account or document the exact policy that would be applied in production.
+    \item \textbf{Encryption:} Use encryption at rest with customer-managed keys stored in Azure Key Vault. Document key rotation ownership, break-glass access, and monitoring.
+    \item \textbf{Access control:} Enforce least privilege with Microsoft Entra ID, Azure RBAC, managed identities, and ADLS Gen2 ACLs. Avoid shared keys and account-wide contributor assignments unless a documented exception exists \cite{microsoft2025rbac}.
+\end{itemize}
+
+\subsection*{Reference Architecture}
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[
+        capnode/.style={rectangle, rounded corners, draw=primary, thick, fill=primary!4, align=center, minimum width=3.1cm, minimum height=1.1cm, font=\small},
+        ctrl/.style={rectangle, rounded corners, draw=codegreen!60!black, thick, fill=green!6, align=center, minimum width=3.0cm, minimum height=0.9cm, font=\footnotesize},
+        tier/.style={rectangle, draw=codegray, thick, fill=white, align=center, minimum width=2.4cm, minimum height=0.8cm, font=\footnotesize},
+        arr/.style={-{Stealth[length=2.5mm]}, draw=primary, thick}
+    ]
+        \node[capnode] (pacs) {Hospital PACS\\X-ray ingest};
+        \node[capnode, right=1.2cm of pacs] (ingest) {Private ingest\\AzCopy, SDK, ADF};
+        \node[store, right=1.4cm of ingest] (lake) {ADLS Gen2\\HNS + CMK\\versioned + immutable};
+        \node[tier, above right=0.7cm and 1.3cm of lake] (hot) {Hot\\0--30 days};
+        \node[tier, right=1.0cm of hot] (cool) {Cool\\31--180 days};
+        \node[tier, right=1.0cm of cool] (archive) {Archive\\181+ days};
+        \node[store, below right=1.0cm and 2.4cm of lake] (secondary) {Secondary account\\replicated objects};
+        \node[ctrl, below=1.3cm of ingest] (security) {Entra ID + RBAC\\ADLS ACLs};
+        \node[ctrl, below=1.3cm of lake] (vault) {Key Vault CMK\\rotation evidence};
+        \node[ctrl, below=1.3cm of secondary] (dr) {DR runbook\\RPO + RTO tests};
+        \node[draw=primary!45, dashed, rounded corners, fit=(lake)(hot)(cool)(archive)(secondary), inner sep=10pt, label={[font=\small\bfseries\color{primary}]above:GZRS storage boundary and object replication}] (boundary) {};
+
+        \draw[arr] (pacs) -- (ingest);
+        \draw[arr] (ingest) -- (lake);
+        \draw[arr] (lake) -- node[above,font=\scriptsize]{lifecycle policy} (hot);
+        \draw[arr] (hot) -- (cool);
+        \draw[arr] (cool) -- (archive);
+        \draw[arr] (lake) -- node[below,font=\scriptsize]{object replication} (secondary);
+        \draw[arr] (security) -- (ingest);
+        \draw[arr] (security) -- (lake);
+        \draw[arr] (vault) -- (lake);
+        \draw[arr] (dr) -- (secondary);
+    \end{tikzpicture}%
+    }
+    \caption{Capstone reference architecture for a compliant medical imaging archive on ADLS Gen2 with hierarchical namespace, customer-managed keys, lifecycle tiering, immutable retention, GZRS, and object replication.}
+    \label{fig:ch1-capstone-medical-imaging-archive}
+\end{figure}
+
+\subsection*{Implementation Steps}
+Use a sandbox subscription and unique names. The commands below are written for Windows PowerShell and Azure CLI. Replace placeholder subscription, tenant, object IDs, locations, and account names before running.
+
+\begin{enumerate}
+    \item \textbf{Create the secured ADLS Gen2 accounts.} Deploy a primary GZRS account with hierarchical namespace enabled, a secondary account in another region, and baseline recoverability controls.
+\begin{lstlisting}[language=bash,caption={PowerShell plus Azure CLI for the primary ADLS Gen2 account.},label={lst:ch1-capstone-primary-cli}]
+az login
+az account set --subscription "00000000-0000-0000-0000-000000000000"
+
+$rg = "rg-medimg-capstone"
+$primaryLocation = "eastus"
+$secondaryLocation = "westus"
+$primary = "stmedimgprimary001"
+$secondary = "stmedimgsecondary001"
+$keyVault = "kv-medimg-capstone-001"
+$keyName = "cmk-medimg-archive"
+$container = "xray-raw"
+
+az group create `
+  --name $rg `
+  --location $primaryLocation
+
+az keyvault create `
+  --name $keyVault `
+  --resource-group $rg `
+  --location $primaryLocation `
+  --enable-rbac-authorization true
+
+az keyvault key create `
+  --vault-name $keyVault `
+  --name $keyName `
+  --kty RSA `
+  --size 3072
+
+az storage account create `
+  --name $primary `
+  --resource-group $rg `
+  --location $primaryLocation `
+  --sku Standard_GZRS `
+  --kind StorageV2 `
+  --hierarchical-namespace true `
+  --min-tls-version TLS1_2 `
+  --https-only true `
+  --allow-blob-public-access false `
+  --default-action Deny `
+  --assign-identity
+
+az storage account create `
+  --name $secondary `
+  --resource-group $rg `
+  --location $secondaryLocation `
+  --sku Standard_LRS `
+  --kind StorageV2 `
+  --hierarchical-namespace true `
+  --min-tls-version TLS1_2 `
+  --https-only true `
+  --allow-blob-public-access false `
+  --default-action Deny `
+  --assign-identity
+
+az storage account blob-service-properties update `
+  --account-name $primary `
+  --resource-group $rg `
+  --enable-versioning true `
+  --enable-delete-retention true `
+  --delete-retention-days 30 `
+  --enable-container-delete-retention true `
+  --container-delete-retention-days 30
+
+az storage fs create `
+  --account-name $primary `
+  --name $container `
+  --auth-mode login
+
+az storage fs create `
+  --account-name $secondary `
+  --name $container `
+  --auth-mode login
+\end{lstlisting}
+
+    \item \textbf{Attach customer-managed keys and least-privilege roles.} Grant the storage account managed identity access to the Key Vault key, set the account encryption key source to Microsoft Key Vault, and assign data-plane roles only to ingestion and operations identities. In production, use groups or managed identities rather than individual users.
+
+    \item \textbf{Apply lifecycle management.} Save the following as \texttt{capstone-lifecycle.json}. Review the prefix carefully before applying it to production.
+\begin{lstlisting}[language=json,caption={Lifecycle policy for raw X-ray images and older versions.},label={lst:ch1-capstone-lifecycle-json}]
+{
+  "rules": [
+    {
+      "enabled": true,
+      "name": "xray-hot-cool-archive",
+      "type": "Lifecycle",
+      "definition": {
+        "filters": {
+          "blobTypes": ["blockBlob"],
+          "prefixMatch": ["xray-raw/dicom/"]
+        },
+        "actions": {
+          "baseBlob": {
+            "tierToCool": {
+              "daysAfterModificationGreaterThan": 30
+            },
+            "tierToArchive": {
+              "daysAfterModificationGreaterThan": 180
+            }
+          },
+          "version": {
+            "tierToCool": {
+              "daysAfterCreationGreaterThan": 30
+            },
+            "delete": {
+              "daysAfterCreationGreaterThan": 365
+            }
+          }
+        }
+      }
+    }
+  ]
+}
+\end{lstlisting}
+
+\begin{lstlisting}[language=bash,caption={Applying lifecycle, immutable retention, legal hold, and object replication.},label={lst:ch1-capstone-policy-cli}]
+az storage account management-policy create `
+  --account-name $primary `
+  --resource-group $rg `
+  --policy .\capstone-lifecycle.json
+
+az storage container immutability-policy create `
+  --account-name $primary `
+  --container-name $container `
+  --period 2555 `
+  --allow-protected-append-writes true `
+  --auth-mode login
+
+az storage container legal-hold set `
+  --account-name $primary `
+  --container-name $container `
+  --tags "regulatory-review" `
+  --auth-mode login
+
+az storage account or-policy create `
+  --resource-group $rg `
+  --account-name $secondary `
+  --source-account $primary `
+  --destination-account $secondary `
+  --rules .\object-replication-rules.json
+\end{lstlisting}
+
+    \item \textbf{Ingest and verify a sample image manifest.} Use a non-production sample file, never real protected health information. The snippet writes one DICOM placeholder and verifies length and metadata through the ADLS Gen2 endpoint.
+\begin{lstlisting}[language=Python,caption={Ingesting and verifying a sample object with azure-storage-file-datalake.},label={lst:ch1-capstone-python-ingest}]
+from azure.identity import DefaultAzureCredential
+from azure.storage.filedatalake import DataLakeServiceClient
+
+account_name = "stmedimgprimary001"
+file_system_name = "xray-raw"
+path = "dicom/facility=denver/year=2026/month=07/image-0001.dcm"
+payload = b"DICOM-SAMPLE-PLACEHOLDER\n"
+
+credential = DefaultAzureCredential()
+service = DataLakeServiceClient(
+    account_url=f"https://{account_name}.dfs.core.windows.net",
+    credential=credential,
+)
+
+file_system = service.get_file_system_client(file_system_name)
+directory_name, file_name = path.rsplit("/", 1)
+directory = file_system.get_directory_client(directory_name)
+directory.create_directory()
+
+file_client = directory.create_file(file_name)
+file_client.append_data(payload, offset=0, length=len(payload))
+file_client.flush_data(len(payload))
+file_client.set_metadata({
+    "classification": "phi",
+    "modality": "xray",
+    "retention": "worm",
+})
+
+properties = file_client.get_file_properties()
+assert properties.size == len(payload)
+assert properties.metadata["classification"] == "phi"
+print(f"verified {path} with {properties.size} bytes")
+\end{lstlisting}
+
+    \item \textbf{Record validation evidence.} Capture account configuration, lifecycle policy, versioning, soft delete settings, immutability policy state, role assignments, and a DR test note. Evidence is a required deliverable, not optional paperwork.
+\end{enumerate}
+
+\subsection*{Deliverables}
+Submit the following artifacts.
+\begin{itemize}
+    \item A one-page architecture diagram showing primary region, secondary region, GZRS, ADLS Gen2, Key Vault, lifecycle tiers, and object replication.
+    \item Azure CLI or infrastructure-as-code snippets that create the storage accounts, enable hierarchical namespace, configure soft delete and versioning, and apply lifecycle management.
+    \item A short ADR explaining why ADLS Gen2, GZRS, immutable storage, customer-managed keys, and object replication were selected.
+    \item A sample ingestion script or AzCopy command plus verification output.
+    \item A retention and restore runbook covering overwrite recovery, blob deletion recovery, container deletion recovery, legal hold release, archive rehydration, and regional outage response.
+    \item A cost note estimating how much of the 10 PB archive remains Hot, Cool, and Archive during normal operations.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item The account design uses ADLS Gen2 with hierarchical namespace enabled and does not rely on a flat namespace for analytics paths.
+    \item Redundancy is explicitly set to GZRS or the ADR documents why a stricter data-residency rule prevents GZRS.
+    \item Lifecycle policy transitions the intended X-ray prefix from Hot to Cool to Archive and has a separate rule for previous versions.
+    \item Blob versioning, blob soft delete, and container soft delete are enabled and each restore scenario is explained.
+    \item Immutable storage includes time-based retention and legal hold procedures for WORM requirements.
+    \item Object replication policy or production-ready policy draft maps the primary X-ray container to a secondary-region account.
+    \item Encryption uses customer-managed keys in Key Vault and includes ownership for rotation, monitoring, and emergency access.
+    \item RBAC and ACL assignments are least-privilege and avoid shared keys for normal ingestion.
+    \item Evidence is reproducible: another engineer can run the commands in a sandbox after changing only names and IDs.
+    \item The DR runbook distinguishes storage replication from full application recovery and states RPO, RTO, and failover authority.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Build a lifecycle cost model for 10 PB that compares all-Hot storage with a Hot, Cool, and Archive distribution over three years.
+    \item Add Microsoft Purview scanning and classification for the raw and curated containers, including evidence that protected health information is tagged.
+    \item Add private endpoints, private DNS validation, storage firewall rules, and a network diagram showing how ingestion avoids public internet exposure.
+    \item Use Azure Policy to audit storage accounts that lack hierarchical namespace, CMK encryption, soft delete, or public access restrictions.
+    \item Add monitoring alerts for lifecycle failures, replication lag, key access failures, denied data-plane operations, and sudden version-count growth.
+    \item Prototype archive rehydration into a controlled restore prefix and measure the operational steps required before clinicians or auditors can read restored images.
+\end{itemize}

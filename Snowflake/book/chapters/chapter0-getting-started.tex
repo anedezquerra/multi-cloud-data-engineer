@@ -1,0 +1,475 @@
+\chapter{Getting Started: Your Snowflake Free Trial and Environment}
+\index{Snowflake!free trial}\index{Snowsight}\index{ACCOUNTADMIN}\index{Resource Monitor}\index{virtual warehouse}\index{PowerShell}\index{least privilege}%
+\begin{objectives}
+\begin{itemize}
+    \item Create a Snowflake free trial account with the right edition, cloud provider, region, and account identifier.
+    \item Navigate Snowsight worksheets, account menus, roles, databases, warehouses, and query history.
+    \item Separate administration from development by using least-privilege roles and by protecting \texttt{ACCOUNTADMIN} with MFA.
+    \item Provision a small virtual warehouse, database, schema, role, and user for hands-on labs.
+    \item Connect from Windows PowerShell by using SnowSQL, the Python connector, or Snowpark.
+    \item Apply cost guardrails with auto-suspend, resource monitors, and usage checks before running Chapter 1 labs.
+    \item Verify the environment with a tiny end-to-end table exercise that can be safely dropped.
+\end{itemize}
+\end{objectives}
+
+\begin{keyterms}
+\textbf{Snowsight}: Snowflake's browser-based user interface for worksheets, administration, monitoring, and data exploration.\quad
+\textbf{Account identifier}: the locator or organization-account name used to route clients to a Snowflake account.\quad
+\textbf{Role}: a Snowflake security principal that receives privileges and is assigned to users or other roles.\quad
+\textbf{Virtual warehouse}: an elastic compute cluster that consumes credits while running queries.\quad
+\textbf{Resource Monitor}: a quota object that alerts or suspends warehouses when credit usage crosses thresholds.
+\end{keyterms}
+
+\begin{crosscloud}
+Before opening a Snowflake trial, orient the setup steps against the three clouds on which Snowflake can run. The cloud choice affects physical region, networking, data residency, and future integrations, even though most SQL in this book is identical after the account is created.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{2.9cm}p{3.0cm}p{3.0cm}p{3.0cm}@{}}
+\toprule
+\textbf{Setup step} & \textbf{AWS} & \textbf{Azure} & \textbf{GCP} \\
+\midrule
+Free offer & Free Tier (12 mo + always free) & Free account (\$200/30 days + always free) & Free trial (\$300/90 days + Always Free) \\
+Sign-up guard & Card + root email & Card + Microsoft account & Card + Google account \\
+Identity model & IAM / IAM Identity Center & Microsoft Entra ID + RBAC & Cloud IAM \\
+Admin isolation & Never use root daily & Avoid Global Admin daily & Avoid Owner; least privilege \\
+CLI & AWS CLI v2 (\texttt{aws configure}) & Azure CLI (\texttt{az login}) & gcloud CLI (\texttt{gcloud init}) \\
+Browser shell & AWS CloudShell & Azure Cloud Shell & Cloud Shell \\
+Cost guardrail & AWS Budgets + alerts & Cost Management budgets & Budgets \& alerts \\
+Console & AWS Management Console & Azure Portal & Google Cloud Console \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+THIS book's platform, Snowflake, uses a 30-day/\$400 trial (no card) guarded by Resource Monitors and runs ON one of the three clouds above; by contrast Microsoft Fabric uses a Microsoft 365/Power BI work account plus a Fabric trial capacity (no card, org tenant), and MongoDB Atlas offers a forever-free M0 cluster (no card) secured by database users and an IP allowlist.
+\end{crosscloud}
+
+\section{Why Chapter 0 Exists}
+Snowflake is easy to start and equally easy to misconfigure during a first lab. A new user can click into Snowsight, run a worksheet as \texttt{ACCOUNTADMIN}, create a large warehouse, forget to suspend it, and consume trial credits before learning the architecture. This chapter prevents that outcome. It creates a safe personal training environment that is small, observable, and disposable.
+
+The chapter assumes a Windows workstation and PowerShell. You can complete the core setup entirely in the browser, then optionally connect from PowerShell with SnowSQL or Python. The commands use conservative names so they are easy to recognize in billing and query history:
+\begin{itemize}
+    \item \texttt{DE\_LEARNER\_ROLE} for hands-on work.
+    \item \texttt{DE\_TRAINING\_USER} for a non-admin learner identity.
+    \item \texttt{DE\_TRAINING\_WH} for the extra-small warehouse.
+    \item \texttt{SNOWFLAKE\_DE\_BOOK} for the book database.
+\end{itemize}
+
+\begin{notebox}
+If your organization has already provided a managed Snowflake account, do not create a personal trial for company data. Use the organization's identity, networking, tagging, and cost-governance process. The free trial path is for personal training, workshops, and isolated experimentation.
+\end{notebox}
+
+\section{Creating a Snowflake Free Trial}
+\index{Snowflake!trial}\index{edition}\index{cloud provider}\index{region}\index{account identifier}
+Open the Snowflake free trial sign-up page in a browser and use an email address that you can access immediately. Snowflake trials commonly do not require a credit card, which makes them suitable for training. The offer is time-limited and credit-limited: plan on a 30-day trial with approximately \$400 in Snowflake credits. The exact commercial terms shown on the sign-up page are authoritative, but the operational implication is stable: you have enough capacity for small labs, not enough for careless large warehouses.
+
+\subsection{Sign-Up Fields}
+The trial flow asks for identity and account information. Use a real email address, your name, country or region, company or training organization if requested, and a strong password. After submitting the form, confirm the email message from Snowflake. The activation link opens the new account in Snowsight.
+
+Snowflake then asks for three choices that matter later.
+\begin{enumerate}
+    \item \textbf{Edition.} Choose \textbf{Enterprise} for the trial unless your instructor says otherwise. Standard is enough for basic SQL, but Enterprise exposes features that appear in real data-engineering environments. Business Critical adds stronger compliance and data-protection features but is rarely needed for a personal learning account.
+    \item \textbf{Cloud provider.} Choose AWS, Azure, or Google Cloud based on your target ecosystem. If you work mostly with Azure Data Lake, choose Azure. If your data pipelines use S3, choose AWS. If your future workloads use BigQuery-adjacent or Google Cloud services, choose GCP.
+    \item \textbf{Region.} Choose the nearest region that also matches future data-residency expectations. Region affects latency, cross-cloud data movement, available features, marketplace availability, and later private networking decisions.
+\end{enumerate}
+
+\begin{tipbox}
+For a personal learning account, choose the cloud and region you expect to use professionally. For team training, choose one shared target cloud and region so screenshots, account identifiers, and integration examples remain consistent.
+\end{tipbox}
+
+\subsection{Understanding the Account URL and Identifier}
+After activation, Snowflake displays a URL similar to one of these forms:
+\begin{itemize}
+    \item \texttt{https://<organization>-<account>.snowflakecomputing.com}
+    \item \texttt{https://<account\_locator>.<region>.<cloud>.snowflakecomputing.com}
+\end{itemize}
+For client tools, the account identifier is usually either the organization-account name or the account locator plus cloud-region suffix. In Snowsight, open the account menu and look for account details. Record the following values in a private notes file or password manager, not in source code:
+\begin{itemize}
+    \item Account URL.
+    \item Account identifier for connectors.
+    \item Initial administrator username.
+    \item Cloud provider and region.
+    \item Trial start date and expected expiration date.
+\end{itemize}
+
+\begin{pitfall}
+\textbf{Confusing the URL with the connector account value.} Python, SnowSQL, and JDBC often need the account identifier, not the full browser URL. If a connector fails before authentication, verify the account value and region suffix before resetting passwords.
+\end{pitfall}
+
+\section{Snowsight Orientation}
+\index{Snowsight!worksheets}\index{worksheet}\index{role switching}\index{query history}
+Snowsight is Snowflake's modern web interface. It is the fastest place to begin because it requires no local installation. You will use it to create worksheets, run SQL, switch roles, inspect warehouses, review query history, monitor usage, and manage security.
+
+\subsection{The Home and Navigation Areas}
+The left navigation changes as Snowflake evolves, but the core destinations are stable.
+\begin{itemize}
+    \item \textbf{Worksheets} are SQL editors with a selected role, warehouse, database, and schema.
+    \item \textbf{Data} shows databases, schemas, tables, stages, views, and shared data.
+    \item \textbf{Admin} contains users, roles, warehouses, resource monitors, account settings, billing, and usage features depending on your privileges.
+    \item \textbf{Monitoring} or \textbf{Activity} surfaces query history, warehouse load, task history, and usage views.
+\end{itemize}
+
+Open a new worksheet and examine the context selector. A worksheet does not run in a vacuum. It runs as a role and usually uses a warehouse. If the role lacks privileges or the warehouse is suspended without auto-resume, a query may fail even though the SQL text is valid.
+
+\subsection{Switching Roles}
+\index{USE ROLE}
+Snowflake access is role-based. The active role decides which objects you can see and which operations you can perform. In a worksheet, you can switch with the role selector or with SQL:
+\begin{lstlisting}[language=SQL,caption={Checking and switching role context in a worksheet.},label={lst:chapter0-role-context}]
+SELECT CURRENT_USER(), CURRENT_ROLE(), CURRENT_WAREHOUSE();
+
+USE ROLE SYSADMIN;
+SELECT CURRENT_ROLE();
+
+USE ROLE ACCOUNTADMIN;
+SELECT CURRENT_ROLE();
+\end{lstlisting}
+
+The point is not to stay as \texttt{ACCOUNTADMIN}. The point is to understand which hat you are wearing before running DDL. In later labs, most database and warehouse objects should be owned by \texttt{SYSADMIN} or by a delegated training role, not by the all-powerful account role.
+
+\begin{notebox}
+Snowsight worksheets remember context. Before running copied SQL, always check the context bar or run \texttt{SELECT CURRENT\_ROLE(), CURRENT\_WAREHOUSE();}. Many setup errors are simply role-context errors.
+\end{notebox}
+
+\section{Security and Roles}
+\index{role hierarchy}\index{least privilege}\index{MFA}\index{ACCOUNTADMIN}\index{SECURITYADMIN}\index{SYSADMIN}\index{USERADMIN}\index{PUBLIC}
+Snowflake privileges are assigned to roles. Roles can be granted to users and to other roles, forming a hierarchy. The default system roles provide separation of duties:
+\begin{itemize}
+    \item \texttt{ACCOUNTADMIN}: top-level account administration. It inherits high privilege and can manage critical settings. Use sparingly.
+    \item \texttt{SECURITYADMIN}: security administration, including role and privilege grants.
+    \item \texttt{SYSADMIN}: system object administration, commonly used for warehouses, databases, schemas, and application objects.
+    \item \texttt{USERADMIN}: user and role creation.
+    \item \texttt{PUBLIC}: a role granted to every user. Do not put sensitive object privileges here.
+\end{itemize}
+
+In a small trial, one person may wear every administrative hat. Still, practice the separation now. Use \texttt{ACCOUNTADMIN} for account-level configuration, MFA checks, resource monitors, and other top-level actions. Use \texttt{SECURITYADMIN} or \texttt{USERADMIN} for users and roles. Use \texttt{SYSADMIN} or a lab role for warehouses, databases, schemas, and tables.
+
+\begin{pitfall}
+\textbf{Doing everything as \texttt{ACCOUNTADMIN}.} Objects created by \texttt{ACCOUNTADMIN} become entangled with the highest administrative role. That hides missing grants, makes examples less portable, and teaches a dangerous production habit. Build application objects with a least-privilege role instead.
+\end{pitfall}
+
+\subsection{Enable MFA on the Administrator}
+\index{multi-factor authentication}
+Before creating data objects, protect the administrator identity. In Snowsight, open your profile or security settings and enroll multi-factor authentication for the account administrator user. Use an authenticator application, recovery codes, or the factor types available in your account. Store recovery codes safely. In a production account, enforce MFA and federated identity through organizational policy; in a trial, at least protect \texttt{ACCOUNTADMIN}.
+
+\subsection{Create a Least-Privilege Lab Role and User}
+The following SQL creates a lab role, a user, a warehouse, a database, and a schema. It uses temporary training defaults. Replace the password with a strong value or use a passwordless/federated flow when your environment supports it. Run the security part as an administrative role, then switch to \texttt{SYSADMIN} for object creation.
+
+\begin{lstlisting}[language=SQL,caption={Creating a least-privilege Snowflake training environment.},label={lst:chapter0-security-setup}]
+-- Administrative setup. Run as ACCOUNTADMIN in a new trial.
+USE ROLE ACCOUNTADMIN;
+
+CREATE ROLE IF NOT EXISTS DE_LEARNER_ROLE;
+
+CREATE USER IF NOT EXISTS DE_TRAINING_USER
+  PASSWORD = 'Replace_With_A_Strong_Training_Password_Only'
+  DEFAULT_ROLE = DE_LEARNER_ROLE
+  DEFAULT_WAREHOUSE = DE_TRAINING_WH
+  DEFAULT_NAMESPACE = SNOWFLAKE_DE_BOOK.PUBLIC
+  MUST_CHANGE_PASSWORD = TRUE;
+
+GRANT ROLE DE_LEARNER_ROLE TO USER DE_TRAINING_USER;
+GRANT ROLE DE_LEARNER_ROLE TO ROLE SYSADMIN;
+
+-- Object setup. Use SYSADMIN or another delegated owner role.
+USE ROLE SYSADMIN;
+
+CREATE WAREHOUSE IF NOT EXISTS DE_TRAINING_WH
+  WAREHOUSE_SIZE = 'XSMALL'
+  AUTO_SUSPEND = 60
+  AUTO_RESUME = TRUE
+  INITIALLY_SUSPENDED = TRUE
+  COMMENT = 'Training warehouse for the Snowflake data engineering book';
+
+CREATE DATABASE IF NOT EXISTS SNOWFLAKE_DE_BOOK;
+CREATE SCHEMA IF NOT EXISTS SNOWFLAKE_DE_BOOK.PUBLIC;
+
+GRANT USAGE ON WAREHOUSE DE_TRAINING_WH TO ROLE DE_LEARNER_ROLE;
+GRANT USAGE ON DATABASE SNOWFLAKE_DE_BOOK TO ROLE DE_LEARNER_ROLE;
+GRANT USAGE ON SCHEMA SNOWFLAKE_DE_BOOK.PUBLIC TO ROLE DE_LEARNER_ROLE;
+GRANT CREATE TABLE ON SCHEMA SNOWFLAKE_DE_BOOK.PUBLIC TO ROLE DE_LEARNER_ROLE;
+GRANT CREATE VIEW ON SCHEMA SNOWFLAKE_DE_BOOK.PUBLIC TO ROLE DE_LEARNER_ROLE;
+\end{lstlisting}
+
+This role is intentionally narrow. It can use one warehouse and create objects in one training schema. It cannot administer the account, create users, grant arbitrary privileges, or use every warehouse. That is enough for Chapter 1 and safer than learning as an administrator.
+
+\section{Compute and Tooling}
+\index{virtual warehouse}\index{SnowSQL}\index{Python connector}\index{Snowpark}\index{PowerShell}
+Snowflake charges compute through virtual warehouses. A warehouse has a size, suspend policy, resume policy, and optional scaling configuration. For early labs, use \texttt{XSMALL}. It is large enough for examples and cheap enough to keep mistakes small.
+
+\subsection{Warehouse Defaults}
+The setup SQL already created \texttt{DE\_TRAINING\_WH} with \texttt{AUTO\_SUSPEND = 60}, \texttt{AUTO\_RESUME = TRUE}, and \texttt{INITIALLY\_SUSPENDED = TRUE}. Those settings mean the warehouse starts only when needed and suspends after roughly one idle minute. When you finish a lab, you can explicitly suspend it:
+\begin{lstlisting}[language=SQL,caption={Setting and suspending the default training warehouse.},label={lst:chapter0-warehouse-context}]
+USE ROLE DE_LEARNER_ROLE;
+USE WAREHOUSE DE_TRAINING_WH;
+USE DATABASE SNOWFLAKE_DE_BOOK;
+USE SCHEMA PUBLIC;
+
+SELECT CURRENT_ROLE(), CURRENT_WAREHOUSE(), CURRENT_DATABASE(), CURRENT_SCHEMA();
+
+ALTER WAREHOUSE DE_TRAINING_WH SUSPEND;
+\end{lstlisting}
+
+\subsection{Installing SnowSQL on Windows}
+SnowSQL is Snowflake's command-line SQL client. In a Windows environment, download the Windows installer from Snowflake documentation or the Snowsight help area, install it, then open a new PowerShell window. Verify the executable:
+\begin{lstlisting}[language={},caption={Verifying SnowSQL from Windows PowerShell.},label={lst:chapter0-snowsql-powershell}]
+snowsql -v
+\end{lstlisting}
+
+SnowSQL can read connection profiles from the user configuration file. Use a profile instead of typing passwords into scripts. The exact path can vary by installation, but Windows commonly stores user configuration under the user profile. Keep the file out of Git repositories. A minimal profile contains account, user, role, warehouse, database, and schema values. Prefer an authenticator flow or secure password handling supported by your organization.
+
+\begin{tipbox}
+In PowerShell, use environment variables for short-lived connector tests and a secrets manager for real automation. Never paste passwords into a shared transcript, notebook, Git repository, issue, or build log.
+\end{tipbox}
+
+\subsection{Python Connector from PowerShell}
+\index{snowflake-connector-python}
+Python is often more convenient than SnowSQL for repeatable validation, metadata collection, and future DataOps scripts. Create a virtual environment in your project folder, install the connector, and set environment variables in the same PowerShell session.
+
+\begin{lstlisting}[language={},caption={Installing the Python connector in Windows PowerShell.},label={lst:chapter0-python-install}]
+py -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+python -m pip install snowflake-connector-python
+
+$env:SNOWFLAKE_ACCOUNT = "your_account_identifier"
+$env:SNOWFLAKE_USER = "DE_TRAINING_USER"
+$env:SNOWFLAKE_PASSWORD = "your_password"
+\end{lstlisting}
+
+The following Python script connects, selects the lab context, and runs a small query. It deliberately reads credentials from environment variables. The account value should be the account identifier, not the full URL.
+
+\begin{lstlisting}[language=Python,caption={Connecting to Snowflake with the Python connector and running a query.},label={lst:chapter0-python-query}]
+import os
+
+import snowflake.connector
+
+connection = snowflake.connector.connect(
+    account=os.environ["SNOWFLAKE_ACCOUNT"],
+    user=os.environ["SNOWFLAKE_USER"],
+    password=os.environ["SNOWFLAKE_PASSWORD"],
+    role="DE_LEARNER_ROLE",
+    warehouse="DE_TRAINING_WH",
+    database="SNOWFLAKE_DE_BOOK",
+    schema="PUBLIC",
+)
+
+try:
+    with connection.cursor() as cursor:
+        cursor.execute("""
+            SELECT
+                CURRENT_VERSION() AS version,
+                CURRENT_ROLE() AS role_name,
+                CURRENT_WAREHOUSE() AS warehouse_name
+        """)
+        for row in cursor.fetchall():
+            print(row)
+finally:
+    connection.close()
+\end{lstlisting}
+
+Snowpark Python uses a different programming model but the same account, role, warehouse, database, and schema concepts \cite{snowflakeSnowparkPythonDocs}. Start with the connector for this chapter because the goal is setup verification, not distributed DataFrame processing.
+
+\section{Cost Guardrails for a Credit Trial}
+\index{cost guardrails}\index{credits}\index{Resource Monitor}\index{auto-suspend}\index{usage monitoring}
+Snowflake trial credits are not dollars in a bank account. Snowflake consumes credits based on warehouse size, runtime, and certain cloud services or managed features. The trial advertises a dollar-equivalent amount, but your day-to-day control lever is credit usage. A small warehouse with short auto-suspend is forgiving. A large warehouse left running is not.
+
+\subsection{Credit Habits}
+Adopt these habits before running any generated-data lab:
+\begin{itemize}
+    \item Keep training warehouses at \texttt{XSMALL} unless a lab explicitly requires more.
+    \item Use \texttt{AUTO\_SUSPEND = 60} or similarly low idle windows for interactive learning.
+    \item Leave \texttt{AUTO\_RESUME = TRUE} so small queries work without manual starts.
+    \item Suspend warehouses at the end of each session.
+    \item Check warehouse activity and usage in Snowsight after every significant lab.
+    \item Avoid creating multiple warehouses until you understand which workload needs isolation.
+\end{itemize}
+
+\begin{tipbox}
+\textbf{Measure it.} After every lab, open query history and warehouse usage. Record which statement consumed the most time, which warehouse ran, and whether auto-suspend stopped it. Cost intuition comes from measured usage, not from guessing.
+\end{tipbox}
+
+\subsection{Create a Resource Monitor}
+A Resource Monitor tracks credit usage and can notify or suspend assigned warehouses at thresholds. The following example assigns a small quota to the training warehouse. In a trial, choose a quota that leaves room for later chapters. The exact value below is intentionally conservative and can be adjusted by the instructor.
+
+\begin{lstlisting}[language=SQL,caption={Creating a resource monitor that suspends the training warehouse.},label={lst:chapter0-resource-monitor}]
+USE ROLE ACCOUNTADMIN;
+
+CREATE OR REPLACE RESOURCE MONITOR DE_TRAINING_RM
+  WITH CREDIT_QUOTA = 20
+  FREQUENCY = MONTHLY
+  START_TIMESTAMP = IMMEDIATELY
+  TRIGGERS
+    ON 50 PERCENT DO NOTIFY
+    ON 80 PERCENT DO NOTIFY
+    ON 100 PERCENT DO SUSPEND;
+
+ALTER WAREHOUSE DE_TRAINING_WH
+  SET RESOURCE_MONITOR = DE_TRAINING_RM;
+
+SHOW RESOURCE MONITORS LIKE 'DE_TRAINING_RM';
+\end{lstlisting}
+
+\begin{pitfall}
+\textbf{Relying only on the monthly trial limit.} The free trial stops eventually, but that is a last-resort boundary. A resource monitor tied to the training warehouse gives earlier feedback and can suspend compute before a lab mistake consumes most of the trial.
+\end{pitfall}
+
+\subsection{Monitor Usage in Snowsight}
+In Snowsight, inspect warehouse load, query history, and usage or billing pages available to your role. Look for these questions:
+\begin{enumerate}
+    \item Which warehouse consumed credits?
+    \item Did it auto-suspend after the worksheet became idle?
+    \item Which query ran longest?
+    \item Did any query use a different role or warehouse than expected?
+    \item Is the Resource Monitor approaching a notify threshold?
+\end{enumerate}
+
+For a training account, the correct answer after this chapter should be boring: one extra-small warehouse, short bursts of activity, and no unexpected always-on compute.
+
+\section{Setup Flow}
+The complete environment path is short but important. Create the trial, open Snowsight, secure administration, create least-privilege objects, attach cost controls, then verify with a tiny table.
+
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[
+        setupstep/.style={rectangle, rounded corners, draw=primary, thick, fill=primary!5, text width=2.35cm, minimum height=1.2cm, align=center, font=\scriptsize\bfseries},
+        guard/.style={rectangle, rounded corners, draw=red!60!black, thick, fill=red!7, text width=2.45cm, minimum height=1.2cm, align=center, font=\scriptsize\bfseries},
+        arrow/.style={draw, thick, -Latex, draw=primary}
+    ]
+        \node[setupstep] (trial) at (0, 0) {Create trial\\Enterprise\\cloud + region};
+        \node[setupstep] (ui) at (3.0, 0) {Open Snowsight\\record account ID};
+        \node[guard] (roles) at (6.0, 0) {Secure roles\\MFA\\least privilege};
+        \node[setupstep] (wh) at (9.0, 0) {Create XS\\warehouse\\auto-suspend};
+        \node[guard] (rm) at (12.0, 0) {Attach Resource\\Monitor};
+        \node[setupstep] (verify) at (15.0, 0) {Verify query\\create + drop\\tiny table};
+        \draw[arrow] (trial) -- (ui);
+        \draw[arrow] (ui) -- (roles);
+        \draw[arrow] (roles) -- (wh);
+        \draw[arrow] (wh) -- (rm);
+        \draw[arrow] (rm) -- (verify);
+    \end{tikzpicture}%
+    }
+    \caption{A safe Snowflake learning setup moves from trial creation to security, compute, cost controls, and verification.}
+    \label{fig:chapter0-setup-flow}
+\end{figure}
+
+\section{Verify the Setup}
+\index{verification}\index{CURRENT\_VERSION}\index{CURRENT\_ROLE}\index{CURRENT\_WAREHOUSE}
+Verification should prove four things: authentication works, the active role is not \texttt{ACCOUNTADMIN}, the warehouse can resume, and the role can create and query a tiny object in the training schema.
+
+\subsection{Context Check}
+Run this in a Snowsight worksheet as \texttt{DE\_LEARNER\_ROLE}.
+\begin{lstlisting}[language=SQL,caption={Verifying Snowflake version, role, and warehouse context.},label={lst:chapter0-context-check}]
+USE ROLE DE_LEARNER_ROLE;
+USE WAREHOUSE DE_TRAINING_WH;
+USE DATABASE SNOWFLAKE_DE_BOOK;
+USE SCHEMA PUBLIC;
+
+SELECT
+    CURRENT_VERSION() AS snowflake_version,
+    CURRENT_ROLE() AS active_role,
+    CURRENT_WAREHOUSE() AS active_warehouse;
+\end{lstlisting}
+
+Expected shape:
+\begin{lstlisting}[language={},caption={Expected verification output shape.},label={lst:chapter0-context-output}]
+SNOWFLAKE_VERSION | ACTIVE_ROLE     | ACTIVE_WAREHOUSE
+------------------+-----------------+-----------------
+<current version> | DE_LEARNER_ROLE | DE_TRAINING_WH
+\end{lstlisting}
+
+\subsection{Create, Query, and Drop a Tiny Table}
+The final test creates a small table, inserts three rows, reads them, then drops the table. The cleanup is part of the verification. If the drop fails, stop and inspect privileges before moving on.
+
+\begin{lstlisting}[language=SQL,caption={End-to-end setup verification with a disposable table.},label={lst:chapter0-table-check}]
+CREATE OR REPLACE TABLE CHAPTER0_SETUP_CHECK (
+    check_id NUMBER,
+    check_name VARCHAR,
+    created_at TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
+);
+
+INSERT INTO CHAPTER0_SETUP_CHECK (check_id, check_name)
+VALUES
+    (1, 'role works'),
+    (2, 'warehouse works'),
+    (3, 'table lifecycle works');
+
+SELECT
+    check_id,
+    check_name
+FROM CHAPTER0_SETUP_CHECK
+ORDER BY check_id;
+
+DROP TABLE CHAPTER0_SETUP_CHECK;
+
+ALTER WAREHOUSE DE_TRAINING_WH SUSPEND;
+\end{lstlisting}
+
+Expected rows:
+\begin{lstlisting}[language={},caption={Expected rows from the disposable setup check.},label={lst:chapter0-table-output}]
+CHECK_ID | CHECK_NAME
+---------+----------------------
+1        | role works
+2        | warehouse works
+3        | table lifecycle works
+\end{lstlisting}
+
+\begin{definitionbox}
+The setup is ready for Chapter 1 when a non-admin role can run \texttt{SELECT CURRENT\_VERSION(), CURRENT\_ROLE(), CURRENT\_WAREHOUSE();}, create and drop a tiny table, and the training warehouse is protected by auto-suspend plus a Resource Monitor.
+\end{definitionbox}
+
+\section{Troubleshooting First-Run Problems}
+\index{troubleshooting}\index{permissions}\index{connector errors}
+\subsection{Role or Privilege Errors}
+If Snowflake reports that an object does not exist or you are not authorized, first check context. A missing table and a missing privilege can look similar from a restricted role. Run:
+\begin{lstlisting}[language=SQL,caption={Inspecting current execution context.},label={lst:chapter0-troubleshooting-context}]
+SELECT
+    CURRENT_USER(),
+    CURRENT_ROLE(),
+    CURRENT_WAREHOUSE(),
+    CURRENT_DATABASE(),
+    CURRENT_SCHEMA();
+\end{lstlisting}
+Then confirm the grants from an administrative worksheet. Do not solve every privilege issue by switching back to \texttt{ACCOUNTADMIN}; fix the grant or context so the lab role works correctly.
+
+\subsection{Warehouse Is Not Running}
+If a query says no active warehouse is selected, run \texttt{USE WAREHOUSE DE\_TRAINING\_WH;}. If a query waits while the warehouse resumes, that is normal. If the warehouse cannot resume, check the Resource Monitor and whether the role has \texttt{USAGE} on the warehouse.
+
+\subsection{Python Cannot Connect}
+Most first connector failures are one of four issues: wrong account identifier, wrong username, password or MFA flow mismatch, or network restrictions. Print only non-secret diagnostic values:
+\begin{lstlisting}[language=Python,caption={Safe connector diagnostics that avoid printing secrets.},label={lst:chapter0-python-diagnostics}]
+import os
+
+print("account set:", bool(os.environ.get("SNOWFLAKE_ACCOUNT")))
+print("user set:", bool(os.environ.get("SNOWFLAKE_USER")))
+print("password set:", bool(os.environ.get("SNOWFLAKE_PASSWORD")))
+\end{lstlisting}
+If the booleans are correct, re-check the account identifier in Snowsight. If authentication reaches Snowflake but fails, use the account's supported authenticator or reset the training user's password from an administrative role.
+
+\section{Further Reading}
+Read Snowflake's introductory architecture documentation for the account, warehouse, and services model \cite{snowflakeArchitectureDocs}. Use the Python connector documentation when automating setup checks from PowerShell or scheduled jobs \cite{snowflakeConnectorPythonDocs}. Review the Snowpark Python guide when you are ready to run Python logic inside Snowflake-managed execution rather than only from a client workstation \cite{snowflakeSnowparkPythonDocs}.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item A Snowflake trial is typically a 30-day, approximately \$400-credit account that does not require a credit card, but it still needs cost discipline.
+    \item Choose Enterprise edition for the trial unless instructed otherwise; choose the cloud provider and region that match your likely professional environment.
+    \item Snowsight worksheets run with a selected role, warehouse, database, and schema; context explains many first-run errors.
+    \item Protect \texttt{ACCOUNTADMIN} with MFA and avoid creating application objects as \texttt{ACCOUNTADMIN}.
+    \item Use a least-privilege training role with one extra-small auto-suspending warehouse and one training database.
+    \item Resource Monitors, low auto-suspend values, and usage review are mandatory habits on a credit trial.
+    \item The environment is ready when a non-admin role can connect, run the context query, create a tiny table, query it, drop it, and suspend the warehouse.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{Setup checklist.} Create the Snowflake trial, select Enterprise edition, choose a cloud provider and region, activate Snowsight, and record the account URL plus account identifier in a private location.
+    \item \textbf{Security checklist.} Enable MFA for the administrator, create \texttt{DE\_LEARNER\_ROLE}, create or configure a non-admin training user, and verify that the user defaults to the lab role and warehouse.
+    \item \textbf{Compute checklist.} Create \texttt{DE\_TRAINING\_WH} as an \texttt{XSMALL} warehouse with \texttt{AUTO\_SUSPEND = 60}, \texttt{AUTO\_RESUME = TRUE}, and \texttt{INITIALLY\_SUSPENDED = TRUE}.
+    \item \textbf{Cost checklist.} Create \texttt{DE\_TRAINING\_RM}, assign it to the training warehouse, and confirm in Snowsight that the monitor exists.
+    \item \textbf{Verification checklist.} Run \texttt{SELECT CURRENT\_VERSION(), CURRENT\_ROLE(), CURRENT\_WAREHOUSE();} as the lab role and confirm that the active role is not \texttt{ACCOUNTADMIN}.
+    \item \textbf{Table lifecycle.} Create, insert into, query, and drop \texttt{CHAPTER0\_SETUP\_CHECK}. Explain which privilege allowed each step.
+    \item \textbf{PowerShell practice.} Install SnowSQL or the Python connector, then run the context query from your Windows terminal without hardcoding credentials in a script.
+    \item \textbf{Cost reflection.} After completing the chapter, open Snowsight usage monitoring. Record whether the warehouse auto-suspended and whether any unexpected warehouse ran.
+    \item \textbf{Role reasoning.} Explain why \texttt{SYSADMIN} or a delegated learner role should own lab databases instead of \texttt{ACCOUNTADMIN}.
+    \item \textbf{Before Chapter 1.} Confirm that the training warehouse is suspended, the disposable setup table is dropped, and you know how to return to the same worksheet context for the architecture lab.
+\end{enumerate}

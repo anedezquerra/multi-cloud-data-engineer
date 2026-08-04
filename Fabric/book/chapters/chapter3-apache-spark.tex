@@ -1,0 +1,649 @@
+\chapter{Apache Spark in Fabric}
+\index{Apache Spark}\index{Microsoft Fabric!Apache Spark}\index{Spark pools}\index{Starter pools}\index{Custom pools}\index{Spark environments}\index{Fabric Notebooks}\index{PySpark}\index{Spark SQL}\index{OneLake!Spark access}\index{Delta Lake!Spark}
+
+\begin{objectives}
+\begin{itemize}
+    \item Explain how Microsoft Fabric provides managed Apache Spark compute through Starter pools and Custom pools.
+    \item Configure Spark environments so notebooks use consistent libraries, runtime versions, and session settings.
+    \item Use Fabric Notebooks to write PySpark that reads and writes files in OneLake.
+    \item Combine PySpark DataFrame logic and Spark SQL in the same notebook for practical lakehouse engineering.
+    \item Build a Bronze-to-Silver transformation that reads raw CSV, removes duplicates, drops invalid null records, and writes Delta tables.
+    \item Design a scalable Spark notebook ingestion layer for telemetry systems that process 100 GB of JSON logs daily.
+    \item Implement a capstone telemetry pipeline from Bronze JSON to cleaned Silver Delta with operational checks.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+Managed Spark exists on every major analytical cloud, but the operating model differs. Fabric hides much of the cluster administration behind pools, lakehouses, environments, and notebooks; other platforms expose more choices around clusters, jobs, and object storage.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{2.9cm}p{3.2cm}p{3.2cm}p{3.2cm}p{3.2cm}@{}}
+\toprule
+\textbf{Concept} & \textbf{Fabric Spark} & \textbf{AWS} & \textbf{Azure} & \textbf{GCP} \\
+\midrule
+Cluster or pool model & Starter pools for fast managed sessions; Custom pools for controlled node family, size, and scale settings & AWS Glue jobs, EMR clusters, and EMR Serverless applications & Synapse Spark pools and Azure Databricks clusters or serverless compute & Dataproc clusters and Dataproc Serverless batches \\
+Autoscaling & Pool-level autoscale and dynamic Spark allocation are managed through Fabric capacity and pool settings & Glue workers scale by job configuration; EMR supports managed scaling; EMR Serverless scales per application & Synapse pools and Databricks support autoscale settings by pool or cluster & Dataproc autoscaling policies and serverless automatic resource allocation \\
+Notebook experience & Fabric Notebooks attach to lakehouses, use Spark sessions, support PySpark, Spark SQL, and collaborative authoring & Glue Studio notebooks, EMR notebooks, SageMaker Studio, or managed Jupyter patterns & Synapse notebooks and Databricks notebooks with rich job integration & Vertex AI Workbench, Dataproc Jupyter, and notebook-connected batches \\
+Delta and lakehouse integration & Native Fabric Lakehouse tables in OneLake use Delta-Parquet and integrate with SQL analytics endpoints and Direct Lake & Delta Lake on S3 through EMR, Glue, or Databricks; catalog integration depends on Glue Data Catalog or Unity Catalog & Delta Lake through Synapse or Databricks on ADLS; strong lakehouse integration in Databricks & Delta Lake on Cloud Storage through Dataproc or Databricks on GCP \\
+Serverless option & Starter pools feel serverless to notebook authors; Fabric capacity still governs consumption & AWS Glue and EMR Serverless & Synapse serverless patterns for SQL, and Databricks serverless where available & Dataproc Serverless for Spark batches \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+Snowflake approaches distributed data engineering through Snowpark rather than a user-managed Spark pool. MongoDB commonly participates through the MongoDB Spark Connector, where Spark reads operational collections and writes curated analytical outputs to a lakehouse or warehouse.
+\end{crosscloud}
+
+\begin{keyterms}
+\textbf{Driver}: the Spark process that plans work and coordinates executors. \quad
+\textbf{Executor}: a worker process that runs tasks and stores shuffle or cached data. \quad
+\textbf{Starter pool}: Fabric-managed Spark compute intended for quick notebook startup and low-friction development. \quad
+\textbf{Custom pool}: a Fabric Spark pool with explicit sizing and scale settings. \quad
+\textbf{Spark environment}: a reusable Fabric item that pins runtime, libraries, and Spark properties.
+\end{keyterms}
+
+\section{Week 3 Roadmap}
+Week~3 moves from storage architecture into distributed processing. Monday introduces Spark compute in Fabric, including Starter pools, Custom pools, and Spark environments. Tuesday focuses on Fabric Notebooks, PySpark basics, and reading or writing files in OneLake. Wednesday adds Spark SQL and shows how to combine SQL cells with PySpark DataFrames in the same notebook. Thursday is a hands-on transformation from raw Bronze CSV to cleaned Silver Delta tables. Friday applies the pattern to a telemetry platform that must process 100 GB of JSON logs every day.
+
+Apache Spark is the distributed execution engine behind many modern lakehouse workloads. It splits large file scans and transformations into tasks, runs them across executors, and writes outputs in formats such as Delta and Parquet. Fabric packages this capability as a managed notebook and lakehouse experience so data engineers can focus on ingestion, validation, and table contracts rather than cluster plumbing \cite{apacheSparkOverview,microsoftFabricSparkCompute}.
+
+\begin{notebox}
+Spark is not required for every Fabric workload. Use it when the data shape, volume, file format, transformation logic, or semi-structured parsing requirement benefits from distributed processing. For small relational transformations, Warehouse SQL or Dataflows Gen2 may be simpler.
+\end{notebox}
+
+\section{Monday: Spark Compute in Fabric}
+\index{Spark pools!Fabric}\index{Starter pools}\index{Custom pools}\index{Spark environments}
+Fabric Spark compute is organized around managed sessions. A notebook requests a Spark session from a pool, the session starts with a runtime and environment, and Spark creates a driver plus executors to process work. The user experience is intentionally simpler than administering open-source clusters, but the engineering decisions still matter: startup latency, concurrency, scale limits, library versions, and capacity consumption.
+
+\begin{definitionbox}
+\textbf{Apache Spark in Fabric} is a managed Spark service for notebooks, lakehouse transformations, machine learning preparation, and file-scale data engineering. Spark sessions run on Fabric capacity, read and write OneLake, and commonly store trusted outputs as Delta tables.
+\end{definitionbox}
+
+\subsection{Starter Pools}
+Starter pools are the fastest way to begin Spark development in Fabric. They are managed for convenience and optimized for quick session startup. A training notebook, exploratory data profiling task, or small Bronze-to-Silver prototype is a good fit when the default runtime and general sizing are enough.
+
+Starter pools reduce friction. New engineers can open a notebook, attach a lakehouse, run a PySpark cell, and inspect results without waiting for a separately administered cluster. The trade-off is control: production workloads may need more explicit sizing, library pinning, and concurrency planning than a starter configuration provides.
+
+\begin{tipbox}
+Use Starter pools while discovering schemas, writing the first notebook cells, and teaching the programming model. Move repeatable production jobs to a controlled pool and environment once workload size, dependencies, and service-level expectations are known.
+\end{tipbox}
+
+\subsection{Custom Pools}
+Custom pools give teams more control over Spark resources. A Custom pool can specify node families, node sizes, autoscale boundaries, and other settings that affect throughput and cost. The goal is not to create the largest possible cluster; the goal is to provide enough parallelism for the workload while keeping predictable capacity consumption.
+
+Custom pools are useful when notebooks become scheduled jobs, when multiple pipelines compete for the same capacity, or when a large transformation repeatedly reads many files. For the telemetry scenario later in this chapter, a Custom pool is easier to reason about because daily data volume, expected duration, and concurrency can be estimated.
+
+\begin{pitfall}
+\textbf{Treating pool size as the only performance lever.} Larger pools may hide inefficient code for a while, but file layout, partition sizing, schema inference, skew, shuffle volume, and Delta write patterns often matter more than raw executor count.
+\end{pitfall}
+
+\subsection{Spark Environments}
+Spark environments package runtime choices, libraries, and Spark properties so notebooks start consistently \cite{microsoftFabricSparkEnvironments}. Without an environment, two notebooks can drift: one may install a library interactively, another may use a different runtime, and a scheduled job may fail because a dependency was not available. Environments make notebook behavior repeatable.
+
+A practical environment should specify only what the workload needs. Common examples include JSON parsing helpers, validation packages approved by the organization, or Spark properties for shuffle partitions. Avoid turning the environment into a dumping ground for every library used by every team.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.0cm}p{4.6cm}p{4.7cm}@{}}
+\toprule
+\textbf{Choice} & \textbf{Best fit} & \textbf{Engineering concern} \\
+\midrule
+Starter pool & Training, exploration, short notebooks, early prototypes & Limited control and less workload-specific sizing \\
+Custom pool & Scheduled transformations, larger files, predictable operations & Requires sizing, autoscale, and capacity planning \\
+Spark environment & Repeatable notebooks and dependency governance & Must be versioned and kept small enough to maintain \\
+\bottomrule
+\end{tabular}
+\caption{Compute choices for Spark development in Fabric.}
+\label{tab:chapter3-compute-choices}
+\end{table}
+
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[
+        pool/.style={rectangle, rounded corners, draw=primary, thick, fill=primary!6, align=center, minimum width=4.0cm, minimum height=1.2cm, font=\small\bfseries},
+        proc/.style={rectangle, rounded corners, draw=codegreen!60!black, thick, fill=green!7, align=center, minimum width=2.8cm, minimum height=1.0cm, font=\small},
+        lake/.style={cylinder, shape border rotate=90, aspect=0.25, draw=primary, thick, fill=backcolour, align=center, minimum width=2.6cm, minimum height=1.35cm, font=\small},
+        arrow/.style={draw, thick, -Latex, draw=primary}
+    ]
+        \node[pool] (notebook) at (0, 0) {Fabric Notebook\\PySpark + SQL};
+        \node[pool] (pool) at (4.6, 0) {Spark Pool\\Starter or Custom};
+        \node[proc] (driver) at (8.7, 0.9) {Driver\\plans jobs};
+        \node[proc] (exec1) at (8.7, -0.45) {Executor 1\\tasks};
+        \node[proc] (exec2) at (12.0, -0.45) {Executor 2\\tasks};
+        \node[lake, fill=brown!12] (bronze) at (15.5, 0.65) {OneLake\\Bronze Files};
+        \node[lake, fill=gray!15] (silver) at (15.5, -1.15) {Lakehouse\\Silver Delta};
+
+        \draw[arrow] (notebook) -- node[above, font=\scriptsize]{requests session} (pool);
+        \draw[arrow] (pool) -- (driver);
+        \draw[arrow] (driver) -- node[right, font=\scriptsize]{coordinates} (exec1);
+        \draw[arrow] (driver) -- (exec2);
+        \draw[arrow] (exec1) -- node[above, font=\scriptsize]{read files} (bronze);
+        \draw[arrow] (exec2) -- (bronze);
+        \draw[arrow] (exec1) -- node[below, font=\scriptsize]{write Delta} (silver);
+        \draw[arrow] (exec2) -- (silver);
+
+        \node[note, text width=12.5cm, align=center] at (8.0, -2.65) {Fabric manages session startup and pool resources, while Spark still uses the standard driver-and-executor execution model over OneLake files and Delta tables.};
+    \end{tikzpicture}%
+    }
+    \caption{Spark driver and executors on a Fabric pool reading OneLake and writing Delta.}
+    \label{fig:chapter3-spark-fabric-execution}
+\end{figure}
+
+\section{Tuesday: Fabric Notebooks and PySpark Basics}
+\index{Fabric Notebooks}\index{PySpark!basics}\index{OneLake!Files}
+Fabric Notebooks are interactive development items for Spark workloads. A notebook can attach to a lakehouse, run PySpark cells, use Spark SQL, display DataFrames, and be scheduled or orchestrated later. The notebook is both a development surface and a repeatable job artifact, so it should be written with production habits even during learning \cite{microsoftFabricNotebooks}.
+
+\subsection{The PySpark DataFrame Model}
+PySpark code usually describes transformations before Spark executes them. Reading a file creates a DataFrame. Selecting columns, casting types, filtering rows, and joining tables create a logical plan. Spark executes the plan when an action such as \texttt{count()}, \texttt{show()}, \texttt{write}, or \texttt{collect()} is called.
+
+This lazy execution model is powerful because Spark can optimize the plan. It can also surprise beginners. A cell that defines ten transformations may appear to succeed even when the source path is wrong; the error appears only when an action triggers a scan.
+
+\begin{definitionbox}
+A \textbf{DataFrame} is a distributed table-like abstraction with named columns and a schema. In PySpark, DataFrames are transformed with methods such as \texttt{select}, \texttt{where}, \texttt{groupBy}, and \texttt{join}; Spark translates those operations into distributed execution.
+\end{definitionbox}
+
+\subsection{Reading Files from OneLake}
+A Fabric notebook attached to a lakehouse can read relative paths under \texttt{Files/}. For example, raw CSV might live under \texttt{Files/bronze/raw\_csv/orders/}, and raw JSON telemetry might live under \texttt{Files/bronze/raw\_json/telemetry/}. In production, use explicit path conventions, avoid hardcoded personal workspace names, and validate that files exist before starting expensive transformations.
+
+\begin{tipbox}
+For CSV, specify whether headers exist and decide whether schema inference is acceptable. For large or scheduled jobs, prefer explicit schemas so a single malformed file cannot silently change column types.
+\end{tipbox}
+
+\subsection{Writing Delta Tables}
+Fabric lakehouse tables are commonly written as Delta tables. A DataFrame write using \texttt{format("delta")} and \texttt{saveAsTable(...)} creates a table that can be read by Spark and exposed through the lakehouse experience. Delta transactions provide a safer table abstraction than unmanaged folders because readers see consistent versions and writers record metadata in the transaction log \cite{armbrust2020delta,deltaLakeDocs}.
+
+\begin{pitfall}
+\textbf{Using overwrite casually.} \texttt{mode("overwrite")} is convenient in labs, but production jobs should specify overwrite scope carefully, preserve history when required, and avoid replacing an entire table because one daily batch arrived late.
+\end{pitfall}
+
+\section{Wednesday: Spark SQL and Hybrid Notebooks}
+\index{Spark SQL}\index{PySpark!Spark SQL integration}\index{temporary views}
+Spark SQL lets engineers express transformations in SQL while Spark executes them on the same distributed engine. In Fabric notebooks, a team can use PySpark for file parsing and schema logic, then use SQL for validation queries, aggregates, or analyst-friendly transformations. This hybrid style is practical because data engineering teams often include both Python-first and SQL-first contributors.
+
+\subsection{Temporary Views}
+A PySpark DataFrame can be registered as a temporary view with \texttt{createOrReplaceTempView}. After that, Spark SQL can query it in the same session. Temporary views are not durable lakehouse tables; they are session-scoped names that help organize notebook logic.
+
+\begin{notebox}
+Use temporary views to bridge cells, not as production storage. Durable outputs should be written as Delta tables with clear names, owners, and refresh expectations.
+\end{notebox}
+
+\subsection{Choosing DataFrame or SQL Syntax}
+DataFrame syntax works well when logic is programmatic: dynamic column lists, loops over quality rules, reusable functions, or complex parsing. SQL syntax works well for joins, aggregates, window functions, and validation queries that analysts can read. Both compile to Spark plans, so the choice is often about maintainability.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.3cm}p{4.8cm}p{4.8cm}@{}}
+\toprule
+\textbf{Need} & \textbf{Prefer PySpark} & \textbf{Prefer Spark SQL} \\
+\midrule
+File parsing & Explicit schemas, file metadata, dynamic paths & Simple external table queries after files are tabled \\
+Data quality & Programmatic checks across many columns & Clear count and exception queries \\
+Aggregations & Reusable functions and conditional expressions & Grouping, joins, and window calculations readable by analysts \\
+Notebook collaboration & Python-first engineering team & SQL-first analytics team \\
+\bottomrule
+\end{tabular}
+\caption{Choosing PySpark or Spark SQL inside Fabric notebooks.}
+\label{tab:chapter3-pyspark-sql-choice}
+\end{table}
+
+\section{Thursday: Hands-on Project}
+\index{hands-on lab}\index{Bronze layer!CSV}\index{Silver layer!Delta}\index{PySpark!deduplication}\index{null handling}
+The Week~3 lab implements a small but production-shaped Silver transformation. A raw CSV arrives in the Bronze Lakehouse. The notebook reads the file, captures ingestion metadata, removes duplicate business keys, drops rows missing required fields, and writes the accepted records to the Silver Lakehouse as a Delta table. The same notebook then mixes PySpark with Spark SQL for validation and summary checks.
+
+\subsection{Goal and Architecture}
+Create or reuse a workspace named \texttt{fabric-de-week03}. Add lakehouses named \texttt{lh\_bronze} and \texttt{lh\_silver}. Upload raw CSV files to \texttt{lh\_bronze} under \texttt{Files/bronze/raw\_csv/telemetry\_devices/}. Create a notebook named \texttt{nb\_week03\_spark\_csv\_to\_silver} and attach the required lakehouses.
+
+\begin{notebox}
+If your tenant permits only one default lakehouse per notebook, first run the lab in one lakehouse with explicit layer prefixes. Then repeat in a multi-lakehouse setup when attachments and shortcuts are available.
+\end{notebox}
+
+\subsection{Step-by-Step Actions}
+\begin{enumerate}
+    \item Create \texttt{fabric-de-week03}, \texttt{lh\_bronze}, and \texttt{lh\_silver} if they do not already exist.
+    \item In Bronze, create \texttt{Files/bronze/raw\_csv/telemetry\_devices/} and upload a CSV with columns such as \texttt{event\_id}, \texttt{device\_id}, \texttt{event\_timestamp}, \texttt{temperature\_c}, \texttt{status}, and \texttt{source\_system}.
+    \item Create a notebook attached to the Bronze and Silver lakehouses, or attach one lakehouse and adjust paths for your training tenant.
+    \item Run the PySpark transformation in \cref{lst:chapter3-bronze-csv-silver-delta}.
+    \item Run the hybrid Spark SQL validation in \cref{lst:chapter3-hybrid-spark-sql}.
+    \item Confirm that \texttt{silver\_telemetry\_device\_events} appears as a Delta table and that duplicate and null records are excluded.
+\end{enumerate}
+
+\begin{lstlisting}[language=Python,caption={PySpark Bronze CSV to cleaned Silver Delta table.},label={lst:chapter3-bronze-csv-silver-delta}]
+from pyspark.sql import functions as F
+from pyspark.sql.types import StructType, StructField, StringType
+
+raw_schema = StructType([
+    StructField("event_id", StringType(), True),
+    StructField("device_id", StringType(), True),
+    StructField("event_timestamp", StringType(), True),
+    StructField("temperature_c", StringType(), True),
+    StructField("status", StringType(), True),
+    StructField("source_system", StringType(), True),
+])
+
+raw_path = "Files/bronze/raw_csv/telemetry_devices/*.csv"
+
+raw_df = (
+    spark.read
+    .option("header", "true")
+    .schema(raw_schema)
+    .csv(raw_path)
+)
+
+bronze_with_metadata_df = (
+    raw_df
+    .withColumn("ingested_at", F.current_timestamp())
+    .withColumn("source_file", F.input_file_name())
+)
+
+required_columns = ["event_id", "device_id", "event_timestamp"]
+
+silver_df = (
+    bronze_with_metadata_df
+    .dropDuplicates(["event_id"])
+    .dropna(subset=required_columns)
+    .select(
+        F.col("event_id").cast("string").alias("event_id"),
+        F.col("device_id").cast("string").alias("device_id"),
+        F.to_timestamp("event_timestamp").alias("event_timestamp"),
+        F.to_date("event_timestamp").alias("event_date"),
+        F.col("temperature_c").cast("double").alias("temperature_c"),
+        F.upper(F.col("status")).alias("status"),
+        F.col("source_system").cast("string").alias("source_system"),
+        "ingested_at",
+        "source_file",
+    )
+    .where(F.col("event_timestamp").isNotNull())
+)
+
+silver_df.write.format("delta").mode("overwrite").saveAsTable(
+    "silver_telemetry_device_events"
+)
+\end{lstlisting}
+
+The second listing registers the Silver DataFrame as a temporary view and uses Spark SQL from Python. This is useful when a notebook cell needs to calculate validation metrics or feed a SQL-first aggregate without leaving the PySpark session.
+
+\begin{lstlisting}[language=Python,caption={Mixing Spark SQL with PySpark in the same notebook.},label={lst:chapter3-hybrid-spark-sql}]
+silver_df.createOrReplaceTempView("v_silver_telemetry_device_events")
+
+quality_summary_df = spark.sql("""
+SELECT
+    COUNT(*) AS accepted_rows,
+    COUNT(DISTINCT event_id) AS distinct_events,
+    SUM(CASE WHEN temperature_c IS NULL THEN 1 ELSE 0 END) AS missing_temperature_rows,
+    MIN(event_timestamp) AS first_event_timestamp,
+    MAX(event_timestamp) AS last_event_timestamp
+FROM v_silver_telemetry_device_events
+""")
+
+quality_summary_df.show(truncate=False)
+
+daily_status_df = spark.sql("""
+SELECT
+    event_date,
+    status,
+    COUNT(*) AS event_count,
+    AVG(temperature_c) AS average_temperature_c
+FROM v_silver_telemetry_device_events
+GROUP BY event_date, status
+ORDER BY event_date, status
+""")
+
+daily_status_df.write.format("delta").mode("overwrite").saveAsTable(
+    "silver_telemetry_daily_status_summary"
+)
+\end{lstlisting}
+
+\subsection{Validation Checklist}
+\begin{itemize}
+    \item The notebook uses an explicit schema instead of relying on CSV inference.
+    \item Duplicate \texttt{event\_id} values are removed before the Silver table is written.
+    \item Records with null \texttt{event\_id}, \texttt{device\_id}, or \texttt{event\_timestamp} are excluded from Silver.
+    \item The Silver table is written in Delta format and appears in the lakehouse table list.
+    \item A Spark SQL query validates row counts, distinct keys, and basic time range.
+    \item No secret values, personal workspace identifiers, or real device identifiers are hardcoded in the notebook.
+\end{itemize}
+
+\section{Friday: Use Case and Architecture}
+\index{telemetry ingestion}\index{JSON logs}\index{Spark Notebooks!ingestion}\index{100 GB daily processing}
+A telemetry platform receives approximately 100 GB of JSON logs per day from applications, devices, gateways, and operational services. The raw stream is valuable for debugging and audit, but analytics teams need reliable Silver Delta tables with typed timestamps, normalized severities, required identifiers, and duplicate handling. Spark Notebooks are a strong fit because JSON parsing, nested fields, and large daily files benefit from distributed processing.
+
+\subsection{Architecture Strategy}
+The design lands raw JSON in a Bronze Lakehouse under date-partitioned folders, then runs a scheduled Spark Notebook that reads one processing date, applies an explicit schema, drops malformed or incomplete records, deduplicates event identifiers, and writes Silver Delta partitioned by event date. The pool should be sized from observed throughput, not guessed permanently. Start with a Custom pool for predictable daily processing, measure duration, then tune file sizes, shuffle partitions, and schedule windows.
+
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[
+        src/.style={rectangle, rounded corners, draw=codegray, thick, fill=white, align=center, minimum width=3.0cm, minimum height=1.0cm, font=\small\bfseries},
+        proc/.style={rectangle, rounded corners, draw=primary, thick, fill=primary!7, align=center, minimum width=3.2cm, minimum height=1.05cm, font=\small\bfseries},
+        lake/.style={cylinder, shape border rotate=90, aspect=0.25, draw=primary, thick, fill=backcolour, align=center, minimum width=2.9cm, minimum height=1.35cm, font=\small},
+        arrow/.style={draw, thick, -Latex, draw=primary}
+    ]
+        \node[src] (apps) at (0, 0) {Apps + Devices\\JSON logs};
+        \node[proc] (ingest) at (3.8, 0) {Landing job\\100 GB/day};
+        \node[lake, fill=brown!12] (bronze) at (7.5, 0) {Bronze\\raw JSON};
+        \node[proc] (spark) at (11.4, 0) {Spark Notebook\\parse + clean};
+        \node[lake, fill=gray!15] (silver) at (15.4, 0) {Silver Delta\\typed events};
+        \node[src, fill=green!7, draw=codegreen!60!black] (consume) at (19.1, 0) {Monitoring\\BI + ML};
+
+        \draw[arrow] (apps) -- (ingest);
+        \draw[arrow] (ingest) -- node[above, font=\scriptsize]{date folders} (bronze);
+        \draw[arrow] (bronze) -- node[above, font=\scriptsize]{daily batch} (spark);
+        \draw[arrow] (spark) -- node[above, font=\scriptsize]{Delta write} (silver);
+        \draw[arrow] (silver) -- (consume);
+
+        \node[note, text width=13cm, align=center] at (9.6, -1.7) {The notebook processes one date or batch window at a time so failures can be retried without rewriting unrelated telemetry.};
+    \end{tikzpicture}%
+    }
+    \caption{Spark notebook ingestion pipeline for 100 GB per day of telemetry JSON.}
+    \label{fig:chapter3-telemetry-pipeline}
+\end{figure}
+
+\subsection{Design Decisions}
+Date folders make incremental processing observable. Explicit JSON schemas reduce expensive inference and prevent schema drift from surprising downstream tables. Silver Delta tables provide durable, queryable outputs for BI, alerting, and machine learning features. Quality metrics should be written after every run so operators know how many raw records were accepted, rejected, duplicated, or malformed.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.3cm}p{5.0cm}p{5.0cm}@{}}
+\toprule
+\textbf{Concern} & \textbf{Decision} & \textbf{Reason} \\
+\midrule
+Daily volume & Process by date or batch window & Limits retry scope and supports predictable scheduling \\
+JSON parsing & Use explicit schema with a corrupt-record strategy & Avoids inference cost and captures malformed data \\
+Compute & Use a Custom pool after prototype validation & Provides repeatable sizing and autoscale boundaries \\
+Storage & Write Silver as Delta partitioned by event date & Improves query pruning and table reliability \\
+Operations & Record quality metrics per run & Makes acceptance, rejection, and duplicate rates visible \\
+\bottomrule
+\end{tabular}
+\caption{Design decisions for a 100 GB/day telemetry ingestion layer.}
+\label{tab:chapter3-telemetry-decisions}
+\end{table}
+
+\section{Operational Guidance for Week 3}
+Spark operations should focus on repeatability and evidence. Every scheduled notebook should identify its processing window, input path, output table, pool, environment, and quality metrics. A failed daily load should be retryable without guessing which files were read or which table partitions were overwritten.
+
+\subsection{Performance and Reliability}
+Avoid using \texttt{inferSchema} for large CSV or JSON jobs. Avoid tiny files when possible because thousands of small files can create scheduling overhead. Prefer explicit schemas, partition-aware reads, and deterministic output paths. Monitor duration, executor utilization, data skew, and failed tasks before increasing pool size.
+
+\begin{tipbox}
+Tune with measurements. Capture input bytes, input file count, accepted rows, rejected rows, duplicate count, write duration, and pool used. These numbers make capacity conversations factual.
+\end{tipbox}
+
+\subsection{Security Checklist}
+\begin{itemize}
+    \item Store raw telemetry in Bronze with least-privilege workspace access.
+    \item Remove tokens, secrets, request headers, and unnecessary payload text before Silver publication.
+    \item Do not print full raw JSON records in notebook output.
+    \item Pin required libraries in a Spark environment rather than installing packages interactively in production cells.
+    \item Use parameterized processing dates and avoid hardcoded personal paths.
+    \item Keep Silver Delta tables documented with owner, refresh cadence, schema, and quality expectations.
+\end{itemize}
+
+\section{Interview Q\&A}
+\begin{enumerate}
+    \item \textbf{Q: What is the difference between a Starter pool and a Custom pool in Fabric Spark?}\\
+    A: A Starter pool is optimized for quick, managed notebook startup with minimal configuration. A Custom pool gives teams explicit control over sizing and scale settings for repeatable workloads.
+    \item \textbf{Q: Why are Spark environments important?}\\
+    A: They make notebooks repeatable by pinning runtime choices, libraries, and Spark properties instead of relying on interactive installs or hidden session state.
+    \item \textbf{Q: When should you avoid schema inference?}\\
+    A: Avoid it for large or scheduled jobs because it adds scan cost and can let unexpected files change inferred column types.
+    \item \textbf{Q: How can PySpark and Spark SQL work together?}\\
+    A: PySpark can create a DataFrame and register it as a temporary view; Spark SQL can then query that view in the same session.
+    \item \textbf{Q: Why write Silver outputs as Delta tables?}\\
+    A: Delta tables provide transactional metadata, consistent reads, schema management options, and strong integration with Fabric lakehouses.
+    \item \textbf{Q: What is the safest retry unit for a daily telemetry pipeline?}\\
+    A: A specific processing date or batch window, because the job can reread the same Bronze files and replace only the corresponding Silver output scope.
+\end{enumerate}
+
+\section{Further Reading}
+Review Microsoft documentation for Fabric Spark compute \cite{microsoftFabricSparkCompute}, Fabric Notebooks \cite{microsoftFabricNotebooks}, Spark environments \cite{microsoftFabricSparkEnvironments}, Fabric Lakehouses \cite{microsoftFabricLakehouse}, and OneLake \cite{microsoftOneLakeOverview}. For distributed execution and table reliability, read the Apache Spark overview \cite{apacheSparkOverview}, Delta Lake documentation \cite{deltaLakeDocs}, and the Delta Lake paper \cite{armbrust2020delta}.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item Fabric Spark provides managed distributed processing through notebook sessions that run on Starter or Custom pools.
+    \item Starter pools are convenient for learning and exploration; Custom pools are better for repeatable production workloads.
+    \item Spark environments keep notebooks consistent by controlling runtime, dependencies, and Spark properties.
+    \item PySpark DataFrames are lazily evaluated, so errors often appear when an action reads, displays, or writes data.
+    \item Fabric notebooks can combine PySpark and Spark SQL through temporary views and shared Spark sessions.
+    \item Bronze-to-Silver Spark jobs should use explicit schemas, deterministic duplicate rules, null handling, and Delta writes.
+    \item A 100 GB/day telemetry ingestion layer should process bounded windows, record quality metrics, and tune from observed performance.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Explain the driver and executor roles in a Spark application running on a Fabric pool.
+    \item \textbf{(Conceptual)} Compare Starter pools and Custom pools for a training notebook, a scheduled daily job, and an urgent debugging notebook.
+    \item \textbf{(Design)} Define a Spark environment for a telemetry ingestion team. Include runtime, approved libraries, and one Spark property you would discuss before changing.
+    \item \textbf{(Hands-on)} Create a Fabric notebook that reads a CSV from \texttt{Files/bronze/raw\_csv/} and displays the schema without writing a table.
+    \item \textbf{(Hands-on)} Modify \cref{lst:chapter3-bronze-csv-silver-delta} to write rejected rows with missing required fields to a quarantine Delta table.
+    \item \textbf{(SQL)} Register a DataFrame as a temporary view and write a Spark SQL query that counts records by processing date and status.
+    \item \textbf{(Operational)} Draft a runbook for rerunning a failed daily telemetry batch without corrupting other dates.
+    \item \textbf{(Interview)} In five sentences, explain why explicit schemas matter for 100 GB/day JSON processing.
+\end{enumerate}
+
+\section{Capstone Project: Spark-Based Telemetry Ingestion at 100 GB per Day}\label{sec:ch3-capstone}
+\index{capstone project}\index{telemetry ingestion!capstone}\index{Bronze layer!JSON}\index{Silver layer!Delta}\index{Spark Notebooks!capstone}\index{Delta Lake!partitioning}
+
+\begin{capstonebox}
+\textbf{Mission.} Build a Spark-based telemetry ingestion pipeline in Microsoft Fabric. The pipeline must read raw JSON logs from a Bronze Lakehouse, clean and deduplicate the records, drop invalid null-key rows, and write typed Silver Delta tables that can support a 100 GB/day operating target.
+
+\textbf{Estimated time.} 4--6 hours, depending on tenant permissions, available sample data, and whether the class simulates 100 GB with smaller generated files.
+
+\textbf{What you'll practice.}
+\begin{itemize}
+    \item Designing a bounded daily Spark processing window.
+    \item Reading nested JSON from OneLake with an explicit schema.
+    \item Applying duplicate and null handling before Silver publication.
+    \item Writing partitioned Delta tables for queryable telemetry.
+    \item Recording run metrics that prove operational readiness.
+\end{itemize}
+\end{capstonebox}
+
+\subsection*{Scenario}
+A software company operates web applications, device gateways, and background services. Each component emits JSON telemetry containing event identifiers, device identifiers, timestamps, severity, service name, region, latency, and optional diagnostic payloads. The platform lands about 100 GB per day in Bronze. Engineering, reliability, BI, and machine learning teams need a cleaned Silver table for trend analysis, incident review, anomaly detection, and service-level reporting.
+
+Your job is to build the first production-shaped notebook. It does not need to ingest a real 100 GB during training, but the design must show how it would process one daily folder, validate records, remove duplicates, and write partitioned Delta output without exposing raw payloads unnecessarily.
+
+\subsection*{Requirements}
+Build a working Fabric design with these minimum elements:
+\begin{itemize}
+    \item A workspace named \texttt{telemetry-de-dev} with a Bronze lakehouse \texttt{lh\_telemetry\_bronze} and a Silver lakehouse \texttt{lh\_telemetry\_silver}, or one training lakehouse with clearly separated layer paths.
+    \item A raw JSON path such as \texttt{Files/bronze/raw\_json/telemetry/event\_date=2026-07-31/}.
+    \item A notebook named \texttt{nb\_telemetry\_bronze\_to\_silver} that accepts a processing date variable.
+    \item An explicit JSON schema with required fields \texttt{event\_id}, \texttt{device\_id}, and \texttt{event\_timestamp}.
+    \item Duplicate removal by \texttt{event\_id} and null dropping for required keys.
+    \item A Silver Delta table named \texttt{silver\_telemetry\_events} partitioned by \texttt{event\_date}.
+    \item A run metrics table named \texttt{silver\_telemetry\_ingestion\_metrics}.
+    \item No secrets, tokens, full request headers, or real customer identifiers in notebook output or deliverables.
+\end{itemize}
+
+\subsection*{Reference Architecture}
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[
+        capsrc/.style={rectangle, rounded corners, draw=codegray, thick, fill=white, align=center, minimum width=3.1cm, minimum height=1.0cm, font=\small\bfseries},
+        capproc/.style={rectangle, rounded corners, draw=primary, thick, fill=primary!7, align=center, minimum width=3.35cm, minimum height=1.1cm, font=\small\bfseries},
+        capstore/.style={cylinder, shape border rotate=90, aspect=0.25, draw=primary, thick, fill=backcolour, align=center, minimum width=2.9cm, minimum height=1.35cm, font=\small},
+        caparrow/.style={draw, thick, -Latex, draw=primary}
+    ]
+        \node[capsrc] (source) at (0, 0) {Applications\\Devices\\Services};
+        \node[capproc] (landing) at (4.0, 0) {Raw landing\\date folders};
+        \node[capstore, fill=brown!12] (bronze) at (8.0, 0) {Bronze JSON\\100 GB/day};
+        \node[capproc] (notebook) at (12.2, 0) {Fabric Spark\\Notebook job};
+        \node[capstore, fill=gray!15] (silver) at (16.5, 0.7) {Silver Delta\\events};
+        \node[capstore, fill=blue!10] (metrics) at (16.5, -1.05) {Run Metrics\\quality};
+        \node[capsrc, fill=green!7, draw=codegreen!60!black] (users) at (20.4, 0) {BI\\SRE\\ML};
+
+        \draw[caparrow] (source) -- (landing);
+        \draw[caparrow] (landing) -- (bronze);
+        \draw[caparrow] (bronze) -- node[above, font=\scriptsize]{processing date} (notebook);
+        \draw[caparrow] (notebook) -- node[above, font=\scriptsize]{clean Delta} (silver);
+        \draw[caparrow] (notebook) -- node[below, font=\scriptsize]{counts} (metrics);
+        \draw[caparrow] (silver) -- (users);
+
+        \node[note, text width=14cm, align=center] at (10.0, -2.55) {The capstone separates raw telemetry evidence from cleaned Silver analytics and records quality metrics for each processing date.};
+    \end{tikzpicture}%
+    }
+    \caption{Reference architecture for the Spark telemetry ingestion capstone.}
+    \label{fig:chapter3-capstone-reference-architecture}
+\end{figure}
+
+\subsection*{Implementation Steps}
+\begin{enumerate}
+    \item \textbf{Create lakehouses.} Create \texttt{lh\_telemetry\_bronze} and \texttt{lh\_telemetry\_silver}. If your training tenant supports one lakehouse only, create paths and table prefixes that preserve the same boundary.
+    \item \textbf{Prepare raw JSON.} Upload instructor-provided synthetic telemetry JSON to \texttt{Files/bronze/raw\_json/telemetry/event\_date=2026-07-31/}. Use smaller files for training if needed.
+    \item \textbf{Configure compute.} Start with a Starter pool for the first run. Document the Custom pool settings you would use for scheduled 100 GB/day processing.
+    \item \textbf{Create an environment.} Pin approved runtime and library choices in a Spark environment when your tenant allows it.
+    \item \textbf{Run Bronze to Silver.} Execute \cref{lst:chapter3-capstone-json-silver} for one processing date.
+    \item \textbf{Record metrics.} Execute \cref{lst:chapter3-capstone-metrics} to write run-level quality metrics.
+    \item \textbf{Validate output.} Query the Silver table by \texttt{event\_date}, \texttt{severity}, and \texttt{service\_name}.
+    \item \textbf{Document operations.} Describe retry behavior, expected schedule, pool choice, and how rejected records would be investigated.
+\end{enumerate}
+
+\begin{lstlisting}[language=Python,caption={Capstone Bronze JSON to cleaned Silver Delta transformation.},label={lst:chapter3-capstone-json-silver}]
+from pyspark.sql import functions as F
+from pyspark.sql.types import (
+    StructType, StructField, StringType, DoubleType, LongType
+)
+
+processing_date = "2026-07-31"
+raw_path = f"Files/bronze/raw_json/telemetry/event_date={processing_date}/*.json"
+
+telemetry_schema = StructType([
+    StructField("event_id", StringType(), True),
+    StructField("device_id", StringType(), True),
+    StructField("event_timestamp", StringType(), True),
+    StructField("severity", StringType(), True),
+    StructField("service_name", StringType(), True),
+    StructField("region", StringType(), True),
+    StructField("latency_ms", DoubleType(), True),
+    StructField("bytes_in", LongType(), True),
+    StructField("bytes_out", LongType(), True),
+    StructField("payload", StringType(), True),
+])
+
+raw_json_df = spark.read.schema(telemetry_schema).json(raw_path)
+raw_count = raw_json_df.count()
+
+accepted_df = (
+    raw_json_df
+    .withColumn("ingested_at", F.current_timestamp())
+    .withColumn("source_file", F.input_file_name())
+    .dropDuplicates(["event_id"])
+    .dropna(subset=["event_id", "device_id", "event_timestamp"])
+    .select(
+        F.col("event_id").cast("string").alias("event_id"),
+        F.sha2(F.col("device_id").cast("string"), 256).alias("device_hash"),
+        F.to_timestamp("event_timestamp").alias("event_timestamp"),
+        F.to_date("event_timestamp").alias("event_date"),
+        F.upper(F.col("severity")).alias("severity"),
+        F.col("service_name").cast("string").alias("service_name"),
+        F.col("region").cast("string").alias("region"),
+        F.col("latency_ms").cast("double").alias("latency_ms"),
+        F.col("bytes_in").cast("long").alias("bytes_in"),
+        F.col("bytes_out").cast("long").alias("bytes_out"),
+        "ingested_at",
+        "source_file",
+    )
+    .where(F.col("event_timestamp").isNotNull())
+)
+
+accepted_df.write.format("delta").mode("overwrite").partitionBy("event_date").saveAsTable(
+    "silver_telemetry_events"
+)
+\end{lstlisting}
+
+\begin{lstlisting}[language=Python,caption={Capstone run metrics and Spark SQL validation.},label={lst:chapter3-capstone-metrics}]
+accepted_df.createOrReplaceTempView("v_accepted_telemetry")
+accepted_count = accepted_df.count()
+
+duplicate_count = raw_count - raw_json_df.dropDuplicates(["event_id"]).count()
+required_non_null_count = (
+    raw_json_df
+    .dropDuplicates(["event_id"])
+    .dropna(subset=["event_id", "device_id", "event_timestamp"])
+    .count()
+)
+rejected_count = raw_count - accepted_count
+
+metrics_rows = [(
+    processing_date,
+    raw_count,
+    accepted_count,
+    rejected_count,
+    duplicate_count,
+    required_non_null_count,
+)]
+metrics_columns = [
+    "processing_date",
+    "raw_rows",
+    "accepted_rows",
+    "rejected_rows",
+    "duplicate_rows",
+    "required_non_null_rows",
+]
+
+metrics_df = spark.createDataFrame(metrics_rows, metrics_columns).withColumn(
+    "metrics_recorded_at", F.current_timestamp()
+)
+
+metrics_df.write.format("delta").mode("append").saveAsTable(
+    "silver_telemetry_ingestion_metrics"
+)
+
+spark.sql("""
+SELECT
+    event_date,
+    severity,
+    service_name,
+    COUNT(*) AS event_count,
+    AVG(latency_ms) AS average_latency_ms,
+    SUM(bytes_in + bytes_out) AS total_bytes
+FROM v_accepted_telemetry
+GROUP BY event_date, severity, service_name
+ORDER BY event_date, severity, service_name
+""").show(100, truncate=False)
+\end{lstlisting}
+
+\subsection*{Deliverables}
+Submit evidence that the architecture and implementation are complete:
+\begin{itemize}
+    \item Workspace, lakehouse, notebook, pool, and environment names.
+    \item Screenshot or exported evidence of the Bronze JSON folder and Silver Delta tables.
+    \item Notebook output showing raw, accepted, rejected, duplicate, and required non-null counts.
+    \item Schema for \texttt{silver\_telemetry\_events}, including hashed device identifiers and removed raw payload fields.
+    \item Description of partitioning strategy and retry unit for daily processing.
+    \item A short operational note explaining how the design scales from training files to 100 GB/day.
+    \item Confirmation that no secrets, request headers, tokens, or real customer identifiers were printed or submitted.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+Use this rubric before declaring the capstone complete:
+\begin{itemize}
+    \item[\(\square\)] Raw JSON files are stored in a Bronze path by processing date.
+    \item[\(\square\)] The notebook reads only the requested processing date or batch window.
+    \item[\(\square\)] The JSON reader uses an explicit schema.
+    \item[\(\square\)] Silver records remove duplicate \texttt{event\_id} values.
+    \item[\(\square\)] Records missing \texttt{event\_id}, \texttt{device\_id}, or \texttt{event\_timestamp} are excluded or quarantined.
+    \item[\(\square\)] The Silver Delta table is partitioned by \texttt{event\_date}.
+    \item[\(\square\)] Run metrics capture raw, accepted, rejected, and duplicate counts.
+    \item[\(\square\)] Raw payloads, tokens, and full diagnostic text are not exposed in Silver outputs.
+    \item[\(\square\)] The design states when a Custom pool would replace a Starter pool.
+    \item[\(\square\)] Retry behavior is bounded to one processing date or batch window.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+If you finish early, extend the capstone while preserving the Bronze-to-Silver contract:
+\begin{itemize}
+    \item Add a quarantine Delta table that stores rejected records and rejection reasons.
+    \item Add schema evolution handling for a new optional field such as \texttt{app\_version}.
+    \item Add a small Gold aggregate for daily service health by region and severity.
+    \item Compare Starter pool and Custom pool execution time on the same sample data.
+    \item Add a validation that fails the notebook when rejected records exceed an agreed threshold.
+    \item Document a deployment path from development to production workspaces.
+\end{itemize}

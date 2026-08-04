@@ -1,0 +1,649 @@
+\chapter{Wide-Column NoSQL: Cloud Bigtable}
+\index{Cloud Bigtable}\index{wide-column NoSQL}\index{NoSQL!wide-column}\index{Bigtable!tablets}\index{Bigtable!row keys}\index{hotspotting}\index{Key Visualizer}\index{app profiles}
+
+\begin{objectives}
+\begin{itemize}
+    \item Explain Cloud Bigtable architecture, including instances, clusters, nodes, tablets, column families, and app profiles.
+    \item Design row keys that distribute high-throughput reads and writes while preserving efficient access patterns.
+    \item Apply salting, hashing, reversed timestamps, and entity-prefix layouts to avoid hotspotting.
+    \item Tune Bigtable performance with node sizing, schema choices, garbage collection policies, and Key Visualizer.
+    \item Deploy a Bigtable cluster and ingest IoT temperature-sensor readings with a Python script and reversed-timestamp row key.
+    \item Design an ingestion and serving layer for a financial trading platform processing 100,000 stock ticks per second.
+    \item Complete the Part I capstone by integrating Cloud SQL, Cloud Spanner, Cloud Bigtable, and Cloud Storage behind secure private connectivity.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+Wide-column and high-throughput NoSQL systems expose different APIs, but the core design questions are consistent: partition key, row-key order, hot-range prevention, throughput scaling, consistency, and operational visibility.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{2.2cm}p{2.6cm}p{2.8cm}p{2.8cm}p{2.8cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{GCP Bigtable} & \textbf{AWS} & \textbf{Azure} & \textbf{Apache HBase / Cassandra} \\
+\midrule
+Wide-column model & Sparse rows, column families, cells, timestamps, Bigtable API & DynamoDB items and attributes; Keyspaces uses Cassandra tables & Cosmos DB Cassandra API; Table Storage entities with partition and row keys & HBase tables and column families; Cassandra wide rows and clustering columns \\
+Row-key / partition design & Row key controls tablet locality and scan order & DynamoDB partition key and sort key; Keyspaces partition key & Cosmos partition key and clustering; Table Storage partition key plus row key & HBase row key regions; Cassandra partition key and clustering order \\
+Hotspotting mitigation & Salting, hashing, bucketing, reversed timestamps, app-profile routing & Write sharding, adaptive capacity, random prefixes, capacity planning & Synthetic partition keys, partition spread, RU planning & Region pre-splitting, token distribution, bucketing, compaction-aware modeling \\
+Tablets vs partitions & Tablets are contiguous row-key ranges served by nodes and split automatically & DynamoDB partitions and Keyspaces storage partitions distribute load & Logical partitions map to physical partitions & HBase regions and Cassandra token ranges distribute ownership \\
+Throughput scaling & Add nodes per cluster; replicate clusters; route with app profiles & Provisioned or on-demand capacity; table and global secondary index limits & Request units and partition throughput limits & Add region servers or Cassandra nodes and rebalance tokens \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+MongoDB can serve high-volume document workloads, but it is not a direct wide-column replacement because its shard key, document model, and secondary-index behavior differ. Snowflake is excellent for analytical serving, yet it is not designed as a single-digit-millisecond operational key-value store.
+\end{crosscloud}
+
+\begin{keyterms}
+\textbf{Cloud Bigtable}: Google Cloud's managed, horizontally scalable wide-column database for low-latency, high-throughput operational and analytical workloads.
+\textbf{Tablet}: a contiguous range of row keys assigned to servers and split as data or traffic grows.
+\textbf{Row key}: the byte string that determines physical ordering, locality, and scan behavior in a Bigtable table.
+\textbf{Column family}: a grouping of columns that share storage, compression, and garbage collection policy.
+\textbf{App profile}: a routing and transaction policy that sends client traffic to one or more clusters in a Bigtable instance.
+\textbf{Hotspot}: a narrow row-key range or node that receives disproportionate reads or writes.
+\end{keyterms}
+
+\section{Week 4 Roadmap}
+Week~4 closes Part I by moving from relational infrastructure to high-throughput wide-column storage. Cloud Bigtable is the GCP service to evaluate when the workload needs predictable low latency at large scale, sparse data, very high write rates, and key-range access patterns rather than ad hoc relational joins \cite{googlecloudbigtabledocs}. It descends from the Bigtable system that influenced HBase, Cassandra, and many distributed storage systems \cite{chang2008bigtable}.
+
+Monday introduces Bigtable architecture: instances, clusters, nodes, tablets, column families, timestamps, replication, and app profiles. Tuesday focuses on row-key design, salting, hashing, and hotspot avoidance. Wednesday studies performance tuning, garbage collection, Key Visualizer, and operational evidence. Thursday builds a hands-on lab that ingests IoT temperature-sensor data with reversed-timestamp row keys. Friday applies the same principles to a financial trading platform that must ingest and serve 100,000 stock ticks per second.
+
+\begin{definitionbox}
+\textbf{Cloud Bigtable} is a managed wide-column store that sorts all rows lexicographically by row key. It is optimized for high-throughput point lookups, prefix scans, time-series patterns, feature stores, personalization, telemetry, and serving layers where query access is known before the schema is designed.
+\end{definitionbox}
+
+\section{Monday: Bigtable Architecture, Tablets, Nodes, and App Profiles}
+\index{Cloud Bigtable!architecture}\index{Bigtable!instances}\index{Bigtable!clusters}\index{Bigtable!nodes}\index{Bigtable!app profiles}
+
+\subsection{Instances, Clusters, Nodes, Tables, and Column Families}
+A Bigtable instance is an administrative boundary that can contain one or more clusters. A cluster is a set of Bigtable nodes in one zone. Nodes provide CPU, memory, and network capacity for serving reads and writes. Tables live inside the instance, and each table stores rows ordered by row key. Columns are grouped into column families, and each cell can have multiple timestamped versions.
+
+Unlike Cloud SQL or Spanner, Bigtable does not enforce relational constraints, joins, or multi-row SQL transactions. Its strength is serving known access patterns at massive scale. You model the table from the query first: identify the entity, time range, prefix scan, latest-state lookup, or reverse-time feed that the application must read quickly. Then choose a row key and column families that make that read path local and predictable.
+
+\begin{notebox}
+Bigtable is sparse. A row can have thousands of possible columns, but only stored cells consume space. This is useful for telemetry, feature vectors, metrics, and event attributes where different entities report different measurements.
+\end{notebox}
+
+\subsection{Tablets and Node-Level Sharding}
+\index{Bigtable!tablets}
+Bigtable stores each table as tablets. A tablet is a contiguous row-key range such as \texttt{sensor\#03\#...} through \texttt{sensor\#04\#...}. Tablets can split as the table grows, and Bigtable assigns tablets across nodes in a cluster. The row key therefore controls both scan locality and write distribution. If every new write lands at the same end of the keyspace, only a small number of tablets and nodes are busy even when the cluster has many nodes.
+
+\begin{definitionbox}
+\textbf{Lexicographic row-key order} means that row keys are sorted byte by byte. Prefixes are powerful because they make range scans efficient, but low-cardinality or monotonically increasing prefixes can create hot tablets.
+\end{definitionbox}
+
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[
+        tablet/.style={rectangle, rounded corners, draw=primary, thick, fill=primary!6, text width=3.0cm, minimum height=0.9cm, align=center, font=\footnotesize\bfseries},
+        node/.style={cylinder, shape border rotate=90, aspect=0.25, draw=primary, thick, fill=primary!10, text width=2.7cm, minimum height=1.3cm, align=center, font=\small\bfseries},
+        client/.style={rectangle, rounded corners, draw=codegray, thick, fill=white, text width=2.7cm, minimum height=0.9cm, align=center, font=\small\bfseries},
+        arrow/.style={-{Stealth[length=2.5mm]}, draw=primary, thick},
+        dasharrow/.style={-{Stealth[length=2.5mm]}, draw=codegray, thick, dashed}
+    ]
+        \node[client] (app) at (0,0) {Telemetry\\Clients};
+        \node[tablet] (t1) at (4,2.0) {Tablet A\\00\#sensor--19\#};
+        \node[tablet] (t2) at (4,0.7) {Tablet B\\20\#sensor--49\#};
+        \node[tablet] (t3) at (4,-0.7) {Tablet C\\50\#sensor--79\#};
+        \node[tablet] (t4) at (4,-2.0) {Tablet D\\80\#sensor--99\#};
+        \node[node] (n1) at (8.2,1.4) {Node 1};
+        \node[node] (n2) at (8.2,-1.4) {Node 2};
+        \node[node] (n3) at (11.4,0) {Node 3};
+
+        \draw[arrow] (app) -- node[above, font=\footnotesize]{row-key routed reads / writes} (t2);
+        \draw[dasharrow] (t1) -- (n1);
+        \draw[dasharrow] (t2) -- (n2);
+        \draw[dasharrow] (t3) -- (n3);
+        \draw[dasharrow] (t4) -- (n1);
+    \end{tikzpicture}%
+    }
+    \caption{Bigtable splits a table into tablets, then serves those row-key ranges across cluster nodes.}
+    \label{fig:bigtable-tablets-nodes}
+\end{figure}
+
+\subsection{Replication and App Profiles}
+\index{Bigtable!replication}\index{Bigtable!app profiles}
+A Bigtable instance can replicate data across clusters. Replication supports availability, locality, and workload isolation, but it also requires careful routing decisions. App profiles define whether a client routes to one cluster or multiple clusters and whether single-row transactions are allowed. For example, an ingestion app profile might send writes to a regional cluster near devices, while an analytics app profile might route batch reads to a separate cluster so scans do not compete with serving traffic.
+
+\begin{tipbox}
+Use app profiles as part of application design, not as an afterthought. Separate ingestion, serving, analytics, and backfill traffic when their latency and retry behavior differ.
+\end{tipbox}
+
+\section{Tuesday: Row-Key Design, Salting, Hashing, and Hotspot Avoidance}
+\index{Bigtable!row-key design}\index{salting}\index{hashing}\index{hotspotting}\index{reversed timestamp}
+
+\subsection{Design from Access Patterns}
+A Bigtable schema is successful when the row key makes the critical query a short point lookup or a bounded range scan. A row key such as \texttt{device\#bucket\#reverse\_timestamp} works for recent events by device. A row key such as \texttt{symbol\#bucket\#reverse\_timestamp} works for recent market ticks by symbol. A row key such as \texttt{tenant\#hash\#entity} works for multi-tenant entity lookup when tenants need isolation but large tenants must spread traffic.
+
+The dangerous row key is often the obvious one. A key beginning with the current timestamp makes chronological scans simple, but it concentrates all new writes at the newest range. A key beginning with a single popular symbol, merchant, or device can also become hot. A good design balances three pressures: distributing writes, preserving read locality, and keeping the key understandable enough to operate.
+
+\begin{pitfall}
+Do not use an unbounded timestamp as the leading row-key component for high-volume ingestion. It usually creates a moving hot spot at the end of the table, even when the cluster has enough total nodes.
+\end{pitfall}
+\subsection{Salting, Hashing, Bucketing, and Reverse Time}
+\index{row key!salting}\index{row key!hashing}\index{row key!bucketing}
+Salting adds a small prefix such as \texttt{00} through \texttt{63} before the natural key. Hashing derives the prefix from stable fields such as device identifier or account identifier. Bucketing groups time into coarse windows such as hour or day. Reversed timestamps invert chronological order so the newest data appears first inside an entity prefix. These techniques are often combined: \texttt{hash\#symbol\#reversed\_millis\#trade\_id} distributes writes while supporting recent-tick scans by symbol and bucket fan-out.
+
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[
+        bad/.style={rectangle, draw=red!60!black, thick, fill=red!6, text width=3.0cm, minimum height=0.85cm, align=center, font=\footnotesize\bfseries},
+        good/.style={rectangle, draw=codegreen!60!black, thick, fill=green!7, text width=3.0cm, minimum height=0.85cm, align=center, font=\footnotesize\bfseries},
+        note/.style={font=\footnotesize, align=center, text width=3.4cm},
+        arrow/.style={-{Stealth[length=2.5mm]}, draw=primary, thick},
+        warn/.style={-{Stealth[length=2.5mm]}, draw=red!60!black, thick}
+    ]
+        \node[bad] (b1) at (0,1.2) {2026-07-31T18:44\\sensor-009};
+        \node[bad] (b2) at (3.6,1.2) {2026-07-31T18:44\\sensor-010};
+        \node[bad] (b3) at (7.2,1.2) {2026-07-31T18:44\\sensor-011};
+        \node[note] (hot) at (10.9,1.2) {all current writes hit the newest tablet};
+
+        \node[good] (g1) at (0,-1.2) {17\#sensor-009\\revts-8234};
+        \node[good] (g2) at (3.6,-1.2) {42\#sensor-010\\revts-8233};
+        \node[good] (g3) at (7.2,-1.2) {05\#sensor-011\\revts-8232};
+        \node[note] (spread) at (10.9,-1.2) {hash prefixes spread writes while reverse time keeps recent reads nearby};
+
+        \draw[warn] (b3) -- (hot);
+        \draw[arrow] (g3) -- (spread);
+        \draw[warn] (b1) -- (b2);
+        \draw[warn] (b2) -- (b3);
+        \draw[arrow] (g1) -- (g2);
+        \draw[arrow] (g2) -- (g3);
+    \end{tikzpicture}%
+    }
+    \caption{A timestamp-leading key hot spots current writes, while a salted reversed-timestamp key spreads ingestion and preserves recent-event scans.}
+    \label{fig:bigtable-reversed-timestamp-layout}
+\end{figure}
+
+\subsection{Column Families and Cell Versions}
+Column families should group data with similar lifecycle, compression, and access behavior. A time-series table might place measurements in a \texttt{metrics} family and metadata in a \texttt{meta} family. A trading table might keep raw ticks in \texttt{tick}, derived indicators in \texttt{signal}, and audit ingestion markers in \texttt{audit}. Avoid creating many column families without a reason; each family has configuration and storage implications.
+
+\begin{notebox}
+Bigtable cells are timestamped. You can store multiple versions of a value, but garbage collection policy determines how many versions or how much history remains. Versioning is not a substitute for a deliberate event-history schema.
+\end{notebox}
+
+\section{Wednesday: Performance Optimization, Garbage Collection, and Key Visualizer}
+\index{Cloud Bigtable!performance}\index{Bigtable!garbage collection}\index{Key Visualizer!Bigtable}\index{Bigtable!monitoring}
+
+\subsection{Throughput, Nodes, and Workload Isolation}
+Bigtable performance depends on schema, cluster size, storage type, request mix, replication, and client behavior \cite{googlecloudbigtableperformance}. Adding nodes increases serving capacity, but it cannot fully compensate for a hot row key. Before scaling up, inspect CPU, latency, request count, error rate, storage utilization, and Key Visualizer heatmaps. If one range is hot while other nodes are idle, fix the row-key distribution first.
+
+Workload isolation is equally important. A batch export or backfill that scans broad key ranges can affect latency for online serving. Use separate clusters, app profiles, scheduled windows, Dataflow connector throttling, and bounded scans. For high-throughput writes, batch mutations, reuse clients, use retry settings intentionally, and keep row mutations reasonably sized.
+
+\begin{tipbox}
+Tune in this order: verify the row key, verify the access path, isolate workload classes, tune client batching and retries, then add nodes. Scaling a poor key often hides the problem temporarily and raises cost permanently.
+\end{tipbox}
+
+\subsection{Garbage Collection Policies}
+\index{garbage collection!Bigtable}
+Garbage collection policies control old cell versions. A max-age policy keeps cells younger than a specified duration. A max-versions policy keeps a fixed number of versions. Intersection and union policies combine those rules. Use them to align storage cost with retention requirements. For IoT readings, raw high-frequency telemetry may need only 30 days in Bigtable before being archived to Cloud Storage or BigQuery. For financial ticks, compliance may require immutable downstream storage even if the serving table retains only recent windows.
+
+\begin{definitionbox}
+\textbf{Bigtable garbage collection} removes cells according to configured family policies during compaction. It is not an immediate delete guarantee for compliance workflows; design retention, export, and legal hold requirements explicitly.
+\end{definitionbox}
+
+\subsection{Key Visualizer and Heatmap Evidence}
+\index{Key Visualizer}
+Key Visualizer displays access patterns by row-key range over time \cite{googlecloudbigtablekeyvisualizer}. Bright diagonal lines often indicate a moving timestamp hot spot. Vertical bands can indicate one hot prefix or tenant. Broad evenly distributed color suggests healthy spread. Use the heatmap together with Cloud Monitoring metrics because a quiet heatmap can still hide client errors, failed retries, or inefficient downstream processing.
+
+\begin{pitfall}
+A salted key requires read fan-out. If an application needs the latest 100 rows for a symbol and the table has 64 salt buckets, the service may need to query 64 prefixes and merge results. Use only as many buckets as the write rate requires.
+\end{pitfall}
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.0cm}p{4.8cm}p{4.8cm}@{}}
+\toprule
+\textbf{Signal} & \textbf{Likely meaning} & \textbf{Response} \\
+\midrule
+High latency and one hot key range & Row-key hotspotting & Add hash or salt prefix, pre-split when appropriate, or redesign leading key \\
+High CPU on all nodes & Cluster capacity pressure & Add nodes, reduce broad scans, batch requests, or isolate workloads \\
+Storage growing faster than expected & Retention or version policy mismatch & Review garbage collection, archive raw history, and compress family design \\
+Many failed retries & Client backoff or quota issue & Tune deadlines, retry policy, batching, and app-profile routing \\
+Analytical scans hurting serving & Workload contention & Use a separate replicated cluster or route batch jobs with a different app profile \\
+\bottomrule
+\end{tabular}
+\caption{Bigtable performance diagnosis patterns.}
+\label{tab:bigtable-performance-diagnosis}
+\end{table}
+
+\section{Thursday Hands-On Project: IoT Temperature Sensor Ingestion}
+\index{hands-on project}\index{Bigtable!cbt}\index{Bigtable!Python client}\index{IoT telemetry}\index{reversed timestamp}
+This lab creates a single-cluster Bigtable instance, configures a table for temperature telemetry, and writes synthetic sensor events with reversed-timestamp row keys. Use a sandbox project, replace placeholders, and delete resources when finished. Commands are written for Windows PowerShell.
+
+\begin{notebox}
+Bigtable clusters can incur cost while running. Use a small development cluster, label resources, and delete the instance immediately after the lab unless you are intentionally keeping it for later exercises.
+\end{notebox}
+
+\subsection{PowerShell Preparation and Cluster Creation}
+\begin{lstlisting}[language=bash,caption={Creating a Bigtable instance, cluster, and telemetry table from PowerShell.}]
+$env:PROJECT_ID = "my-gcp-bigtable-lab"
+$env:INSTANCE_ID = "iot-telemetry-lab"
+$env:CLUSTER_ID = "iot-telemetry-c1"
+$env:ZONE = "us-central1-b"
+$env:TABLE_ID = "temperature_readings"
+
+gcloud config set project $env:PROJECT_ID
+gcloud services enable bigtable.googleapis.com bigtableadmin.googleapis.com
+
+gcloud bigtable instances create $env:INSTANCE_ID `
+  --display-name="IoT telemetry lab" `
+  --cluster=$env:CLUSTER_ID `
+  --cluster-zone=$env:ZONE `
+  --cluster-num-nodes=1 `
+  --cluster-storage-type=SSD
+
+cbt -project $env:PROJECT_ID -instance $env:INSTANCE_ID createtable $env:TABLE_ID
+cbt -project $env:PROJECT_ID -instance $env:INSTANCE_ID createfamily $env:TABLE_ID metrics
+cbt -project $env:PROJECT_ID -instance $env:INSTANCE_ID createfamily $env:TABLE_ID meta
+cbt -project $env:PROJECT_ID -instance $env:INSTANCE_ID setgcpolicy $env:TABLE_ID metrics maxage=30d
+\end{lstlisting}
+
+\subsection{Python Ingestion Script}
+The script uses a two-digit hash bucket, sensor identifier, and reversed millisecond timestamp. Recent readings for one sensor can be found by scanning that sensor's bucketed prefixes, while writes from many sensors spread across the keyspace.
+
+\begin{lstlisting}[language=Python,caption={Ingesting IoT temperature readings with google-cloud-bigtable and reversed-timestamp row keys.}]
+import hashlib
+import os
+import random
+import time
+from datetime import datetime, timezone
+
+from google.cloud import bigtable
+
+
+PROJECT_ID = os.environ["PROJECT_ID"]
+INSTANCE_ID = os.environ.get("INSTANCE_ID", "iot-telemetry-lab")
+TABLE_ID = os.environ.get("TABLE_ID", "temperature_readings")
+MAX_TS = 9999999999999
+SENSOR_COUNT = 200
+READINGS_PER_SENSOR = 25
+
+
+def bucket_for(sensor_id: str, buckets: int = 64) -> str:
+    digest = hashlib.sha256(sensor_id.encode("utf-8")).hexdigest()
+    return f"{int(digest[:4], 16) % buckets:02d}"
+
+
+def make_row_key(sensor_id: str, event_ms: int) -> bytes:
+    reverse_ms = MAX_TS - event_ms
+    return f"{bucket_for(sensor_id)}#{sensor_id}#{reverse_ms:013d}".encode("utf-8")
+
+
+def main() -> None:
+    client = bigtable.Client(project=PROJECT_ID, admin=True)
+    instance = client.instance(INSTANCE_ID)
+    table = instance.table(TABLE_ID)
+    mutations = []
+
+    now_ms = int(time.time() * 1000)
+    for sensor_number in range(SENSOR_COUNT):
+        sensor_id = f"sensor-{sensor_number:04d}"
+        for offset in range(READINGS_PER_SENSOR):
+            event_ms = now_ms - offset * 60000 - random.randint(0, 5000)
+            row = table.direct_row(make_row_key(sensor_id, event_ms))
+            temperature = 18.0 + random.random() * 12.0
+            event_time = datetime.fromtimestamp(event_ms / 1000, tz=timezone.utc)
+            row.set_cell("metrics", "temp_c", f"{temperature:.2f}")
+            row.set_cell("metrics", "humidity_pct", f"{random.uniform(30, 80):.1f}")
+            row.set_cell("meta", "sensor_type", "warehouse-thermistor")
+            row.set_cell("meta", "event_time", event_time.isoformat())
+            mutations.append(row)
+
+    table.mutate_rows(mutations)
+    print({"rows_written": len(mutations), "table": TABLE_ID})
+
+
+if __name__ == "__main__":
+    main()
+\end{lstlisting}
+
+\subsection{Read Check and Cleanup}
+\begin{lstlisting}[language=bash,caption={Reading sample rows and deleting the Bigtable lab instance.}]
+cbt -project $env:PROJECT_ID -instance $env:INSTANCE_ID read $env:TABLE_ID count=10
+
+python .\ingest_iot_bigtable.py
+
+cbt -project $env:PROJECT_ID -instance $env:INSTANCE_ID read $env:TABLE_ID count=10
+
+gcloud bigtable instances delete $env:INSTANCE_ID --quiet
+\end{lstlisting}
+
+\section{Friday Use Case: 100,000 Stock Ticks per Second}
+\index{financial trading}\index{stock ticks}\index{serving layer}\index{Bigtable!financial services}
+
+\subsection{Scenario}
+A trading platform receives quotes and trades from multiple exchanges. The target rate is 100,000 stock ticks per second during market peaks. Downstream systems need immediate lookup of the latest ticks by symbol, short historical windows for charting, anomaly detection features, and replay into analytics. The platform must absorb bursts without putting the serving path or compliance archive at risk.
+
+\subsection{Architecture Pattern}
+Pub/Sub absorbs exchange events and decouples producers from consumers. Dataflow validates, normalizes, enriches, and writes tick rows to Bigtable using a salted symbol and reversed-timestamp key. Bigtable serves recent market data to APIs with single-digit-millisecond lookups and bounded prefix scans. Cloud Storage stores immutable raw feed files, while BigQuery receives curated analytical facts for surveillance, reporting, and model training.
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[
+        ext/.style={rectangle, rounded corners, draw=codegray, thick, fill=white, text width=2.4cm, minimum height=0.9cm, align=center, font=\small\bfseries},
+        svc/.style={rectangle, rounded corners, draw=primary, thick, fill=primary!6, text width=2.6cm, minimum height=1.0cm, align=center, font=\small\bfseries},
+        db/.style={cylinder, shape border rotate=90, aspect=0.25, draw=primary, thick, fill=primary!10, text width=2.9cm, minimum height=1.3cm, align=center, font=\small\bfseries},
+        ana/.style={rectangle, rounded corners, draw=magenta, thick, fill=magenta!8, text width=2.7cm, minimum height=0.95cm, align=center, font=\small\bfseries},
+        arrow/.style={-{Stealth[length=2.5mm]}, draw=primary, thick},
+        dasharrow/.style={-{Stealth[length=2.5mm]}, draw=codegray, thick, dashed}
+    ]
+        \node[ext] (ex1) at (0,1.8) {Exchange A};
+        \node[ext] (ex2) at (0,0.3) {Exchange B};
+        \node[ext] (ex3) at (0,-1.2) {Exchange C};
+        \node[svc] (pubsub) at (3.3,0.3) {Pub/Sub\\Tick Topics};
+        \node[svc] (dataflow) at (6.6,0.3) {Dataflow\\Normalize\\Enrich};
+        \node[db] (bigtable) at (10.0,0.3) {Bigtable\\Salted Symbol\\Reverse Time};
+        \node[svc] (api) at (13.5,1.6) {Market Data\\Serving API};
+        \node[ana] (storage) at (13.5,0.0) {Cloud Storage\\Raw Archive};
+        \node[ana] (bq) at (13.5,-1.6) {BigQuery\\Surveillance\\Analytics};
+
+        \draw[arrow] (ex1) -- (pubsub);
+        \draw[arrow] (ex2) -- (pubsub);
+        \draw[arrow] (ex3) -- (pubsub);
+        \draw[arrow] (pubsub) -- node[above, font=\footnotesize]{100,000 ticks/sec} (dataflow);
+        \draw[arrow] (dataflow) -- (bigtable);
+        \draw[arrow] (bigtable) -- (api);
+        \draw[dasharrow] (dataflow) -- (storage);
+        \draw[dasharrow] (dataflow) -- (bq);
+    \end{tikzpicture}%
+    }
+    \caption{Trading ingestion uses Pub/Sub and Dataflow for burst absorption, Bigtable for low-latency serving, and analytical stores for archive and surveillance.}
+    \label{fig:bigtable-trading-serving-layer}
+\end{figure}
+
+\subsection{Serving and Correctness Controls}
+A practical tick row key is \texttt{bucket\#symbol\#reverse\_event\_nanos\#exchange\#sequence}. The bucket spreads writes, the symbol supports bounded reads, reverse time returns latest ticks first, and exchange sequence numbers support de-duplication. Use separate column families for raw tick fields, normalized fields, and derived indicators. Keep the serving table focused on recent windows; archive immutable raw feeds and replay checkpoints to Cloud Storage for audit and recovery.
+
+\begin{tipbox}
+For trading systems, prove both speed and replayability. Bigtable serves the current operational window, while Cloud Storage and BigQuery preserve raw history, reconstructed facts, and compliance evidence.
+\end{tipbox}
+
+\section{Security, Operations, and Cost Notes}
+\index{Cloud Bigtable!security}\index{IAM}\index{CMEK}\index{VPC Service Controls}\index{cost governance}
+Use least-privilege IAM, service accounts per workload, CMEK where required, VPC Service Controls for sensitive projects, audit logging, and private application paths where possible. Bigtable access is usually from application code, Dataflow, or GKE/GCE workloads using IAM rather than database usernames. Monitor node CPU, latency percentiles, request errors, storage, replication lag, hot ranges, garbage collection policy, and client retry behavior.
+
+\begin{notebox}
+Bigtable cost is driven by nodes, storage type, stored bytes, backups, replication, network, and inefficient scans. A table that retains every raw version forever can become more expensive than the serving workload itself.
+\end{notebox}
+
+\section{Interview Q\&A}
+\subsection{Concepts and Trade-offs}
+\begin{enumerate}
+    \item \textbf{Q: Why is row-key design the most important Bigtable schema decision?}\\
+    A: The row key determines physical sort order, tablet ranges, scan locality, and whether reads and writes distribute across nodes.
+
+    \item \textbf{Q: What is a tablet in Bigtable?}\\
+    A: A tablet is a contiguous row-key range that Bigtable can split, move, and serve independently across cluster nodes.
+
+    \item \textbf{Q: Why use a reversed timestamp in a time-series key?}\\
+    A: It places the newest events first inside an entity prefix, so recent-history reads can stop after a small range scan.
+
+    \item \textbf{Q: What is the downside of salting row keys?}\\
+    A: Salting spreads writes but can require read fan-out across buckets and result merging for entity-level queries.
+
+    \item \textbf{Q: How do app profiles help production systems?}\\
+    A: They route client traffic to specific clusters or multi-cluster policies, allowing workload isolation and locality-aware access.
+
+    \item \textbf{Q: When is Bigtable a poor fit?}\\
+    A: It is a poor fit for ad hoc joins, relational constraints, small departmental OLTP, and workloads without predictable key-based access paths.
+\end{enumerate}
+
+\section{Further Reading}
+Read the Cloud Bigtable documentation for current table, cluster, replication, backup, and administration guidance \cite{googlecloudbigtabledocs}. Study schema design guidance before committing to row keys and column families \cite{googlecloudbigtableschemadocs}. Review performance guidance for node sizing, workload isolation, and request patterns \cite{googlecloudbigtableperformance}. Use Key Visualizer documentation to interpret heatmaps and diagnose hot ranges \cite{googlecloudbigtablekeyvisualizer}. Read the original Bigtable paper to understand the storage model and design lineage \cite{chang2008bigtable}.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item Bigtable is a managed wide-column database for predictable, key-based access at very high throughput.
+    \item Row keys determine locality and distribution; poor leading keys create hot tablets regardless of total cluster capacity.
+    \item Salting, hashing, bucketing, and reversed timestamps trade read simplicity for write distribution and recent-event access.
+    \item Column families should reflect access and retention patterns because garbage collection is configured at the family level.
+    \item Key Visualizer, Cloud Monitoring, and client metrics should guide tuning before adding nodes.
+    \item Bigtable often pairs with Pub/Sub, Dataflow, Cloud Storage, and BigQuery to separate ingestion, serving, archive, and analytics responsibilities.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Explain how a Bigtable tablet differs from a Spanner split and from a DynamoDB partition.
+    \item \textbf{(Conceptual)} Describe why Bigtable is not a relational database even though it stores tables, rows, and columns.
+    \item \textbf{(Design)} Propose a row key for a fleet of 2 million vehicles reporting location every five seconds.
+    \item \textbf{(Design)} Redesign a timestamp-leading key that is creating a moving hotspot during ingestion.
+    \item \textbf{(Hands-on)} Create the IoT lab table and write at least 1,000 readings using the Python ingestion script.
+    \item \textbf{(Performance)} Interpret a Key Visualizer heatmap that shows one vertical red band for three hours.
+    \item \textbf{(Operations)} Define garbage collection policies for raw telemetry, latest device state, and derived alert flags.
+    \item \textbf{(Architecture)} Extend the trading use case with disaster recovery, replay, monitoring, and cost controls.
+\end{enumerate}
+
+\section{Milestone 1 Capstone: E-Commerce Multi-Tier Data Backend}\label{sec:ch4-capstone}
+\index{Milestone 1 capstone}\index{e-commerce backend}\index{Cloud SQL!capstone}\index{Cloud Spanner!capstone}\index{Cloud Bigtable!capstone}\index{Cloud Storage!capstone}\index{private connectivity}
+
+\begin{capstonebox}
+\textbf{Mission:} Design and prototype the Part I e-commerce data backend. Integrate Cloud SQL for user accounts, Cloud Spanner for global inventory and checkout transactions, Cloud Bigtable for clickstream tracking, and Cloud Storage for product images with lifecycle management and CMEK. Secure the tiers with VPC peering, private services access, private IP, service accounts, and least-privilege IAM.
+
+\textbf{Estimated time:} 8--10 hours.
+
+\textbf{What you'll practice:}
+\begin{itemize}
+    \item Mapping Week~1 Cloud Storage image buckets with lifecycle rules, uniform access, and CMEK.
+    \item Using Week~2 Cloud SQL private IP for user-account and profile data.
+    \item Using Week~3 Cloud Spanner for globally consistent inventory reservations and checkout transactions.
+    \item Using Week~4 Cloud Bigtable for clickstream events, product impressions, and recent behavior serving.
+    \item Designing VPC peering and private connectivity so application tiers do not depend on public database endpoints.
+    \item Producing acceptance evidence across security, data modeling, operations, and cleanup.
+\end{itemize}
+\end{capstonebox}
+
+\subsection*{Scenario}
+Mercury Retail runs an international e-commerce platform. User profile updates are regional and relational. Inventory reservations and checkout must remain globally consistent. Product images need durable object storage with lifecycle transitions and customer-managed encryption keys. Clickstream events arrive at high volume and must support recent-session personalization. Leadership wants a single reference design that proves Part I services can work together securely.
+
+\subsection*{Requirements}
+\begin{itemize}
+    \item Store user accounts, hashed credentials, profile settings, and consent flags in Cloud SQL with private IP.
+    \item Store global inventory, carts, checkout orders, and reservation transactions in Cloud Spanner.
+    \item Store clickstream events in Cloud Bigtable using a salted user or session prefix and reversed timestamp.
+    \item Store product images in Cloud Storage with uniform bucket-level access, lifecycle rules, versioning where appropriate, and CMEK.
+    \item Use a shared application VPC with private services access or required service networking peering for Cloud SQL and other private managed-service paths.
+    \item Use least-privilege service accounts for web API, checkout worker, image pipeline, and clickstream ingester.
+    \item Document IAM, KMS keys, audit logs, monitoring dashboards, backup policies, and cleanup commands.
+    \item Provide validation evidence for private connectivity, row-key distribution, Spanner transaction correctness, Cloud SQL backups, and Storage lifecycle configuration.
+\end{itemize}
+\subsection*{Reference Architecture}
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[
+        user/.style={rectangle, rounded corners, draw=codegray, thick, fill=white, text width=2.3cm, minimum height=0.85cm, align=center, font=\small\bfseries},
+        svc/.style={rectangle, rounded corners, draw=primary, thick, fill=primary!6, text width=2.6cm, minimum height=0.95cm, align=center, font=\small\bfseries},
+        data/.style={cylinder, shape border rotate=90, aspect=0.25, draw=primary, thick, fill=primary!10, text width=2.7cm, minimum height=1.2cm, align=center, font=\small\bfseries},
+        sec/.style={rectangle, rounded corners, draw=codegreen!60!black, thick, fill=green!7, text width=2.6cm, minimum height=0.9cm, align=center, font=\footnotesize\bfseries},
+        obj/.style={rectangle, rounded corners, draw=magenta, thick, fill=magenta!8, text width=2.8cm, minimum height=0.95cm, align=center, font=\small\bfseries},
+        arrow/.style={-{Stealth[length=2.5mm]}, draw=primary, thick},
+        dasharrow/.style={-{Stealth[length=2.5mm]}, draw=codegray, thick, dashed}
+    ]
+        \node[user] (shopper) at (0,1.5) {Shopper\\Browser};
+        \node[user] (mobile) at (0,-0.2) {Mobile App};
+        \node[svc] (lb) at (3.0,0.6) {HTTPS Load\\Balancer};
+        \node[svc] (api) at (6.0,1.4) {Web API\\Private VPC};
+        \node[svc] (checkout) at (6.0,-0.2) {Checkout\\Worker};
+        \node[svc] (clicks) at (6.0,-1.8) {Clickstream\\Ingester};
+        \node[data] (sql) at (10.0,2.0) {Cloud SQL\\Users\\Private IP};
+        \node[data] (spanner) at (10.0,0.4) {Cloud Spanner\\Inventory\\Checkout};
+        \node[data] (bigtable) at (10.0,-1.4) {Cloud Bigtable\\Clickstream};
+        \node[obj] (storage) at (13.4,1.3) {Cloud Storage\\Product Images\\Lifecycle + CMEK};
+        \node[sec] (kms) at (13.4,-0.5) {Cloud KMS\\IAM\\Audit Logs};
+        \node[sec] (peering) at (10.0,-3.0) {Private Services\\Access / VPC\\Peering};
+
+        \draw[arrow] (shopper) -- (lb);
+        \draw[arrow] (mobile) -- (lb);
+        \draw[arrow] (lb) -- (api);
+        \draw[arrow] (api) -- node[above, font=\footnotesize]{accounts} (sql);
+        \draw[arrow] (checkout) -- node[above, font=\footnotesize]{transactions} (spanner);
+        \draw[arrow] (clicks) -- node[below, font=\footnotesize]{events} (bigtable);
+        \draw[arrow] (api) -- (storage);
+        \draw[dasharrow] (kms) -- (storage);
+        \draw[dasharrow] (kms) -- (sql);
+        \draw[dasharrow] (kms) -- (spanner);
+        \draw[dasharrow] (kms) -- (bigtable);
+        \draw[dasharrow] (peering) -- (sql);
+        \draw[dasharrow] (peering) -- (api);
+        \draw[dasharrow] (peering) -- (checkout);
+        \draw[dasharrow] (peering) -- (clicks);
+    \end{tikzpicture}%
+    }
+    \caption{Milestone 1 reference architecture integrating Cloud Storage, Cloud SQL, Spanner, and Bigtable behind private application connectivity.}
+    \label{fig:ch4-capstone-ecommerce-backend}
+\end{figure}
+
+\subsection*{Implementation Steps}
+\begin{enumerate}
+    \item \textbf{Create the shared network, private services access range, KMS key, image bucket, and managed data services.} Replace placeholders and use a sandbox project.
+
+\begin{lstlisting}[language=bash,caption={Creating the Milestone 1 network, storage, and managed-service foundations.}]
+$env:PROJECT_ID = "my-gcp-ecommerce-capstone"
+$env:REGION = "us-central1"
+$env:ZONE = "us-central1-b"
+$env:VPC = "ecommerce-private-vpc"
+$env:RANGE = "google-managed-services-range"
+$env:KEYRING = "ecommerce-keys"
+$env:KEY = "data-backend-key"
+$env:BUCKET = "my-ecommerce-product-images"
+
+gcloud config set project $env:PROJECT_ID
+gcloud services enable compute.googleapis.com servicenetworking.googleapis.com `
+  sqladmin.googleapis.com spanner.googleapis.com bigtable.googleapis.com `
+  bigtableadmin.googleapis.com storage.googleapis.com cloudkms.googleapis.com
+
+gcloud compute networks create $env:VPC --subnet-mode=custom
+gcloud compute networks subnets create app-subnet `
+  --network=$env:VPC --range=10.20.0.0/24 --region=$env:REGION
+
+gcloud compute addresses create $env:RANGE `
+  --global --purpose=VPC_PEERING --prefix-length=20 --network=$env:VPC
+
+gcloud services vpc-peerings connect `
+  --service=servicenetworking.googleapis.com `
+  --ranges=$env:RANGE `
+  --network=$env:VPC
+
+gcloud kms keyrings create $env:KEYRING --location=$env:REGION
+gcloud kms keys create $env:KEY --location=$env:REGION `
+  --keyring=$env:KEYRING --purpose=encryption
+
+gcloud storage buckets create gs://$env:BUCKET `
+  --location=$env:REGION `
+  --uniform-bucket-level-access `
+  --default-encryption-key=projects/$env:PROJECT_ID/locations/$env:REGION/keyRings/$env:KEYRING/cryptoKeys/$env:KEY
+
+gcloud storage buckets update gs://$env:BUCKET --versioning
+\end{lstlisting}
+
+    \item \textbf{Deploy representative schemas and write one clickstream event.} This prototype shows the service boundaries; production code should add migrations, secret management, and CI validation.
+
+\begin{lstlisting}[language=Python,caption={Writing a Bigtable clickstream event with a salted reversed-timestamp row key.}]
+import hashlib
+import os
+import time
+import uuid
+
+from google.cloud import bigtable
+
+
+PROJECT_ID = os.environ["PROJECT_ID"]
+INSTANCE_ID = os.environ.get("BIGTABLE_INSTANCE", "ecommerce-clicks")
+TABLE_ID = os.environ.get("BIGTABLE_TABLE", "clickstream")
+MAX_TS = 9999999999999
+
+
+def bucket_for(user_id: str, buckets: int = 32) -> str:
+    digest = hashlib.sha256(user_id.encode("utf-8")).hexdigest()
+    return f"{int(digest[:4], 16) % buckets:02d}"
+
+
+def row_key(user_id: str, session_id: str, event_ms: int) -> bytes:
+    reverse_ms = MAX_TS - event_ms
+    return f"{bucket_for(user_id)}#{user_id}#{session_id}#{reverse_ms:013d}".encode("utf-8")
+
+
+def main() -> None:
+    client = bigtable.Client(project=PROJECT_ID, admin=True)
+    table = client.instance(INSTANCE_ID).table(TABLE_ID)
+    user_id = "user-123"
+    session_id = "session-456"
+    event_ms = int(time.time() * 1000)
+    row = table.direct_row(row_key(user_id, session_id, event_ms))
+    row.set_cell("event", "event_id", str(uuid.uuid4()))
+    row.set_cell("event", "type", "product_view")
+    row.set_cell("event", "product_id", "sku-00042")
+    row.set_cell("event", "event_ms", str(event_ms))
+    row.commit()
+    print({"status": "written", "user_id": user_id, "session_id": session_id})
+
+
+if __name__ == "__main__":
+    main()
+\end{lstlisting}
+
+    \item \textbf{Add database-specific setup.} Create a private-IP Cloud SQL instance for users, a Spanner instance for inventory and checkout, and a Bigtable instance for clickstream. Use the same VPC and service accounts where applicable.
+
+\begin{lstlisting}[language=bash,caption={Representative Cloud SQL, Spanner, and Bigtable creation commands for the capstone.}]
+gcloud sql instances create ecommerce-users `
+  --database-version=POSTGRES_16 `
+  --region=$env:REGION `
+  --network=$env:VPC `
+  --no-assign-ip `
+  --backup-start-time=03:00
+
+gcloud spanner instances create ecommerce-global `
+  --config=nam3 `
+  --description="E-commerce global inventory and checkout" `
+  --processing-units=1000
+
+gcloud spanner databases create commerce --instance=ecommerce-global
+
+gcloud bigtable instances create ecommerce-clicks `
+  --display-name="E-commerce clickstream" `
+  --cluster=ecommerce-clicks-c1 `
+  --cluster-zone=$env:ZONE `
+  --cluster-num-nodes=3 `
+  --cluster-storage-type=SSD
+
+cbt -project $env:PROJECT_ID -instance ecommerce-clicks createtable clickstream
+cbt -project $env:PROJECT_ID -instance ecommerce-clicks createfamily clickstream event
+cbt -project $env:PROJECT_ID -instance ecommerce-clicks setgcpolicy clickstream event maxage=90d
+\end{lstlisting}
+\end{enumerate}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item A one-page architecture summary explaining why each Part I service is used and what data it owns.
+    \item A completed reference diagram showing browser, application VPC, private connectivity, Cloud SQL, Spanner, Bigtable, Storage, KMS, IAM, logging, and monitoring.
+    \item Command transcripts for network peering, KMS, bucket creation, lifecycle configuration, Cloud SQL private IP, Spanner database, and Bigtable table setup.
+    \item DDL or schema notes for user accounts, inventory reservations, checkout orders, and clickstream rows.
+    \item Python or pseudocode evidence for one user lookup, one checkout transaction, one image object operation, and one clickstream write.
+    \item A security and operations checklist covering IAM, service accounts, CMEK, backups, lifecycle, audit logs, alerting, and cleanup.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item Cloud SQL is reachable through private IP from the application VPC and has automated backups enabled.
+    \item Spanner schema supports globally consistent inventory reservation and checkout without duplicate order application.
+    \item Bigtable row-key design distributes clickstream writes and supports recent-session reads with bounded scans.
+    \item Cloud Storage product-image bucket uses uniform bucket-level access, CMEK, lifecycle policy, and appropriate versioning.
+    \item VPC peering or private services access is documented with reserved ranges, routes, firewall assumptions, and service producer connectivity.
+    \item IAM grants each workload only the roles required for its owned data service and no broad owner/editor permissions.
+    \item Monitoring covers database latency, errors, backups, storage growth, hot ranges, lifecycle actions, and KMS key usage.
+    \item The final report includes cleanup steps and a residual-risk statement for production hardening.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Add Pub/Sub and Dataflow between the web tier and Bigtable so clickstream ingestion can absorb traffic bursts.
+    \item Export Spanner order facts and Bigtable clickstream summaries to BigQuery for product analytics.
+    \item Add Cloud Armor, Identity-Aware Proxy, Secret Manager, and Binary Authorization to strengthen the application tier.
+    \item Create Terraform or Deployment Manager equivalents for the manual commands.
+    \item Add synthetic load tests for checkout latency, image-object throughput, and clickstream row-key distribution.
+    \item Estimate monthly cost by service, environment, and workload owner using labels and billing export.
+\end{itemize}

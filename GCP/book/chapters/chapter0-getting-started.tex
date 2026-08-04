@@ -1,0 +1,444 @@
+\chapter{Getting Started: Your Google Cloud Free Trial and Environment}
+\index{Google Cloud!free trial}\index{Google Cloud!getting started}\index{Google Cloud CLI}\index{Cloud IAM}\index{billing budgets}\index{Cloud Shell}\index{regions and zones}\index{PowerShell}
+
+\begin{objectives}
+\begin{itemize}
+    \item Create a Google Cloud account, start the \$300 / 90-day free trial, and explain how the Always Free tier differs from trial credits.
+    \item Navigate the Organization, Folder, Project, and Resource hierarchy and use Projects as isolation, ownership, and billing boundaries.
+    \item Secure a learner environment with Cloud IAM least privilege, service-account hygiene, and 2-Step Verification.
+    \item Install and initialize the Google Cloud CLI on Windows, or use Cloud Shell when a browser-only environment is preferable.
+    \item Configure cost guardrails with budgets, alert thresholds, labels, quotas, and billing export before creating data resources.
+    \item Apply the book's region, zone, naming, and labeling conventions consistently across every hands-on chapter.
+    \item Verify the setup by authenticating, selecting a project, creating a temporary Cloud Storage bucket, listing it, and deleting it.
+\end{itemize}
+\end{objectives}
+
+\lstdefinelanguage{PowerShell}{
+    morekeywords={Get-Command,Get-Date,Write-Host,New-Guid,if,else,foreach,Set-Location,Remove-Item},
+    sensitive=false,
+    morecomment=[l]{\#},
+    morestring=[b]",
+    morestring=[b]'
+}
+
+\begin{keyterms}
+\textbf{Google Cloud account}: a billing-enabled cloud identity associated with a Google account and payment verification.
+\textbf{Free trial}: time-limited introductory credit, currently \$300 for 90 days for eligible new customers.
+\textbf{Always Free}: ongoing monthly no-cost usage limits for selected services in eligible regions.
+\textbf{Project}: the main Google Cloud isolation, API, quota, IAM, and billing unit used throughout this book.
+\textbf{Cloud IAM}: Google Cloud's identity and access management system for granting roles on resources.
+\textbf{Service account}: a non-human identity used by applications, pipelines, and managed services.
+\textbf{Budget}: a billing guardrail that sends alerts when actual or forecasted spend crosses thresholds.
+\end{keyterms}
+
+\section{Why Chapter 0 Matters}
+Chapter~1 begins with Cloud Storage, but successful cloud data engineering starts before the first bucket is created. A learner needs an account, a project, a billing boundary, a secure identity model, a working command line, and cost alerts. These foundations are not administrative trivia. They determine who can create resources, where data can live, how charges are attributed, and how quickly an experiment can be cleaned up.
+
+This chapter is written for a Windows workstation using PowerShell. All commands are safe to run from a normal PowerShell session unless explicitly marked as an administrative install step. Cloud Shell is included as a browser-based alternative when local installation is unavailable. The goal is a small, well-labeled, disposable learning environment that can be used for every hands-on exercise in this book.
+
+\begin{definitionbox}
+\textbf{Google Cloud setup} is the combination of identity, billing, project selection, regional defaults, CLI authentication, labels, and cost controls required before provisioning technical services. A good setup makes later labs repeatable, auditable, and inexpensive.
+\end{definitionbox}
+
+\section{Creating a Google Cloud Account}
+\index{Google Cloud account}\index{free trial}\index{Always Free tier}\index{billing account}
+
+\subsection{Prerequisites}
+To start the labs, you need three things. First, you need a Google account. This can be a personal Google account for individual study or an account supplied by an organization or school. Second, eligible new customers need a card or accepted payment method for identity and payment verification. Third, you need a browser, a phone or authenticator app for stronger sign-in security, and either a Windows PowerShell terminal or access to Cloud Shell.
+
+Google Cloud's introductory offer gives eligible new customers a free trial with \$300 in credits for 90 days. The credits can be used across many Google Cloud services, subject to product limits and trial restrictions. Google also offers an Always Free tier for selected services, which provides limited no-cost usage each month in eligible regions. The trial and Always Free tier are related but not identical: trial credits expire after the trial period, while Always Free limits can continue after the trial if the account remains in good standing and usage stays within eligible limits \cite{googlecloudfreeprogram}.
+
+\begin{notebox}
+Cloud offers change over time. Treat the exact trial amount, duration, eligible countries, and Always Free product limits as values to verify on the official free program page before beginning a cohort or workshop \cite{googlecloudfreeprogram}.
+\end{notebox}
+
+\subsection{Sign-Up Walkthrough}
+Use the Google Cloud Console sign-up flow rather than an unofficial link. The process is normally:
+
+\begin{enumerate}
+    \item Open the Google Cloud free program page and choose the option to start for free.
+    \item Sign in with the Google account you will use for the book.
+    \item Select country, account type, and required profile information.
+    \item Accept the terms after reading the trial and billing conditions.
+    \item Provide a card or accepted payment method for verification.
+    \item Create or confirm the first billing account.
+    \item Land in the Google Cloud Console and open the project selector.
+    \item Create a dedicated learning project instead of using a default or shared project.
+\end{enumerate}
+
+The card protects Google from abuse and verifies payment readiness, but the trial is designed to prevent automatic charges during the free trial unless you explicitly upgrade to a paid account. When credits are exhausted or the trial ends, resources may stop, and you must choose whether to upgrade. You should still configure budgets and alerts immediately, because cost awareness is a professional habit, not only a payment-protection mechanism.
+
+\subsection{Resource Hierarchy: Organization, Folders, Projects, Resources}
+\index{resource hierarchy}\index{Organization}\index{Folder}\index{Project}\index{Resource}
+Google Cloud organizes resources hierarchically. At the top, an \textbf{Organization} represents a company, school, or domain-managed tenant. Under the Organization, \textbf{Folders} can group departments, environments, applications, or compliance zones. Under folders, \textbf{Projects} host resources. Resources are the services you create: buckets, BigQuery datasets, Pub/Sub topics, service accounts, Dataflow jobs, Dataproc clusters, and more.
+
+Personal learners often start without an Organization resource. In that case, projects sit directly under the account's project list. Enterprise learners usually work inside an Organization with folder-level policies, shared networking, centralized billing, and security controls. The same project-centered mental model still applies.
+
+\begin{definitionbox}
+A \textbf{Project} is the primary boundary for APIs, quotas, IAM grants, billing attribution, audit logs, and many operational policies. In this book, every hands-on resource belongs to one learner project unless a chapter explicitly says otherwise.
+\end{definitionbox}
+
+Projects are the unit of isolation because they collect related resources and make deletion practical. Deleting a lab project is safer than manually deleting dozens of scattered resources. Projects are also the billing attribution boundary. A billing account can fund many projects, but charges are reported by project, service, SKU, label, and time. Finally, projects are an IAM boundary. You can grant a user permission on one project without granting access to unrelated projects.
+
+\begin{figure}[H]
+    \centering
+    \resizebox{0.95\textwidth}{!}{%
+    \begin{tikzpicture}[node distance=1.4cm]
+        \node[stage] (org) {Organization\\\texttt{example.com}};
+        \node[stage, below left=of org, xshift=-2.6cm] (folder1) {Folder\\Data Platform};
+        \node[stage, below right=of org, xshift=2.6cm] (folder2) {Folder\\Security};
+        \node[stage, below=of folder1, xshift=-1.8cm] (dev) {Project\\\texttt{gcp-book-dev}};
+        \node[stage, below=of folder1, xshift=1.8cm] (prod) {Project\\\texttt{analytics-prod}};
+        \node[tool, below=of dev, xshift=-2.2cm] (bucket) {Cloud Storage\\bucket};
+        \node[tool, below=of dev] (bq) {BigQuery\\dataset};
+        \node[tool, below=of dev, xshift=2.2cm] (sa) {Service\\account};
+        \draw[arrow] (org) -- (folder1);
+        \draw[arrow] (org) -- (folder2);
+        \draw[arrow] (folder1) -- (dev);
+        \draw[arrow] (folder1) -- (prod);
+        \draw[arrow] (dev) -- (bucket);
+        \draw[arrow] (dev) -- (bq);
+        \draw[arrow] (dev) -- (sa);
+    \end{tikzpicture}%
+    }
+    \caption{Google Cloud's hierarchy places hands-on resources inside Projects, which may sit under Folders and an Organization.}
+    \label{fig:chapter0-resource-hierarchy}
+\end{figure}
+
+\section{Securing Identity Before Provisioning}
+\index{Cloud IAM}\index{least privilege}\index{service accounts}\index{2-Step Verification}
+
+\subsection{Cloud IAM Role Types}
+Cloud IAM grants permissions by binding a principal to a role on a resource. A principal can be a user, group, service account, domain, or workload identity. A role is a collection of permissions. A binding says, in effect, ``this principal receives this role on this resource.'' Permissions inherited from an Organization or Folder can flow down to projects, so always inspect the effective access path when troubleshooting.
+
+Cloud IAM roles come in three major types \cite{googlecloudiamoverview}:
+
+\begin{itemize}
+    \item \textbf{Basic roles}: Owner, Editor, and Viewer. These are broad legacy roles. They are easy to understand but too coarse for most production use.
+    \item \textbf{Predefined roles}: Google-managed roles scoped to services and job functions, such as \texttt{roles/storage.admin}, \texttt{roles/bigquery.dataViewer}, or \texttt{roles/pubsub.publisher}.
+    \item \textbf{Custom roles}: organization- or project-level roles containing a specific set of permissions selected by your team.
+\end{itemize}
+
+The principle of least privilege says each identity should receive only the permissions needed, at the narrowest practical scope, for the shortest practical time. In a learner project, you may temporarily act as an administrator because you own the environment. In a professional environment, day-to-day data engineers should not hold broad Owner access. They should use groups, predefined roles, approval workflows, break-glass procedures, and audited elevation.
+
+\subsection{Why Not Grant Owner Broadly}
+The Owner role can change IAM policy, enable services, manage resources, and link or modify billing settings. It is powerful enough to create security, cost, and data-loss incidents. Owner should be limited to a small number of accountable administrators and emergency paths. Avoid granting Owner to service accounts, lab partners, automation jobs, or broad groups. If a person only needs to create buckets, grant a storage-specific role. If a pipeline only needs to write objects to one bucket, grant an object-writing role on that bucket rather than Owner on the project.
+
+\begin{pitfall}
+Leaked service-account keys and Owner sprawl are two of the fastest ways to lose control of a cloud project. A JSON key committed to source control can be copied instantly, and an over-broad Owner grant can disable guardrails or create expensive resources. Prefer short-lived credentials, workload identity patterns, service-specific predefined roles, and routine access reviews.
+\end{pitfall}
+
+\subsection{Service Accounts and Keys}
+Service accounts are identities for workloads, not people. A Dataflow job, VM, Cloud Run service, Composer environment, or local automation script may run as a service account. Treat service accounts as production identities with owners, descriptions, minimal roles, and rotation or replacement plans.
+
+Avoid user-managed service-account keys whenever possible. A downloaded key file is a long-lived bearer credential: whoever has the file can authenticate as the service account until the key is revoked or expires. Prefer managed service identities, Workload Identity Federation, attached service accounts on Google Cloud runtimes, and short-lived credentials. When a key is unavoidable for a lab or legacy integration, store it outside source control, restrict the service account, set a rotation date, and delete the key as soon as the exercise ends \cite{googlecloudiamoverview}.
+
+\subsection{Enable 2-Step Verification}
+Before creating resources, enable 2-Step Verification on the Google account used for the book. Use an authenticator app, security key, or another supported second factor. Store backup codes securely. If the account is managed by an organization, follow its identity policy and do not bypass centralized controls. Strong sign-in is especially important because the same account can access billing, IAM, audit logs, and project deletion.
+
+\section{Tooling for Windows and PowerShell}
+\index{Google Cloud CLI}\index{gcloud init}\index{Cloud Shell}\index{gsutil}\index{gcloud storage}
+
+\subsection{Install the Google Cloud CLI on Windows}
+The Google Cloud CLI provides the \texttt{gcloud}, \texttt{bq}, \texttt{gsutil}, and modern \texttt{gcloud storage} command groups used throughout this book \cite{googlecloudclioverview}. On Windows, install it with the official Google Cloud CLI installer, Windows package management approved by your organization, or a managed software center. Use the official documentation rather than copying binaries from a third party.
+
+After installation, open a new PowerShell window so that the updated \texttt{PATH} is loaded. Confirm that the command is available:
+
+\begin{lstlisting}[language=PowerShell,caption={Verifying the Google Cloud CLI from Windows PowerShell.},label={lst:chapter0-gcloud-version}]
+Get-Command gcloud
+
+gcloud --version
+\end{lstlisting}
+
+Expected output includes the path to \texttt{gcloud.cmd} and a version block similar to this:
+
+\begin{lstlisting}[language=bash,caption={Representative Google Cloud CLI version output.},label={lst:chapter0-gcloud-version-output}]
+Google Cloud SDK 528.0.0
+bq 2.1.18
+core 2026.07.15
+gcloud-crc32c 1.0.0
+gsutil 5.35
+\end{lstlisting}
+
+Version numbers will differ. The important result is that \texttt{gcloud} runs from PowerShell without requiring a special terminal.
+
+\subsection{Initialize Authentication and Defaults}
+Run \texttt{gcloud init} to authenticate, select or create a configuration, choose the default project, and optionally set a default Compute Engine region and zone. The command opens a browser login flow. Use the same Google account that owns or has access to the learner project.
+
+\begin{lstlisting}[language=PowerShell,caption={Initial Google Cloud CLI setup in PowerShell.},label={lst:chapter0-gcloud-init}]
+gcloud init
+
+gcloud auth login
+
+gcloud config set project PROJECT_ID
+gcloud config set compute/region us-central1
+gcloud config set compute/zone us-central1-a
+\end{lstlisting}
+
+Replace \texttt{PROJECT\_ID} with your real project ID. The project ID is globally unique, lower case, and different from the display name. A display name can be changed; the project ID is the stable identifier used by APIs, logs, and commands.
+
+\begin{notebox}
+\texttt{gcloud init} and \texttt{gcloud auth login} both authenticate a user account for CLI use. If you already initialized the CLI, \texttt{gcloud auth login} can refresh or add an account without redoing all configuration prompts.
+\end{notebox}
+
+\subsection{Use \texttt{gcloud storage} and \texttt{gsutil}}
+Google now emphasizes \texttt{gcloud storage} for Cloud Storage command-line operations, while \texttt{gsutil} remains common in older scripts, documentation, and installed environments. This book prefers \texttt{gcloud storage} for new examples and mentions \texttt{gsutil} when it appears in production patterns or migration materials. Learn both names so that existing runbooks are readable.
+
+For example, these commands express similar intent:
+
+\begin{lstlisting}[language=PowerShell,caption={Modern and legacy Cloud Storage command examples.},label={lst:chapter0-storage-command-comparison}]
+# Preferred for new examples in this book
+gcloud storage buckets list
+
+# Legacy command still seen in many environments
+gsutil ls
+\end{lstlisting}
+
+\subsection{Cloud Shell: No Local Install}
+Cloud Shell is a browser-based shell in the Google Cloud Console with the Google Cloud CLI preinstalled, temporary compute, and persistent home storage within documented limits. It is useful for classrooms, locked-down laptops, and quick console-adjacent troubleshooting. Open it from the Cloud Shell icon in the Google Cloud Console. The shell already knows the console account, but you should still confirm the active project and configuration before running labs.
+
+\begin{lstlisting}[language=bash,caption={Checking the active project from Cloud Shell.},label={lst:chapter0-cloud-shell-check}]
+gcloud config get-value project
+gcloud auth list
+\end{lstlisting}
+
+Cloud Shell is convenient, but local PowerShell remains valuable. Local development lets you use an editor, source control, local sample data, and the same scripts you will later automate. Use Cloud Shell when installation is blocked; use local PowerShell when building repeatable project workflows.
+
+\section{Cost Guardrails Before Labs}
+\index{billing budgets}\index{billing export}\index{quotas}\index{labels}
+
+\subsection{Billing Account and Trial Protection}
+A project must be linked to a billing account before most billable resources can run. The billing account is the payment and invoicing container. The project is where charges originate. The free trial credits apply to eligible usage while the trial is active. Google states that you are not automatically charged after the free trial ends unless you upgrade to a paid account \cite{googlecloudfreeprogram}. This protection is helpful, but it does not replace cost design. If you upgrade, remove forgotten resources, or move to an organizational billing account, spend can become real.
+
+\begin{tipbox}
+\textbf{Measure it.} Every lab should have a way to answer three questions: what did we create, who owns it, and how much can it cost if forgotten for a week? Budgets, labels, quotas, and billing export turn those questions into observable signals.
+\end{tipbox}
+
+\subsection{Create a Budget with Alert Thresholds}
+Create a budget immediately after linking billing. In the Console, open \textbf{Billing} $\rightarrow$ \textbf{Budgets \& alerts}, choose the billing account, create a budget scoped to the learner project, and set alert thresholds such as 50\%, 90\%, and 100\% of a small monthly amount. For an individual learner, a budget of \$10 or \$25 is often enough to reveal mistakes. For a cohort, set budgets per project or per folder according to the teaching plan.
+
+Budget alerts notify selected users or billing administrators. They do not automatically stop all resources. Think of a budget as an alarm, not a circuit breaker. Pair budgets with quotas, labels, lifecycle rules, and cleanup habits.
+
+The exact CLI support for budgets can vary by installed components and API availability. The following PowerShell example shows a practical pattern: create a project, link billing, enable billing APIs, and create a budget from a JSON file through \texttt{gcloud billing budgets create}. If your organization restricts billing APIs, perform the budget step in the Console.
+
+\begin{lstlisting}[language=PowerShell,caption={Creating a learner project and budget guardrail from PowerShell.},label={lst:chapter0-project-budget}]
+$ProjectId = "gcp-book-$((New-Guid).Guid.Substring(0,8))"
+$BillingAccount = "BILLING_ACCOUNT_ID"
+$Region = "us-central1"
+
+# Create a dedicated project for the book.
+gcloud projects create $ProjectId --name="GCP Book Labs"
+
+# Link the project to a billing account.
+gcloud billing projects link $ProjectId --billing-account=$BillingAccount
+
+# Set defaults for later commands.
+gcloud config set project $ProjectId
+gcloud config set compute/region $Region
+gcloud config set compute/zone "$Region-a"
+
+# Enable the services used by setup and early chapters.
+gcloud services enable cloudbilling.googleapis.com billingbudgets.googleapis.com storage.googleapis.com
+
+# Create budget.json in the current directory, then create the budget.
+@'
+{
+  "displayName": "gcp-book-lab-budget",
+  "budgetFilter": {
+    "projects": ["projects/PROJECT_NUMBER"]
+  },
+  "amount": {
+    "specifiedAmount": {
+      "currencyCode": "USD",
+      "units": "25"
+    }
+  },
+  "thresholdRules": [
+    {"thresholdPercent": 0.5},
+    {"thresholdPercent": 0.9},
+    {"thresholdPercent": 1.0}
+  ]
+}
+'@ | Set-Content -Path .\budget.json -Encoding utf8
+
+$ProjectNumber = gcloud projects describe $ProjectId --format="value(projectNumber)"
+(Get-Content .\budget.json) -replace "PROJECT_NUMBER", $ProjectNumber |
+    Set-Content -Path .\budget.json -Encoding utf8
+
+gcloud billing budgets create --billing-account=$BillingAccount --budget-from-file=.\budget.json
+Remove-Item .\budget.json
+\end{lstlisting}
+
+\subsection{Billing Export and Quotas}
+Billing export sends detailed cost and usage data to BigQuery. Enable it early in serious learning environments so that future chapters can query real spend patterns. In a single-person trial, billing export may feel unnecessary, but it teaches the same FinOps loop used in production: export, label, query, visualize, and review.
+
+Quotas limit how much of a resource class a project can consume. They protect Google Cloud and can protect you from runaway experiments. Review quotas for expensive or scalable services before labs that create compute, streaming, or data processing resources. A quota error during a lab is not always bad; it may be a guardrail doing its job.
+
+\section{Regions, Zones, Naming, and Labels}
+\index{regions}\index{zones}\index{naming conventions}\index{labels}
+
+\subsection{Regions and Zones}
+A Google Cloud region is a specific geographic area, such as \texttt{us-central1}. A zone is an isolated deployment area within a region, such as \texttt{us-central1-a}. Some resources are zonal, such as many virtual machine placements. Some are regional, such as many managed service locations. Some are multi-region or global. Data engineering resources often have location compatibility requirements. For example, moving data between a Cloud Storage bucket and BigQuery dataset can involve location and egress considerations.
+
+This book uses \texttt{us-central1} and \texttt{us-central1-a} as defaults unless a chapter explicitly chooses another region to demonstrate disaster recovery, data residency, or multi-region design. If you are outside the United States or under organizational policy, choose an approved region and use it consistently. Do not mix regions casually; inconsistent location choices complicate cost, latency, and governance.
+
+\subsection{Naming Conventions Used by the Book}
+Names should be readable, unique, and disposable. Use lower-case kebab-case for projects, buckets, topics, datasets when allowed, and service accounts where the product permits it. Include platform, purpose, environment, and a short random suffix when global uniqueness is required.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.0cm}p{4.1cm}p{5.0cm}@{}}
+\toprule
+\textbf{Resource} & \textbf{Pattern} & \textbf{Example} \\
+\midrule
+Project ID & \texttt{gcp-book-<name>-<suffix>} & \texttt{gcp-book-labs-a1b2c3d4} \\
+Bucket & \texttt{<project>-<zone>-<purpose>} & \texttt{gcp-book-labs-a1b2c3d4-raw} \\
+Service account & \texttt{<workload>-sa} & \texttt{dataflow-lab-sa} \\
+BigQuery dataset & \texttt{<domain>\_<layer>} & \texttt{retail\_raw} \\
+Pub/Sub topic & \texttt{<domain>-<event>-topic} & \texttt{orders-created-topic} \\
+Labels & \texttt{owner}, \texttt{env}, \texttt{book}, \texttt{chapter} & \texttt{env=lab}, \texttt{chapter=00} \\
+\bottomrule
+\end{tabular}
+\caption{Book naming and labeling conventions.}
+\label{tab:chapter0-naming}
+\end{table}
+
+Labels are key-value metadata used for cost allocation, inventory, and operations. Apply labels at creation time whenever a service supports them. Recommended labels for this book are \texttt{book=gcp-data-engineer}, \texttt{env=lab}, \texttt{owner=<your-alias>}, and \texttt{chapter=00}. Avoid personal data in labels because labels may appear in billing exports, logs, and reports.
+
+\begin{pitfall}
+A globally unique bucket name can accidentally reveal project names, customer names, or internal programs. Use neutral lab names and random suffixes. Never include secrets, email addresses, or regulated data categories in resource names.
+\end{pitfall}
+
+\section{Hands-On Verification}
+\index{setup verification}\index{Cloud Storage!verification}\index{gcloud auth list}\index{gcloud config list}
+This section confirms that authentication, project selection, APIs, region defaults, and Cloud Storage access work. It creates one temporary bucket, lists it, and deletes it. The commands assume PowerShell and a configured project.
+
+\subsection{Confirm Authentication and Configuration}
+Run the following commands:
+
+\begin{lstlisting}[language=PowerShell,caption={Verifying authentication and active configuration.},label={lst:chapter0-auth-config}]
+gcloud auth list
+gcloud config list
+\end{lstlisting}
+
+Expected output resembles the following. Your account, project, and zone will differ.
+
+\begin{lstlisting}[language=bash,caption={Representative authentication and configuration output.},label={lst:chapter0-auth-config-output}]
+Credentialed Accounts
+ACTIVE  ACCOUNT
+*       learner@example.com
+
+[compute]
+region = us-central1
+zone = us-central1-a
+[core]
+account = learner@example.com
+project = gcp-book-labs-a1b2c3d4
+\end{lstlisting}
+
+If no active account appears, run \texttt{gcloud auth login}. If no project appears, run \texttt{gcloud config set project PROJECT\_ID}. If the storage API is disabled, enable it with \texttt{gcloud services enable storage.googleapis.com}.
+
+\subsection{Create, List, and Delete a Bucket}
+Cloud Storage bucket names are globally unique. The following script builds a unique name from your project ID and a timestamp, creates the bucket in the default region, lists it, and then deletes it. The bucket is empty, so deletion should succeed immediately.
+
+\begin{lstlisting}[language=PowerShell,caption={Creating, listing, and deleting a temporary verification bucket.},label={lst:chapter0-bucket-verify}]
+$ProjectId = gcloud config get-value project
+$Region = gcloud config get-value compute/region
+$Suffix = Get-Date -Format "yyyyMMddHHmmss"
+$Bucket = "${ProjectId}-ch00-${Suffix}"
+
+# Create a temporary bucket with labels.
+gcloud storage buckets create "gs://$Bucket" --location=$Region --uniform-bucket-level-access --project=$ProjectId
+
+gcloud storage buckets update "gs://$Bucket" --update-labels=book=gcp-data-engineer,env=lab,chapter=00
+
+# List the bucket and inspect basic metadata.
+gcloud storage buckets list --filter="name:$Bucket"
+gcloud storage buckets describe "gs://$Bucket" --format="value(name,location,iamConfiguration.uniformBucketLevelAccess.enabled)"
+
+# Clean up immediately.
+gcloud storage rm --recursive "gs://$Bucket"
+\end{lstlisting}
+
+Representative output:
+
+\begin{lstlisting}[language=bash,caption={Representative output from the bucket verification script.},label={lst:chapter0-bucket-output}]
+Creating gs://gcp-book-labs-a1b2c3d4-ch00-20260731010203/...
+---
+creation_time: 2026-07-31T07:02:05+0000
+name: gcp-book-labs-a1b2c3d4-ch00-20260731010203
+storage_url: gs://gcp-book-labs-a1b2c3d4-ch00-20260731010203/
+
+gcp-book-labs-a1b2c3d4-ch00-20260731010203 US-CENTRAL1 True
+Removing gs://gcp-book-labs-a1b2c3d4-ch00-20260731010203/...
+\end{lstlisting}
+
+\begin{notebox}
+A successful verification proves only that the basic learner path works. Later chapters may require additional APIs, roles, quotas, or service accounts. Return to this setup checklist whenever a lab fails before debugging the service itself.
+\end{notebox}
+
+\section{Cross-Cloud Setup Equivalence}
+\begin{crosscloud}
+{\footnotesize
+\begin{tabular}{@{}p{2.9cm}p{3.0cm}p{3.0cm}p{3.0cm}@{}}
+\toprule
+\textbf{Setup step} & \textbf{AWS} & \textbf{Azure} & \textbf{GCP} \\
+\midrule
+Free offer & Free Tier (12 mo + always free) & Free account (\$200/30 days + always free) & Free trial (\$300/90 days + Always Free) \\
+Sign-up guard & Card + root email & Card + Microsoft account & Card + Google account \\
+Identity model & IAM / IAM Identity Center & Microsoft Entra ID + RBAC & Cloud IAM \\
+Admin isolation & Never use root daily & Avoid Global Admin daily & Avoid Owner; least privilege \\
+CLI & AWS CLI v2 (\texttt{aws configure}) & Azure CLI (\texttt{az login}) & gcloud CLI (\texttt{gcloud init}) \\
+Browser shell & AWS CloudShell & Azure Cloud Shell & Cloud Shell \\
+Cost guardrail & AWS Budgets + alerts & Cost Management budgets & Budgets \& alerts \\
+Console & AWS Management Console & Azure Portal & Google Cloud Console \\
+\bottomrule
+\end{tabular}}
+
+Microsoft Fabric uses a Microsoft 365/Power BI work account plus a Fabric trial capacity (no card, org tenant); Snowflake uses a 30-day/\$400 trial (no card) guarded by Resource Monitors; MongoDB Atlas offers a forever-free M0 cluster (no card) secured by database users and an IP allowlist.
+\end{crosscloud}
+
+\section{Setup Checklist for the Rest of the Book}
+Before starting Chapter~1, confirm the following:
+
+\begin{enumerate}
+    \item The Google account used for labs has 2-Step Verification enabled.
+    \item The free trial is active, or the project is intentionally attached to an approved paid billing account.
+    \item A dedicated learner project exists and is selected in \texttt{gcloud config list}.
+    \item The project has a budget with alerts at 50\%, 90\%, and 100\% of the chosen threshold.
+    \item The default region and zone are set to \texttt{us-central1} and \texttt{us-central1-a}, or to approved local alternatives.
+    \item The Cloud Storage API is enabled.
+    \item \texttt{gcloud auth list} shows the intended account as active.
+    \item The temporary bucket verification succeeded and the bucket was deleted.
+    \item You know how to open Cloud Shell if local PowerShell stops working.
+    \item You have recorded the project ID, billing account owner, region, and cleanup plan.
+\end{enumerate}
+
+\section{Further Reading}
+Read the Google Cloud free program page for the current free trial and Always Free terms \cite{googlecloudfreeprogram}. Review the resource hierarchy and project documentation before designing multi-team environments \cite{googlecloudresourcehierarchy}. Study Cloud IAM role types, service accounts, and least-privilege guidance before granting access \cite{googlecloudiamoverview}. Use the Google Cloud CLI documentation for installation, initialization, and command reference details \cite{googlecloudclioverview}. Review Cloud Billing budgets, alerts, and billing export before running long-lived labs \cite{googlecloudbillingdocs}. The Google Cloud Architecture Framework provides broader operational, security, reliability, and cost review guidance \cite{googlecloudarchitectureframework}.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item Google Cloud's free trial supplies temporary credits, while Always Free provides ongoing limited usage for eligible services.
+    \item Projects are the practical unit of lab isolation, billing attribution, quota management, IAM scope, and cleanup.
+    \item Least privilege, limited Owner grants, secure service accounts, and 2-Step Verification should be in place before data work begins.
+    \item Windows learners can use the Google Cloud CLI from PowerShell; Cloud Shell is the no-install browser alternative.
+    \item Budgets alert you, labels explain ownership, quotas constrain scale, and billing export makes costs queryable.
+    \item Consistent regions, names, and labels prevent avoidable troubleshooting and cost-allocation problems.
+    \item A setup is not complete until authentication, configuration, bucket creation, listing, and deletion have been verified.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Checklist)} Complete every item in the setup checklist above. Record the project ID, active account, default region, and budget amount in your private lab notes.
+    \item \textbf{(Conceptual)} Explain the difference between a billing account and a project. Why can one billing account fund many projects while each project remains a useful isolation boundary?
+    \item \textbf{(Security)} Identify three reasons the Owner role should not be granted broadly. For each reason, name a safer predefined role or process.
+    \item \textbf{(Service accounts)} Describe why a downloaded JSON service-account key is riskier than an attached service account on a managed Google Cloud runtime.
+    \item \textbf{(PowerShell)} Run \texttt{gcloud auth list} and \texttt{gcloud config list}. Paste the output into private notes after removing email addresses if your notes may be shared.
+    \item \textbf{(Cost)} Create or verify a project-scoped budget with at least three alert thresholds. Explain why an alert is not the same as automatic shutdown.
+    \item \textbf{(Naming)} Propose names and labels for a raw bucket, a curated bucket, a Pub/Sub topic, and a Dataflow service account for a retail orders lab.
+    \item \textbf{(Hands-on)} Re-run the temporary bucket verification, then prove cleanup by listing buckets with the same prefix and confirming the verification bucket is gone.
+    \item \textbf{(Design)} Your organization requires data to remain in Canada. Rewrite this chapter's region and naming assumptions for an approved Canadian region and explain which later labs may need location checks.
+    \item \textbf{(Reflection)} Write a five-sentence runbook for what you will do when a budget alert fires during the book.
+\end{enumerate}

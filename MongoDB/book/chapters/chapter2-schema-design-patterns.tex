@@ -1,0 +1,724 @@
+\chapter{Advanced Schema Design Patterns}
+\index{schema design}\index{document model}\index{Polymorphic Pattern}\index{Attribute Pattern}\index{Bucket Pattern}\index{Outlier Pattern}\index{Computed Pattern}\index{Subset Pattern}\index{Extended Reference Pattern}\index{Schema Versioning Pattern}\index{TTL index}\index{IoT metrics}%
+
+\begin{objectives}
+\begin{itemize}
+    \item Explain how MongoDB schema design starts from query, update, and growth patterns rather than from third-normal-form decomposition.
+    \item Apply the Polymorphic, Attribute, Bucket, and Outlier Patterns to collections that contain varied entities, dynamic fields, time-series events, and exceptional documents.
+    \item Use the Computed, Subset, Extended Reference, and Schema Versioning Patterns to reduce hot-path reads, bound working-set memory, avoid repetitive lookups, and evolve documents safely.
+    \item Design data-lifecycle models with Time-To-Live indexes, pre-allocation, and archival collections while preserving operational and compliance requirements.
+    \item Refactor a monolithic e-commerce product catalog with the Attribute Pattern and Subset Pattern using \texttt{mongosh} and PyMongo examples.
+    \item Architect a bucketed IoT metrics store for 100,000 events per second and prove the document-count and metadata-overhead reduction.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+Document-model schema design appears in every cloud platform, but the modeling knobs differ. MongoDB patterns place related data in BSON documents and choose indexes around access paths; DynamoDB often uses single-table design with compound primary keys and overloaded item types; Cosmos DB for NoSQL emphasizes partition keys, item shape, and request-unit efficiency; Firestore and Datastore organize documents, collections, entity groups, and composite indexes. Relational services such as Amazon RDS, Azure SQL Database, and Cloud SQL usually normalize entities into tables and use joins, constraints, and materialized views for equivalent access paths.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{2.7cm}p{3.0cm}p{3.0cm}p{3.0cm}p{3.0cm}@{}}
+\toprule
+\textbf{Concept} & \textbf{MongoDB} & \textbf{DynamoDB} & \textbf{Cosmos DB} & \textbf{Firestore} \\
+\midrule
+Polymorphic entities & One collection with type discriminator and shared indexes & Single-table items with entity prefix in partition or sort key & Container with item type and partition key & Collection or collection group with type field \\
+Dynamic attributes & Attribute Pattern array of key-value subdocuments & Sparse attributes or map fields projected into GSIs when needed & JSON properties with selective indexing policy & Map fields plus composite indexes for queried attributes \\
+Time-series buckets & Bucket Pattern or time-series collection & Partition by device and time window; item per bucket & Partition by device or tenant plus windowed bucket item & Document per bucket or subcollection per device \\
+Hot subset & Embedded recent subset in parent document & Duplicated summary item near access key & Denormalized hot properties in same logical partition & Parent document summary plus child collection for full history \\
+References & Extended Reference with copied stable fields & Duplicated attributes in item families & Denormalized fields to avoid cross-partition fan-out & Duplicated reference fields to avoid extra reads \\
+Lifecycle expiry & TTL index or Atlas Online Archive & TTL attribute & TTL policy & TTL policy or scheduled deletion \\
+Relational equivalent & Embedded documents replace many joins & Access-pattern table replaces join model & JSON container trades joins for partition-local reads & Hierarchical documents replace selected joins \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+Snowflake and Microsoft Fabric commonly keep semi-structured data in \texttt{VARIANT} or JSON-capable columns and project it into relational views, tables, or lakehouse shortcuts. They are excellent analytical landing zones for flexible documents, but they do not remove the need to model MongoDB's operational write path, indexes, shard keys, and working set correctly \cite{mongodbDataModelingDocs,dynamodbSingleTableDocs,cosmosPartitionDocs,firestoreDataModelDocs,snowflakeSemiStructuredDocs,fabricJsonDocs}.
+\end{crosscloud}
+
+\section{Week 2 Roadmap: Designing Documents Around Workloads}
+Schema design in MongoDB is an engineering discipline, not a license to store arbitrary JSON forever. The central question is: \emph{which document shape minimizes total cost for the dominant reads, writes, updates, retention rules, and growth modes?} The answer may embed data, reference data, duplicate stable fields, bucket events, compute summaries, or move cold records to archival storage. MongoDB's data-modeling guidance starts from application query patterns and relationships because the document model can encode locality directly in the record \cite{mongodbDataModelingDocs,mongodbSchemaPatternsDocs}.
+
+\begin{definitionbox}
+A \textbf{schema design pattern} is a repeatable document-shaping strategy that solves a common access-path, growth, lifecycle, or operational problem. Patterns are not mutually exclusive; a production collection may combine Attribute, Bucket, Computed, and Schema Versioning decisions in one design.
+\end{definitionbox}
+
+\begin{keyterms}
+\textbf{Embedding}: storing related data inside the same document. \textbf{Referencing}: storing an identifier to another document. \textbf{Working set}: the subset of data and indexes repeatedly touched by active operations. \textbf{Cardinality}: the number of distinct values or related records. \textbf{Fan-out}: the number of documents or partitions a query must touch. \textbf{Write amplification}: extra writes caused by indexes, denormalized copies, summaries, or bucket updates.
+\end{keyterms}
+
+\section{Monday: Core Design Patterns}
+\subsection{Polymorphic Pattern}
+The Polymorphic Pattern stores related but not identical document types in one collection. It is useful when entities share enough access paths to justify common indexes but differ in optional fields. A media catalog, for example, may store books, videos, and podcasts together because users search by title, creator, tags, and publication date even though each media type has different metadata.
+
+\begin{definitionbox}
+The \textbf{Polymorphic Pattern} uses a discriminator field, such as \texttt{kind} or \texttt{type}, so one collection can hold multiple document shapes while preserving queryable common fields.
+\end{definitionbox}
+
+\begin{notebox}
+Polymorphism is strongest when shared predicates are real. If every query includes a different field set, one collection can become a weak compromise that carries too many sparse indexes.
+\end{notebox}
+
+\begin{tipbox}
+Index common predicates first, then add partial indexes for type-specific paths. A partial index on \texttt{kind: "subscription"} can avoid making every document pay for a field used by only one subtype.
+\end{tipbox}
+
+\begin{pitfall}
+\textbf{Hiding unrelated domains in one collection.} A type field is not enough. Keep documents together only when they share lifecycle, security rules, scale profile, and important access paths.
+\end{pitfall}
+
+\subsection{Attribute Pattern}
+The Attribute Pattern converts many dynamic or sparsely populated fields into an array of name-value subdocuments. It is common in product catalogs, clinical observations, asset inventories, and machine specifications where each category has different attributes but users filter across a small set of attribute names.
+
+\begin{definitionbox}
+The \textbf{Attribute Pattern} represents variable fields as entries such as \texttt{\{ k: "screen\_size", v: "15.6", unit: "inch" \}} instead of creating a new top-level field for every possible attribute.
+\end{definitionbox}
+
+\begin{tipbox}
+Create a compound multikey index on the attribute key and value only for attributes that are actually queried. For example, \texttt{\{ "attributes.k": 1, "attributes.v": 1 \}} supports filtering by attribute name and value.
+\end{tipbox}
+
+\begin{pitfall}
+\textbf{Turning every field into an attribute.} Stable, high-selectivity, commonly projected fields such as \texttt{tenantId}, \texttt{sku}, status, category, and price usually deserve top-level fields and ordinary indexes.
+\end{pitfall}
+
+\subsection{Bucket Pattern}
+The Bucket Pattern groups many small, related events into one document. It is especially valuable for time-series measurements because a single bucket can store metadata once and many readings in arrays or compact subdocuments. Instead of one document per reading, the collection stores one document per device per time window or count threshold.
+
+\begin{definitionbox}
+The \textbf{Bucket Pattern} stores a bounded group of events in one document, typically keyed by entity and time window, so metadata is repeated once per bucket rather than once per event.
+\end{definitionbox}
+
+\begin{notebox}
+MongoDB time-series collections automate parts of this idea, but data engineers still need to understand bucket boundaries, metadata fields, granularity, retention, and query patterns \cite{mongodbTimeSeriesDocs}.
+\end{notebox}
+
+\begin{figure}[H]
+    \centering
+    \resizebox{0.95\textwidth}{!}{%
+    \begin{tikzpicture}[
+        event/.style={rectangle, rounded corners, draw=codegray, fill=white, minimum width=1.25cm, minimum height=0.7cm, align=center, font=\scriptsize},
+        bucket/.style={rectangle, rounded corners, draw=primary, fill=primary!6, minimum width=4.0cm, minimum height=2.1cm, align=center, font=\small\bfseries},
+        meta/.style={rectangle, rounded corners, draw=green!45!black, fill=green!8, minimum width=2.5cm, minimum height=0.7cm, align=center, font=\scriptsize},
+        arrow/.style={-{Stealth[length=2.5mm]}, draw=primary, thick}
+    ]
+        \node[event] (e1) at (0,1.2) {reading 1};
+        \node[event] (e2) at (0,0.3) {reading 2};
+        \node[event] (e3) at (0,-0.6) {reading 3};
+        \node[event] (e4) at (0,-1.5) {reading N};
+        \node[bucket] (b) at (5,0) {Bucket document\\device + hour};
+        \node[meta] (m) at (5,0.75) {metadata once};
+        \node[meta] (v) at (5,-0.3) {values array};
+        \node[meta] (s) at (5,-1.2) {min / max / count};
+        \draw[arrow] (e1) -- (b.west);
+        \draw[arrow] (e2) -- (b.west);
+        \draw[arrow] (e3) -- (b.west);
+        \draw[arrow] (e4) -- (b.west);
+    \end{tikzpicture}%
+    }
+    \caption{Bucket Pattern grouping many time-series readings into one bounded document with shared metadata and summary fields.}
+    \label{fig:ch2-bucket-pattern}
+\end{figure}
+
+\begin{pitfall}
+\textbf{Unbounded buckets.} Buckets must close by time, count, or size. A document that grows forever risks large updates, jumbo chunks in sharded clusters, and the 16 MB document limit.
+\end{pitfall}
+
+\subsection{Outlier Pattern}
+The Outlier Pattern handles rare documents whose size or relationship count would distort the common schema. Most users may have a small number of permissions, addresses, or notifications, while a few enterprise accounts have thousands. The normal case stays embedded for locality; the exceptional case spills to a side collection.
+
+\begin{definitionbox}
+The \textbf{Outlier Pattern} keeps the common case simple and adds an overflow path for documents that exceed a defined threshold.
+\end{definitionbox}
+
+\begin{tipbox}
+Store an explicit marker such as \texttt{hasOutlierItems: true} and a count. Queries can fetch the normal embedded array first and follow the overflow reference only when needed.
+\end{tipbox}
+
+\begin{pitfall}
+\textbf{Designing the whole model for the rarest customer.} If 0.1\% of accounts have extreme cardinality, do not force every account to pay the read cost of a fully normalized design.
+\end{pitfall}
+
+\section{Tuesday: Operational Patterns}
+\subsection{Computed Pattern}
+The Computed Pattern stores derived values that are expensive or repetitive to calculate on every request. Examples include order totals, product review averages, inventory availability, per-device hourly summaries, and dashboard counters.
+
+\begin{definitionbox}
+The \textbf{Computed Pattern} materializes derived values in a document so the hot read path avoids repeated aggregation work.
+\end{definitionbox}
+
+\begin{notebox}
+A computed value is a consistency decision. Some systems update it transactionally with the source write; others accept eventual consistency through change streams, scheduled jobs, or aggregation pipelines with \texttt{\$merge}.
+\end{notebox}
+
+\begin{tipbox}
+Record the source and freshness of computed fields with names such as \texttt{stats.updatedAt} or \texttt{rollupVersion}. This makes stale summaries observable.
+\end{tipbox}
+
+\begin{pitfall}
+\textbf{Materializing everything.} Computed fields reduce read cost but add write work and correctness obligations. Compute only values with clear read-frequency or latency justification.
+\end{pitfall}
+
+\subsection{Subset Pattern}
+The Subset Pattern embeds a small hot subset of related data in the parent document while keeping the complete set elsewhere. A product page may embed the first three reviews, a user profile may embed recent notifications, and an account may embed recent transactions. Reads for the common screen stay fast and memory-resident; deep history remains available through a separate collection.
+
+\begin{definitionbox}
+The \textbf{Subset Pattern} stores the most frequently read related records with the parent document and stores the complete related collection separately.
+\end{definitionbox}
+
+\begin{figure}[H]
+    \centering
+    \resizebox{0.9\textwidth}{!}{%
+    \begin{tikzpicture}[
+        parent/.style={rectangle, rounded corners, draw=primary, fill=primary!6, minimum width=3.3cm, minimum height=2.2cm, align=center, font=\small\bfseries},
+        child/.style={rectangle, rounded corners, draw=codegray, fill=white, minimum width=2.4cm, minimum height=0.75cm, align=center, font=\scriptsize},
+        store/.style={cylinder, shape border rotate=90, aspect=0.25, draw=green!45!black, fill=green!8, minimum width=2.4cm, minimum height=1.25cm, align=center, font=\small\bfseries},
+        arrow/.style={-{Stealth[length=2.5mm]}, draw=primary, thick}
+    ]
+        \node[parent] (p) at (0,0) {Product document\\hot fields\\top reviews};
+        \node[child] (r1) at (4,1.1) {review 1};
+        \node[child] (r2) at (4,0.25) {review 2};
+        \node[child] (r3) at (4,-0.6) {review 3};
+        \node[store] (all) at (8,0.25) {Reviews\\collection};
+        \draw[arrow] (p) -- node[above,font=\scriptsize]{common page read} (r1);
+        \draw[arrow] (p) -- (r2);
+        \draw[arrow] (p) -- (r3);
+        \draw[arrow] (r2) -- node[above,font=\scriptsize]{deep history} (all);
+    \end{tikzpicture}%
+    }
+    \caption{Subset Pattern keeping a small hot subset near the parent document while preserving full history in a separate collection.}
+    \label{fig:ch2-subset-pattern}
+\end{figure}
+
+\begin{pitfall}
+\textbf{Forgetting synchronization.} The subset must be updated when the full collection changes. Decide whether updates are transactional, event-driven, or repaired by a periodic reconciliation job.
+\end{pitfall}
+
+\subsection{Extended Reference Pattern}
+The Extended Reference Pattern copies stable fields from a referenced document into the referencing document. An order may store \texttt{customerId}, \texttt{customerName}, and loyalty tier at purchase time. A support ticket may store \texttt{accountId}, account name, and service plan to avoid a join on every ticket list page.
+
+\begin{definitionbox}
+The \textbf{Extended Reference Pattern} stores the foreign key plus selected stable descriptive fields from the referenced entity to avoid extra reads in common paths.
+\end{definitionbox}
+
+\begin{tipbox}
+Copy fields that are stable or historically meaningful. A shipping order should keep the customer name used at order time even if the current profile changes later.
+\end{tipbox}
+
+\begin{pitfall}
+\textbf{Copying volatile fields.} Duplicating frequently changing fields creates fan-out updates. If the field changes often and every copy must be current, reference it instead or maintain it through a controlled update workflow.
+\end{pitfall}
+
+\subsection{Schema Versioning Pattern}
+Schema Versioning allows documents to evolve gradually without requiring a risky all-at-once migration. Each document carries a version field, and application code knows how to read old and new shapes during the transition.
+
+\begin{definitionbox}
+The \textbf{Schema Versioning Pattern} records document shape with a field such as \texttt{schemaVersion}, allowing readers, writers, and migrations to coexist while data evolves.
+\end{definitionbox}
+
+\begin{notebox}
+Schema versioning is not an excuse for permanent chaos. Keep the number of supported versions small, document migration rules, and remove old reader branches after the migration is complete.
+\end{notebox}
+
+\begin{tipbox}
+Prefer forward-only migrations with idempotent update scripts. Store enough evidence to resume safely after interruption, especially for collections with millions of documents.
+\end{tipbox}
+
+\section{Wednesday: Data Lifecycle Patterns}
+\subsection{Time-To-Live Pattern}
+TTL indexes automatically delete documents after a date field reaches a configured age. They are useful for sessions, expiring invitations, short-lived telemetry, cache collections, and privacy retention windows.
+
+\begin{definitionbox}
+A \textbf{TTL index} is a single-field index with \texttt{expireAfterSeconds}; MongoDB's background monitor removes expired documents asynchronously \cite{mongodbTTLDocs}.
+\end{definitionbox}
+
+\begin{tipbox}
+Use TTL for data that can be deleted eventually, not exactly at a contractual second. The TTL monitor runs periodically, and deletion time can lag behind expiration time.
+\end{tipbox}
+
+\begin{pitfall}
+\textbf{Using TTL where archival is required.} TTL deletes data. If compliance or analytics requires retention, move documents to an archive first, then expire the operational copy.
+\end{pitfall}
+
+\subsection{Pre-allocation Pattern}
+Pre-allocation creates a known document or bucket structure before all data arrives. It can simplify high-rate updates when the target bucket is predictable, such as one IoT device per minute or one calendar slot per facility. Modern WiredTiger does not require manual padding in the way older storage engines did, so the pattern should be used for logical predictability, not folklore about physical allocation.
+
+\begin{definitionbox}
+\textbf{Pre-allocation} creates bounded placeholder documents or arrays in advance so writers update known records instead of repeatedly discovering or creating the target shape.
+\end{definitionbox}
+
+\begin{notebox}
+Pre-allocation is most useful when it reduces contention and branching in application code. It can be harmful if many empty buckets are created and never filled.
+\end{notebox}
+
+\subsection{Archival Pattern}
+The Archival Pattern moves cold data out of the operational collection while preserving queryability through a separate collection, Atlas Online Archive, object storage, or an analytical platform. The goal is to reduce working-set pressure without losing retention history.
+
+\begin{definitionbox}
+The \textbf{Archival Pattern} separates hot operational data from cold historical data using a controlled copy, validation, and deletion process.
+\end{definitionbox}
+
+\begin{tipbox}
+Make archives provable. Record counts, hash totals where practical, date ranges, and restore tests. A retention process that cannot prove what moved is an operational risk.
+\end{tipbox}
+
+\begin{pitfall}
+\textbf{Archiving without indexes on restore paths.} Cold data eventually becomes important during audits, incidents, or customer disputes. Design the archive query keys before deleting the hot copy.
+\end{pitfall}
+
+\section{Thursday Hands-On Project: Refactor a Product Catalog}
+\subsection{Scenario}
+A monolithic e-commerce product document has grown organically. Every category adds new top-level fields, and the product page embeds every review, all media objects, warehouse details, and vendor-specific specifications. The result is wide documents, many sparse indexes, high memory pressure, and slow category filters. We will refactor the shape using the Attribute Pattern for dynamic specifications and the Subset Pattern for product-page reviews.
+
+\begin{lstlisting}[language=JavaScript, caption={Before: monolithic product document with sparse dynamic fields and unbounded reviews.}]
+use catalog;
+db.products.insertOne({
+  _id: ObjectId("64f000000000000000000101"),
+  sku: "LAP-2026-15-OLED",
+  category: "laptops",
+  title: "15 inch OLED developer laptop",
+  brand: "Northwind",
+  price: NumberDecimal("1499.00"),
+  screen_size_in: 15.6,
+  screen_type: "OLED",
+  cpu_model: "Ryzen AI 9",
+  memory_gb: 32,
+  storage_gb: 1000,
+  keyboard_layout: "US",
+  battery_wh: 84,
+  shoe_size: null,
+  fabric: null,
+  reviews: [
+    { reviewId: "r1", rating: 5, title: "fast", createdAt: ISODate("2026-07-01") },
+    { reviewId: "r2", rating: 4, title: "bright screen", createdAt: ISODate("2026-07-03") }
+  ],
+  warehouseAvailability: [
+    { warehouseId: "den-01", qty: 15 },
+    { warehouseId: "phx-02", qty: 8 }
+  ]
+});
+\end{lstlisting}
+
+The category-specific fields are sparse across the catalog. Indexing each one independently would inflate index storage and write cost. The reviews array also grows without bound, even though the product page needs only a few recent or most helpful reviews.
+
+\begin{lstlisting}[language=JavaScript, caption={After: Attribute Pattern for dynamic specifications and Subset Pattern for hot reviews.}]
+db.products.replaceOne(
+  { sku: "LAP-2026-15-OLED" },
+  {
+    sku: "LAP-2026-15-OLED",
+    schemaVersion: 2,
+    category: "laptops",
+    title: "15 inch OLED developer laptop",
+    brand: "Northwind",
+    price: NumberDecimal("1499.00"),
+    attributes: [
+      { k: "screen_size", v: 15.6, unit: "inch", n: 15.6 },
+      { k: "screen_type", v: "OLED" },
+      { k: "cpu_model", v: "Ryzen AI 9" },
+      { k: "memory", v: 32, unit: "GB", n: 32 },
+      { k: "storage", v: 1000, unit: "GB", n: 1000 },
+      { k: "keyboard_layout", v: "US" }
+    ],
+    reviewSummary: { count: 248, averageRating: 4.7, updatedAt: new Date() },
+    topReviews: [
+      { reviewId: "r1", rating: 5, title: "fast", createdAt: ISODate("2026-07-01") },
+      { reviewId: "r2", rating: 4, title: "bright screen", createdAt: ISODate("2026-07-03") }
+    ],
+    warehouseAvailability: [
+      { warehouseId: "den-01", qty: 15 },
+      { warehouseId: "phx-02", qty: 8 }
+    ]
+  },
+  { upsert: true }
+);
+
+db.products.createIndex({ category: 1, "attributes.k": 1, "attributes.v": 1 });
+db.reviews.createIndex({ sku: 1, helpfulVotes: -1, createdAt: -1 });
+\end{lstlisting}
+
+\begin{lstlisting}[language=Python, caption={PyMongo migration sketch that writes the new product shape and full review collection.}]
+from decimal import Decimal
+from pymongo import MongoClient, UpdateOne
+
+client = MongoClient("mongodb://127.0.0.1:27017")
+db = client.catalog
+products = db.products
+reviews = db.reviews
+
+ATTRIBUTE_FIELDS = {
+    "screen_size_in": ("screen_size", "inch"),
+    "screen_type": ("screen_type", None),
+    "cpu_model": ("cpu_model", None),
+    "memory_gb": ("memory", "GB"),
+    "storage_gb": ("storage", "GB"),
+    "keyboard_layout": ("keyboard_layout", None),
+}
+
+for old in products.find({"schemaVersion": {"$ne": 2}}):
+    attrs = []
+    for old_name, (new_name, unit) in ATTRIBUTE_FIELDS.items():
+        value = old.get(old_name)
+        if value is None:
+            continue
+        entry = {"k": new_name, "v": value}
+        if unit:
+            entry["unit"] = unit
+        if isinstance(value, (int, float, Decimal)):
+            entry["n"] = float(value)
+        attrs.append(entry)
+
+    full_reviews = old.get("reviews", [])
+    if full_reviews:
+        reviews.bulk_write([
+            UpdateOne(
+                {"sku": old["sku"], "reviewId": review["reviewId"]},
+                {"$set": {**review, "sku": old["sku"]}},
+                upsert=True,
+            )
+            for review in full_reviews
+        ])
+
+    products.update_one(
+        {"_id": old["_id"]},
+        {"$set": {
+            "schemaVersion": 2,
+            "attributes": attrs,
+            "topReviews": sorted(full_reviews, key=lambda r: r.get("rating", 0), reverse=True)[:3],
+            "reviewSummary.count": len(full_reviews),
+        }, "$unset": {field: "" for field in ATTRIBUTE_FIELDS} | {"reviews": ""}},
+    )
+\end{lstlisting}
+
+\begin{notebox}
+The migration is intentionally a sketch. A production migration would batch writes, record progress, handle retries idempotently, validate counts, and run behind feature flags or dual readers.
+\end{notebox}
+
+\section{Friday Use Case and Architecture: IoT Metrics at 100,000 Events per Second}
+\subsection{Scenario and Requirements}
+An industrial IoT platform receives metrics from 500,000 devices deployed across factories, vehicles, and edge gateways. Peak ingest reaches 100,000 events per second. Each event contains tenant, device, sensor type, timestamp, value, unit, firmware version, and location metadata. If the platform stores one document per reading, it writes 8.64 billion documents per day and repeats metadata billions of times.
+
+The Bucket Pattern changes the economics. Suppose each bucket stores 100 readings for one device, sensor, and minute. Document count drops from 8.64 billion event documents per day to about 86.4 million bucket documents per day, a 99\% count reduction. If the metadata portion is roughly the same size as one reading payload, storing it once per 100 readings reduces metadata overhead by about 99\%; with smaller bucket sizes or richer per-reading values, a conservative architecture claim of about 95\% metadata reduction is realistic and easier to defend.
+
+\subsection{Bucketed Document Shape}
+A bucket document should contain immutable identity fields, a bounded time window, compact readings, summary values, and close-state metadata. Common query patterns include device timeline, tenant outage investigation, sensor percentile analysis, and downsampling into analytical stores.
+
+\begin{lstlisting}[language=JavaScript, caption={Bucketed IoT metrics document for one device, sensor, and one-minute window.}]
+{
+  tenantId: "tenant-acme",
+  deviceId: "press-17",
+  sensor: "temperature",
+  bucketStart: ISODate("2026-07-31T07:37:00Z"),
+  bucketEnd: ISODate("2026-07-31T07:38:00Z"),
+  count: 100,
+  min: 72.4,
+  max: 79.8,
+  sum: 7592.1,
+  metadata: {
+    firmware: "8.2.1",
+    siteId: "den-factory-03",
+    lineId: "line-4",
+    unit: "C"
+  },
+  readings: [
+    { offsetMs: 0, v: 73.1, quality: "ok" },
+    { offsetMs: 600, v: 73.3, quality: "ok" },
+    { offsetMs: 1200, v: 73.8, quality: "ok" }
+  ],
+  closed: true
+}
+\end{lstlisting}
+
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[
+        source/.style={rectangle, rounded corners, draw=primary, fill=primary!6, minimum width=2.45cm, minimum height=1cm, align=center, font=\small\bfseries},
+        bucket/.style={rectangle, rounded corners, draw=green!45!black, fill=green!8, minimum width=3.2cm, minimum height=1.1cm, align=center, font=\small\bfseries},
+        store/.style={cylinder, shape border rotate=90, aspect=0.25, draw=primary, fill=primary!10, minimum width=2.5cm, minimum height=1.3cm, align=center, font=\small\bfseries},
+        analytics/.style={rectangle, rounded corners, draw=orange!85!black, fill=orange!10, minimum width=2.7cm, minimum height=1cm, align=center, font=\small\bfseries},
+        arrow/.style={-{Stealth[length=2.5mm]}, draw=primary, thick},
+        stream/.style={-{Stealth[length=2.5mm]}, draw=green!45!black, thick}
+    ]
+        \node[source] (devices) at (0,0) {Devices\\100k events/sec};
+        \node[source] (gateway) at (3.2,0) {Edge gateway\\validation};
+        \node[bucket] (open) at (6.8,0.9) {Open buckets\\device + minute};
+        \node[bucket] (close) at (6.8,-0.9) {Closed buckets\\count / time limit};
+        \node[store] (mongo) at (10.5,0) {MongoDB\\bucket collection};
+        \node[analytics] (archive) at (14,0.9) {Archive / lake\\cold history};
+        \node[analytics] (dash) at (14,-0.9) {Dashboards\\rollups};
+        \draw[arrow] (devices) -- (gateway);
+        \draw[arrow] (gateway) -- (open);
+        \draw[arrow] (open) -- (close);
+        \draw[arrow] (close) -- (mongo);
+        \draw[stream] (mongo) -- (archive);
+        \draw[stream] (mongo) -- (dash);
+    \end{tikzpicture}%
+    }
+    \caption{Bucketed IoT metrics architecture reducing document count and repeated metadata for 100,000 events per second.}
+    \label{fig:ch2-iot-bucketed-schema}
+\end{figure}
+
+\begin{tipbox}
+Use bucket keys that align with both ingest and query: tenant, device, sensor, and time window. If sharded, choose a shard key that spreads write load without making device timeline queries scatter across every shard.
+\end{tipbox}
+
+\begin{pitfall}
+\textbf{Hot-bucket contention.} If too many writers update the same bucket concurrently, the bucket document becomes a hot record. Partition buckets by device, sensor, and short windows, or buffer at the edge before writing.
+\end{pitfall}
+
+\section{Interview Q\&A}
+\subsection{Concepts and Trade-offs}
+\begin{enumerate}
+    \item \textbf{Q: How do you decide whether to embed or reference?}\\
+    A: Embed when data is read together, bounded, and shares lifecycle. Reference when relationships are large, independently updated, independently secured, or queried on their own.
+
+    \item \textbf{Q: Why does the Attribute Pattern help product catalogs?}\\
+    A: It turns category-specific sparse fields into a consistent key-value array, enabling shared indexes for dynamic filters without creating many top-level sparse indexes.
+
+    \item \textbf{Q: What is the main risk of the Bucket Pattern?}\\
+    A: Unbounded or highly contended bucket documents. Buckets must close by count, time, or size, and write distribution must avoid hot records.
+
+    \item \textbf{Q: When is the Computed Pattern appropriate?}\\
+    A: When a derived value is read frequently enough that materializing it is cheaper than recomputing it, and the system has an acceptable consistency strategy.
+
+    \item \textbf{Q: How does Schema Versioning reduce migration risk?}\\
+    A: It lets readers and writers handle old and new document shapes during a rolling migration, so the database does not require a single blocking rewrite.
+
+    \item \textbf{Q: Why is TTL not the same as archival?}\\
+    A: TTL deletes expired documents asynchronously. Archival copies and validates cold data before removing it from the hot operational store.
+\end{enumerate}
+
+\section{Further Reading}
+Start with MongoDB's data modeling, schema pattern, time-series, TTL, and indexing documentation \cite{mongodbDataModelingDocs,mongodbSchemaPatternsDocs,mongodbTimeSeriesDocs,mongodbTTLDocs,mongodbIndexesDocs}. For adjacent platform modeling, compare DynamoDB single-table design, Cosmos DB partitioning, and Firestore data modeling \cite{dynamodbSingleTableDocs,cosmosPartitionDocs,firestoreDataModelDocs}. For analytical handling of flexible documents, review Snowflake semi-structured data and Microsoft Fabric JSON guidance \cite{snowflakeSemiStructuredDocs,fabricJsonDocs}.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item MongoDB schema design is workload design: query paths, update frequency, lifecycle, cardinality, and working set drive the document shape.
+    \item The Polymorphic Pattern is useful for related entity types with shared access paths, while the Attribute Pattern handles dynamic searchable fields.
+    \item The Bucket Pattern reduces document count and repeated metadata for time-series workloads, but buckets must be bounded and protected from hot-record contention.
+    \item The Outlier Pattern keeps the common case embedded while moving rare high-cardinality cases to overflow collections.
+    \item Computed, Subset, Extended Reference, and Schema Versioning Patterns trade extra write complexity for faster reads, lower memory pressure, and safer evolution.
+    \item TTL, pre-allocation, and archival patterns manage data lifecycle, but deletion, retention, and restore requirements must be explicit.
+    \item For IoT ingest at 100,000 events per second, bucketed schemas can cut document count and repeated metadata by about 95\% or more when bucket sizes are well chosen.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Choose embed or reference for customer addresses, order line items, payment attempts, and product reviews. Explain the lifecycle and cardinality reason for each choice.
+    \item \textbf{(Conceptual)} Design a Polymorphic Pattern collection for digital media. Name the discriminator field, common indexes, and one partial index.
+    \item \textbf{(Hands-on)} Convert five category-specific product fields into Attribute Pattern entries and write the compound multikey index needed for filtering.
+    \item \textbf{(Hands-on)} Create a TTL index for expiring session documents after seven days. Explain why deletion may not occur at the exact expiration second.
+    \item \textbf{(Design)} Design an Outlier Pattern for enterprise accounts with more than 1,000 team members while keeping small accounts embedded.
+    \item \textbf{(Design)} Build a Schema Versioning migration plan from \texttt{schemaVersion: 1} to \texttt{schemaVersion: 2}; include reader behavior, writer behavior, and rollback evidence.
+    \item \textbf{(Performance)} Estimate daily document counts for one-event-per-document versus 100-event buckets at 100,000 events per second. State the operational impact on indexes and backups.
+    \item \textbf{(Interview)} A team wants every product specification as a top-level indexed field. Write a concise architecture-review response explaining the Attribute Pattern alternative.
+\end{enumerate}
+
+\section{Capstone Project: Design and Validate a Bucket-Pattern IoT Metrics Store}\label{sec:ch2-capstone}
+
+\begin{capstonebox}
+\textbf{Mission:} design, implement, and validate a MongoDB IoT metrics store that uses the Bucket Pattern to reduce document count, repeated metadata, and working-set memory. You will model raw events, create bucket documents, load synthetic measurements, compare document counts against a one-event-per-document baseline, and prove the reduction with queries and metrics.
+
+\textbf{Estimated time:} 4--6 hours, depending on local MongoDB speed and the event volume selected for the lab.
+
+\textbf{What you will practice:}
+\begin{itemize}
+    \item Translating event-rate and metadata assumptions into bucket size, bucket window, and index choices.
+    \item Writing Windows PowerShell-friendly \texttt{mongosh} and PyMongo loaders.
+    \item Creating bounded bucket documents with count, min, max, sum, and metadata fields.
+    \item Measuring document-count reduction and estimating metadata savings.
+    \item Defending a production architecture for high-rate telemetry ingestion.
+\end{itemize}
+\end{capstonebox}
+
+\subsection*{Scenario}
+You own the telemetry store for a manufacturing analytics platform. Each device emits temperature, vibration, pressure, and power metrics. The platform must ingest a peak of 100,000 events per second, retain hot operational data for seven days in MongoDB, archive cold buckets to analytical storage, and support recent device timeline queries. The business wants proof that bucketed storage materially reduces document count and memory pressure before approving the architecture.
+
+\subsection*{Requirements}
+\begin{itemize}
+    \item Model the one-event-per-document baseline and the bucketed design for the same tenant, device, sensor, and time range.
+    \item Use buckets bounded by device, sensor, and one-minute windows, with an additional maximum reading count such as 100 or 500.
+    \item Store metadata once per bucket: tenant, site, device, sensor, unit, firmware, and bucket time range.
+    \item Store compact readings with timestamp offset and value, plus optional quality code.
+    \item Maintain computed fields: \texttt{count}, \texttt{min}, \texttt{max}, \texttt{sum}, and \texttt{closed}.
+    \item Create indexes for device timeline reads and archival scans, such as \texttt{\{ tenantId: 1, deviceId: 1, sensor: 1, bucketStart: -1 \}}.
+    \item Calculate expected document-count reduction and metadata-overhead reduction for the chosen bucket size.
+    \item Validate the result by loading a repeatable sample and comparing collection counts and average document sizes.
+\end{itemize}
+
+\subsection*{Reference Architecture}
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[
+        box/.style={rectangle, rounded corners, draw=primary, fill=primary!6, minimum width=2.5cm, minimum height=1cm, align=center, font=\small\bfseries},
+        bucket/.style={rectangle, rounded corners, draw=green!45!black, fill=green!8, minimum width=2.8cm, minimum height=1cm, align=center, font=\small\bfseries},
+        store/.style={cylinder, shape border rotate=90, aspect=0.25, draw=primary, fill=primary!10, minimum width=2.4cm, minimum height=1.25cm, align=center, font=\small\bfseries},
+        archive/.style={rectangle, rounded corners, draw=orange!85!black, fill=orange!10, minimum width=2.8cm, minimum height=1cm, align=center, font=\small\bfseries},
+        arrow/.style={-{Stealth[length=2.5mm]}, draw=primary, thick},
+        flow/.style={-{Stealth[length=2.5mm]}, draw=green!45!black, thick}
+    ]
+        \node[box] (devices) at (0,0) {Device fleet};
+        \node[box] (ingest) at (3.1,0) {Ingest API\\validation};
+        \node[bucket] (builder) at (6.5,0) {Bucket builder\\count + minute};
+        \node[store] (hot) at (10,0.8) {MongoDB\\hot buckets};
+        \node[archive] (cold) at (13.5,0.8) {Archive\\lake / warehouse};
+        \node[archive] (rollup) at (10,-1.5) {Rollup jobs\\hourly summaries};
+        \node[box] (query) at (13.5,-1.5) {Dashboards\\device timelines};
+        \draw[arrow] (devices) -- (ingest);
+        \draw[arrow] (ingest) -- (builder);
+        \draw[arrow] (builder) -- (hot);
+        \draw[flow] (hot) -- (cold);
+        \draw[flow] (hot) -- (rollup);
+        \draw[flow] (rollup) -- (query);
+        \draw[arrow] (query) -- (hot);
+    \end{tikzpicture}%
+    }
+    \caption{Capstone architecture for validating bucketed IoT metrics, hot MongoDB retention, rollups, and archival flow.}
+    \label{fig:ch2-capstone-architecture}
+\end{figure}
+
+\subsection*{Implementation Steps}
+\begin{enumerate}
+    \item \textbf{Prepare the collections and indexes.} Use a local MongoDB database named \texttt{iot\_capstone}. Keep raw and bucketed collections side by side so counts are comparable.
+
+\begin{lstlisting}[language=JavaScript, caption={\texttt{mongosh} setup for raw and bucketed IoT collections.}]
+use iot_capstone;
+db.raw_events.drop();
+db.metric_buckets.drop();
+
+db.raw_events.createIndex({ tenantId: 1, deviceId: 1, sensor: 1, ts: -1 });
+db.metric_buckets.createIndex({ tenantId: 1, deviceId: 1, sensor: 1, bucketStart: -1 });
+db.metric_buckets.createIndex({ tenantId: 1, bucketStart: 1, closed: 1 });
+\end{lstlisting}
+
+    \item \textbf{Load a repeatable sample.} The script below keeps the sample small enough for a laptop but preserves the same math used for 100,000 events per second.
+
+\begin{lstlisting}[language=Python, caption={PyMongo loader that writes raw events and equivalent bucket documents.}]
+from datetime import datetime, timedelta, timezone
+from pymongo import MongoClient, UpdateOne
+
+client = MongoClient("mongodb://127.0.0.1:27017")
+db = client.iot_capstone
+raw = db.raw_events
+buckets = db.metric_buckets
+raw.delete_many({})
+buckets.delete_many({})
+
+start = datetime(2026, 7, 31, 7, 37, tzinfo=timezone.utc)
+tenants = ["tenant-acme"]
+devices = [f"press-{i:03d}" for i in range(100)]
+sensors = ["temperature", "vibration", "pressure", "power"]
+events_per_series = 250
+bucket_size = 100
+raw_batch = []
+bucket_ops = []
+
+for tenant in tenants:
+    for device in devices:
+        for sensor in sensors:
+            for i in range(events_per_series):
+                ts = start + timedelta(milliseconds=i * 600)
+                value = 70 + (i % 30) * 0.1
+                raw_batch.append({
+                    "tenantId": tenant,
+                    "deviceId": device,
+                    "sensor": sensor,
+                    "ts": ts,
+                    "value": value,
+                    "unit": "C" if sensor == "temperature" else "raw",
+                    "firmware": "8.2.1",
+                    "siteId": "den-factory-03",
+                })
+                bucket_number = i // bucket_size
+                bucket_start = start + timedelta(minutes=bucket_number)
+                bucket_id = f"{tenant}|{device}|{sensor}|{bucket_start.isoformat()}"
+                bucket_ops.append(UpdateOne(
+                    {"_id": bucket_id},
+                    {
+                        "$setOnInsert": {
+                            "tenantId": tenant,
+                            "deviceId": device,
+                            "sensor": sensor,
+                            "bucketStart": bucket_start,
+                            "bucketEnd": bucket_start + timedelta(minutes=1),
+                            "metadata": {"firmware": "8.2.1", "siteId": "den-factory-03"},
+                            "closed": False,
+                        },
+                        "$push": {"readings": {"offsetMs": int((ts - bucket_start).total_seconds() * 1000), "v": value}},
+                        "$inc": {"count": 1, "sum": value},
+                        "$min": {"min": value},
+                        "$max": {"max": value},
+                    },
+                    upsert=True,
+                ))
+
+raw.insert_many(raw_batch, ordered=False)
+buckets.bulk_write(bucket_ops, ordered=False)
+buckets.update_many({"count": {"$gte": bucket_size}}, {"$set": {"closed": True}})
+
+raw_count = raw.count_documents({})
+bucket_count = buckets.count_documents({})
+print({
+    "rawCount": raw_count,
+    "bucketCount": bucket_count,
+    "documentReductionPercent": round((1 - bucket_count / raw_count) * 100, 2),
+})
+\end{lstlisting}
+
+    \item \textbf{Measure size and query behavior.} Run collection stats and a representative device timeline query. Compare document counts, average object size, total index size, and the number of documents examined.
+
+\begin{lstlisting}[language=JavaScript, caption={\texttt{mongosh} validation queries for count, size, and timeline access.}]
+use iot_capstone;
+const rawStats = db.raw_events.stats();
+const bucketStats = db.metric_buckets.stats();
+printjson({
+  rawCount: db.raw_events.countDocuments(),
+  bucketCount: db.metric_buckets.countDocuments(),
+  rawAvgObjSize: rawStats.avgObjSize,
+  bucketAvgObjSize: bucketStats.avgObjSize,
+  rawIndexSize: rawStats.totalIndexSize,
+  bucketIndexSize: bucketStats.totalIndexSize
+});
+
+printjson(db.metric_buckets.find({
+  tenantId: "tenant-acme",
+  deviceId: "press-017",
+  sensor: "temperature",
+  bucketStart: { $gte: ISODate("2026-07-31T07:37:00Z") }
+}).sort({ bucketStart: 1 }).explain("executionStats"));
+\end{lstlisting}
+
+    \item \textbf{Scale the math to production.} For 100,000 events per second, compute daily raw documents as \texttt{100000 * 86400}. Divide by the chosen bucket size to estimate bucket documents per day. Estimate metadata reduction as \texttt{1 - (1 / bucketSize)} when metadata is stored once per bucket instead of once per event, then temper the claim based on actual measured object sizes.
+\end{enumerate}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item A short schema design document showing raw event shape, bucket document shape, bucket key, close rule, and indexes.
+    \item The \texttt{mongosh} setup script and PyMongo loader used in the lab.
+    \item A results table with raw count, bucket count, reduction percentage, average object sizes, total collection sizes, and total index sizes.
+    \item An explanation of how the sample maps to 100,000 events per second in production.
+    \item A risk section covering hot buckets, late events, duplicate events, shard key choice, TTL, and archival.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item The bucket design stores metadata once per bucket and readings in bounded arrays.
+    \item Buckets close by count and time window, preventing unbounded document growth.
+    \item The validation load creates both raw and bucketed versions of the same logical events.
+    \item The measured document-count reduction is reported and the production-scale calculation is shown.
+    \item The design includes indexes for recent device timeline reads and archival scans.
+    \item The architecture explains how hot seven-day data remains in MongoDB while cold data moves to archive.
+    \item The recommendation discusses shard-key implications for high ingest and targeted reads.
+    \item The final write-up proves or rejects the about 95\% reduction claim with measured data and explicit assumptions.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Add deduplication with an event identifier and prove duplicate writes do not inflate bucket counts.
+    \item Support late-arriving events by reopening recent buckets or writing correction buckets.
+    \item Compare bucket sizes of 50, 100, and 500 readings and measure update contention, query latency, and index size.
+    \item Add a TTL index for hot buckets after archival validation and explain the deletion lag.
+    \item Implement hourly rollup documents with the Computed Pattern and compare dashboard query cost.
+    \item Test a sharded design in a development cluster and compare shard distribution for candidate shard keys.
+    \item Export bucketed data to Parquet or JSON for Snowflake or Fabric analysis and document the field mapping.
+\end{itemize}

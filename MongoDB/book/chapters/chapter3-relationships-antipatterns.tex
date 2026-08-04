@@ -1,0 +1,651 @@
+\chapter{Modeling Relationships and Modern Anti-Patterns}
+\index{relationship modeling}\index{embedding}\index{referencing}\index{\$lookup}\index{referential integrity}\index{document anti-patterns}\index{unbounded arrays}\index{16 MB BSON limit}\index{JSON Schema validation}\index{\$jsonSchema}\index{capped collections}\index{parent referencing}\index{activity logs}%
+
+\begin{objectives}
+\begin{itemize}
+    \item Choose embedding or referencing for 1:1, 1:N few, 1:N many, and N:M relationships based on read locality, update frequency, lifecycle, and growth bounds.
+    \item Recognize document anti-patterns such as unbounded arrays, bloated documents near the 16 MB BSON limit, and massive collections without lifecycle or partitioning strategy.
+    \item Use MongoDB JSON Schema validation to enforce required fields, data types, enum rules, nested structures, and operational guardrails.
+    \item Build an enterprise HR collection with \texttt{\$jsonSchema} validation in \texttt{createCollection} and verify accepted and rejected documents with PyMongo.
+    \item Re-architect a legacy user-activity logging system that fails with \texttt{BSONObj size exceeds 16MB} errors.
+    \item Combine parent-referencing, capped collections, indexes, retention windows, and validation rules into a defensible production remediation plan.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+Relationship modeling and referential integrity appear in every data platform, but each system exposes different knobs. MongoDB optimizes for locality through embedding and targeted references, with \texttt{\$lookup} available when a read path needs server-side joining. Relational services such as Amazon RDS, Azure SQL Database, and Cloud SQL enforce foreign keys and execute joins natively. DynamoDB commonly models relationships with single-table adjacency items and application-enforced integrity. Cosmos DB for NoSQL favors embedding inside a logical partition and carefully chosen partition keys to avoid cross-partition fan-out.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{2.4cm}p{3.0cm}p{3.1cm}p{3.1cm}p{3.1cm}@{}}
+\toprule
+\textbf{Concept} & \textbf{MongoDB} & \textbf{Relational RDS / Azure SQL / Cloud SQL} & \textbf{DynamoDB} & \textbf{Cosmos DB for NoSQL} \\
+\midrule
+1:1 relationship & Embed when read and lifecycle are shared; reference when independently secured or updated & Same table for optional columns or separate table with unique foreign key & Same item or adjacent item with same partition key & Embed in item when partition-local; split item if growth or access differs \\
+1:N few & Embed bounded child array such as addresses or current roles & Child table with foreign key and join & Item collection under one partition key with sort-key prefixes & Embedded array if bounded and partition-local \\
+1:N many & Parent-reference children; query by parent key; avoid unbounded parent arrays & Child table indexed by foreign key; pagination through joins or covering indexes & Many child items under partition key, often time-ordered sort key & Child items in same partition when possible; separate container for extreme scale \\
+N:M relationship & Junction collection with both foreign keys, optional extended references, and indexes & Junction table with two foreign keys and uniqueness constraints & Edge items for both traversal directions in single-table design & Edge documents, often duplicated by traversal direction and partition key \\
+Referential integrity & Usually application-enforced; transactions can coordinate bounded multi-document changes; \texttt{\$lookup} does not enforce integrity & Database-enforced foreign keys, cascading rules, constraints, and join optimizer & Application-enforced conditional writes and transactions for small item groups & Application-enforced; transactional batch only within logical partition \\
+Document / row size limits & 16 MB BSON document limit; design arrays and embedded histories with hard bounds & Row and page limits vary by engine; large values often stored off-row or in separate tables & 400 KB item limit encourages narrow items and adjacency records & 2 MB item limit in API for NoSQL requires partition-aware item sizing \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+The architectural equivalence is not \emph{documents versus joins}; it is \emph{where relationship cost is paid}. MongoDB pays design attention up front by placing bounded data together and referencing high-cardinality data. Relational systems pay at query time through joins backed by constraints. DynamoDB and Cosmos DB pay through key design, duplication, and partition-local access patterns \cite{mongodbDataModelingDocs,mongodbLimitsDocs,mongodbLookupDocs,dynamodbSingleTableDocs,cosmosPartitionDocs}.
+\end{crosscloud}
+
+\section{Week 3 Roadmap: Relationships, Limits, and Validation}
+MongoDB lets data engineers encode relationships directly inside documents, but that power is safe only when growth is bounded and access paths are explicit. A relationship that begins as a convenient embedded array can become a production incident when the array grows forever, every update rewrites a large parent document, and the record approaches the 16 MB BSON document limit \cite{mongodbLimitsDocs}. This week focuses on designing relationship boundaries before they become operational failures.
+
+\begin{definitionbox}
+\textbf{Relationship modeling} is the practice of deciding whether related facts belong in the same document, in separate documents connected by references, or in a hybrid design with selected duplicated fields.
+\end{definitionbox}
+
+\begin{keyterms}
+\textbf{1:1}: one parent relates to one child. \textbf{1:N few}: one parent relates to a small bounded child set. \textbf{1:N many}: one parent relates to a large or unbounded child set. \textbf{N:M}: many records on both sides relate through an edge or junction. \textbf{Parent referencing}: each child stores the parent identifier. \textbf{Child referencing}: the parent stores child identifiers. \textbf{Cardinality}: relationship count. \textbf{Validation}: database-side rules that reject invalid document shapes.
+\end{keyterms}
+
+\section{Monday: Embedding versus Referencing}
+\subsection{Decision Criteria}
+Embedding and referencing are not moral choices; they are workload choices. Embed when the child data is needed with the parent, changes at the same pace, has the same security boundary, and has a clear maximum size. Reference when the child data is large, independently updated, independently retained, or queried without the parent.
+
+\begin{definitionbox}
+\textbf{Embedding} stores related data inside the same BSON document. \textbf{Referencing} stores an identifier, such as \texttt{employeeId} or \texttt{departmentId}, that points to a document in the same or another collection.
+\end{definitionbox}
+
+\begin{notebox}
+The important question is not whether MongoDB can perform a \texttt{\$lookup}. It can. The important question is whether the dominant access path benefits from locality or from independent document growth and indexing.
+\end{notebox}
+
+\begin{figure}[H]
+    \centering
+    \resizebox{0.95\textwidth}{!}{%
+    \begin{tikzpicture}[
+        question/.style={diamond, aspect=2.2, draw=primary, thick, fill=primary!6, align=center, font=\small\bfseries, inner sep=2pt},
+        answer/.style={rectangle, rounded corners, draw=green!45!black, thick, fill=green!8, minimum width=3.2cm, minimum height=0.9cm, align=center, font=\small\bfseries},
+        warn/.style={rectangle, rounded corners, draw=red!60!black, thick, fill=red!6, minimum width=3.2cm, minimum height=0.9cm, align=center, font=\small\bfseries},
+        arrow/.style={-{Stealth[length=2.5mm]}, draw=primary, thick}
+    ]
+        \node[question] (read) at (0,0) {Read together\\most of the time?};
+        \node[question] (bounded) at (4.3,0) {Bounded\\cardinality?};
+        \node[question] (lifecycle) at (8.6,0) {Same lifecycle\\and security?};
+        \node[answer] (embed) at (13,0.85) {Embed\\bounded child data};
+        \node[warn] (ref) at (13,-0.85) {Reference\\query children by parent};
+        \node[warn] (ref2) at (4.3,-2.2) {Reference or use\\Outlier Pattern};
+        \draw[arrow] (read) -- node[above,font=\scriptsize]{yes} (bounded);
+        \draw[arrow] (bounded) -- node[above,font=\scriptsize]{yes} (lifecycle);
+        \draw[arrow] (lifecycle) -- node[above,font=\scriptsize]{yes} (embed);
+        \draw[arrow] (lifecycle) -- node[below,font=\scriptsize]{no} (ref);
+        \draw[arrow] (bounded) -- node[right,font=\scriptsize]{no} (ref2);
+        \draw[arrow] (read) |- node[left,font=\scriptsize]{no} (ref2);
+    \end{tikzpicture}%
+    }
+    \caption{Embedding versus referencing decision tree for bounded relationships, shared lifecycle, and dominant read locality.}
+    \label{fig:ch3-embed-reference-decision}
+\end{figure}
+
+\subsection{1:1 Relationships}
+For a 1:1 relationship, embedding is usually correct when the child is simply a component of the parent. An employee profile may embed emergency contact preferences or workstation assignment metadata if they are read with the employee and remain small. A payroll profile, however, may require separate access controls, encryption policy, audit handling, and retention rules; those concerns justify a reference even with 1:1 cardinality.
+
+\begin{tipbox}
+For 1:1 relationships, look beyond count. Separate the document when the child has a different compliance boundary, owner, retention period, or update workflow.
+\end{tipbox}
+
+\subsection{1:N Few Relationships}
+A 1:N few relationship is the document model's sweet spot. User addresses, employee skills, product images, and current role assignments are often embedded because the array is small and naturally read with the parent. The phrase \emph{few} must be enforced by product rules or validation. If a user may eventually have millions of activity events, the relationship is not 1:N few even if the first week has only ten events.
+
+\begin{pitfall}
+\textbf{Assuming current data volume is the design limit.} A development sample with five children does not prove the relationship is bounded. Bound it with domain policy, validation, or a different model.
+\end{pitfall}
+
+\subsection{1:N Many Relationships}
+A 1:N many relationship should usually use parent referencing: each child document stores the parent's identifier and indexes it. A user activity event stores \texttt{userId}; a support ticket stores \texttt{accountId}; an order line may store \texttt{orderId} if line counts can be very large or independently processed. Parent referencing lets the child collection grow, paginate, expire, shard, and archive independently.
+
+\begin{definitionbox}
+\textbf{Parent referencing} stores the parent's identifier in each child document, enabling queries such as \texttt{find(\{ userId: ... \})} without growing the parent document.
+\end{definitionbox}
+
+\subsection{N:M Relationships}
+N:M relationships need an edge collection, similar to a relational junction table. A training platform may store \texttt{employee\_course\_enrollments} with \texttt{employeeId}, \texttt{courseId}, status, enrollment date, completion date, and stable duplicated fields such as course title. Create indexes for both traversal directions.
+
+\begin{tipbox}
+For N:M edges, design the edge document as a first-class entity. It often has its own lifecycle, status, audit fields, and uniqueness rule, not merely two identifiers.
+\end{tipbox}
+
+\section{Tuesday: Document Anti-Patterns}
+\subsection{Unbounded Arrays}
+An unbounded array grows without a strict maximum count or size. It may begin harmlessly as \texttt{activityLog: []}, \texttt{messages: []}, or \texttt{loginHistory: []}. Over time, the parent document becomes large, updates move more bytes, indexes on array fields become more expensive, and a single hot parent can serialize a high-volume write path.
+
+\begin{definitionbox}
+An \textbf{unbounded array} is an array whose maximum number of elements is not controlled by domain rules, validation, bucketing, archival, or an overflow collection.
+\end{definitionbox}
+
+\begin{figure}[H]
+    \centering
+    \resizebox{0.92\textwidth}{!}{%
+    \begin{tikzpicture}[
+        box/.style={rectangle, rounded corners, draw=primary, fill=primary!6, minimum width=2.6cm, minimum height=0.9cm, align=center, font=\small\bfseries},
+        bad/.style={rectangle, rounded corners, draw=red!60!black, fill=red!6, minimum width=3.0cm, minimum height=1cm, align=center, font=\small\bfseries},
+        good/.style={rectangle, rounded corners, draw=green!45!black, fill=green!8, minimum width=3.0cm, minimum height=1cm, align=center, font=\small\bfseries},
+        arrow/.style={-{Stealth[length=2.5mm]}, draw=primary, thick}
+    ]
+        \node[box] (u) at (0,0) {User document};
+        \node[bad] (a1) at (4,1.0) {Embedded\\activity[1..N]};
+        \node[bad] (limit) at (8,1.0) {16 MB limit\\large rewrites};
+        \node[good] (events) at (4,-1.0) {Activity events\\parent-referenced};
+        \node[good] (ret) at (8,-1.0) {TTL / capped\\retention};
+        \draw[arrow] (u) -- node[above,font=\scriptsize]{anti-pattern} (a1);
+        \draw[arrow] (a1) -- (limit);
+        \draw[arrow] (u) -- node[below,font=\scriptsize]{remediation} (events);
+        \draw[arrow] (events) -- (ret);
+    \end{tikzpicture}%
+    }
+    \caption{Unbounded arrays turn a convenient embedded design into a size-limit and write-amplification failure.}
+    \label{fig:ch3-unbounded-array-pitfall}
+\end{figure}
+
+\begin{pitfall}
+\textbf{Embedding history forever.} Logs, clicks, messages, audit trails, and telemetry are rarely safe as growing arrays inside an account or user document.
+\end{pitfall}
+
+\subsection{Bloated Documents and the 16 MB Limit}
+MongoDB stores documents as BSON and enforces a maximum document size of 16 MB \cite{mongodbLimitsDocs}. The limit protects the server from documents that would be too expensive to move, replicate, and keep in memory. A bloated document may also be a performance problem long before it reaches the hard limit because every read and write touches unnecessary bytes.
+
+\begin{notebox}
+The 16 MB limit is not a target. A healthy hot document is usually much smaller and contains only data needed together by a known access path.
+\end{notebox}
+
+\begin{tipbox}
+Track approximate document size in load tests with \texttt{Object.bsonsize(doc)} in \texttt{mongosh}, collection statistics, and representative production samples. Alert on growth trends, not just hard failures.
+\end{tipbox}
+
+\subsection{Massive Collections Without Shape Strategy}
+A massive collection is not automatically an anti-pattern. MongoDB can handle very large collections when indexes, shard keys, retention, and query filters are designed deliberately. The anti-pattern is a collection that grows without lifecycle policy, selective indexes, archive path, or query boundaries. User activity, observability, and event streams require time and tenant keys, retention windows, and operational ownership.
+
+\begin{pitfall}
+\textbf{One giant collection with no lifecycle.} If data never expires, never archives, and every query scans by a low-selectivity field, collection size will eventually dominate cost and incident response.
+\end{pitfall}
+
+\section{Wednesday: JSON Schema Validation}
+\subsection{Validation Goals}
+MongoDB JSON Schema validation lets the database reject documents that violate structural rules. It is not a replacement for application validation, but it is a strong boundary for shared collections, migrations, and critical domains. A validator can require fields, restrict BSON types, enforce enums, validate nested objects, and reject unknown or oversized patterns when combined with application checks \cite{mongodbJsonSchemaDocs}.
+
+\begin{definitionbox}
+\textbf{JSON Schema validation} in MongoDB uses the \texttt{\$jsonSchema} operator inside a collection validator to enforce document shape and selected field rules at insert and update time.
+\end{definitionbox}
+
+\begin{notebox}
+MongoDB validators run on writes. They protect the collection boundary, but they do not automatically repair existing invalid documents unless validation level and migration logic address them.
+\end{notebox}
+
+\subsection{Structural Constraints, Types, and Enums}
+A validator should express durable invariants: required identifiers, tenant ownership, lifecycle state, date fields, bounded arrays, and domain enums. In HR systems, examples include employee status, worker type, department identifier, and effective dates. Use \texttt{bsonType} for MongoDB-specific types such as \texttt{objectId}, \texttt{date}, \texttt{decimal}, and \texttt{int}.
+
+\begin{tipbox}
+Use validation for invariants that must never be bypassed, and use application code for user-friendly messages, cross-collection existence checks, and workflow-specific rules.
+\end{tipbox}
+
+\begin{pitfall}
+\textbf{Encoding every business workflow in one validator.} Overly complex validators become hard to migrate. Keep validators focused on stable structural boundaries and domain states.
+\end{pitfall}
+
+\section{Thursday Hands-On Project: Enterprise HR Validator}
+\subsection{Scenario}
+The HR data platform stores employee master records consumed by payroll, benefits, identity governance, and analytics. Invalid documents have caused downstream failures: missing employee identifiers, free-form employment status values, arrays of certifications with no limit, and profile documents that accidentally include large audit histories. The goal is to create a collection that enforces required fields, types, enums, bounded arrays, and size guardrails.
+
+\begin{lstlisting}[language=JavaScript, caption={\texttt{mongosh} collection creation with an enterprise HR \texttt{\$jsonSchema} validator.}]
+use hr_master;
+db.employees.drop();
+
+db.createCollection("employees", {
+  validator: {
+    $jsonSchema: {
+      bsonType: "object",
+      required: ["employeeId", "tenantId", "status", "workerType", "legalName", "departmentId", "hireDate", "schemaVersion"],
+      additionalProperties: true,
+      properties: {
+        employeeId: {
+          bsonType: "string",
+          pattern: "^EMP-[0-9]{6}$",
+          description: "employeeId must match EMP-000000"
+        },
+        tenantId: { bsonType: "string" },
+        status: { enum: ["active", "leave", "terminated"] },
+        workerType: { enum: ["employee", "contractor", "intern"] },
+        legalName: {
+          bsonType: "object",
+          required: ["given", "family"],
+          properties: {
+            given: { bsonType: "string", maxLength: 80 },
+            family: { bsonType: "string", maxLength: 80 },
+            preferred: { bsonType: "string", maxLength: 80 }
+          }
+        },
+        departmentId: { bsonType: "string" },
+        managerId: { bsonType: ["string", "null"] },
+        hireDate: { bsonType: "date" },
+        terminationDate: { bsonType: ["date", "null"] },
+        schemaVersion: { bsonType: "int", minimum: 1, maximum: 3 },
+        certifications: {
+          bsonType: "array",
+          maxItems: 25,
+          items: {
+            bsonType: "object",
+            required: ["code", "issuedAt"],
+            properties: {
+              code: { bsonType: "string", maxLength: 40 },
+              issuedAt: { bsonType: "date" },
+              expiresAt: { bsonType: ["date", "null"] }
+            }
+          }
+        },
+        profileSummary: { bsonType: "string", maxLength: 2000 },
+        activityRef: { bsonType: ["objectId", "null"] }
+      }
+    }
+  },
+  validationLevel: "strict",
+  validationAction: "error"
+});
+
+db.employees.createIndex({ tenantId: 1, employeeId: 1 }, { unique: true });
+db.employees.createIndex({ tenantId: 1, departmentId: 1, status: 1 });
+\end{lstlisting}
+
+The validator bounds the embedded certification list and profile summary. It does not embed audit history or activity logs. Those high-cardinality records belong in separate collections referenced by \texttt{employeeId} or \texttt{activityRef}.
+
+\begin{lstlisting}[language=Python, caption={PyMongo validation test that inserts a valid HR document and handles validation errors.}]
+from datetime import datetime, timezone
+from pymongo import MongoClient
+from pymongo.errors import WriteError
+
+client = MongoClient("mongodb://127.0.0.1:27017")
+db = client.hr_master
+employees = db.employees
+
+valid_employee = {
+    "employeeId": "EMP-000123",
+    "tenantId": "tenant-acme",
+    "status": "active",
+    "workerType": "employee",
+    "legalName": {"given": "Avery", "family": "Nguyen", "preferred": "Avery"},
+    "departmentId": "DEPT-DATA",
+    "managerId": None,
+    "hireDate": datetime(2024, 5, 1, tzinfo=timezone.utc),
+    "terminationDate": None,
+    "schemaVersion": 1,
+    "certifications": [
+        {"code": "MONGO-DE", "issuedAt": datetime(2026, 7, 31, tzinfo=timezone.utc), "expiresAt": None}
+    ],
+    "profileSummary": "Senior data engineer supporting MongoDB platforms.",
+    "activityRef": None,
+}
+
+invalid_employee = {
+    "employeeId": "123",
+    "tenantId": "tenant-acme",
+    "status": "active-ish",
+    "workerType": "employee",
+    "legalName": {"given": "Jordan"},
+    "departmentId": "DEPT-DATA",
+    "hireDate": "2026-07-31",
+    "schemaVersion": 99,
+    "certifications": [{"code": f"CERT-{i}", "issuedAt": datetime.now(timezone.utc)} for i in range(30)],
+}
+
+employees.delete_many({"tenantId": "tenant-acme", "employeeId": {"$in": ["EMP-000123", "123"]}})
+employees.insert_one(valid_employee)
+print("valid employee inserted")
+
+try:
+    employees.insert_one(invalid_employee)
+except WriteError as exc:
+    print("invalid employee rejected")
+    print(exc.details.get("errmsg", str(exc)))
+\end{lstlisting}
+
+\begin{notebox}
+The script expects the collection to already exist with the validator. In production, deploy validator changes through versioned migration scripts and test them against representative documents before enforcing \texttt{validationAction: "error"}.
+\end{notebox}
+
+\section{Friday Use Case and Architecture: Remediating 16 MB Activity-Log Failures}
+\subsection{Scenario and Root Cause}
+A legacy customer portal embeds user activity inside each user document: \texttt{\{ \_id, userId, profile, activityLog: [ ... millions of events ... ] \}}. As the highest-traffic users accumulate years of login, click, export, and security events, updates begin failing with \texttt{BSONObj size exceeds 16MB}. The design also makes retention impossible because old events cannot be deleted without rewriting the user document.
+
+The remediation separates identity from activity. User profile data remains in \texttt{users}. New events are written to \texttt{user\_activity\_events} with parent references, indexed by \texttt{tenantId}, \texttt{userId}, and event time. A capped collection keeps the newest operational firehose for fast diagnostics, while a normal collection or archival pipeline stores records requiring audit retention.
+
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[
+        source/.style={rectangle, rounded corners, draw=primary, fill=primary!6, minimum width=2.6cm, minimum height=1cm, align=center, font=\small\bfseries},
+        store/.style={cylinder, shape border rotate=90, aspect=0.25, draw=primary, fill=primary!10, minimum width=2.6cm, minimum height=1.25cm, align=center, font=\small\bfseries},
+        event/.style={rectangle, rounded corners, draw=green!45!black, fill=green!8, minimum width=3.1cm, minimum height=1cm, align=center, font=\small\bfseries},
+        archive/.style={rectangle, rounded corners, draw=orange!85!black, fill=orange!10, minimum width=2.8cm, minimum height=1cm, align=center, font=\small\bfseries},
+        arrow/.style={-{Stealth[length=2.5mm]}, draw=primary, thick},
+        flow/.style={-{Stealth[length=2.5mm]}, draw=green!45!black, thick}
+    ]
+        \node[source] (app) at (0,0) {Portal API\\activity writes};
+        \node[store] (users) at (3.4,1.0) {users\\profile only};
+        \node[event] (events) at (3.4,-1.0) {user\_activity\_events\\parent references};
+        \node[event] (capped) at (7.5,-1.0) {capped recent\\diagnostics};
+        \node[archive] (audit) at (11.4,-0.1) {audit retention\\normal collection};
+        \node[archive] (lake) at (11.4,-1.9) {cold archive\\lake / warehouse};
+        \draw[arrow] (app) -- node[above,font=\scriptsize]{read profile} (users);
+        \draw[arrow] (app) -- node[below,font=\scriptsize]{append event} (events);
+        \draw[flow] (events) -- (capped);
+        \draw[flow] (events) -- (audit);
+        \draw[flow] (audit) -- (lake);
+    \end{tikzpicture}%
+    }
+    \caption{Parent-referenced activity events and capped recent diagnostics replace an unbounded embedded activity array.}
+    \label{fig:ch3-activity-remediation}
+\end{figure}
+
+\begin{tipbox}
+Use capped collections for bounded recent streams where automatic overwrite is acceptable. Do not use them as the only store for records that require legal, security, or customer audit retention \cite{mongodbCappedCollectionsDocs}.
+\end{tipbox}
+
+\begin{pitfall}
+\textbf{Replacing one unbounded array with one unbounded retention problem.} The activity collection still needs indexes, time windows, archival, and deletion or tiering rules.
+\end{pitfall}
+
+\section{Interview Q\&A}
+\subsection{Concepts and Trade-offs}
+\begin{enumerate}
+    \item \textbf{Q: How do you choose embedding versus referencing?}\\
+    A: Embed data that is read together, bounded, and shares lifecycle. Reference data that grows independently, updates independently, has separate security, or needs its own query and retention path.
+
+    \item \textbf{Q: Why are unbounded arrays dangerous in MongoDB?}\\
+    A: They increase document size, amplify updates, can create multikey index overhead, and eventually risk the 16 MB BSON document limit.
+
+    \item \textbf{Q: When would you use \texttt{\$lookup}?}\\
+    A: Use it for targeted joins when references are the right model and indexes support the join predicates. Do not use it to excuse a relationship model that ignores cardinality and access patterns.
+
+    \item \textbf{Q: How do you model N:M relationships?}\\
+    A: Use an edge collection with identifiers for both sides, a uniqueness rule, traversal indexes in both directions, and any relationship attributes such as status or effective dates.
+
+    \item \textbf{Q: What does JSON Schema validation protect?}\\
+    A: It protects structural invariants at the database boundary: required fields, types, enums, nested shapes, array bounds, and selected value ranges.
+
+    \item \textbf{Q: Can MongoDB enforce foreign keys like a relational database?}\\
+    A: Not as declarative foreign-key constraints. Applications usually enforce references, sometimes with transactions, change streams, or reconciliation jobs for bounded workflows.
+
+    \item \textbf{Q: What should you do after seeing \texttt{BSONObj size exceeds 16MB}?}\\
+    A: Identify the growing field, stop new growth, move high-cardinality data to a referenced collection, migrate existing history, add validation or limits, and add retention controls.
+\end{enumerate}
+
+\section{Further Reading}
+Start with MongoDB data modeling, document limit, \texttt{\$lookup}, JSON Schema validation, and capped collection documentation \cite{mongodbDataModelingDocs,mongodbLimitsDocs,mongodbLookupDocs,mongodbJsonSchemaDocs,mongodbCappedCollectionsDocs}. For adjacent platform comparison, review DynamoDB single-table design and Cosmos DB partitioning guidance \cite{dynamodbSingleTableDocs,cosmosPartitionDocs}. For schema patterns that complement this chapter, revisit the Bucket, Outlier, Extended Reference, and Schema Versioning Patterns from Chapter 2.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item Embedding is ideal for bounded, co-read, same-lifecycle data; referencing is safer for large, independently queried, independently updated, or separately retained data.
+    \item 1:1 and 1:N few relationships often embed, while 1:N many and N:M relationships usually require parent references or edge collections.
+    \item Unbounded arrays and bloated documents are production anti-patterns because they increase write cost and can reach MongoDB's 16 MB BSON document limit.
+    \item Massive collections are manageable only when indexes, retention, shard keys, archival, and query boundaries are explicit.
+    \item JSON Schema validation enforces durable collection invariants, but application code still handles friendly errors and cross-collection workflow rules.
+    \item Capped collections are useful for bounded recent streams, not for the sole copy of regulated audit history.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Classify employee profile, payroll profile, emergency contacts, certifications, and audit events as embedded or referenced. Justify each decision with lifecycle and cardinality.
+    \item \textbf{(Conceptual)} Explain why a current array length of five does not prove a relationship is safe to embed forever.
+    \item \textbf{(Hands-on)} Write a \texttt{\$jsonSchema} validator for a department collection with required \texttt{tenantId}, \texttt{departmentId}, \texttt{name}, and enum status.
+    \item \textbf{(Hands-on)} Create indexes for an N:M \texttt{employee\_course\_enrollments} edge collection supporting employee transcript and course roster queries.
+    \item \textbf{(Design)} Re-model a social-media comments array that can reach one million comments per post. Include pagination, indexes, and retention.
+    \item \textbf{(Design)} Propose a migration plan for moving embedded user activity arrays into a parent-referenced collection without downtime.
+    \item \textbf{(Performance)} Estimate the risk of a 2 KB activity event appended 10,000 times to one user document. Compare that with 10,000 referenced event documents.
+    \item \textbf{(Interview)} Write a concise answer to: \emph{Does MongoDB support joins, and does that mean we should normalize every relationship?}
+\end{enumerate}
+
+\section{Capstone Project: Remediate a 16 MB Activity-Log Failure}\label{sec:ch3-capstone}
+
+\begin{capstonebox}
+\textbf{Mission:} remediate a production activity-log design that embeds unbounded user events and fails with \texttt{BSONObj size exceeds 16MB}. You will design parent-referenced event storage, create a capped recent diagnostics collection, enforce JSON Schema validation, migrate sample data, and prove that the new profile document remains bounded.
+
+\textbf{Estimated time:} 5--7 hours, depending on migration sample size and validation depth.
+
+\textbf{What you will practice:}
+\begin{itemize}
+    \item Diagnosing document growth from embedded high-cardinality arrays.
+    \item Creating normal and capped collections for different retention purposes.
+    \item Applying \texttt{\$jsonSchema} validators to user profile and activity event collections.
+    \item Writing migration code that moves embedded activity into parent-referenced documents.
+    \item Validating document sizes, counts, indexes, and failure-mode remediation evidence.
+\end{itemize}
+\end{capstonebox}
+
+\subsection*{Scenario}
+A SaaS portal stores every user event inside \texttt{users.activityLog}. Enterprise tenants with automated exports generate hundreds of thousands of events per user. Profile updates now fail for heavy users, incident responders cannot query recent activity efficiently, and compliance requires one year of selected security events. The architecture must keep user profiles small, retain recent operational events, preserve required audit history, and reject any future attempt to reintroduce unbounded embedded activity.
+
+\subsection*{Requirements}
+\begin{itemize}
+    \item Keep \texttt{users} limited to profile, account status, stable preferences, and small bounded subsets only.
+    \item Store each activity event in \texttt{user\_activity\_events} with \texttt{tenantId}, \texttt{userId}, \texttt{eventId}, \texttt{eventType}, \texttt{occurredAt}, and payload metadata.
+    \item Maintain a capped \texttt{recent\_activity\_stream} collection for recent diagnostics where overwrite is acceptable.
+    \item Add JSON Schema validation that rejects embedded \texttt{activityLog} on user profiles and enforces required event fields.
+    \item Create indexes for user timeline reads, tenant security investigations, and event de-duplication.
+    \item Provide a migration path from embedded arrays to referenced event documents with idempotent writes.
+    \item Define archival and retention rules for one-year audit events and shorter operational diagnostics.
+\end{itemize}
+
+\subsection*{Reference Architecture}
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[
+        box/.style={rectangle, rounded corners, draw=primary, fill=primary!6, minimum width=2.7cm, minimum height=1cm, align=center, font=\small\bfseries},
+        store/.style={cylinder, shape border rotate=90, aspect=0.25, draw=primary, fill=primary!10, minimum width=2.6cm, minimum height=1.25cm, align=center, font=\small\bfseries},
+        event/.style={rectangle, rounded corners, draw=green!45!black, fill=green!8, minimum width=3.0cm, minimum height=1cm, align=center, font=\small\bfseries},
+        archive/.style={rectangle, rounded corners, draw=orange!85!black, fill=orange!10, minimum width=2.8cm, minimum height=1cm, align=center, font=\small\bfseries},
+        arrow/.style={-{Stealth[length=2.5mm]}, draw=primary, thick},
+        flow/.style={-{Stealth[length=2.5mm]}, draw=green!45!black, thick}
+    ]
+        \node[box] (api) at (0,0) {Application API\\writes events};
+        \node[store] (profile) at (3.3,1.1) {users\\bounded profile};
+        \node[event] (events) at (3.3,-1.1) {activity events\\parent reference};
+        \node[event] (cap) at (7.4,-1.1) {recent capped\\stream};
+        \node[archive] (audit) at (11.2,0.2) {audit store\\1 year};
+        \node[archive] (archive) at (11.2,-1.8) {cold archive\\analytics};
+        \node[box] (query) at (7.4,1.1) {Investigations\\timeline queries};
+        \draw[arrow] (api) -- (profile);
+        \draw[arrow] (api) -- (events);
+        \draw[flow] (events) -- (cap);
+        \draw[flow] (events) -- (audit);
+        \draw[flow] (audit) -- (archive);
+        \draw[arrow] (query) -- (profile);
+        \draw[arrow] (query) -- (events);
+    \end{tikzpicture}%
+    }
+    \caption{Capstone reference architecture with bounded user profiles, parent-referenced events, capped diagnostics, and audit archival.}
+    \label{fig:ch3-capstone-architecture}
+\end{figure}
+
+\subsection*{Implementation Steps}
+\begin{enumerate}
+    \item \textbf{Create bounded collections and indexes.} The setup below prevents embedded activity on the user profile and creates separate event stores.
+
+\begin{lstlisting}[language=JavaScript, caption={\texttt{mongosh} setup for bounded users, referenced activity events, and capped diagnostics.}]
+use activity_remediation;
+db.users.drop();
+db.user_activity_events.drop();
+db.recent_activity_stream.drop();
+
+db.createCollection("users", {
+  validator: {
+    $jsonSchema: {
+      bsonType: "object",
+      required: ["tenantId", "userId", "email", "status", "schemaVersion"],
+      properties: {
+        tenantId: { bsonType: "string" },
+        userId: { bsonType: "string" },
+        email: { bsonType: "string" },
+        status: { enum: ["active", "locked", "disabled"] },
+        schemaVersion: { bsonType: "int", minimum: 2 },
+        activityLog: { bsonType: "undefined", description: "activityLog must not be embedded" }
+      }
+    }
+  },
+  validationAction: "error"
+});
+
+db.createCollection("user_activity_events", {
+  validator: {
+    $jsonSchema: {
+      bsonType: "object",
+      required: ["tenantId", "userId", "eventId", "eventType", "occurredAt"],
+      properties: {
+        tenantId: { bsonType: "string" },
+        userId: { bsonType: "string" },
+        eventId: { bsonType: "string" },
+        eventType: { enum: ["login", "logout", "export", "permission_change", "api_call"] },
+        occurredAt: { bsonType: "date" },
+        payload: { bsonType: ["object", "null"] }
+      }
+    }
+  },
+  validationAction: "error"
+});
+
+db.createCollection("recent_activity_stream", { capped: true, size: 104857600, max: 500000 });
+db.users.createIndex({ tenantId: 1, userId: 1 }, { unique: true });
+db.user_activity_events.createIndex({ tenantId: 1, userId: 1, occurredAt: -1 });
+db.user_activity_events.createIndex({ tenantId: 1, eventType: 1, occurredAt: -1 });
+db.user_activity_events.createIndex({ tenantId: 1, eventId: 1 }, { unique: true });
+\end{lstlisting}
+
+    \item \textbf{Migrate embedded arrays idempotently.} The script writes each embedded event as a child document, mirrors it into the capped stream, upgrades the user schema, and removes the embedded array.
+
+\begin{lstlisting}[language=Python, caption={PyMongo migration from embedded activity arrays to parent-referenced events.}]
+from datetime import datetime, timezone
+from pymongo import MongoClient, UpdateOne
+from pymongo.errors import BulkWriteError
+
+client = MongoClient("mongodb://127.0.0.1:27017")
+db = client.activity_remediation
+users = db.legacy_users
+profiles = db.users
+events = db.user_activity_events
+recent = db.recent_activity_stream
+
+sample_user = {
+    "tenantId": "tenant-acme",
+    "userId": "user-001",
+    "email": "user001@example.com",
+    "status": "active",
+    "schemaVersion": 1,
+    "activityLog": [
+        {"eventId": "evt-1", "eventType": "login", "occurredAt": datetime(2026, 7, 31, 10, 0, tzinfo=timezone.utc), "payload": {"ip": "10.0.0.5"}},
+        {"eventId": "evt-2", "eventType": "export", "occurredAt": datetime(2026, 7, 31, 10, 5, tzinfo=timezone.utc), "payload": {"rows": 1200}},
+    ],
+}
+users.replace_one({"tenantId": sample_user["tenantId"], "userId": sample_user["userId"]}, sample_user, upsert=True)
+
+for user in users.find({"activityLog.0": {"$exists": True}}):
+    tenant_id = user["tenantId"]
+    user_id = user["userId"]
+    event_ops = []
+    recent_docs = []
+    for event in user.get("activityLog", []):
+        child = {
+            "tenantId": tenant_id,
+            "userId": user_id,
+            "eventId": event["eventId"],
+            "eventType": event["eventType"],
+            "occurredAt": event["occurredAt"],
+            "payload": event.get("payload"),
+        }
+        event_ops.append(UpdateOne(
+            {"tenantId": tenant_id, "eventId": event["eventId"]},
+            {"$setOnInsert": child},
+            upsert=True,
+        ))
+        recent_docs.append(child)
+
+    if event_ops:
+        try:
+            events.bulk_write(event_ops, ordered=False)
+        except BulkWriteError as exc:
+            print("duplicate or validation issue", exc.details.get("writeErrors", [])[:1])
+    if recent_docs:
+        recent.insert_many(recent_docs, ordered=False)
+
+    profiles.update_one(
+        {"tenantId": tenant_id, "userId": user_id},
+        {"$set": {
+            "tenantId": tenant_id,
+            "userId": user_id,
+            "email": user["email"],
+            "status": user["status"],
+            "schemaVersion": 2,
+        }},
+        upsert=True,
+    )
+    users.update_one({"_id": user["_id"]}, {"$unset": {"activityLog": ""}, "$set": {"schemaVersion": 2}})
+
+print({
+    "profiles": profiles.count_documents({}),
+    "events": events.count_documents({}),
+    "recent": recent.count_documents({}),
+})
+\end{lstlisting}
+
+    \item \textbf{Validate the fix.} Check that user profiles reject future embedded activity, event queries use indexes, and profile document size remains bounded.
+
+\begin{lstlisting}[language=JavaScript, caption={\texttt{mongosh} validation checks for the remediated activity-log design.}]
+use activity_remediation;
+try {
+  db.users.insertOne({
+    tenantId: "tenant-acme",
+    userId: "bad-user",
+    email: "bad@example.com",
+    status: "active",
+    schemaVersion: 2,
+    activityLog: [{ eventId: "should-not-embed" }]
+  });
+} catch (e) {
+  print("embedded activity rejected: " + e.codeName);
+}
+
+printjson(db.user_activity_events.find({
+  tenantId: "tenant-acme",
+  userId: "user-001"
+}).sort({ occurredAt: -1 }).explain("executionStats"));
+
+const profile = db.users.findOne({ tenantId: "tenant-acme", userId: "user-001" });
+print("profile BSON bytes: " + Object.bsonsize(profile));
+\end{lstlisting}
+\end{enumerate}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item A before-and-after schema design note explaining why embedded activity failed and why parent referencing fixes the growth mode.
+    \item The \texttt{mongosh} setup script for validators, indexes, normal event collection, and capped recent stream.
+    \item The PyMongo migration script with idempotent event writes and evidence that embedded arrays are removed.
+    \item A validation report showing profile document size, event counts, rejected embedded activity, and indexed timeline query execution statistics.
+    \item A retention plan identifying which events remain in MongoDB, which enter capped diagnostics, and which move to audit archive.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item New user profile documents cannot include \texttt{activityLog}.
+    \item Activity events are stored as parent-referenced child documents with indexes for user timelines and tenant investigations.
+    \item The capped collection has explicit byte and document limits and is not the only audit store.
+    \item Migration is idempotent by \texttt{tenantId} and \texttt{eventId}.
+    \item The design prevents future 16 MB profile failures caused by activity growth.
+    \item Validation errors are demonstrated with an intentionally invalid write.
+    \item The architecture includes retention and archival rules for compliance-sensitive activity.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Add a TTL index for non-audit activity events after archive confirmation.
+    \item Add a change stream that copies selected event types into the audit store.
+    \item Add a reconciliation job that compares legacy array counts with migrated event counts before deleting legacy fields.
+    \item Model a sharded version using a tenant-aware shard key and evaluate targeted user timeline reads.
+    \item Create a dashboard query that summarizes activity by event type without reading user profiles.
+    \item Add schema versioning so readers can tolerate profiles during the migration window.
+    \item Measure average object size before and after migration and estimate storage avoided for 100,000 heavy users.
+\end{itemize}

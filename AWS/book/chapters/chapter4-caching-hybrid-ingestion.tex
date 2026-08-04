@@ -1,0 +1,548 @@
+\chapter{Hybrid Ingestion and Caching}
+\index{hybrid ingestion}\index{caching}\index{Amazon ElastiCache}\index{Redis}\index{Memcached}\index{DynamoDB Accelerator}\index{DAX}\index{AWS AppSync}\index{Amazon API Gateway}\index{cache-aside}\index{write-through cache}%
+\begin{objectives}
+\begin{itemize}
+    \item Explain when to accelerate databases with Amazon ElastiCache for Redis or Memcached, and how cache-aside, write-through, TTL, eviction, and invalidation choices affect correctness.
+    \item Describe DynamoDB Accelerator as a managed, API-compatible, in-memory cache for read-heavy DynamoDB workloads.
+    \item Compare AWS AppSync and Amazon API Gateway as managed ingestion front doors for GraphQL, REST, HTTP, and event-driven data APIs.
+    \item Deploy an ElastiCache Redis cluster and write a Python cache-aside script that caches RDS query results to reduce repeated database load.
+    \item Design a high-throughput, low-latency mobile data API that survives live sports traffic spikes with cache-aware serving paths.
+    \item Complete the Part I milestone by integrating S3, Aurora Serverless v2, DynamoDB, ElastiCache, DAX, and AWS DMS into an e-commerce data backend.
+\end{itemize}
+\end{objectives}
+\begin{crosscloud}
+Caching services vary by API, but the engineering vocabulary transfers across clouds: in-memory acceleration, TTL, eviction, cache-aside, write-through, database-integrated cache, invalidation, and hot-key protection.
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{2.7cm}p{2.9cm}p{2.9cm}p{2.7cm}p{2.7cm}@{}}
+\toprule
+\textbf{Concept} & \textbf{AWS} & \textbf{Azure} & \textbf{GCP} & \textbf{Others} \\
+\midrule
+Managed Redis / Memcached & ElastiCache for Redis OSS, Valkey, and Memcached; MemoryDB for durable Redis-compatible workloads & Azure Cache for Redis & Memorystore for Redis and Memorystore for Memcached & Redis Enterprise Cloud, Upstash Redis, self-managed Redis or Memcached \\
+Database-integrated cache & DynamoDB Accelerator for API-compatible DynamoDB read caching & Azure Cosmos DB integrated cache & No direct universal equivalent; combine Memorystore with Firestore, Spanner, AlloyDB, or Bigtable patterns & MongoDB Atlas query features plus external Redis caches \\
+Cache-aside & Application checks cache, then queries RDS, Aurora, DynamoDB, or an API and stores the result & Same pattern with Azure SQL, Cosmos DB, or services behind Functions & Same pattern with Cloud SQL, Spanner, Firestore, or Bigtable & Common pattern in open-source Redis, Memcached, and application frameworks \\
+Write-through / write-behind & Application or library writes cache and source together; requires idempotency and failure handling & Same concept with cache plus source write coordination & Same concept; often implemented in service code or stream processors & Available in some cache clients, proxies, and data-grid products \\
+TTL and eviction & Per-key TTL, Redis policies, Memcached LRU behavior, DAX item and query cache TTL & TTL and eviction policies in Azure Cache for Redis; Cosmos DB integrated-cache staleness setting & Memorystore maxmemory policies and TTL support & Product-specific maxmemory, LRU, LFU, TTL, and persistence options \\
+Hot-key control & Shard keys, precompute hot pages, DAX for DynamoDB reads, ElastiCache replicas, API throttling & Redis clustering, replicas, API Management throttles & Memorystore scaling, Cloud CDN, API Gateway quotas & CDN, request coalescing, client backoff, distributed locks, and key bucketing \\
+\bottomrule
+\end{tabular}}
+\vspace{1mm}
+The transferable skill is not choosing a cache by brand. It is deciding which data can be stale, how stale it may be, who invalidates it, and how the system behaves when the cache is unavailable.
+\end{crosscloud}
+\section{Week 4 Roadmap and Mental Model}
+Weeks 1--3 built the storage foundation: S3 for durable objects, RDS and Aurora for relational records, and DynamoDB for high-scale key-value and document access. Week 4 adds the serving layer that makes those systems usable during real traffic: cache acceleration, managed API ingestion, and hybrid read paths. A cache is not a database replacement. It is a latency and load-management tool placed between clients and a durable source of truth.
+\index{latency}\index{source of truth}\index{hot path}\index{read amplification}
+\begin{definitionbox}
+\textbf{Hybrid ingestion and caching} combines durable data stores, in-memory acceleration, and managed API front doors so applications can accept traffic quickly, serve hot reads cheaply, and preserve correct writes in systems of record.
+\end{definitionbox}
+\begin{keyterms}
+\textbf{Cache-aside}: application reads from cache first, then loads from the database on a miss. \textbf{TTL}: time to live for cached values. \textbf{Eviction}: removal caused by capacity pressure or policy. \textbf{Invalidation}: explicit removal or refresh after source data changes. \textbf{Hot key}: cache or database key receiving disproportionate traffic.
+\end{keyterms}
+\section{Monday: Amazon ElastiCache for Database Acceleration}
+\subsection{Redis, Valkey, and Memcached in the Data Path}
+Amazon ElastiCache is a managed in-memory service for Redis OSS, Valkey, and Memcached workloads \cite{awsElastiCacheUserGuide}. Redis-compatible engines provide rich data structures, replication, clustering, persistence options, sorted sets, streams, pub/sub, and atomic operations. Memcached is simpler: it is a distributed, in-memory key-value cache optimized for ephemeral objects and horizontal simplicity. A data engineer usually places ElastiCache in front of RDS, Aurora, an API, or a derived view when repeated reads are expensive or latency-sensitive.
+\index{ElastiCache for Redis}\index{Valkey}\index{Memcached}\index{RDS cache}\index{Aurora cache}
+\begin{definitionbox}
+\textbf{Amazon ElastiCache} is a fully managed in-memory cache service. It reduces database load by serving repeated reads from memory and by storing short-lived computations, sessions, counters, and hot aggregates.
+\end{definitionbox}
+\begin{notebox}
+ElastiCache improves read latency only when the application repeatedly asks for cacheable data. It will not fix unindexed SQL, missing DynamoDB access patterns, slow network calls, or write bottlenecks unless the architecture changes the path those requests take.
+\end{notebox}
+\subsection{Cache-Aside, Write-Through, TTL, and Invalidation}
+The most common pattern is cache-aside. The application checks Redis or Memcached. If the key exists, the value is returned. If it misses, the application queries the database, serializes the result, stores it with a TTL, and returns it. This pattern keeps the cache disposable and easy to rebuild. The cost is application complexity: every caller must agree on key names, serialization, TTL, error handling, and invalidation.
+\index{cache-aside pattern}\index{cache invalidation}\index{TTL}\index{write-through cache}
+\begin{figure}[H]
+    \centering
+    \resizebox{0.95\textwidth}{!}{%
+    \begin{tikzpicture}[
+        app/.style={rectangle, rounded corners, draw=codegreen!60!black, thick, fill=green!7, align=center, minimum width=2.7cm, minimum height=0.85cm, font=\small\bfseries},
+        cache/.style={rectangle, rounded corners, draw=magenta, thick, fill=magenta!10, align=center, minimum width=2.7cm, minimum height=0.85cm, font=\small\bfseries},
+        db/.style={cylinder, shape border rotate=90, aspect=0.25, draw=primary, thick, fill=blue!7, align=center, text width=2.6cm, minimum height=1.3cm, font=\small\bfseries},
+        flow/.style={-{Latex[length=2.5mm]}, draw=primary, thick},
+        miss/.style={-{Latex[length=2.5mm]}, draw=orange!85!black, thick, dashed}
+    ]
+        \node[app] (client) at (0,1.4) {Client / mobile app};
+        \node[app] (api) at (3.2,1.4) {Application API};
+        \node[cache] (redis) at (6.6,1.4) {ElastiCache\\Redis cluster};
+        \node[db] (rds) at (10.0,1.4) {Aurora / RDS\\source of truth};
+        \node[app] (writer) at (3.2,-1.3) {Write path\\updates source};
+        \draw[flow] (client) -- node[above,font=\scriptsize]{read product} (api);
+        \draw[flow] (api) -- node[above,font=\scriptsize]{1. get key} (redis);
+        \draw[miss] (redis) -- node[above,font=\scriptsize]{2. miss} (rds);
+        \draw[miss] (rds) -- node[below,font=\scriptsize]{3. result} (redis);
+        \draw[flow] (redis) -- node[below,font=\scriptsize]{4. hit next time} (api);
+        \draw[flow] (writer) -- (rds);
+        \draw[miss] (writer) -- node[right,font=\scriptsize]{invalidate or refresh} (redis);
+        \node[font=\footnotesize\itshape,text=codegray,align=center] at (5.0,-2.3) {Cache-aside keeps Redis disposable, but correctness depends on TTL selection and write-path invalidation.};
+    \end{tikzpicture}%
+    }
+    \caption{Cache-aside flow between an application, ElastiCache Redis, and an RDS or Aurora source of truth.}
+    \label{fig:ch4-cache-aside-rds}
+\end{figure}
+Write-through writes data to the cache and database together. It can make read-after-write behavior more predictable, but it creates more failure modes. If the cache write succeeds and the database write fails, the cache may advertise data that is not durable. If the database write succeeds and the cache write fails, reads may stay stale until TTL or invalidation. For most operational systems, cache-aside plus precise invalidation is easier to reason about.
+\begin{tipbox}
+Start with short TTLs and explicit invalidation for data that users can change. Use longer TTLs for reference data, product catalog fragments, feature flags, and computed summaries where bounded staleness is acceptable.
+\end{tipbox}
+\begin{pitfall}
+\textbf{Caching without an ownership rule.} Every cached key needs an owner that knows when the source data changes. If multiple services write the same database row but only one service invalidates the cache, stale reads become intermittent and hard to diagnose.
+\end{pitfall}
+\subsection{Operational Design}
+ElastiCache clusters live in VPC subnets and should be reached from private application tiers, not from public clients. Production designs use security groups, encryption in transit where supported, authentication, subnet groups, Multi-AZ replication, automatic failover, metrics, and alarms. Important metrics include cache hit ratio, evictions, CPU, memory, network throughput, replication lag, current connections, and command latency.
+\index{cache hit ratio}\index{eviction}\index{replication lag}\index{security group}
+\begin{notebox}
+A low cache hit ratio is not automatically bad. New workloads, write-heavy workloads, or personalized one-time reads may be poor cache candidates. Measure hit ratio with database load, latency, and stale-read tolerance before declaring success.
+\end{notebox}
+\section{Tuesday: DynamoDB Accelerator}
+\subsection{Where DAX Fits}
+DynamoDB Accelerator is a managed, in-memory cache for DynamoDB. It is API-compatible with DynamoDB client patterns through the DAX SDK, so applications can accelerate eventually consistent read-heavy access patterns without building a separate Redis key naming scheme \cite{awsDynamoDBDAX}. DAX keeps item and query results in memory, handles cache population, and invalidates entries for writes that pass through the DAX client.
+\index{DynamoDB Accelerator}\index{DAX}\index{DynamoDB cache}\index{eventual consistency}
+\begin{definitionbox}
+\textbf{DAX} is a DynamoDB-compatible caching layer that can reduce read latency from milliseconds to microseconds for suitable read-heavy workloads. It is not a general Redis replacement and it does not support strongly consistent reads.
+\end{definitionbox}
+\subsection{DAX Versus ElastiCache}
+Choose DAX when the source is DynamoDB, the application uses key-value or query access patterns, and the team wants the cache to understand DynamoDB operations. Choose ElastiCache when the source is RDS, Aurora, APIs, S3 metadata, computed responses, session data, counters, sorted sets, rate limits, or any workload requiring custom cache structures. DAX is specialized; ElastiCache is general-purpose.
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.2cm}p{5.0cm}p{5.0cm}@{}}
+\toprule
+\textbf{Decision point} & \textbf{DAX} & \textbf{ElastiCache} \\
+\midrule
+Source of truth & DynamoDB tables and indexes & RDS, Aurora, DynamoDB, APIs, files, computed values, and service responses \\
+Client model & DAX-aware DynamoDB client & Redis, Valkey, or Memcached protocol clients \\
+Invalidation & Managed for writes through DAX; TTL for cached items and query results & Application-managed invalidation, TTL, eviction, pub/sub, or stream-driven refresh \\
+Data structures & DynamoDB items and query result sets & Strings, hashes, lists, sets, sorted sets, streams, counters, and arbitrary serialized objects \\
+Consistency & Eventually consistent reads only & Application-defined; cache can be stale unless invalidated or bypassed \\
+Best fit & Read-heavy DynamoDB hot paths & General cache-aside, sessions, rate limits, leaderboards, API response cache, SQL result cache \\
+\bottomrule
+\end{tabular}
+\caption{DAX and ElastiCache solve different cache problems.}
+\label{tab:ch4-dax-vs-elasticache}
+\end{table}
+\begin{tipbox}
+Use DAX for workloads with repeated \texttt{GetItem}, \texttt{BatchGetItem}, and predictable \texttt{Query} requests. Do not use it to hide poor partition-key design, scans, or analytical access patterns.
+\end{tipbox}
+\begin{pitfall}
+\textbf{Expecting strong consistency from DAX.} Strongly consistent reads bypass the DAX cache and go to DynamoDB. If the workflow requires read-after-write correctness for every request, design that path explicitly instead of assuming the cache can provide it.
+\end{pitfall}
+\subsection{DAX Operations}
+A DAX cluster is deployed into a VPC with subnet groups and IAM permissions. Applications should set timeouts, retries, and fallback behavior so a cache issue does not become a total outage. Monitor cache hit rate, item-cache hits, query-cache hits, CPU, memory, error counts, and request latency. Because DAX nodes are stateful caches, resizing or failover can temporarily reduce hit ratio while entries warm again.
+\index{DAX cluster}\index{cache warming}\index{fallback behavior}
+\section{Wednesday: AppSync and API Gateway Data Ingestion}
+\subsection{Managed API Front Doors}
+AWS AppSync is a managed GraphQL service for building APIs that connect clients to DynamoDB, Lambda, OpenSearch, HTTP services, RDS through resolvers, and other sources \cite{awsAppSyncDeveloperGuide}. Amazon API Gateway provides managed REST, HTTP, and WebSocket APIs with authorization, throttling, usage plans, transformations, stages, and integrations \cite{awsAPIGatewayDeveloperGuide}. In data engineering systems, these services are the ingestion and serving layer that protects databases from direct client traffic.
+\index{AWS AppSync}\index{GraphQL}\index{Amazon API Gateway}\index{REST API}\index{HTTP API}\index{WebSocket API}
+\begin{definitionbox}
+\textbf{Managed API ingestion} uses services such as AppSync and API Gateway to authenticate, validate, throttle, transform, and route incoming data before it reaches storage or processing systems.
+\end{definitionbox}
+\subsection{Choosing AppSync or API Gateway}
+AppSync fits applications where clients need a typed graph, flexible selection sets, subscriptions, offline synchronization, or direct resolver integration with DynamoDB. API Gateway fits RESTful ingestion, HTTP proxy patterns, serverless microservices, webhooks, partner APIs, and simple mobile backends. Both can integrate with Lambda for validation and orchestration, and both can sit in front of cached read paths.
+\begin{notebox}
+GraphQL reduces over-fetching, but it can increase resolver fan-out if each field triggers a separate backend lookup. Use batching, pipeline resolvers, authorization boundaries, and cache-aware resolver design for high-traffic graphs.
+\end{notebox}
+\begin{tipbox}
+Place throttles and quotas at the API layer before traffic reaches the database. A cache absorbs repeated reads, but API Gateway usage plans, AppSync limits, WAF rules, and client backoff prevent abusive or accidental request storms.
+\end{tipbox}
+\subsection{Hybrid Ingestion Patterns}
+Common ingestion patterns include API Gateway to Lambda to Aurora, AppSync resolvers to DynamoDB, API Gateway to Kinesis for streaming telemetry, and AppSync subscriptions for near-real-time client updates. The serving side may read from DAX for DynamoDB, ElastiCache for RDS query results, or precomputed S3 and CloudFront assets for public content. The best architecture often separates write correctness from read speed: writes go to the durable source, while reads use caches, materialized views, and CDN-friendly objects.
+\index{API throttling}\index{resolver}\index{materialized view}\index{mobile ingestion}
+\begin{pitfall}
+\textbf{Letting clients bypass the ingestion layer.} Direct database access from mobile or browser clients exposes credentials, weakens throttling, and removes the chance to validate payloads before writes reach the system of record.
+\end{pitfall}
+\section{Thursday Hands-on Project: Redis Cache-Aside for RDS Queries}
+This lab deploys a small ElastiCache Redis-compatible cluster and uses Python to cache RDS query results. The commands assume Windows PowerShell, AWS CLI v2, a sandbox VPC with at least two private subnets, an application security group, and an existing RDS or Aurora database endpoint. Replace identifiers before running, and clean up resources after testing.
+\index{Redis cluster}\index{redis-py}\index{RDS query cache}\index{AWS CLI}
+\begin{notebox}
+ElastiCache nodes are billed while running. Use the smallest test node type available in your account and delete the replication group after the lab if it is not needed.
+\end{notebox}
+\begin{lstlisting}[language=bash,caption={PowerShell-oriented AWS CLI commands to create an ElastiCache Redis replication group.},label={lst:ch4-elasticache-cli-create}]
+# Run from Windows PowerShell with AWS CLI v2 configured.
+$Region = "us-east-1"
+$VpcId = "vpc-0123456789abcdef0"
+$SubnetIds = "subnet-aaaa1111 subnet-bbbb2222"
+$AppSecurityGroupId = "sg-app1234567890"
+$CacheSecurityGroupId = "sg-cache1234567890"
+$SubnetGroupName = "ch4-redis-subnets"
+$ReplicationGroupId = "ch4-rds-query-cache"
+aws elasticache create-cache-subnet-group `
+  --cache-subnet-group-name $SubnetGroupName `
+  --cache-subnet-group-description "Private subnets for Chapter 4 Redis" `
+  --subnet-ids $SubnetIds `
+  --region $Region
+aws elasticache create-replication-group `
+  --replication-group-id $ReplicationGroupId `
+  --replication-group-description "Chapter 4 Redis cache-aside demo" `
+  --engine redis `
+  --cache-node-type cache.t4g.micro `
+  --num-cache-clusters 2 `
+  --automatic-failover-enabled `
+  --cache-subnet-group-name $SubnetGroupName `
+  --security-group-ids $CacheSecurityGroupId `
+  --transit-encryption-enabled `
+  --at-rest-encryption-enabled `
+  --region $Region
+aws elasticache wait replication-group-available `
+  --replication-group-id $ReplicationGroupId `
+  --region $Region
+\end{lstlisting}
+\begin{lstlisting}[language=Python,caption={Python cache-aside script using redis-py and psycopg to cache RDS query results.},label={lst:ch4-python-rds-cache-aside}]
+import json
+import os
+from decimal import Decimal
+import psycopg
+import redis
+redis_client = redis.Redis(
+    host=os.environ["REDIS_HOST"],
+    port=int(os.environ.get("REDIS_PORT", "6379")),
+    ssl=os.environ.get("REDIS_SSL", "true").lower() == "true",
+    socket_timeout=1.0,
+    decode_responses=True,
+)
+connection_string = os.environ["RDS_POSTGRES_DSN"]
+CACHE_SECONDS = int(os.environ.get("CACHE_SECONDS", "60"))
+def default_json(value):
+    if isinstance(value, Decimal):
+        return float(value)
+    raise TypeError(f"Cannot serialize {type(value)}")
+def get_product(product_id):
+    cache_key = f"product:{product_id}"
+    cached = redis_client.get(cache_key)
+    if cached:
+        return {"source": "cache", "item": json.loads(cached)}
+    with psycopg.connect(connection_string) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT product_id, name, price, inventory_count, updated_at
+                FROM products
+                WHERE product_id = %s
+                """,
+                (product_id,),
+            )
+            row = cur.fetchone()
+    if row is None:
+        redis_client.setex(cache_key, 15, json.dumps({"missing": True}))
+        return {"source": "database", "item": None}
+    item = {
+        "product_id": row[0],
+        "name": row[1],
+        "price": row[2],
+        "inventory_count": row[3],
+        "updated_at": row[4].isoformat(),
+    }
+    redis_client.setex(cache_key, CACHE_SECONDS, json.dumps(item, default=default_json))
+    return {"source": "database", "item": item}
+if __name__ == "__main__":
+    for _ in range(2):
+        print(get_product(os.environ.get("PRODUCT_ID", "SKU-1001")))
+\end{lstlisting}
+\begin{tipbox}
+Cache negative lookups briefly. A short TTL for missing products, users, or feature flags prevents repeated database hits during typos or crawler traffic while limiting stale absence after a new record appears.
+\end{tipbox}
+\section{Friday Use Case: Mobile Sports API with Extreme Traffic Spikes}
+A sports media company serves a mobile app during championship events. Before kickoff, traffic is moderate. During a goal, trade, injury, or final play, millions of clients refresh the same scorecards, player statistics, odds summaries, and social reactions. The workload combines hot public reads, personalized user reads, bursty clickstream writes, and strict correctness for purchases, subscriptions, and user settings.
+\index{mobile data API}\index{sports analytics}\index{traffic spike}\index{API Gateway cache}\index{AppSync subscription}
+\subsection{Architecture Narrative}
+The write path accepts clickstream and interaction events through API Gateway and routes them to Kinesis, DynamoDB, or Lambda depending on latency and ordering needs. User profile and billing writes go to Aurora or RDS through a service boundary. Active sessions, shopping carts, live score summaries, and user-specific notification state use DynamoDB where key-value scale is required. The read path uses AppSync for GraphQL mobile screens, API Gateway for REST endpoints, DAX for repeated DynamoDB reads, and ElastiCache for live-score fragments, SQL query results, rate limits, and computed response objects.
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[
+        client/.style={rectangle, rounded corners, draw=codegreen!60!black, thick, fill=green!7, align=center, minimum width=2.4cm, minimum height=0.85cm, font=\small\bfseries},
+        api/.style={rectangle, rounded corners, draw=primary, thick, fill=primary!6, align=center, minimum width=2.5cm, minimum height=0.85cm, font=\small\bfseries},
+        cache/.style={rectangle, rounded corners, draw=magenta, thick, fill=magenta!10, align=center, minimum width=2.5cm, minimum height=0.85cm, font=\small\bfseries},
+        db/.style={cylinder, shape border rotate=90, aspect=0.25, draw=primary, thick, fill=blue!7, align=center, text width=2.5cm, minimum height=1.3cm, font=\small\bfseries},
+        stream/.style={rectangle, rounded corners, draw=orange!85!black, thick, fill=orange!8, align=center, minimum width=2.5cm, minimum height=0.85cm, font=\small\bfseries},
+        flow/.style={-{Latex[length=2.4mm]}, draw=primary, thick},
+        hot/.style={-{Latex[length=2.4mm]}, draw=orange!85!black, thick, dashed}
+    ]
+        \node[client] (mobile) at (0,1.8) {Mobile clients\\traffic spike};
+        \node[api] (front) at (3.0,1.8) {API Gateway\\and AppSync};
+        \node[cache] (edge) at (6.0,2.9) {ElastiCache\\hot scorecards};
+        \node[cache] (dax) at (6.0,1.0) {DAX\\DynamoDB reads};
+        \node[db] (ddb) at (9.0,1.0) {DynamoDB\\sessions carts\\clickstream};
+        \node[db] (rds) at (9.0,2.9) {Aurora / RDS\\profiles billing};
+        \node[stream] (kinesis) at (6.0,-0.9) {Kinesis / Lambda\\event ingestion};
+        \node[db] (s3) at (9.0,-0.9) {S3 lake\\analytics};
+        \node[api] (ops) at (12.0,1.0) {CloudWatch\\WAF\\alarms};
+        \draw[flow] (mobile) -- (front);
+        \draw[hot] (front) -- node[above,font=\scriptsize]{hot public reads} (edge);
+        \draw[flow] (front) -- (dax);
+        \draw[flow] (dax) -- (ddb);
+        \draw[flow] (front) -- (rds);
+        \draw[flow] (front) -- node[left,font=\scriptsize]{events} (kinesis);
+        \draw[flow] (kinesis) -- (ddb);
+        \draw[flow] (kinesis) -- (s3);
+        \draw[flow] (ops) -- (front);
+        \draw[flow] (ops) -- (edge);
+        \draw[flow] (ops) -- (ddb);
+    \end{tikzpicture}%
+    }
+    \caption{Spiky-traffic mobile sports API using API Gateway, AppSync, ElastiCache, DAX, DynamoDB, Aurora or RDS, and streaming ingestion.}
+    \label{fig:ch4-spiky-mobile-api}
+\end{figure}
+\subsection{Design Decisions}
+\textbf{Separate hot public reads from personalized reads.} Everyone asks for the same live score after a major play, so cache public scorecards and summary fragments aggressively. Personalized notifications, purchases, and account settings need user-scoped keys and stricter authorization.
+\textbf{Precompute the most popular shapes.} Maintain live scoreboard documents, player stat cards, and top-comment summaries with stream processors or scheduled refresh. Do not ask the database to assemble the same response millions of times during a spike.
+\textbf{Throttle before storage.} API Gateway, AppSync, AWS WAF, quotas, and client retry guidance protect the database from fan-out. Caches reduce load after requests arrive, but throttles prevent overload when the request itself is unnecessary or abusive.
+\begin{pitfall}
+\textbf{Caching the wrong boundary.} Caching a full personalized response can leak data if the cache key omits identity, locale, subscription tier, or authorization context. Public and private response fragments should use different key spaces and TTL policies.
+\end{pitfall}
+\section{Interview Q\&A}
+\subsection{Concepts and Trade-offs}
+\begin{enumerate}
+    \item \textbf{Q: What problem does ElastiCache solve?}\\
+    A: It serves repeated reads or transient computations from memory so durable databases and APIs handle fewer requests with lower average latency.
+    \item \textbf{Q: When would you choose Redis-compatible ElastiCache over Memcached?}\\
+    A: Choose Redis-compatible engines for richer data structures, replication, clustering, atomic operations, streams, sorted sets, and persistence options. Choose Memcached for simple ephemeral object caching with a minimal key-value model.
+    \item \textbf{Q: What is cache-aside?}\\
+    A: The application checks the cache first, loads from the database on a miss, stores the result with a TTL, and returns it. The database remains the source of truth.
+    \item \textbf{Q: Why is cache invalidation difficult?}\\
+    A: The system must know every write that changes a cached value, remove or refresh all affected keys, and handle races between readers, writers, retries, and TTL expiration.
+    \item \textbf{Q: How is DAX different from ElastiCache?}\\
+    A: DAX is a DynamoDB-specific, API-compatible cache for eventually consistent read-heavy access patterns. ElastiCache is a general Redis, Valkey, or Memcached service for many sources and data structures.
+    \item \textbf{Q: Can DAX provide strongly consistent reads?}\\
+    A: No. Strongly consistent reads bypass DAX and go to DynamoDB, so workflows requiring strict read-after-write behavior need explicit design.
+    \item \textbf{Q: When is AppSync a better fit than API Gateway?}\\
+    A: AppSync is often better for GraphQL mobile or web experiences that need typed schemas, subscriptions, flexible selection sets, and resolver integration. API Gateway is often better for REST, HTTP, webhook, and microservice ingestion patterns.
+    \item \textbf{Q: What metrics indicate cache health?}\\
+    A: Cache hit ratio, latency, evictions, memory pressure, CPU, connection count, replication lag, error rate, and downstream database load together show whether the cache is helping.
+\end{enumerate}
+\section{Further Reading}
+Start with the ElastiCache documentation for engine choices, cluster modes, security, scaling, and monitoring \cite{awsElastiCacheUserGuide}. Review DAX behavior before using it with DynamoDB hot paths \cite{awsDynamoDBDAX}. Study AppSync and API Gateway ingestion patterns, authorization options, quotas, and resolver or integration models \cite{awsAppSyncDeveloperGuide,awsAPIGatewayDeveloperGuide}. For the capstone, revisit S3, Aurora Serverless v2, DynamoDB, and AWS DMS documentation from Weeks 1--3 \cite{awsS3UserGuide,awsAuroraServerlessV2,awsDynamoDBDeveloperGuide,awsDMSUserGuide}.
+\section*{Key Takeaways}
+\begin{itemize}
+    \item Caches reduce latency and database load only for cacheable access patterns with repeated reads or reusable computations.
+    \item ElastiCache is general-purpose in-memory acceleration; DAX is specialized DynamoDB read acceleration.
+    \item Cache-aside is simple and resilient, but it requires disciplined key naming, TTLs, serialization, fallback behavior, and invalidation.
+    \item AppSync and API Gateway protect data stores by authenticating, throttling, validating, transforming, and routing client traffic.
+    \item Spiky mobile APIs need precomputed hot responses, API throttles, cache-aware read paths, and durable write paths.
+    \item Part I systems become powerful when S3, Aurora, DynamoDB, caches, and DMS are composed around clear sources of truth.
+\end{itemize}
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Explain why a cache should usually be treated as disposable rather than as the system of record.
+    \item \textbf{(Conceptual)} Compare cache-aside and write-through for product catalog reads where prices change hourly.
+    \item \textbf{(Design)} Choose Redis-compatible ElastiCache, Memcached, or DAX for sessions, leaderboard sorted sets, DynamoDB product lookups, and RDS report fragments. Justify each choice.
+    \item \textbf{(Hands-on)} Run \cref{lst:ch4-elasticache-cli-create} in a sandbox VPC and capture the replication group status, primary endpoint, security group rule, and subnet group.
+    \item \textbf{(Hands-on)} Modify \cref{lst:ch4-python-rds-cache-aside} to cache a category query and print whether each response came from the cache or database.
+    \item \textbf{(Operations)} Define CloudWatch alarms for cache evictions, CPU, memory pressure, replication lag, connection count, and RDS read load.
+    \item \textbf{(Security)} Describe how cache key design changes when responses vary by user identity, subscription tier, locale, or authorization scope.
+    \item \textbf{(Architecture)} Sketch a spiky live sports API and identify which responses use AppSync, API Gateway, DAX, ElastiCache, DynamoDB, Aurora, and S3.
+\end{enumerate}
+\section{Milestone 1 Capstone: E-Commerce Multi-Tier Data Backend}\label{sec:ch4-capstone}
+\index{Milestone 1 capstone}\index{e-commerce backend}\index{Aurora Serverless v2}\index{S3 lifecycle}\index{S3 encryption}\index{AWS DMS}\index{DAX!capstone}\index{ElastiCache!capstone}
+\begin{capstonebox}
+\textbf{Mission.} Build an e-commerce multi-tier data backend that integrates the Part I services: Aurora Serverless v2 for user profiles and billing, DynamoDB for active shopping carts and clickstream tracking, S3 for encrypted product images with lifecycle rules, ElastiCache and DAX for hot-path acceleration, and AWS DMS to continuously replicate Aurora data to S3 for analytics.
+\textbf{Estimated time.} 8--12 hours in a sandbox AWS account, or 4--6 hours for a documented architecture and scripted dry run when account limits prevent full deployment.
+\textbf{What you\textquotesingle{}ll practice.}
+\begin{itemize}
+    \item Composing relational, NoSQL, object storage, cache, and replication services into one data platform.
+    \item Separating sources of truth from hot read paths and analytical replicas.
+    \item Applying encryption, lifecycle management, least privilege, TTL, capacity planning, and operational evidence.
+    \item Producing implementation artifacts, acceptance criteria, and a cleanup plan suitable for a portfolio project.
+\end{itemize}
+\end{capstonebox}
+\subsection*{Scenario}
+A fast-growing e-commerce company is replacing a monolithic database with a multi-tier AWS backend. User profiles, billing methods, orders, refunds, and account status require relational transactions and belong in Aurora Serverless v2. Active shopping carts, clickstream events, recommendation impressions, and session metadata need key-value scale and belong in DynamoDB. Product images and exports belong in S3 with encryption and lifecycle controls. Read-heavy product and cart APIs need ElastiCache and DAX. Finance and analytics teams need a continuous copy of Aurora data in S3 for lake queries without impacting production.
+\subsection*{Requirements}
+\textbf{Functional requirements.}
+\begin{itemize}
+    \item Create an Aurora Serverless v2 cluster or document the exact cluster, database, subnet group, and security configuration required for profiles and billing.
+    \item Create DynamoDB tables or a single-table design for active carts, cart items, clickstream events, session state, and recommendation impressions.
+    \item Store product images in S3 with server-side encryption, public access blocked, versioning where appropriate, and lifecycle transition or expiration rules.
+    \item Use ElastiCache to cache hot product detail and inventory summary reads sourced from Aurora or API composition.
+    \item Use DAX for repeated DynamoDB cart or session reads where eventual consistency is acceptable.
+    \item Configure AWS DMS to continuously replicate selected Aurora tables to S3 for analytics landing files.
+\end{itemize}
+\textbf{Non-functional requirements.}
+\begin{itemize}
+    \item No source code, scripts, or documentation may contain secrets, passwords, personal credentials, or private keys.
+    \item User and billing writes must favor correctness over cache freshness. Caches must be invalidated or bypassed for sensitive updates.
+    \item Product image buckets must block public access unless a separate CloudFront or signed URL design is explicitly documented.
+    \item Cart and clickstream keys must distribute traffic across users and time buckets rather than concentrate all writes on one global key.
+    \item DMS replication must have monitoring for task status, latency, errors, and S3 object delivery.
+\end{itemize}
+\subsection*{Reference Architecture}
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[
+        client/.style={rectangle, rounded corners, draw=codegreen!60!black, thick, fill=green!7, align=center, minimum width=2.4cm, minimum height=0.85cm, font=\small\bfseries},
+        api/.style={rectangle, rounded corners, draw=primary, thick, fill=primary!6, align=center, minimum width=2.5cm, minimum height=0.85cm, font=\small\bfseries},
+        cache/.style={rectangle, rounded corners, draw=magenta, thick, fill=magenta!10, align=center, minimum width=2.4cm, minimum height=0.85cm, font=\small\bfseries},
+        db/.style={cylinder, shape border rotate=90, aspect=0.25, draw=primary, thick, fill=blue!7, align=center, text width=2.4cm, minimum height=1.25cm, font=\small\bfseries},
+        obj/.style={cylinder, shape border rotate=90, aspect=0.25, draw=orange!85!black, thick, fill=orange!8, align=center, text width=2.4cm, minimum height=1.25cm, font=\small\bfseries},
+        ops/.style={rectangle, rounded corners, draw=red!60!black, thick, fill=red!5, align=center, minimum width=2.4cm, minimum height=0.85cm, font=\footnotesize\bfseries},
+        flow/.style={-{Latex[length=2.4mm]}, draw=primary, thick},
+        repl/.style={-{Latex[length=2.4mm]}, draw=orange!85!black, thick, dashed}
+    ]
+        \node[client] (web) at (0,2.4) {Web and\\mobile clients};
+        \node[api] (api) at (2.8,2.4) {API Gateway\\AppSync\\services};
+        \node[cache] (redis) at (5.8,3.5) {ElastiCache\\product hot path};
+        \node[cache] (dax) at (5.8,1.4) {DAX\\cart reads};
+        \node[db] (aurora) at (8.8,3.5) {Aurora\\profiles billing\\orders};
+        \node[db] (ddb) at (8.8,1.4) {DynamoDB\\carts sessions\\clickstream};
+        \node[obj] (images) at (5.8,-0.7) {S3\\product images\\lifecycle};
+        \node[ops] (dms) at (11.5,3.5) {AWS DMS\\CDC task};
+        \node[obj] (lake) at (11.5,1.4) {S3 analytics\\Aurora replica};
+        \node[ops] (cw) at (11.5,-0.7) {CloudWatch\\alarms\\evidence};
+        \draw[flow] (web) -- (api);
+        \draw[flow] (api) -- (redis);
+        \draw[flow] (redis) -- (aurora);
+        \draw[flow] (api) -- (dax);
+        \draw[flow] (dax) -- (ddb);
+        \draw[flow] (api) -- (images);
+        \draw[repl] (aurora) -- (dms);
+        \draw[repl] (dms) -- (lake);
+        \draw[flow] (cw) -- (aurora);
+        \draw[flow] (cw) -- (ddb);
+        \draw[flow] (cw) -- (redis);
+        \draw[flow] (cw) -- (dms);
+    \end{tikzpicture}%
+    }
+    \caption{Milestone 1 e-commerce reference architecture integrating Aurora Serverless v2, DynamoDB, S3, ElastiCache, DAX, AWS DMS, and observability across all tiers.}
+    \label{fig:ch4-capstone-architecture}
+\end{figure}
+\subsection*{Implementation Steps}
+\begin{enumerate}
+    \item \textbf{Define domains and ownership.} Mark Aurora as the source of truth for profiles, billing, orders, and refunds. Mark DynamoDB as the source for active carts, sessions, and clickstream events. Mark S3 as the source for product image objects and analytics landing files.
+    \item \textbf{Create storage foundations.} Configure S3 buckets with encryption, public access block, versioning, and lifecycle rules. Create Aurora Serverless v2 and DynamoDB resources using private networking and least-privilege IAM.
+    \item \textbf{Add acceleration.} Place ElastiCache in private subnets for product detail and inventory summary reads. Add DAX for repeated cart reads if eventual consistency is acceptable.
+    \item \textbf{Implement ingestion APIs.} Use API Gateway or AppSync to validate requests, authorize users, throttle clients, and route writes to Aurora, DynamoDB, or S3 pre-signed URL workflows.
+    \item \textbf{Replicate to analytics.} Configure DMS source and target endpoints, a replication instance or serverless task where available, table mappings, and continuous CDC from Aurora to S3.
+    \item \textbf{Validate failure modes.} Test cache miss behavior, stale cache invalidation, DAX bypass for strict reads, DynamoDB TTL behavior, S3 lifecycle policy syntax, and DMS task recovery.
+    \item \textbf{Capture evidence.} Save architecture diagrams, command output, resource descriptions, sample API calls, metrics screenshots, and cleanup commands.
+\end{enumerate}
+\begin{lstlisting}[language=bash,caption={PowerShell-oriented AWS CLI skeleton for S3, DynamoDB, and cache resources.},label={lst:ch4-capstone-cli}]
+$Region = "us-east-1"
+$AccountSuffix = "123456789012"
+$ImageBucket = "m1-ecommerce-product-images-$AccountSuffix"
+$AnalyticsBucket = "m1-ecommerce-analytics-$AccountSuffix"
+$CartTable = "m1-active-carts"
+$SubnetGroupName = "m1-cache-subnets"
+$ReplicationGroupId = "m1-product-cache"
+aws s3api create-bucket --bucket $ImageBucket --region $Region
+aws s3api put-public-access-block `
+  --bucket $ImageBucket `
+  --public-access-block-configuration `
+    BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
+aws s3api put-bucket-encryption `
+  --bucket $ImageBucket `
+  --server-side-encryption-configuration `
+    '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}'
+aws s3api put-bucket-lifecycle-configuration `
+  --bucket $ImageBucket `
+  --lifecycle-configuration `
+    '{"Rules":[{"ID":"transition-old-images","Status":"Enabled","Filter":{"Prefix":"products/"},"Transitions":[{"Days":90,"StorageClass":"STANDARD_IA"}]}]}'
+aws s3api create-bucket --bucket $AnalyticsBucket --region $Region
+aws dynamodb create-table `
+  --table-name $CartTable `
+  --attribute-definitions AttributeName=PK,AttributeType=S AttributeName=SK,AttributeType=S `
+  --key-schema AttributeName=PK,KeyType=HASH AttributeName=SK,KeyType=RANGE `
+  --billing-mode PAY_PER_REQUEST `
+  --stream-specification StreamEnabled=true,StreamViewType=NEW_AND_OLD_IMAGES `
+  --sse-specification Enabled=true `
+  --region $Region
+aws dynamodb wait table-exists --table-name $CartTable --region $Region
+aws dynamodb update-time-to-live `
+  --table-name $CartTable `
+  --time-to-live-specification "Enabled=true,AttributeName=expiresAt" `
+  --region $Region
+aws elasticache create-cache-subnet-group `
+  --cache-subnet-group-name $SubnetGroupName `
+  --cache-subnet-group-description "Milestone 1 cache subnets" `
+  --subnet-ids subnet-aaaa1111 subnet-bbbb2222 `
+  --region $Region
+aws elasticache create-replication-group `
+  --replication-group-id $ReplicationGroupId `
+  --replication-group-description "Milestone 1 product cache" `
+  --engine redis `
+  --cache-node-type cache.t4g.micro `
+  --num-cache-clusters 2 `
+  --automatic-failover-enabled `
+  --cache-subnet-group-name $SubnetGroupName `
+  --security-group-ids sg-cache1234567890 `
+  --transit-encryption-enabled `
+  --at-rest-encryption-enabled `
+  --region $Region
+\end{lstlisting}
+\begin{lstlisting}[language=Python,caption={Boto3 sketch for carts, clickstream events, and cache invalidation metadata.},label={lst:ch4-capstone-boto3}]
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal
+import os
+import uuid
+import boto3
+region = os.environ.get("AWS_REGION", "us-east-1")
+table = boto3.resource("dynamodb", region_name=region).Table(
+    os.environ.get("CART_TABLE", "m1-active-carts")
+)
+s3 = boto3.client("s3", region_name=region)
+image_bucket = os.environ["IMAGE_BUCKET"]
+def put_cart_item(user_id, sku, quantity, price):
+    now = datetime.now(timezone.utc)
+    ttl = int((now + timedelta(days=30)).timestamp())
+    table.put_item(
+        Item={
+            "PK": f"USER#{user_id}",
+            "SK": f"CART#{sku}",
+            "entityType": "CartItem",
+            "sku": sku,
+            "quantity": quantity,
+            "price": Decimal(str(price)),
+            "updatedAt": now.isoformat(),
+            "expiresAt": ttl,
+        }
+    )
+    return {"cacheInvalidationKey": f"cart:{user_id}", "sku": sku}
+def record_click(user_id, sku, action):
+    now = datetime.now(timezone.utc)
+    event_id = str(uuid.uuid4())
+    day = now.strftime("%Y-%m-%d")
+    table.put_item(
+        Item={
+            "PK": f"CLICK#{day}#{user_id[-2:]}",
+            "SK": f"{now.isoformat()}#{event_id}",
+            "entityType": "ClickstreamEvent",
+            "userId": user_id,
+            "sku": sku,
+            "action": action,
+            "expiresAt": int((now + timedelta(days=7)).timestamp()),
+        }
+    )
+    return event_id
+def create_product_image_upload(sku, content_type="image/jpeg"):
+    key = f"products/{sku}/{uuid.uuid4()}.jpg"
+    return s3.generate_presigned_url(
+        "put_object",
+        Params={"Bucket": image_bucket, "Key": key, "ContentType": content_type},
+        ExpiresIn=900,
+    )
+\end{lstlisting}
+\subsection*{Deliverables}
+\begin{itemize}
+    \item Architecture diagram showing clients, API layer, Aurora Serverless v2, DynamoDB, S3 product images, ElastiCache, DAX, DMS, S3 analytics, and monitoring.
+    \item Data ownership matrix that identifies the source of truth, cache policy, TTL, encryption setting, backup or retention rule, and access pattern for each entity.
+    \item AWS CLI or infrastructure scripts for S3 buckets, DynamoDB tables, ElastiCache, DAX or documented DAX plan, Aurora configuration, and DMS replication.
+    \item Boto3 or service code demonstrating cart writes, clickstream ingestion, product image upload workflow, cache invalidation keys, and safe serialization.
+    \item Evidence packet with resource descriptions, table schemas, bucket policies, lifecycle output, cache endpoints, DMS task status, CloudWatch metrics, and cleanup commands.
+\end{itemize}
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item Aurora Serverless v2 is the documented transactional source for profiles, billing, orders, and refunds.
+    \item DynamoDB cart and clickstream keys distribute traffic by user, date, or bucket and include TTL where temporary data is expected.
+    \item S3 product image storage blocks public access, uses server-side encryption, and has a lifecycle policy.
+    \item ElastiCache is placed in private subnets and has a clear cache-aside or invalidation strategy for product and inventory reads.
+    \item DAX is used only for DynamoDB eventually consistent read paths or is explicitly rejected with a reason.
+    \item AWS DMS has a continuous replication design from Aurora to S3 with table mappings, monitoring, and recovery notes.
+    \item API ingestion includes authentication, validation, throttling, and no direct client access to databases.
+    \item The final design includes cleanup steps and cost controls for every billable resource.
+\end{itemize}
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Add CloudFront with signed URLs or signed cookies for product image delivery without making the S3 bucket public.
+    \item Implement a Lambda or stream consumer that invalidates ElastiCache keys after Aurora product updates.
+    \item Add a synthetic load script that demonstrates database load reduction after cache warmup.
+    \item Add Athena table definitions over the DMS S3 target and run a sample analytics query.
+    \item Add multi-region disaster recovery notes for Aurora, DynamoDB global tables, S3 replication, and cache warmup.
+\end{itemize}

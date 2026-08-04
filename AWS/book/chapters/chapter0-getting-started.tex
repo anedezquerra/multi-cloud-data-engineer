@@ -1,0 +1,475 @@
+\chapter{Getting Started: Your AWS Free Tier Account and Environment}
+\index{AWS account}\index{Free Tier}\index{root user}\index{multi-factor authentication}\index{IAM Identity Center}%
+\index{AWS CLI}\index{AWS CloudShell}\index{AWS Budgets}\index{Cost Explorer}\index{Region}\index{tagging}%
+\lstdefinelanguage{PowerShell}{
+    morekeywords={Set-Variable,Write-Output,New-Item,Remove-Item,Get-Content,Set-Content,ConvertTo-Json,Out-File,if,else,foreach,where,return},
+    sensitive=false,
+    morecomment=[l]{\#},
+    morestring=[b]',
+    morestring=[b]"
+}
+
+\begin{objectives}
+\begin{itemize}
+    \item Create an AWS account, distinguish 12-month Free Tier offers from Always-Free offers and short trials, and identify the inputs required during sign-up.
+    \item Secure the account by protecting the root user with MFA, avoiding root for daily work, and creating a separate administrative identity.
+    \item Install and validate AWS CLI v2 on Windows PowerShell, and compare long-lived access-key configuration with IAM Identity Center sign-in.
+    \item Configure profiles, default Regions, and AWS CloudShell so examples in later chapters can run reproducibly.
+    \item Establish cost guardrails with billing alerts, Free Tier usage alerts, AWS Budgets, Cost Explorer, and routine Billing dashboard checks.
+    \item Apply the Region, naming, and tagging conventions used throughout this book.
+    \item Verify the environment with AWS STS and a short S3 create, list, and cleanup workflow.
+\end{itemize}
+\end{objectives}
+
+\begin{keyterms}
+\textbf{Root user}: the account owner identity created with the account email address. \textbf{IAM Identity Center}: AWS's workforce sign-in service, formerly AWS Single Sign-On. \textbf{Profile}: a named set of AWS CLI credentials and configuration. \textbf{Region}: a geographic AWS service location such as \texttt{us-east-1}. \textbf{Budget}: a billing guardrail that sends alerts when actual or forecasted spend crosses thresholds.
+\end{keyterms}
+
+\section{Why Chapter 0 Exists}
+Before creating buckets, Glue jobs, streams, warehouses, or lakehouse tables, you need a safe sandbox. This chapter builds that sandbox deliberately: account, identity, command-line tooling, budget alarms, naming rules, and a tiny verification exercise. The goal is not to become an AWS administrator in one sitting. The goal is to remove the avoidable problems that derail hands-on learning: using the root user every day, working in the wrong Region, losing track of profiles, creating resources without tags, or discovering charges after a lab was supposed to be cleaned up.
+
+This book assumes a Windows workstation and PowerShell. Most AWS commands are the same on macOS, Linux, AWS CloudShell, Git Bash, and Windows Terminal, but file paths, environment variables, quoting, and here-documents differ. Where the shell matters, listings use native PowerShell. Later chapters may show Bash-style commands when that is shorter for cloud shells or Linux-based services; when you run them on Windows, translate variable assignment and file creation to PowerShell.
+
+\begin{notebox}
+The examples in this chapter use a personal learning account or an organization-approved sandbox account. Do not run training commands in a production account unless your employer has explicitly approved the account, Region, budget, and cleanup process.
+\end{notebox}
+
+\section{Creating an AWS Account on the Free Tier}
+\subsection{What You Need Before Sign-up}
+To create a standard AWS account, prepare four items: a unique email address, a strong password, a credit or debit card for verification and payment, and a phone number that can receive verification. The email address becomes the root user sign-in name. Use an email address you can keep long term, because it is also the recovery channel for account ownership.
+
+The payment card is required even if you plan to stay within free offers. AWS uses it for identity and billing verification, and charges can occur if you exceed Free Tier limits or create resources that are not free. The phone verification step proves that you control a reachable phone number. Depending on country, AWS may also ask for a billing address, tax information, or an additional verification step.
+
+\begin{definitionbox}
+\textbf{AWS Free Tier} is a collection of offers, not a single unlimited free account. Some offers last for 12 months after account creation, some are Always Free within monthly limits, and some are short service-specific trials.
+\end{definitionbox}
+
+\subsection{Understanding Free Tier Categories}
+AWS groups free usage into three practical categories:
+
+\begin{itemize}
+    \item \textbf{12-month Free Tier}: introductory monthly allowances that expire 12 months after the account creation date. Common examples include limited compute, storage, database, and data-transfer allowances. When the 12-month period ends, normal pay-as-you-go pricing applies.
+    \item \textbf{Always-Free offers}: recurring monthly allowances that do not expire as long as AWS continues the offer and you stay within limits. Examples vary by service and Region, so always check the service's current Free Tier page before a lab.
+    \item \textbf{Trials}: service-specific promotions for a fixed time, fixed usage amount, or fixed credit. Trials may start when you first activate the service, not necessarily when you create the account.
+\end{itemize}
+
+Free Tier is measured by usage dimensions: GB-months stored, requests made, compute hours, data processed, messages sent, log ingestion, or data transferred out. A service can have one free dimension but charge for another. For example, a storage allowance may be free while requests, retrieval, replication, public IPv4 addresses, NAT gateways, or cross-Region transfer are billable.
+
+\begin{pitfall}
+\textbf{Assuming Free Tier means no bill.} Free Tier is a discount schedule with limits. Resources outside the offer, usage above the allowance, unsupported Regions, idle billable infrastructure, data egress, and forgotten resources can still create charges.
+\end{pitfall}
+
+\subsection{Sign-up Walkthrough}
+Start at the AWS sign-up page and choose \textbf{Create an AWS account}. Enter the email address that will own the account, an account name, and a strong password. Use an account name that is human-readable but not sensitive, such as \texttt{data-engineering-sandbox}. Avoid patient names, internal project codenames, confidential client names, or anything that would be embarrassing in a bill, screenshot, or support case.
+
+Next, choose the account type. Individual learners usually choose a personal account. Company learners should follow their employer's cloud onboarding process instead, because many organizations require AWS Organizations, centralized identity, service control policies, centralized logging, and approved billing. Enter contact information, payment information, and the verification code sent through the phone flow. Choose the Basic support plan unless your organization requires a different plan.
+
+After sign-up, wait for account activation email. Then sign in as the root user only long enough to secure the account and create an administrative identity. Record the account ID from the console menu; later commands and budget policies may need it. Do not create training resources yet. Security and cost guardrails come first.
+
+\begin{tipbox}
+Use a password manager from the beginning. Store the root email, password, account ID, MFA recovery codes or device recovery notes, and the name of the administrative profile you create later. Do not store access keys in notes, screenshots, or source files.
+\end{tipbox}
+
+\section{Securing the Account}
+\subsection{Root User: Owner, Not Operator}
+The root user has unrestricted authority over the account. It can change billing settings, close the account, alter account-level security settings, recover access, and perform actions that ordinary IAM users or roles may not need. That power makes root valuable for rare account ownership operations and dangerous for daily work.
+
+Daily work should use federated identities, IAM Identity Center permission sets, IAM roles, or in a small learning account, an IAM administrator user. This separation gives you better audit trails, lets you rotate or revoke operational credentials without changing account ownership, and reduces blast radius if a laptop, browser session, or access key is compromised.
+
+\begin{pitfall}
+\textbf{Leaving root unprotected.} An AWS account with root sign-in and no MFA is a high-risk target. If an attacker obtains the root password, they can create users, disable controls, delete resources, change billing settings, and lock you out. Enable MFA on root before building anything.
+\end{pitfall}
+
+\subsection{Enable MFA on the Root User}
+Sign in to the AWS Management Console as the root user. Open the account menu, choose \textbf{Security credentials}, and find the MFA section. Add a virtual authenticator app, hardware security key, or another supported MFA device. Scan the QR code or register the key, enter consecutive MFA codes when prompted, and verify that the device appears as active.
+
+A virtual authenticator is acceptable for a personal lab, but a hardware security key is stronger. If you use a phone app, think about device replacement: keep recovery information in a secure place and avoid a single point of failure. Do not share the root MFA device casually. For organizations, root MFA ownership should follow a documented break-glass process.
+
+\begin{notebox}
+After MFA is enabled, sign out and sign back in once to confirm that root sign-in requires the second factor. Then stop using root for routine labs.
+\end{notebox}
+
+\subsection{Create an Administrative Identity}
+AWS has two common paths for a learning account. The preferred modern path is \textbf{IAM Identity Center}. The smaller, legacy-compatible path is an \textbf{IAM admin user and group}. Use IAM Identity Center if you can; use an IAM admin user only if your account or course environment does not support the Identity Center flow.
+
+\subsubsection{Preferred: IAM Identity Center}
+Open \textbf{IAM Identity Center} in the console. If prompted, enable it for the account. Create a user with your learner email address, assign that user to the AWS account, and attach an administrative permission set for the sandbox account. Accept the invitation email, set a password, register MFA for the workforce user if prompted, and sign in through the AWS access portal URL.
+
+From the access portal, you can open the console or copy CLI configuration values. This flow avoids creating long-lived access keys on your laptop. It also resembles how many companies grant cloud access: users authenticate to a workforce identity system and receive temporary credentials for a role.
+
+\subsubsection{Alternative: IAM Admin User and Group}
+If IAM Identity Center is unavailable, create an IAM group such as \texttt{Administrators}, attach the AWS-managed \texttt{AdministratorAccess} policy, then create a user for daily work and add the user to that group. Give the user a console password only if you need console sign-in. Create access keys only for CLI work, rotate them periodically, and delete unused keys.
+
+For a personal learning account, an admin user is acceptable as a temporary bootstrap identity. For team, enterprise, or production use, prefer federation and roles. Never create access keys for the root user.
+
+\subsection{Password Policy and Account Hygiene}
+In IAM account settings, configure a strong password policy: minimum length of at least 14 characters, uppercase, lowercase, number, symbol, expiration or rotation according to your organization's policy, and prevention of password reuse. Require MFA for privileged users. Add an alternate billing contact and security contact if the account is important enough that another human must receive urgent notices.
+
+Finally, review the account's security credential report or IAM access analyzer findings periodically. Delete unused users, deactivate unused access keys, and avoid embedding credentials in scripts. In later chapters, the safest pattern is to use short-lived role credentials from IAM Identity Center or CloudShell instead of long-lived local keys.
+
+\section{Installing and Configuring the Tooling}
+\subsection{AWS CLI v2 on Windows}
+AWS CLI v2 is the command-line interface used throughout the book. On Windows, install the official MSI package from AWS, or install through an approved package manager if your organization manages software that way. Open a new PowerShell window after installation so \texttt{aws.exe} is on \texttt{PATH}. Verify the version before configuring credentials.
+
+\begin{lstlisting}[language=PowerShell,caption={Verifying AWS CLI v2 from Windows PowerShell.},label={lst:aws-cli-version}]
+aws --version
+
+# Expected shape; exact patch versions vary.
+# aws-cli/2.x.x Python/3.x Windows/10 exe/AMD64 prompt/off
+\end{lstlisting}
+
+On macOS, AWS provides a signed installer package. On Linux, AWS provides a bundled installer archive. The commands in this book focus on AWS CLI behavior, not installer mechanics; use your operating system's official AWS CLI v2 instructions when in doubt.
+
+\subsection{Configuration Option A: IAM Identity Center}
+If you created an IAM Identity Center user, configure the CLI with SSO. The command opens a browser so you can authorize the device. The profile name should be explicit because later labs may use multiple accounts or Regions.
+
+\begin{lstlisting}[language=PowerShell,caption={Configuring an AWS CLI profile with IAM Identity Center.},label={lst:aws-configure-sso}]
+aws configure sso --profile aws-book-admin
+
+# Typical prompts:
+# SSO session name: aws-book
+# SSO start URL: https://your-start-url.awsapps.com/start
+# SSO region: us-east-1
+# CLI default client Region: us-east-1
+# CLI default output format: json
+
+aws sso login --profile aws-book-admin
+aws sts get-caller-identity --profile aws-book-admin
+\end{lstlisting}
+
+SSO profiles use temporary credentials cached locally after login. When the session expires, run \texttt{aws sso login --profile aws-book-admin} again. This is the recommended path for the book because it reduces the risk of leaked static access keys.
+
+\subsection{Configuration Option B: Access Keys}
+If you use an IAM admin user, create an access key for that user and configure a named profile. Keep the secret access key private; AWS shows it only once. Do not paste it into documents, screenshots, notebooks, Git repositories, or chat messages.
+
+\begin{lstlisting}[language=PowerShell,caption={Configuring an AWS CLI profile with access keys.},label={lst:aws-configure-keys}]
+aws configure --profile aws-book-admin
+
+# AWS Access Key ID [None]: AKIA...
+# AWS Secret Access Key [None]: paste-secret-here
+# Default region name [None]: us-east-1
+# Default output format [None]: json
+
+aws sts get-caller-identity --profile aws-book-admin
+\end{lstlisting}
+
+The command writes configuration under \texttt{\%USERPROFILE\%\textbackslash{}.aws}, including the \texttt{config} and \texttt{credentials} files. Treat the credentials file as sensitive. If a key is exposed, deactivate it immediately in IAM and create a replacement only if still needed.
+
+\begin{pitfall}
+\textbf{Using the default profile accidentally.} If one terminal uses \texttt{default} and another uses \texttt{aws-book-admin}, commands may run in different accounts or Regions. Use \texttt{--profile} in examples until you are confident, or set \texttt{\$Env:AWS\_PROFILE = 'aws-book-admin'} for the current PowerShell session.
+\end{pitfall}
+
+\subsection{Profiles, Regions, and Output Formats}
+A profile combines credentials with defaults such as Region and output format. This book uses \texttt{aws-book-admin} as the learning profile and \texttt{us-east-1} as the default Region unless a chapter says otherwise. JSON output is preferred because it can be queried, stored, and compared in tests.
+
+\begin{lstlisting}[language=PowerShell,caption={Selecting the book profile and Region for the current PowerShell session.},label={lst:aws-profile-region}]
+$Env:AWS_PROFILE = 'aws-book-admin'
+$Env:AWS_REGION = 'us-east-1'
+$Env:AWS_DEFAULT_REGION = 'us-east-1'
+
+aws configure list
+aws sts get-caller-identity
+\end{lstlisting}
+
+PowerShell environment variables set this way affect only the current terminal session. That is useful: you can keep one terminal pointed at a sandbox and avoid changing global settings. If you want persistent configuration, use \texttt{aws configure set region us-east-1 --profile aws-book-admin}.
+
+\subsection{AWS CloudShell as a No-install Alternative}
+AWS CloudShell is a browser-based shell available from the AWS console in supported Regions. It includes AWS CLI, credentials from your console session, persistent home storage within service limits, and common command-line tools. CloudShell is excellent when you cannot install software locally, need a quick verification, or want to avoid local credential files.
+
+CloudShell is still tied to your signed-in identity and selected Region. Before running a lab, check the Region selector and run \texttt{aws sts get-caller-identity}. Store only disposable training files in CloudShell home storage. Do not treat it as a permanent development workstation.
+
+\begin{tipbox}
+CloudShell removes local installation friction, not security responsibility. You still need MFA, least privilege, budget alerts, cleanup, and careful Region selection.
+\end{tipbox}
+
+\section{Cost Guardrails to Stay Free}
+\subsection{Turn on Billing Visibility}
+Open the Billing and Cost Management console as root or an identity with billing permissions. Activate IAM access to billing if needed, then use the administrative identity for routine billing checks. Enable Free Tier usage alerts where available and confirm the email address that receives notices. Billing alerts do not prevent spending; they shorten the time between activity and awareness.
+
+Cost Explorer helps you see cost trends by service, Region, usage type, linked account, and tag. It may need to be enabled and can take time to populate. For a learning account, the most important dashboard questions are simple: which services have charges, in which Regions, and from which resources?
+
+\begin{tipbox}
+\textbf{Measure it.} At the start and end of every hands-on session, open the Billing dashboard and Cost Explorer. Record current month-to-date spend and the services with nonzero cost. If the number changed unexpectedly, stop and investigate before starting the next chapter.
+\end{tipbox}
+
+\subsection{Create a Zero-Spend or Low-Spend Budget}
+AWS Budgets can send email alerts when actual or forecasted spend crosses thresholds. A zero-spend budget is useful in a new account because any charge matters. A low-spend budget, such as \$5 or \$10 per month, is practical if you expect tiny unavoidable charges while learning. The budget is a notification guardrail, not a hard spending cap.
+
+Create at least two alerts: one for actual spend and one for forecasted spend. Actual spend tells you that charges have occurred. Forecasted spend warns that current usage trends may exceed your limit by the end of the month. Use an email address you actively read.
+
+\begin{lstlisting}[language=json,caption={Minimal monthly AWS budget definition for a low-spend learning guardrail.},label={lst:aws-budget-json}]
+{
+  "BudgetName": "aws-book-low-spend",
+  "BudgetLimit": {
+    "Amount": "5.00",
+    "Unit": "USD"
+  },
+  "TimeUnit": "MONTHLY",
+  "BudgetType": "COST",
+  "CostFilters": {},
+  "CostTypes": {
+    "IncludeTax": true,
+    "IncludeSubscription": true,
+    "UseBlended": false,
+    "IncludeRefund": false,
+    "IncludeCredit": true,
+    "IncludeUpfront": true,
+    "IncludeRecurring": true,
+    "IncludeOtherSubscription": true,
+    "IncludeSupport": true,
+    "IncludeDiscount": true,
+    "UseAmortized": false
+  }
+}
+\end{lstlisting}
+
+The following PowerShell example creates the JSON files and calls AWS Budgets. Replace the email address and account ID. Budgets is a global billing service, but the CLI still needs a configured profile.
+
+\begin{lstlisting}[language=PowerShell,caption={Creating an AWS Budget with actual and forecasted email alerts.},label={lst:create-budget}]
+$AccountId = '123456789012'
+$Email = 'you@example.com'
+
+@'
+{
+  "BudgetName": "aws-book-low-spend",
+  "BudgetLimit": { "Amount": "5.00", "Unit": "USD" },
+  "TimeUnit": "MONTHLY",
+  "BudgetType": "COST",
+  "CostTypes": {
+    "IncludeTax": true,
+    "IncludeSubscription": true,
+    "UseBlended": false,
+    "IncludeRefund": false,
+    "IncludeCredit": true,
+    "IncludeUpfront": true,
+    "IncludeRecurring": true,
+    "IncludeOtherSubscription": true,
+    "IncludeSupport": true,
+    "IncludeDiscount": true,
+    "UseAmortized": false
+  }
+}
+'@ | Set-Content -Path .\budget.json -Encoding utf8
+
+@"
+[
+  {
+    "Notification": {
+      "NotificationType": "ACTUAL",
+      "ComparisonOperator": "GREATER_THAN",
+      "Threshold": 1,
+      "ThresholdType": "PERCENTAGE"
+    },
+    "Subscribers": [
+      { "SubscriptionType": "EMAIL", "Address": "$Email" }
+    ]
+  },
+  {
+    "Notification": {
+      "NotificationType": "FORECASTED",
+      "ComparisonOperator": "GREATER_THAN",
+      "Threshold": 80,
+      "ThresholdType": "PERCENTAGE"
+    },
+    "Subscribers": [
+      { "SubscriptionType": "EMAIL", "Address": "$Email" }
+    ]
+  }
+]
+"@ | Set-Content -Path .\notifications.json -Encoding utf8
+
+aws budgets create-budget `
+  --account-id $AccountId `
+  --budget file://budget.json `
+  --notifications-with-subscribers file://notifications.json
+\end{lstlisting}
+
+After creating the budget, confirm the subscription email if AWS sends a confirmation message. Test that the budget appears in the console. If you later close or replace the account, recreate budgets in the new account; budgets are not portable across accounts automatically.
+
+\subsection{Free Tier Usage Alerts and Service-specific Controls}
+Free Tier usage alerts warn when usage approaches Free Tier limits for eligible services. Enable them from the Billing preferences page. They complement budgets because some Free Tier dimensions are usage-based rather than cost-based. For example, a service may remain at \$0 until the allowance is exceeded, then begin charging.
+
+Some services also have their own limits, alarms, or quotas. S3 lifecycle expiration can delete temporary objects. CloudWatch alarms can detect unexpected traffic. Service Quotas can request or view quotas, but quotas are not a substitute for cleanup. For this book, the default policy is: create only what the lab requires, tag it, verify it, and delete it when the exercise says to delete it.
+
+\begin{pitfall}
+\textbf{Relying on budgets as a kill switch.} AWS Budgets sends notifications and can trigger actions in some scenarios, but it does not universally stop resource creation or halt all charges. Design labs so cleanup is explicit and cheap resources do not depend on expensive hidden infrastructure.
+\end{pitfall}
+
+\section{Choosing a Region and Naming Conventions}
+\subsection{Default Region for the Book}
+Unless a chapter states otherwise, use \texttt{us-east-1}. It supports broad service coverage, keeps examples consistent, and is commonly used in public documentation. If your organization mandates another Region, use that Region consistently and change names accordingly. Be aware that service availability, pricing, quotas, and Free Tier eligibility can vary by Region.
+
+A Region is not just a performance choice. It affects data residency, regulatory posture, disaster recovery design, KMS key location, networking, and service integration. For personal learning, consistency matters more than geographic perfection. For professional environments, Region selection should be a documented architecture decision.
+
+\subsection{Naming Convention}
+Resource names should be readable, unique where required, and safe to show in screenshots. This book uses the pattern:
+
+\begin{center}
+\texttt{aws-book-<service>-<purpose>-<region>-<suffix>}
+\end{center}
+
+For globally unique names such as S3 buckets, append a short suffix such as your account ID fragment, date, or random string. Avoid uppercase letters in S3 bucket names. Avoid names that reveal sensitive data. Use hyphens rather than underscores for resource names unless the service requires otherwise.
+
+Examples:
+\begin{itemize}
+    \item \texttt{aws-book-s3-landing-us-east-1-1234}
+    \item \texttt{aws-book-glue-demo-us-east-1}
+    \item \texttt{aws-book-budget-low-spend}
+\end{itemize}
+
+\subsection{Tagging Convention}
+Tags help you find, filter, allocate cost, and clean up resources. Not every AWS resource supports tags, but when tags are available, apply a consistent minimum set:
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.4cm}p{4.2cm}p{5.7cm}@{}}
+\toprule
+\textbf{Tag key} & \textbf{Example value} & \textbf{Purpose} \\
+\midrule
+\texttt{Project} & \texttt{AWSBook} & Groups all book resources for search and cost review. \\
+\texttt{Environment} & \texttt{Training} & Distinguishes labs from production, development, or shared sandboxes. \\
+\texttt{Owner} & \texttt{learner} & Identifies who should clean up the resource. Do not put sensitive personal data here. \\
+\texttt{Chapter} & \texttt{Chapter0} & Makes exercise resources easy to find and delete. \\
+\texttt{DeleteAfter} & \texttt{2026-08-31} & Documents intended cleanup date. It is not automatic unless automation enforces it. \\
+\bottomrule
+\end{tabular}
+\caption{Minimum training tags used throughout this book.}
+\label{tab:chapter0-tags}
+\end{table}
+
+\begin{tipbox}
+Use tags in the Billing dashboard and Cost Explorer. If a charge appears and the resource has no project or chapter tag, you have already found a process gap.
+\end{tipbox}
+
+\section{Setup Flow Across the Six Platform Books}
+\begin{crosscloud}
+The first hour in every cloud book follows the same pattern: understand the free offer, secure the administrative identity, install or open the shell, set cost guardrails, and verify the environment.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{2.9cm}p{3.0cm}p{3.0cm}p{3.0cm}@{}}
+\toprule
+\textbf{Setup step} & \textbf{AWS} & \textbf{Azure} & \textbf{GCP} \\
+\midrule
+Free offer & Free Tier (12 mo + always free) & Free account (\$200/30 days + always free) & Free trial (\$300/90 days + Always Free) \\
+Sign-up guard & Card + root email & Card + Microsoft account & Card + Google account \\
+Identity model & IAM / IAM Identity Center & Microsoft Entra ID + RBAC & Cloud IAM \\
+Admin isolation & Never use root daily & Avoid Global Admin daily & Avoid Owner; least privilege \\
+CLI & AWS CLI v2 (\texttt{aws configure}) & Azure CLI (\texttt{az login}) & gcloud CLI (\texttt{gcloud init}) \\
+Browser shell & AWS CloudShell & Azure Cloud Shell & Cloud Shell \\
+Cost guardrail & AWS Budgets + alerts & Cost Management budgets & Budgets \& alerts \\
+Console & AWS Management Console & Azure Portal & Google Cloud Console \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+The three non-object-store books differ: Microsoft Fabric uses a Microsoft 365/Power BI work account plus a Fabric trial capacity (no card, org tenant); Snowflake uses a 30-day/\$400 trial (no card) guarded by Resource Monitors; MongoDB Atlas offers a forever-free M0 cluster (no card) secured by database users and an IP allowlist.
+\end{crosscloud}
+
+\section{Verification: Hello World}
+\subsection{Check the Caller Identity}
+The safest first command is read-only: \texttt{aws sts get-caller-identity}. It returns the AWS account, user or role ARN, and user ID for the active credentials. Run it before every lab, especially if you work with multiple profiles.
+
+\begin{lstlisting}[language=PowerShell,caption={Confirming which AWS identity the CLI is using.},label={lst:sts-identity}]
+$Env:AWS_PROFILE = 'aws-book-admin'
+$Env:AWS_REGION = 'us-east-1'
+
+aws sts get-caller-identity
+
+# Expected output shape:
+# {
+#     "UserId": "AROAXAMPLEID:learner",
+#     "Account": "123456789012",
+#     "Arn": "arn:aws:sts::123456789012:assumed-role/AWSReservedSSO_AdministratorAccess_abc123/learner"
+# }
+\end{lstlisting}
+
+If the account ID is not the account you expect, stop. Do not continue a hands-on lab in the wrong account. If the ARN shows root, stop and switch to your administrative identity.
+
+\subsection{Create, List, and Delete a Small S3 Bucket}
+This smoke test proves that credentials, Region, permissions, and cleanup all work. It creates an empty S3 bucket, lists it, and deletes it. S3 bucket names are globally unique, so the example constructs a suffix from your account ID and the current date. If the name already exists, change the suffix.
+
+\begin{lstlisting}[language=PowerShell,caption={S3 smoke test with cleanup from Windows PowerShell.},label={lst:s3-smoke-test}]
+$Env:AWS_PROFILE = 'aws-book-admin'
+$Env:AWS_REGION = 'us-east-1'
+$AccountId = (aws sts get-caller-identity --query Account --output text)
+$Suffix = Get-Date -Format 'yyyyMMddHHmmss'
+$Bucket = "aws-book-chapter0-$AccountId-$Suffix"
+
+aws s3api create-bucket --bucket $Bucket --region $Env:AWS_REGION
+aws s3api put-bucket-tagging `
+  --bucket $Bucket `
+  --tagging 'TagSet=[{Key=Project,Value=AWSBook},{Key=Environment,Value=Training},{Key=Chapter,Value=Chapter0}]'
+
+aws s3 ls "s3://$Bucket"
+aws s3api list-buckets --query "Buckets[?Name=='$Bucket'].Name" --output text
+
+aws s3api delete-bucket --bucket $Bucket
+aws s3api list-buckets --query "Buckets[?Name=='$Bucket'].Name" --output text
+\end{lstlisting}
+
+Expected behavior: \texttt{create-bucket} succeeds, \texttt{aws s3 ls} returns no objects because the bucket is empty, \texttt{list-buckets} prints the bucket name before deletion, and the final \texttt{list-buckets} prints nothing after deletion. If deletion fails with \texttt{BucketNotEmpty}, remove objects and versions first; this smoke test should not create any objects.
+
+\begin{notebox}
+S3's \texttt{create-bucket} syntax differs for \texttt{us-east-1} and other Regions. In \texttt{us-east-1}, the simple command above is valid. In most other Regions, include \texttt{--create-bucket-configuration LocationConstraint=<region>}.
+\end{notebox}
+
+\subsection{Optional Setup Flow Diagram}
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[node distance=1.4cm]
+        \node[stage] (account) {Create AWS\\account};
+        \node[stage, right=of account] (identity) {Secure root +\\admin identity};
+        \node[tool, right=of identity] (cli) {AWS CLI v2\\or CloudShell};
+        \node[stage, right=of cli] (budget) {Budgets +\\billing alerts};
+        \node[store, right=of budget] (verify) {Verify with\\STS + S3};
+        \draw[arrow] (account) -- (identity);
+        \draw[arrow] (identity) -- (cli);
+        \draw[arrow] (cli) -- (budget);
+        \draw[arrow] (budget) -- (verify);
+        \node[note, below=0.7cm of cli, align=center] {Build guardrails before creating data-engineering resources.};
+    \end{tikzpicture}%
+    }
+    \caption{Chapter 0 setup flow: account, secure identity, tooling, cost guardrail, and verification.}
+    \label{fig:chapter0-setup-flow}
+\end{figure}
+
+\section{Further Reading}
+Review the AWS account creation, Free Tier, IAM, IAM Identity Center, AWS CLI v2, CloudShell, Billing, Budgets, and Cost Explorer documentation from AWS. Keep those pages close while working through the first labs because console navigation and Free Tier offers can change. For security posture, also read AWS guidance on the root user, MFA, least privilege, and the shared-responsibility model. For cost control, read the current pricing page for each service before running a chapter that creates resources.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item Free Tier is a set of limited offers; it is not a guarantee that all account activity is free.
+    \item Protect the root user with MFA and use a separate administrative identity for daily labs.
+    \item IAM Identity Center and \texttt{aws configure sso} are preferred because they use temporary credentials.
+    \item Named profiles and a consistent Region prevent many accidental-account and wrong-Region mistakes.
+    \item Budgets, Free Tier alerts, Cost Explorer, and routine Billing dashboard checks are required learning-account hygiene.
+    \item Tags, naming conventions, and cleanup commands make hands-on work auditable and reversible.
+    \item A successful \texttt{sts get-caller-identity} plus S3 create, list, and delete test proves that Chapter 1 can start safely.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Checklist)} Complete this environment setup checklist before Chapter 1:
+    \begin{itemize}
+        \item AWS account created and account ID recorded.
+        \item Root user password stored securely and root MFA enabled.
+        \item Daily administrative identity created through IAM Identity Center or an IAM admin user and group.
+        \item Administrative identity can sign in to the console without using root.
+        \item AWS CLI v2 installed locally or AWS CloudShell selected as the working shell.
+        \item Named profile \texttt{aws-book-admin} configured, or CloudShell identity verified.
+        \item Default Region set to \texttt{us-east-1} unless your organization requires another Region.
+        \item Billing access verified, Free Tier usage alerts enabled where available, and an AWS Budget created.
+        \item Cost Explorer enabled or checked for availability.
+        \item \texttt{aws sts get-caller-identity} returns the expected account and non-root identity.
+        \item S3 smoke-test bucket created, listed, deleted, and confirmed absent.
+    \end{itemize}
+    \item \textbf{(Conceptual)} Explain the difference between the root user, an IAM user, an IAM role, and an IAM Identity Center user. Which should you use for daily labs and why?
+    \item \textbf{(Cost)} Create a monthly budget with actual and forecasted alerts. Record the budget name, threshold, email recipient, and the date you verified it in the console.
+    \item \textbf{(CLI)} Run \texttt{aws configure list} and \texttt{aws sts get-caller-identity}. Save the account ID and ARN in your private lab notes, not in a public repository.
+    \item \textbf{(Region)} Choose a Region other than \texttt{us-east-1}. Identify one service from later chapters that is available there and one pricing or availability difference you would check before using it.
+    \item \textbf{(Governance)} Propose a tag policy for a shared training account. Include owner, project, environment, chapter, and cleanup-date fields.
+    \item \textbf{(Cleanup)} Search the console for resources tagged \texttt{Project=AWSBook}. Confirm that no Chapter 0 resources remain after the S3 smoke test.
+\end{enumerate}

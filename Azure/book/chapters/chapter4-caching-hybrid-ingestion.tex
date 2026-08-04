@@ -1,0 +1,617 @@
+\chapter{Hybrid Ingestion and Caching}
+\index{Hybrid ingestion}\index{caching}\index{Azure Cache for Redis}\index{Cosmos DB Integrated Cache}\index{Azure API Management}\index{cache-aside}\index{TTL}\index{eviction}%
+\begin{objectives}
+\begin{itemize}
+    \item Explain why low-latency data products need caching, admission control, TTLs, and clear invalidation rules.
+    \item Use Azure Cache for Redis to accelerate Azure SQL Database reads with a cache-aside pattern.
+    \item Compare Redis-based caching with Cosmos DB Integrated Cache for read-heavy document workloads.
+    \item Position Azure API Management as an ingestion gateway for data APIs, mobile applications, partners, and event producers.
+    \item Deploy an Azure Cache for Redis instance and write a Python cache-aside script over Azure SQL Database query results.
+    \item Design a high-throughput, low-latency mobile data API that survives extreme traffic spikes during live sports events.
+    \item Complete the Part I milestone by integrating Azure SQL Database Serverless, Cosmos DB, ADLS Gen2, Redis, APIM, and Change Feed.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+Caching is a portable architecture pattern even when product names differ. The engineer must define what is cached, where the cache lives, how entries expire, how writes update or invalidate entries, and what happens when the cache is unavailable.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{2.5cm}p{2.9cm}p{2.8cm}p{2.6cm}p{3.2cm}@{}}
+\toprule
+\textbf{Concept} & \textbf{Azure} & \textbf{AWS} & \textbf{GCP} & \textbf{Other platforms} \\
+\midrule
+Managed Redis & Azure Cache for Redis with Enterprise tiers for advanced Redis features & Amazon ElastiCache for Redis or MemoryDB for Redis & Memorystore for Redis Cluster or Memorystore for Redis & Redis Enterprise Cloud, self-managed Redis, KeyDB \\
+Database-integrated cache & Cosmos DB Integrated Cache on dedicated gateway & DynamoDB Accelerator (DAX) for DynamoDB & No exact single-service equivalent; combine Memorystore with Firestore or Spanner patterns & MongoDB Atlas tiered storage plus application caches; Cassandra row cache \\
+Cache-aside & Application reads Redis first, then Azure SQL, Cosmos DB, or API source on miss & Application reads ElastiCache first, then RDS, DynamoDB, or service source & Application reads Memorystore first, then Cloud SQL, Firestore, or Spanner & Common pattern across Redis, Memcached, Hazelcast, and application memory \\
+Write-through / write-behind & Application or service updates cache with the write path; less common for Azure PaaS databases than cache-aside & ElastiCache libraries or custom write-through paths & Custom service layer with Memorystore and database writes & Product-specific data grids and stream processors \\
+TTL and eviction & Redis TTL, maxmemory policies, and Cosmos DB Integrated Cache staleness window & Redis TTL, eviction policies, DAX item cache TTL & Memorystore TTL and eviction policies & Memcached expiration, Redis-compatible TTL, local LRU caches \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+A cloud-neutral cache design documents freshness, ownership, invalidation, fallback, warm-up, and observability. Product choice matters, but these contracts matter more.
+\end{crosscloud}
+
+\begin{keyterms}
+\textbf{Cache hit}: a request served from cache without contacting the origin database.\quad
+\textbf{Cache miss}: a request that falls through to the origin and may populate the cache.\quad
+\textbf{TTL}: time-to-live, the maximum age of a cached entry.\quad
+\textbf{Eviction}: removal of cached entries due to memory pressure or policy.\quad
+\textbf{Ingestion gateway}: an API boundary that validates, throttles, authenticates, and routes incoming data.
+\end{keyterms}
+
+\section{Week 4 Overview: Why Caching and Hybrid Ingestion Close Part I}
+Part I has introduced storage foundations, relational databases, and document-scale NoSQL. Week 4 adds the serving patterns that make those systems usable under real product traffic: cache hot reads, shield databases from spikes, and place a governed API gateway in front of ingestion paths. Azure Cache for Redis provides managed in-memory acceleration for databases and services \cite{microsoft2025azureCacheRedis}. Cosmos DB Integrated Cache reduces RU consumption for read-heavy API for NoSQL workloads that use the dedicated gateway \cite{microsoft2025cosmosIntegratedCache}. Azure API Management provides the policy and gateway layer for data APIs \cite{microsoft2025apimOverview}.
+\index{serving layer}\index{database acceleration}\index{API gateway}
+
+Caching is not only a performance trick. It is an architectural contract. A cache introduces a second copy of data, so the team must explain freshness, invalidation, fallback, and observability. Done well, caching reduces database load and user-visible latency. Done poorly, it hides stale data, creates retry storms, and makes incidents harder to reason about.
+
+\begin{definitionbox}
+\textbf{Hybrid ingestion} combines synchronous API ingestion, operational databases, caches, and asynchronous downstream flows. It is common when mobile apps, partner systems, and web backends need low-latency writes while analytics systems need durable event history.
+\end{definitionbox}
+
+\begin{notebox}
+This chapter closes Milestone 1. The final capstone combines the storage, relational, NoSQL, and caching concepts from Weeks 1--4 into an e-commerce data backend.
+\end{notebox}
+
+\section{Monday: Azure Cache for Redis for Database Acceleration}
+\index{Azure Cache for Redis}\index{Redis}\index{database acceleration}\index{cache hit ratio}
+
+\subsection{What Redis Adds to a Data Platform}
+Azure Cache for Redis is a managed, in-memory key-value store based on Redis. Data engineers use it for hot database query results, session state, rate-limit counters, distributed locks, pub/sub notifications, feature flags, and small materialized views. For database acceleration, the usual goal is simple: keep the most frequently requested objects close to the application so Azure SQL Database or another origin can focus on writes, uncommon reads, and durable transactions.
+
+Redis is fast because it keeps data in memory and uses simple data structures. That speed does not remove the need for durable storage. Treat Redis as an acceleration layer unless the tier and architecture explicitly provide the persistence and availability characteristics your workload requires.
+
+\begin{definitionbox}
+\textbf{Cache-aside} is a pattern where the application looks in cache first. On a miss, it reads from the origin database, stores the result in cache with a TTL, and returns the value to the caller.
+\end{definitionbox}
+
+\subsection{Cache-Aside Read Path}
+The cache-aside pattern is the default starting point for Azure SQL acceleration because it keeps the origin database authoritative. The application owns cache keys and serialization. The cache can be flushed without data loss because Azure SQL remains the system of record.
+
+\begin{figure}[H]
+    \centering
+    \resizebox{0.95\textwidth}{!}{%
+    \begin{tikzpicture}[node distance=1.35cm]
+        \node[stage] (app) {Application\\API};
+        \node[store, right=1.6cm of app] (redis) {Azure Cache\\for Redis};
+        \node[store, right=1.9cm of redis] (sql) {Azure SQL\\Database};
+        \node[doc, above=0.9cm of redis] (ttl) {TTL\\eviction\\hit ratio};
+        \node[doc, below=0.9cm of redis] (obs) {Azure Monitor\\logs + metrics};
+        \draw[arrow] (app) -- node[above,font=\scriptsize]{1. get key} (redis);
+        \draw[arrow] (redis) -- node[below,font=\scriptsize]{hit returns JSON} (app);
+        \draw[arrow] (app) to[bend left=18] node[above,font=\scriptsize]{2. miss query} (sql);
+        \draw[arrow] (sql) to[bend left=18] node[below,font=\scriptsize]{3. rows} (app);
+        \draw[arrow] (app) to[bend right=20] node[below,font=\scriptsize]{4. set key + TTL} (redis);
+        \draw[arrow] (ttl) -- (redis);
+        \draw[arrow] (obs) -- (redis);
+    \end{tikzpicture}%
+    }
+    \caption{Cache-aside between an application, Azure Cache for Redis, and Azure SQL Database keeps Azure SQL authoritative while Redis absorbs hot reads.}
+    \label{fig:ch4-cache-aside-sql}
+\end{figure}
+
+\subsection{Keys, TTLs, and Invalidation}
+Good cache keys are stable, specific, and versionable. A profile query might use \texttt{profile:v1:user:42}. A product-card query might use \texttt{product-card:v3:sku:ABC123}. Version prefixes let teams invalidate a family of entries by changing the key format during deployment. TTLs bound staleness and prevent old entries from living forever.
+
+Invalidation is the difficult part. For read-mostly reference data, a five-minute TTL may be enough. For product prices, billing status, inventory reservations, and permissions, the write path should delete or update affected cache keys immediately. If the application cannot name every affected key, use short TTLs and design user experiences that tolerate brief staleness.
+
+\begin{pitfall}
+\textbf{Caching data without a freshness contract.} A cache entry with no TTL and no invalidation rule is a future incident. Every cached object needs an owner, expiration, and fallback behavior.
+\end{pitfall}
+
+\subsection{Availability and Failure Modes}
+A database acceleration cache must fail safely. If Redis is unavailable, the application should usually fall back to Azure SQL for critical reads, apply backpressure to avoid overwhelming the database, and record degraded-mode metrics. Do not allow thousands of application instances to stampede the database on the same cache miss. Use request coalescing, jittered TTLs, and sensible retries.
+
+\begin{tipbox}
+Track cache hit ratio, server load, memory pressure, evicted keys, connected clients, command latency, errors, and database query rate together. A high hit ratio that serves stale or wrong data is not success.
+\end{tipbox}
+
+\section{Tuesday: Cosmos DB Integrated Cache}
+\index{Cosmos DB Integrated Cache}\index{dedicated gateway}\index{Request Units}\index{staleness}
+
+\subsection{Why an Integrated Cache Exists}
+Cosmos DB already provides low-latency reads, but every read consumes RUs unless served by the Integrated Cache through the dedicated gateway. Integrated Cache stores point reads and query results in a gateway-side cache. Repeated reads can return without consuming RUs, subject to the configured maximum integrated cache staleness \cite{microsoft2025cosmosIntegratedCache}.
+
+This is different from Redis cache-aside. The application does not manually set keys for Integrated Cache. Instead, it sends supported requests through the dedicated gateway and accepts a staleness window. The operational model is closer to a database-integrated read cache than to an application-owned key-value cache.
+
+\begin{definitionbox}
+\textbf{Maximum integrated cache staleness} defines how old a cached Cosmos DB response may be before the gateway must refresh it from the backend partitions.
+\end{definitionbox}
+
+\subsection{When Integrated Cache Fits}
+Integrated Cache fits read-heavy document workloads where the same point reads or queries repeat often and slight staleness is acceptable. Examples include catalog pages, product recommendations, configuration documents, reference metadata, and public leaderboard projections. It is less useful for write-heavy workloads, unique one-off queries, cross-partition scans with low repetition, or correctness paths that require the newest committed item.
+
+The cache can reduce RU cost and latency, but it does not fix bad data modeling. A query that fans out across partitions may still be an expensive origin operation when the cache misses. Partition keys, item size, index policy, and materialized views remain central to design.
+
+\begin{notebox}
+Use Redis when the application needs explicit keys, counters, sorted sets, rate limiting, pub/sub, or cross-origin caching. Use Cosmos DB Integrated Cache when repeated Cosmos DB reads can accept bounded staleness and the dedicated gateway model fits the application.
+\end{notebox}
+
+\subsection{Consistency and Freshness Trade-offs}
+Integrated Cache is a deliberate freshness trade. If a user updates a shopping cart and immediately reads through a stale cache path, the application might show the previous state until the staleness window expires. Some workloads can tolerate this; others cannot. Critical user-owned writes should be read with session-aware direct reads or cache bypass where needed.
+
+\begin{pitfall}
+\textbf{Assuming Integrated Cache has the same semantics as Session consistency.} The cache has a staleness setting. Cosmos DB consistency still matters, but the cached response may intentionally be older than the newest backend value.
+\end{pitfall}
+
+\section{Wednesday: Azure API Management for Data Ingestion}
+\index{Azure API Management}\index{APIM}\index{ingestion gateway}\index{rate limiting}\index{policy}
+
+\subsection{APIM as the Data API Front Door}
+Azure API Management is a managed gateway for publishing, securing, transforming, throttling, and observing APIs. In data engineering, APIM often sits in front of ingestion endpoints used by mobile apps, partner systems, internal services, IoT gateways, and batch jobs. It provides a controlled boundary before traffic reaches Azure Functions, App Service, Container Apps, Event Hubs, Azure SQL, Cosmos DB, or custom services.
+
+The gateway should not become a hidden monolith. Keep APIM responsible for boundary concerns: authentication, authorization, subscription keys, quotas, rate limits, schema validation, request transformation, routing, response shaping, and logging. Keep business validation and durable writes in backend services where they can be tested and versioned.
+
+\begin{definitionbox}
+\textbf{Ingestion gateway} is the controlled API boundary that receives external or cross-team data, enforces policy, and routes validated requests to backend ingestion services.
+\end{definitionbox}
+
+\subsection{Policies for Data Ingestion}
+APIM policies can validate JWTs, check subscription keys, limit call rates, reject oversized payloads, require headers, transform JSON, route versions, cache selected responses, and emit diagnostics. For ingestion, the most important policies are often admission-control policies. A backend cannot maintain data quality if a gateway accepts unlimited malformed requests during a traffic spike.
+
+Typical APIM controls include per-consumer quotas, burst rate limits, request size limits, schema validation, correlation IDs, and backend timeout policies. For write APIs, avoid response caching unless the semantics are explicitly idempotent. For read APIs, APIM response caching may complement Redis or Integrated Cache, but it must follow the same freshness contract.
+
+\begin{tipbox}
+Use APIM to protect the backend before scaling the backend. Rejecting invalid or abusive traffic at the edge is cheaper and safer than letting it consume database RUs, DTUs, vCores, or queue capacity.
+\end{tipbox}
+
+\subsection{Synchronous and Asynchronous Ingestion}
+Hybrid ingestion often uses APIM for synchronous request acceptance and Event Hubs, queues, or Change Feed for asynchronous processing. A mobile app may POST a clickstream event through APIM, receive a quick accepted response, and let a backend write to Cosmos DB or Event Hubs. A partner may submit billing adjustments that require synchronous validation against Azure SQL. The correct pattern depends on user feedback, correctness, ordering, and replay requirements.
+
+\begin{notebox}
+APIM is not a message broker. If the system needs durable buffering, replay, or consumer groups, route accepted requests to Event Hubs, Service Bus, Storage queues, Cosmos DB, or another durable ingestion store.
+\end{notebox}
+
+\section{Thursday Hands-on Project: Redis Cache-Aside for Azure SQL Query Results}
+\index{hands-on lab}\index{Azure CLI}\index{redis-py}\index{Azure SQL Database}
+This lab deploys Azure Cache for Redis and uses Python to cache Azure SQL Database query results. Run it only in a sandbox subscription. Delete the resource group when finished, and never commit database passwords, connection strings, or Redis access keys.
+
+\begin{notebox}
+The examples are written for Windows PowerShell with Azure CLI. Production systems should use managed identity for Azure SQL where possible, private endpoints, Key Vault, and infrastructure-as-code.
+\end{notebox}
+
+\subsection{Deploying Azure Cache for Redis}
+The snippet below creates a resource group and a Basic C0 Redis instance for learning. Basic is not appropriate for production availability, but it keeps the lab small. Use Standard, Premium, or Enterprise tiers for real workloads that require replication, clustering, persistence, private networking, or stronger availability characteristics.
+
+\begin{lstlisting}[language=bash,caption={Creating an Azure Cache for Redis instance for the Week 4 lab.},label={lst:ch4-redis-cli-create}]
+az login
+az account set --subscription "00000000-0000-0000-0000-000000000000"
+$rg = "rg-de-azure-book-week4"
+$location = "eastus"
+$redis = "redis-week4-sqlcache-001"
+
+az group create --name $rg --location $location
+
+az redis create `
+  --name $redis --resource-group $rg --location $location `
+  --sku Basic --vm-size c0 `
+  --enable-non-ssl-port false
+
+az redis show `
+  --name $redis --resource-group $rg `
+  --query "{name:name,hostName:hostName,sku:sku.name,sslPort:sslPort}" `
+  --output table
+
+az redis list-keys `
+  --name $redis --resource-group $rg --query primaryKey --output tsv
+\end{lstlisting}
+
+\subsection{Caching Azure SQL Results with Python}
+Install \texttt{redis} and \texttt{pyodbc} in a local virtual environment. The script reads a user profile from Azure SQL Database, serializes the result as JSON, stores it in Redis with a TTL, and prints whether the response was a cache hit or miss.
+
+\begin{lstlisting}[language=Python,caption={Cache-aside Python script using redis-py and Azure SQL query results.},label={lst:ch4-python-redis-sql-cache}]
+import json
+import os
+import time
+
+import pyodbc
+import redis
+
+CACHE_TTL_SECONDS = int(os.environ.get("CACHE_TTL_SECONDS", "300"))
+
+cache = redis.Redis(
+    host=os.environ["REDIS_HOST"],
+    port=6380,
+    password=os.environ["REDIS_KEY"],
+    ssl=True,
+    decode_responses=True,
+)
+
+def cache_key(user_id: int) -> str:
+    return f"profile:v1:user:{user_id}"
+
+def fetch_profile_from_sql(user_id: int) -> dict | None:
+    query = """
+    SELECT UserId, DisplayName, LoyaltyTier, UpdatedAt
+    FROM dbo.UserProfiles
+    WHERE UserId = ?
+    """
+    with pyodbc.connect(os.environ["SQL_CONNECTION_STRING"], timeout=5) as connection:
+        row = connection.execute(query, user_id).fetchone()
+    if row is None:
+        return None
+    return {
+        "userId": row.UserId,
+        "displayName": row.DisplayName,
+        "loyaltyTier": row.LoyaltyTier,
+        "updatedAt": row.UpdatedAt.isoformat(),
+    }
+
+def get_profile(user_id: int) -> dict | None:
+    key = cache_key(user_id)
+    cached = cache.get(key)
+    if cached:
+        print("cache hit", key)
+        return json.loads(cached)
+
+    print("cache miss", key)
+    profile = fetch_profile_from_sql(user_id)
+    if profile is not None:
+        cache.setex(key, CACHE_TTL_SECONDS, json.dumps(profile))
+    return profile
+
+if __name__ == "__main__":
+    start = time.perf_counter()
+    result = get_profile(int(os.environ.get("USER_ID", "42")))
+    elapsed_ms = (time.perf_counter() - start) * 1000
+    print(json.dumps(result, indent=2))
+    print(f"elapsed_ms={elapsed_ms:.1f}")
+\end{lstlisting}
+
+\subsection{Measuring the Load Reduction}
+Set \texttt{REDIS\_HOST}, \texttt{REDIS\_KEY}, \texttt{SQL\_CONNECTION\_STRING}, and \texttt{USER\_ID} in PowerShell, install \texttt{redis} and \texttt{pyodbc}, then run the script twice. The first run should miss the cache and query Azure SQL. The second run should hit Redis until the TTL expires. Capture Azure SQL query duration, Redis latency, cache hit ratio, and database CPU before and after repeated reads.
+
+\section{Friday Use Case: Mobile Sports API with Extreme Traffic Spikes}
+\index{mobile application}\index{traffic spikes}\index{live sports}\index{low latency}
+
+\subsection{Scenario}
+A sports media company runs a mobile app for live games. Traffic is normal during the week, then spikes by 50 times when a championship game starts, when a star player scores, or when fantasy-league results update. Users expect low-latency reads for scores, rosters, schedules, profile settings, and personalized offers. The backend must protect Azure SQL and Cosmos DB from sudden read amplification.
+
+\subsection{Serving Architecture}
+APIM sits at the public API boundary. Redis caches hot scoreboards, team pages, user profile summaries, and rate-limit counters. Cosmos DB stores high-volume event and personalization documents, with Integrated Cache for repeated public document reads where staleness is acceptable. Azure SQL stores billing, subscriptions, and relational user-profile records. The write path invalidates or refreshes affected cache entries after authoritative updates.
+
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[node distance=1.1cm]
+        \node[stage] (mobile) {Mobile apps\\live sports fans};
+        \node[tool, right=1.2cm of mobile] (apim) {Azure API\\Management};
+        \node[stage, right=1.3cm of apim] (api) {Data API\\services};
+        \node[store, above right=0.7cm and 1.3cm of api] (redis) {Azure Cache\\for Redis};
+        \node[store, right=1.6cm of api] (cosmos) {Cosmos DB\\Integrated Cache};
+        \node[store, below right=0.7cm and 1.3cm of api] (sql) {Azure SQL\\profiles + billing};
+        \node[tool, above=0.8cm of apim] (policy) {JWT\\rate limits\\quotas};
+        \node[doc, right=1.4cm of cosmos] (monitor) {Monitor\\p99 + hit ratio\\429s};
+        \draw[arrow] (mobile) -- node[above,font=\scriptsize]{spiky reads} (apim);
+        \draw[arrow] (policy) -- (apim);
+        \draw[arrow] (apim) -- (api);
+        \draw[biarrow] (api) -- (redis);
+        \draw[biarrow] (api) -- (cosmos);
+        \draw[biarrow] (api) -- (sql);
+        \draw[arrow] (redis) -- (monitor);
+        \draw[arrow] (cosmos) -- (monitor);
+        \draw[arrow] (sql) -- (monitor);
+    \end{tikzpicture}%
+    }
+    \caption{Spiky-traffic mobile data API using APIM policy controls, Redis hot-path acceleration, Cosmos DB Integrated Cache, Azure SQL, and shared observability.}
+    \label{fig:ch4-spiky-mobile-api}
+\end{figure}
+
+\subsection{Design Decisions}
+The live scoreboard read path should be cache-first with very short TTLs, often one to five seconds, because users value low latency and tolerate tiny delays. User billing status should have stricter invalidation because access control and payments require correctness. Personalized offers may use Redis or Cosmos DB Integrated Cache with a longer TTL if stale recommendations are acceptable.
+
+APIM rate limits should distinguish anonymous public reads, authenticated users, partners, and internal services. The backend should degrade gracefully: serve slightly stale public scoreboards, disable nonessential personalization, and preserve billing and identity correctness. During the spike, observability should show p95 and p99 latency, cache hit ratio, Redis server load, Cosmos DB RU consumption, Azure SQL CPU, APIM rejected requests, and backend error rates.
+
+\section{Architectural Decision Record Template}
+\index{architectural decision record}
+A Week 4 ADR should capture each cached object, source of truth, key format, TTL, invalidation trigger, stale-read tolerance, fallback behavior, ownership, and metrics. It should also document APIM policies, consumer tiers, rate limits, authentication, backend routing, payload limits, idempotency, and rejected alternatives such as database-only reads, CDN-only caching, direct partner database access, or queue-only ingestion.
+
+\section{Operational Deep Dive: Stampedes, Security, and Observability}
+\index{cache stampede}\index{managed identity}\index{observability}\index{Azure Monitor}
+Cache incidents often come from stampedes, hot keys, overlarge values, missing TTLs, network isolation gaps, secret leakage, and retry storms. A stampede occurs when many callers miss the same key and all query the origin. Prevent it with jittered TTLs, request coalescing, background refresh, small stale-while-revalidate windows where acceptable, and backend concurrency limits.
+
+Security follows the same principles as earlier chapters. Do not commit Redis keys, SQL passwords, connection strings, or APIM subscription keys. Prefer managed identity for backend services, Key Vault for secrets, private endpoints for production, TLS-only connections, least-privilege access, and diagnostic settings that do not log sensitive payloads.
+
+\begin{pitfall}
+\textbf{Letting cache success hide origin weakness.} If the origin database cannot survive a cold start, regional failover, or cache flush, the architecture needs backpressure and capacity planning before production launch.
+\end{pitfall}
+
+\section{Troubleshooting Patterns}
+\index{troubleshooting}\index{latency}\index{throttling}
+Start with the user symptom: stale data, high latency, wrong data, database overload, or gateway rejection. For stale data, inspect TTL, invalidation, key version, and whether the request is using Redis, Integrated Cache, APIM cache, or a direct database path. For latency, separate APIM gateway time, backend service time, Redis command latency, Cosmos DB RU and gateway metrics, and Azure SQL query duration.
+
+For wrong data, confirm cache keys include all dimensions that affect the result: tenant, user, locale, permissions, API version, and product version. For overload, check whether cache misses are correlated, whether APIM limits are too loose, whether database retries are multiplying traffic, and whether a single hot key is saturating Redis.
+
+\section{Week 4 Lab Rubric}
+\index{rubric}
+A complete Week 4 submission includes Azure CLI deployment evidence for Redis, a working Python cache-aside script, documented SQL source query, before-and-after latency observations, cache hit and miss evidence, and an ADR explaining TTLs, invalidation, fallback, and APIM ingestion controls.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.0cm}p{5.0cm}p{5.0cm}@{}}
+\toprule
+\textbf{Criterion} & \textbf{Meets expectation} & \textbf{Needs improvement} \\
+\midrule
+Cache design & Keys, TTLs, invalidation, fallback, and owner are documented & Cache is added without freshness or ownership rules \\
+Hands-on & Azure CLI deploys Redis; Python shows miss then hit over Azure SQL & Portal-only deployment or no measurable cache-hit evidence \\
+Correctness & Sensitive or transactional data has stricter invalidation or bypass rules & Billing, permissions, or inventory rely on stale cache entries \\
+APIM ingestion & Authentication, rate limits, quotas, payload limits, and diagnostics are specified & Gateway only forwards traffic without admission controls \\
+Operations & Hit ratio, latency, memory, evictions, errors, SQL load, and RU usage are monitored together & Only average latency or a single service metric is reported \\
+\bottomrule
+\end{tabular}
+\caption{Week 4 rubric for caching, hybrid ingestion, hands-on implementation, and operational evidence.}
+\label{tab:week4-rubric}
+\end{table}
+
+\section{Interview Q\&A}
+\subsection{Concepts and Trade-offs}
+\begin{enumerate}
+    \item \textbf{Q: What is the cache-aside pattern?}\\
+    A: The application checks cache first, reads the origin on a miss, stores the result with a TTL, and returns the value.
+    \item \textbf{Q: Why is Redis not usually the system of record?}\\
+    A: It is optimized for in-memory speed. Durable databases should own authoritative state unless the Redis tier and design explicitly meet durability requirements.
+    \item \textbf{Q: When should you prefer Cosmos DB Integrated Cache over Redis?}\\
+    A: When repeated Cosmos DB reads can use the dedicated gateway and accept a bounded staleness window without application-managed cache keys.
+    \item \textbf{Q: What causes a cache stampede?}\\
+    A: Many callers miss the same key at once and all query the origin, often after a popular key expires or the cache is flushed.
+    \item \textbf{Q: What belongs in APIM for ingestion?}\\
+    A: Authentication, authorization, quotas, rate limits, validation, transformations, routing, timeout policy, and diagnostics at the API boundary.
+    \item \textbf{Q: What metric is more useful than cache hit ratio alone?}\\
+    A: Hit ratio combined with p95 and p99 latency, origin load, stale-read incidents, errors, evictions, and business correctness metrics.
+\end{enumerate}
+
+\section{Further Reading}
+Start with Azure Cache for Redis concepts and planning guidance \cite{microsoft2025azureCacheRedis}, Redis best practices \cite{microsoft2025azureCacheRedisBestPractices}, Cosmos DB Integrated Cache \cite{microsoft2025cosmosIntegratedCache}, dedicated gateway guidance \cite{microsoft2025cosmosDedicatedGateway}, and Azure API Management overview and policy documentation \cite{microsoft2025apimOverview,microsoft2025apimPolicies}. Review Azure SQL Database \cite{microsoft2025azuresqldb}, Cosmos DB Change Feed \cite{microsoft2025cosmosChangeFeed}, ADLS Gen2 \cite{microsoft2025adlsgen2}, and the Azure Well-Architected Framework \cite{microsoft2025wellarchitected} for the milestone architecture review.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item Caches improve latency and reduce origin load only when freshness, invalidation, and fallback are explicit.
+    \item Azure Cache for Redis is the general-purpose in-memory acceleration layer for hot keys, counters, sessions, and query results.
+    \item Cosmos DB Integrated Cache reduces repeated-read RU cost when bounded staleness and the dedicated gateway fit the workload.
+    \item APIM protects ingestion backends with authentication, quotas, rate limits, validation, transformations, routing, and diagnostics.
+    \item Cache stampedes, hot keys, secret leakage, stale permission data, and retry storms are common production risks.
+    \item Milestone 1 combines durable storage, relational integrity, document scale, hot-path caching, and event-driven analytics export.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Explain cache-aside to a product manager and describe why Azure SQL remains the source of truth.
+    \item \textbf{(Conceptual)} Compare Redis and Cosmos DB Integrated Cache for a product catalog API with repeated public reads.
+    \item \textbf{(Conceptual)} Choose TTLs for live scores, product prices, user permissions, and marketing recommendations.
+    \item \textbf{(Hands-on)} Deploy Azure Cache for Redis in a sandbox and capture hostname, SKU, TLS port, and deletion plan.
+    \item \textbf{(Hands-on)} Run the Python cache-aside script twice and record cache miss latency, cache hit latency, and SQL query count.
+    \item \textbf{(Hands-on)} Add key invalidation after an Azure SQL profile update and prove that the next read refreshes Redis.
+    \item \textbf{(Design)} Write an APIM policy plan for a partner ingestion API, including authentication, quotas, payload limits, and correlation IDs.
+    \item \textbf{(Design)} Create an ADR for the live sports mobile API, including cached objects, TTLs, invalidation, fallback, and observability.
+\end{enumerate}
+
+\section{Milestone 1 Capstone: E-Commerce Multi-Tier Data Backend}\label{sec:ch4-capstone}
+\index{Milestone 1 capstone}\index{e-commerce}\index{multi-tier data backend}\index{Azure SQL Database Serverless}\index{ADLS Gen2}\index{Change Feed}
+
+\begin{capstonebox}
+\textbf{Mission:} Design and prototype an e-commerce multi-tier data backend that integrates Weeks 1--4: Azure SQL Database Serverless for user profiles and billing, Cosmos DB for active shopping carts and clickstream tracking, ADLS Gen2 for product images with lifecycle and encryption controls, Azure Cache for Redis for hot-path acceleration, and Cosmos DB Change Feed to push events to storage for analytics.
+
+\textbf{Estimated time:} 8--10 hours.
+
+\textbf{What you will practice:}
+\begin{itemize}
+    \item Combining relational, document, object-storage, cache, API, and event-driven patterns in one reference architecture.
+    \item Separating systems of record from acceleration layers and analytics sinks.
+    \item Designing hot-path reads, cart writes, image storage, billing correctness, and downstream clickstream analytics.
+    \item Producing implementation evidence, operational metrics, and an architecture decision record suitable for a milestone review.
+\end{itemize}
+\end{capstonebox}
+
+\subsection*{Scenario}
+An e-commerce company is preparing for a seasonal launch. Customers browse product images, sign in, update profiles, add items to carts, receive personalized recommendations, and complete billing workflows. Marketing expects unpredictable spikes after social media announcements. The platform must keep user-facing APIs fast while preserving billing correctness and exporting behavioral events for analytics.
+
+\subsection*{Requirements}
+\begin{itemize}
+    \item \textbf{User profiles and billing:} Use Azure SQL Database Serverless for relational user, address, payment-status, invoice, and billing-reference data.
+    \item \textbf{Carts and clickstream:} Use Cosmos DB for active shopping carts, cart item updates, clickstream events, and short-lived personalization state.
+    \item \textbf{Images:} Store product images in ADLS Gen2 or Blob Storage with hierarchical namespaces where needed, lifecycle policies, encryption, and least-privilege access.
+    \item \textbf{Caching:} Use Azure Cache for Redis for product cards, profile summaries, feature flags, and hot campaign landing-page data.
+    \item \textbf{Analytics export:} Use Cosmos DB Change Feed to write cart and clickstream events to ADLS Gen2 in partitioned folders.
+    \item \textbf{Gateway:} Use APIM to protect public and partner APIs with authentication, rate limits, quotas, request validation, and diagnostics.
+    \item \textbf{Operations:} Monitor p95 and p99 latency, Redis hit ratio, SQL CPU and auto-pause behavior, Cosmos DB RU consumption, Change Feed lag, storage lifecycle transitions, and API rejections.
+\end{itemize}
+
+\subsection*{Reference Architecture}
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[node distance=1.05cm]
+        \node[stage] (web) {Web + mobile\\customers};
+        \node[tool, right=1.1cm of web] (apim) {APIM\\auth + quotas};
+        \node[stage, right=1.2cm of apim] (api) {E-commerce\\API services};
+        \node[store, above right=0.6cm and 1.2cm of api] (redis) {Azure Cache\\for Redis\\hot path};
+        \node[store, right=1.5cm of api] (cosmos) {Cosmos DB\\carts + clicks};
+        \node[store, below right=0.6cm and 1.2cm of api] (sql) {Azure SQL\\Serverless\\profiles + billing};
+        \node[store, below=1.2cm of api] (images) {ADLS Gen2\\product images};
+        \node[tool, right=1.4cm of cosmos] (feed) {Change Feed\\processor};
+        \node[store, right=1.4cm of feed] (lake) {ADLS Gen2\\analytics zones};
+        \node[doc, below=1.0cm of feed] (monitor) {Monitor\\cost + latency\\lag + errors};
+        \draw[arrow] (web) -- (apim);
+        \draw[arrow] (apim) -- (api);
+        \draw[biarrow] (api) -- (redis);
+        \draw[biarrow] (api) -- (cosmos);
+        \draw[biarrow] (api) -- (sql);
+        \draw[biarrow] (api) -- (images);
+        \draw[arrow] (cosmos) -- (feed);
+        \draw[arrow] (feed) -- (lake);
+        \draw[arrow] (monitor) -- (redis);
+        \draw[arrow] (monitor) -- (cosmos);
+        \draw[arrow] (monitor) -- (sql);
+        \draw[arrow] (monitor) -- (lake);
+    \end{tikzpicture}%
+    }
+    \caption{Milestone 1 reference architecture integrating ADLS Gen2, Azure SQL Database Serverless, Cosmos DB, Redis, APIM, and Change Feed analytics export.}
+    \label{fig:ch4-capstone-ecommerce}
+\end{figure}
+
+\subsection*{Implementation Steps}
+Use a sandbox subscription and globally unique names. The snippets show a reproducible skeleton; production deployments should use Bicep, Terraform, or another reviewed infrastructure-as-code workflow.
+
+\begin{enumerate}
+    \item \textbf{Create core resources.} Deploy one resource group, a storage account with hierarchical namespace, Azure SQL logical server and serverless database, Cosmos DB database and containers, and Azure Cache for Redis.
+\begin{lstlisting}[language=bash,caption={Azure CLI skeleton for the Milestone 1 e-commerce backend.},label={lst:ch4-capstone-cli}]
+$rg = "rg-ecommerce-milestone1"
+$location = "eastus"
+$storage = "stecommilestone1001"
+$sqlServer = "sql-ecomm-milestone-001"
+$sqlDb = "profilesbilling"
+$cosmos = "cosmos-ecomm-milestone-001"
+$cosmosDb = "ecommerce"
+$cartContainer = "carts"
+$clickContainer = "clickstream"
+$redis = "redis-ecomm-milestone-001"
+$adminUser = "sqladminuser"
+$adminPassword = "<use-Key-Vault-or-secure-prompt>"
+
+az group create --name $rg --location $location
+
+az storage account create `
+  --name $storage --resource-group $rg --location $location `
+  --sku Standard_LRS --kind StorageV2 --hierarchical-namespace true `
+  --min-tls-version TLS1_2 `
+  --allow-blob-public-access false
+
+az sql server create `
+  --name $sqlServer --resource-group $rg --location $location `
+  --admin-user $adminUser --admin-password $adminPassword
+
+az sql db create `
+  --resource-group $rg --server $sqlServer --name $sqlDb `
+  --compute-model Serverless --edition GeneralPurpose `
+  --family Gen5 --capacity 2
+
+az cosmosdb create `
+  --name $cosmos --resource-group $rg `
+  --locations regionName=$location failoverPriority=0 isZoneRedundant=False `
+  --default-consistency-level Session
+
+az cosmosdb sql database create `
+  --account-name $cosmos --resource-group $rg --name $cosmosDb
+
+az cosmosdb sql container create `
+  --account-name $cosmos --resource-group $rg `
+  --database-name $cosmosDb --name $cartContainer `
+  --partition-key-path "/userId" --throughput 1000 --ttl 604800
+
+az cosmosdb sql container create `
+  --account-name $cosmos --resource-group $rg `
+  --database-name $cosmosDb --name $clickContainer `
+  --partition-key-path "/eventShard" --throughput 1000 --ttl 2592000
+
+az redis create `
+  --name $redis --resource-group $rg --location $location `
+  --sku Basic --vm-size c0 `
+  --enable-non-ssl-port false
+\end{lstlisting}
+
+    \item \textbf{Prototype hot-path reads and event writes.} Use Redis for product-card reads and Cosmos DB for cart and clickstream writes. The sketch below shows the boundary between source-of-truth stores and acceleration.
+\begin{lstlisting}[language=Python,caption={Python sketch for product-card caching and clickstream writes.},label={lst:ch4-capstone-python}]
+import os
+from datetime import datetime, timezone
+
+import redis
+from azure.cosmos import CosmosClient, PartitionKey
+
+cache = redis.Redis(
+    host=os.environ["REDIS_HOST"],
+    port=6380,
+    password=os.environ["REDIS_KEY"],
+    ssl=True,
+    decode_responses=True,
+)
+
+cosmos = CosmosClient(os.environ["COSMOS_ENDPOINT"], os.environ["COSMOS_KEY"])
+db = cosmos.create_database_if_not_exists("ecommerce")
+carts = db.create_container_if_not_exists(
+    id="carts",
+    partition_key=PartitionKey(path="/userId"),
+    offer_throughput=1000,
+)
+clicks = db.create_container_if_not_exists(
+    id="clickstream",
+    partition_key=PartitionKey(path="/eventShard"),
+    offer_throughput=1000,
+)
+
+def product_key(sku: str) -> str:
+    return f"product-card:v1:sku:{sku}"
+
+def get_product_card(sku: str, load_from_sql_or_catalog):
+    key = product_key(sku)
+    cached = cache.get(key)
+    if cached:
+        return cached
+    product = load_from_sql_or_catalog(sku)
+    cache.setex(key, 300, product)
+    return product
+
+def add_to_cart(user_id: str, sku: str, quantity: int):
+    now = datetime.now(timezone.utc).isoformat()
+    return carts.upsert_item({
+        "id": f"cart_{user_id}_{sku}",
+        "type": "cartItem",
+        "userId": user_id,
+        "sku": sku,
+        "quantity": quantity,
+        "updatedAt": now,
+    })
+
+def record_click(user_id: str, sku: str, action: str):
+    now = datetime.now(timezone.utc).isoformat()
+    shard = f"{now[:10]}#{abs(hash(user_id)) % 32:02d}"
+    return clicks.create_item({
+        "id": f"click_{user_id}_{sku}_{now}",
+        "type": "clickstream",
+        "userId": user_id,
+        "sku": sku,
+        "action": action,
+        "eventTime": now,
+        "eventShard": shard,
+    })
+\end{lstlisting}
+
+    \item \textbf{Configure image governance.} Create containers or file systems for product images, define lifecycle movement to cool or archive tiers, document encryption settings, and assign least-privilege roles to upload and serving identities.
+    \item \textbf{Implement Change Feed export.} Build or describe a Change Feed processor that reads cart and clickstream changes, writes JSON or Parquet files to ADLS Gen2 by date and event type, and stores checkpoints or leases.
+    \item \textbf{Add APIM policy evidence.} Document authentication, rate limits, quotas, request size limits, correlation IDs, backend timeouts, version routing, and diagnostic settings.
+    \item \textbf{Validate the hot path.} Demonstrate Redis miss then hit for product-card reads, point reads and writes for carts, SQL correctness for billing data, and Change Feed output arriving in storage.
+\end{enumerate}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item Architecture diagram showing APIM, API services, Azure SQL Database Serverless, Cosmos DB, Redis, ADLS Gen2 images, Change Feed processing, analytics storage, and monitoring.
+    \item ADR explaining system-of-record boundaries, partition keys, TTLs, invalidation, APIM policies, storage lifecycle, and analytics export.
+    \item Reproducible Azure CLI or infrastructure-as-code snippets for the core resources.
+    \item Python scripts or pseudocode for cache-aside product reads, cart writes, clickstream event writes, and Change Feed export.
+    \item Evidence pack with cache hit and miss output, SQL serverless configuration, Cosmos DB RU observations, storage lifecycle policy, and monitoring screenshots or query outputs.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item Azure SQL Database Serverless owns user profile and billing records; cache entries never become authoritative for billing correctness.
+    \item Cosmos DB containers use partition keys that support cart point reads and distributed clickstream writes.
+    \item ADLS Gen2 image storage includes lifecycle, encryption, access-control, and deletion-retention considerations.
+    \item Redis keys, TTLs, invalidation triggers, fallback behavior, and monitored metrics are documented.
+    \item Cosmos DB Change Feed export is idempotent, checkpointed, and writes analytics-ready events to storage partitions.
+    \item APIM policies protect public and partner APIs from malformed, unauthenticated, or excessive traffic.
+    \item The design explains how it degrades during traffic spikes without corrupting billing, carts, or analytics history.
+    \item Another engineer can reproduce the prototype with different globally unique names and produce equivalent evidence.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Replace password-based SQL access with managed identity and Microsoft Entra authentication.
+    \item Add private endpoints for SQL, Redis, Cosmos DB, and storage, then document DNS implications.
+    \item Implement an APIM product with separate quotas for anonymous users, authenticated customers, partners, and internal services.
+    \item Add a lifecycle management policy that moves old product images to cool storage and deletes expired campaign images.
+    \item Build a Change Feed processor with poison-record handling and a replay test.
+    \item Create a small load test that demonstrates Redis protecting Azure SQL during repeated product-card reads.
+    \item Estimate monthly cost for normal traffic, launch-day traffic, and a cache-cold recovery event.
+\end{itemize}

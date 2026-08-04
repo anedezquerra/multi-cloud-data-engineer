@@ -1,0 +1,619 @@
+\chapter{Delta Lake Optimization}
+\index{Delta Lake}\index{Delta Lake!optimization}\index{Delta Lake!transaction log}\index{Parquet}\index{V-Order}\index{OPTIMIZE}\index{Z-Ordering}\index{VACUUM}\index{Time Travel}\index{Schema Evolution}\index{small-file problem}\index{Microsoft Fabric!Delta Lake}
+
+\begin{objectives}
+\begin{itemize}
+    \item Explain how a Delta table combines Parquet data files with a JSON transaction log.
+    \item Describe how Fabric optimization features such as V-Order, \texttt{OPTIMIZE}, and Z-Ordering improve analytical reads.
+    \item Manage Delta table history, retention, and schema changes with Time Travel, \texttt{VACUUM}, and schema evolution.
+    \item Run \texttt{OPTIMIZE} with V-Order on a large Silver table and use Time Travel after an accidental deletion.
+    \item Diagnose the small-file problem and design a remediation plan for streaming tables degraded over months.
+    \item Integrate Weeks~1--4 by building a Spark-driven Bronze, Silver, and Gold lakehouse with OneLake shortcuts and optimized Delta tables.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+Open table formats solve a shared problem: many cloud object stores are excellent for durable files, but analytical tables also need transactions, metadata, compaction, clustering, retention, and historical access. Fabric centers this experience on Delta tables in OneLake, while other platforms expose similar ideas through Delta, Iceberg, Hudi, managed clustering, or compaction services.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{2.8cm}p{3.2cm}p{3.2cm}p{3.2cm}p{3.2cm}@{}}
+\toprule
+\textbf{Optimization need} & \textbf{Fabric Delta} & \textbf{AWS} & \textbf{Azure/Databricks} & \textbf{Snowflake} \\
+\midrule
+Compaction and small-file handling & \texttt{OPTIMIZE} rewrites many small Delta files into fewer larger files; V-Order can be enabled for Fabric read efficiency & Delta, Iceberg, or Hudi tables on S3 use compaction through EMR, Glue, Athena, or table-maintenance jobs & Delta \texttt{OPTIMIZE} on Databricks and Synapse/Fabric-style lakehouse patterns compact object-storage files & Micro-partitions are managed by the service; clustering maintenance is automatic or configured through clustering features \\
+Data skipping and clustering & Z-Ordering colocates related values; Delta statistics and V-Order improve selective scans & Iceberg partition specs, Hudi clustering, Delta Z-Order, and Glue catalog metadata help prune S3 reads & Databricks \texttt{OPTIMIZE ZORDER BY} and data-skipping statistics are common tuning levers & Automatic clustering and pruning reduce scanned micro-partitions \\
+Time travel & Delta history supports \texttt{VERSION AS OF} and timestamp-based reads before retention cleanup & Delta, Iceberg, and Hudi support snapshot or commit-based reads when retained & Delta Time Travel is a core Databricks and Delta Lake capability & Built-in Time Travel exposes previous table states within the configured retention window \\
+Vacuum and retention & \texttt{VACUUM} removes old unreferenced files after the safety retention period & Table formats require expire-snapshot, clean, or compaction jobs to remove obsolete files from S3 & Delta \texttt{VACUUM} and retention settings control cleanup after history is no longer needed & Fail-safe and Time Travel retention are managed service features rather than user file deletion \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+GCP commonly expresses the same pattern through BigLake, BigQuery external tables, Dataproc, and Iceberg or Delta tables on Cloud Storage. MongoDB is not an open-table-format lakehouse engine; it typically feeds optimized Delta, Iceberg, or warehouse tables through connectors, change streams, or batch exports.
+\end{crosscloud}
+
+\begin{keyterms}
+\textbf{Delta table}: a table abstraction that stores data as Parquet files and records table actions in a transaction log. \quad
+\textbf{Transaction log}: ordered metadata files that describe adds, removes, schema changes, and commits. \quad
+\textbf{V-Order}: Fabric's write-time layout optimization for faster analytical reads. \quad
+\textbf{Z-Ordering}: a clustering technique that colocates related values to improve data skipping. \quad
+\textbf{Small-file problem}: degraded performance caused by many tiny files that create excessive listing, scheduling, and metadata overhead.
+\end{keyterms}
+
+\section{Week 4 Roadmap}
+Week~4 closes Part~I by turning lakehouse storage into an operational discipline. Monday explains Delta internals: Parquet data files plus the JSON transaction log. Tuesday covers table optimization with V-Order, \texttt{OPTIMIZE}, and Z-Ordering. Wednesday covers table management with \texttt{VACUUM}, Time Travel, and schema evolution. Thursday is a hands-on recovery and optimization lab. Friday applies the concepts to a streaming table that accumulated millions of small files over six months.
+
+Delta Lake matters because a lakehouse is only useful when tables remain reliable and fast as data changes. Fabric Lakehouses store managed tables in Delta format, which means Spark, SQL analytics endpoints, Direct Lake semantic models, and other engines can reason about consistent table versions rather than loose folders of files \cite{microsoftFabricLakehouse,deltaLakeDocs}. Optimization does not replace good modeling, but it keeps Silver and Gold tables usable when ingestion patterns, streaming frequency, and analytical filters evolve.
+
+\begin{notebox}
+This chapter focuses on data-engineering operations, not one-time performance tricks. A healthy Delta table has a clear owner, expected write pattern, retention policy, optimization cadence, recovery plan, and evidence that reads improved after maintenance.
+\end{notebox}
+
+\section{Monday: Delta Lake Internals}
+\index{Delta Lake!internals}\index{Parquet}\index{Delta Lake!transaction log}\index{JSON transaction log}
+A Delta table is not a single file. It is a directory containing Parquet data files plus a special \texttt{\_delta\_log} folder. The Parquet files store columnar data. The transaction log stores ordered JSON actions that describe which files belong to each table version, which files were removed, what schema is active, and what operation produced the commit \cite{armbrust2020delta,apacheParquet}.
+
+\begin{definitionbox}
+\textbf{Delta Lake} is an open table format that adds ACID transactions, scalable metadata, schema enforcement, schema evolution, and Time Travel over Parquet files in object storage or lakehouse storage.
+\end{definitionbox}
+
+\subsection{Parquet Data Files}
+Parquet is a columnar file format. Values for the same column are stored together, which improves compression and lets analytical engines read only the columns required by a query. For example, a query that groups sales by \texttt{order\_date} and \texttt{region} does not need to scan every descriptive column in the table.
+
+Parquet files are immutable from the practical perspective of table writes. Updating, deleting, or compacting records usually creates new files and marks old files as no longer active in the table log. This immutability is why the transaction log is essential: it tells readers which Parquet files make up the current table state.
+
+\begin{tipbox}
+Think of Parquet files as efficient pages and the Delta log as the table of contents plus audit trail. Query engines need both to produce a consistent result.
+\end{tipbox}
+
+\subsection{The JSON Transaction Log}
+Every Delta commit creates a new version. Early versions are commonly represented as JSON log files under \texttt{\_delta\_log}; checkpoint files may later summarize metadata for efficient reads. A commit can add files, remove files, change metadata, update protocol requirements, or record operation metrics.
+
+Because the log is ordered, a reader can reconstruct version 0, version 1, version 2, and so on. This is the foundation for ACID behavior and Time Travel. When one job writes a new Silver table version, concurrent readers can continue using a consistent previous version until they refresh.
+
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[
+        file/.style={rectangle, rounded corners, draw=primary, thick, fill=primary!6, align=center, minimum width=2.6cm, minimum height=0.85cm, font=\small},
+        log/.style={rectangle, draw=codegreen!60!black, thick, fill=green!7, align=center, minimum width=3.0cm, minimum height=0.85cm, font=\small\bfseries},
+        folder/.style={rectangle, rounded corners, draw=codegray, thick, fill=white, align=center, minimum width=3.2cm, minimum height=1.0cm, font=\small\bfseries},
+        arrow/.style={draw, thick, -Latex, draw=primary}
+    ]
+        \node[folder] (table) at (0, 0) {Delta Table Folder};
+        \node[file] (p1) at (4.0, 1.0) {part-0001.parquet};
+        \node[file] (p2) at (4.0, 0) {part-0002.parquet};
+        \node[file] (p3) at (4.0, -1.0) {part-0003.parquet};
+        \node[log] (log0) at (8.0, 0.8) {\_delta\_log\\000000.json};
+        \node[log] (log1) at (8.0, -0.35) {000001.json\\add/remove};
+        \node[folder, fill=blue!8] (reader) at (12.2, 0.2) {Reader chooses\\table version};
+
+        \draw[arrow] (table) -- node[above, font=\scriptsize]{data files} (p1);
+        \draw[arrow] (table) -- (p2);
+        \draw[arrow] (table) -- (p3);
+        \draw[arrow] (p1) -- node[above, font=\scriptsize]{referenced by log} (log0);
+        \draw[arrow] (p2) -- (log1);
+        \draw[arrow] (log0) -- (reader);
+        \draw[arrow] (log1) -- (reader);
+
+        \node[note, text width=12cm, align=center] at (6.3, -2.2) {Delta readers combine immutable Parquet files with ordered log actions to produce the correct table snapshot.};
+    \end{tikzpicture}%
+    }
+    \caption{Delta table internals: Parquet data files plus a transaction log.}
+    \label{fig:chapter4-delta-internals}
+\end{figure}
+
+\subsection{Why Internals Affect Optimization}
+Optimization rewrites files, but it should not change the logical table result. Compaction creates new larger Parquet files and records removal actions for the older smaller files. Z-Ordering rewrites data into a layout that improves skipping for common filters. Time Travel remains possible because previous versions still reference older files until retention cleanup removes them.
+
+\begin{pitfall}
+\textbf{Deleting files manually.} Removing Parquet files outside Delta operations can corrupt historical versions and break readers. Use Delta commands and retention-aware maintenance instead of manual file deletion.
+\end{pitfall}
+
+\section{Tuesday: Optimizing Delta Tables}
+\index{Delta Lake!optimization}\index{V-Order}\index{OPTIMIZE}\index{Z-Ordering}\index{data skipping}
+Optimization starts with the workload. A table read mostly by date, customer, and product needs a different layout than a table read by device, event type, and timestamp. Fabric supports Delta table optimization patterns that reduce file overhead and improve query pruning for common analytics \cite{microsoftFabricVOrder,microsoftFabricOptimize}.
+
+\subsection{V-Order in Fabric}
+V-Order is a Fabric optimization for Parquet files that improves compression and read performance for Fabric analytical engines. It is especially relevant when a Delta table supports SQL analytics endpoint queries, Direct Lake semantic models, and repeated reporting scans. V-Order is not a substitute for medallion modeling; it makes well-designed tables more efficient to read.
+
+In Fabric, V-Order can be applied through table write settings or optimization commands depending on the workload and runtime support. The important operational habit is to document whether critical Silver and Gold tables are expected to be V-Order optimized and when the optimization runs.
+
+\begin{notebox}
+V-Order is a physical layout decision. It should not change business results, table names, schemas, or downstream contracts.
+\end{notebox}
+
+\subsection{\texttt{OPTIMIZE} for Compaction}
+\texttt{OPTIMIZE} rewrites many small files into fewer larger files. This reduces file-listing overhead, Spark task scheduling overhead, and metadata pressure. It is most valuable after frequent appends, streaming micro-batches, or partitioned writes that produce many tiny files.
+
+Compaction has a cost because it reads and rewrites data. Schedule it according to the table's write pattern and consumption needs. A table loaded once nightly may need optimization after each load. A streaming table may need scheduled maintenance during a low-traffic window.
+
+\begin{tipbox}
+Measure file count before and after compaction. A successful optimization should reduce active file count, improve scan time for representative queries, and preserve row counts.
+\end{tipbox}
+
+\subsection{Z-Ordering}
+Z-Ordering colocates records with similar values across one or more columns so that filters can skip more files. It is useful when queries often filter on high-value columns such as \texttt{customer\_id}, \texttt{device\_id}, \texttt{order\_date}, or \texttt{region}. Do not Z-Order every column. Choose columns from real query patterns and avoid changing layout constantly.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.1cm}p{5.0cm}p{5.0cm}@{}}
+\toprule
+\textbf{Technique} & \textbf{Best fit} & \textbf{Watch for} \\
+\midrule
+V-Order & Fabric analytical reads over Delta-Parquet tables & Requires write or optimize support and clear table policy \\
+\texttt{OPTIMIZE} & Tables with many small files from streaming or frequent appends & Rewrite cost and maintenance scheduling \\
+Z-Ordering & Selective queries that repeatedly filter by known columns & Poor column choice can waste compute without improving reads \\
+Partitioning & Large tables commonly filtered by low-cardinality date or business period & Over-partitioning can create the small-file problem \\
+\bottomrule
+\end{tabular}
+\caption{Optimization choices for Delta tables in Fabric.}
+\label{tab:chapter4-optimization-choices}
+\end{table}
+
+\section{Wednesday: Managing Delta Tables}
+\index{VACUUM}\index{Time Travel}\index{Schema Evolution}\index{Delta Lake!retention}\index{Delta Lake!history}
+Optimization makes reads faster; management keeps tables recoverable and sustainable. The three core management topics are retention cleanup, historical reads, and safe schema changes.
+
+\subsection{\texttt{VACUUM} and Retention}
+\texttt{VACUUM} deletes data files that are no longer referenced by the current table and are older than the retention threshold \cite{microsoftFabricVacuum}. Without cleanup, old files can accumulate indefinitely after overwrites, deletes, merges, and compaction. With aggressive cleanup, Time Travel and rollback options can disappear too quickly.
+
+The retention window should reflect business requirements. A development table may keep less history. A regulated Silver table may require longer retention and separate archival controls. In any case, record the policy before automating cleanup.
+
+\begin{pitfall}
+\textbf{Vacuuming too soon after a mistake.} If an accidental delete is discovered after obsolete files are vacuumed, Time Travel may no longer be able to read the pre-delete version.
+\end{pitfall}
+
+\subsection{Time Travel}
+Time Travel lets readers query a previous version or timestamp of a Delta table \cite{deltaLakeDocs}. It is useful for debugging, audit comparison, reproducible experiments, and recovery after a bad write. A data engineer can compare row counts between versions, recover deleted records, or prove when a schema changed.
+
+Time Travel depends on retained log and data files. It should be part of an incident playbook: identify the bad version, query the last known good version, validate it, and restore or rewrite only after approval.
+
+\subsection{Schema Evolution}
+Schema enforcement protects tables from unexpected columns and type changes. Schema evolution allows intentional changes, such as adding a nullable column when a source system begins sending \texttt{promotion\_code}. The difference is governance: unplanned drift should fail or be quarantined; planned evolution should be reviewed, documented, and tested.
+
+\begin{definitionbox}
+\textbf{Schema evolution} is the controlled process of changing a Delta table schema, commonly by adding nullable columns, while preserving existing data and downstream compatibility.
+\end{definitionbox}
+
+\section{Thursday: Hands-on Project}
+\index{hands-on lab}\index{OPTIMIZE!V-Order}\index{Time Travel!accidental deletion}\index{Silver layer!optimization}
+The Week~4 lab uses a large Silver table such as \texttt{silver\_sales\_orders}. You will compact it with \texttt{OPTIMIZE} and V-Order, simulate an accidental deletion in a safe training copy, and query the previous version with Time Travel. Use synthetic or instructor-provided data; never run delete experiments on a production table.
+
+\subsection{Goal and Architecture}
+Create or reuse a workspace named \texttt{fabric-de-week04}. Add a lakehouse named \texttt{lh\_silver}. Prepare a Delta table named \texttt{silver\_sales\_orders} with enough rows and files to make optimization visible. The table should include columns such as \texttt{order\_id}, \texttt{customer\_id}, \texttt{order\_date}, \texttt{region}, \texttt{product\_id}, and \texttt{net\_amount}.
+
+\begin{notebox}
+If your tenant does not support every optimization syntax shown here, keep the learning outcome: compact the Delta table, record file-count and query-time evidence, and demonstrate a versioned read before cleanup.
+\end{notebox}
+
+\subsection{Step-by-Step Actions}
+\begin{enumerate}
+    \item Create a training Silver Delta table with realistic columns and many files.
+    \item Record a baseline row count, active file count if available, and query duration for a representative filter.
+    \item Run \texttt{OPTIMIZE} with V-Order and optional Z-Ordering for the common query columns.
+    \item Query Delta history and note the latest version number.
+    \item In a training copy, simulate an accidental delete for one region or date range.
+    \item Use \texttt{VERSION AS OF} to read the previous version and validate the missing rows.
+    \item Restore the affected rows from the previous version or rebuild the training table.
+    \item Run \texttt{VACUUM} only after confirming the retention policy and recovery needs.
+\end{enumerate}
+
+\begin{lstlisting}[language=SQL,caption={Optimizing a Silver Delta table with V-Order and Z-Ordering.},label={lst:chapter4-optimize-vorder}]
+-- Capture a baseline for representative analytical filters.
+SELECT region, COUNT(*) AS order_count, SUM(net_amount) AS total_net_amount
+FROM silver_sales_orders
+WHERE order_date >= DATE '2026-07-01'
+GROUP BY region
+ORDER BY region;
+
+-- Compact files and apply Fabric V-Order where supported.
+OPTIMIZE silver_sales_orders VORDER;
+
+-- Add clustering for common selective filters when supported by the runtime.
+OPTIMIZE silver_sales_orders
+ZORDER BY (customer_id, order_date);
+
+DESCRIBE HISTORY silver_sales_orders;
+\end{lstlisting}
+
+After optimization, rerun the same baseline query. The row count and business totals must match. The expected improvement is fewer active files and faster or more predictable reads, not changed data.
+
+\begin{lstlisting}[language=SQL,caption={Using Time Travel after an accidental training-table deletion.},label={lst:chapter4-time-travel-sql}]
+-- Simulate a mistake only in a training copy.
+CREATE TABLE silver_sales_orders_training AS
+SELECT * FROM silver_sales_orders;
+
+DELETE FROM silver_sales_orders_training
+WHERE region = 'West'
+  AND order_date >= DATE '2026-07-01';
+
+DESCRIBE HISTORY silver_sales_orders_training;
+
+-- Replace 12 with the last known good version from DESCRIBE HISTORY.
+SELECT COUNT(*) AS west_orders_before_delete
+FROM silver_sales_orders_training VERSION AS OF 12
+WHERE region = 'West'
+  AND order_date >= DATE '2026-07-01';
+\end{lstlisting}
+
+Some recovery workflows are easier in PySpark because you can read the older version into a DataFrame, filter the missing slice, and append it back after validation.
+
+\begin{lstlisting}[language=Python,caption={Reading a prior Delta version in PySpark for targeted recovery.},label={lst:chapter4-read-prior-version}]
+from pyspark.sql import functions as F
+
+table_name = "silver_sales_orders_training"
+last_good_version = 12
+
+previous_df = (
+    spark.read
+    .format("delta")
+    .option("versionAsOf", last_good_version)
+    .table(table_name)
+)
+
+missing_west_df = (
+    previous_df
+    .where((F.col("region") == "West") & (F.col("order_date") >= F.lit("2026-07-01")))
+)
+
+missing_west_df.createOrReplaceTempView("v_recovered_west_orders")
+
+spark.sql("""
+SELECT COUNT(*) AS rows_to_restore, SUM(net_amount) AS amount_to_restore
+FROM v_recovered_west_orders
+""").show(truncate=False)
+\end{lstlisting}
+
+\begin{lstlisting}[language=SQL,caption={Retention-aware cleanup after recovery validation.},label={lst:chapter4-vacuum}]
+-- Run only after recovery is complete and retention requirements are satisfied.
+VACUUM silver_sales_orders_training RETAIN 168 HOURS;
+\end{lstlisting}
+
+\subsection{Validation Checklist}
+\begin{itemize}
+    \item Baseline and post-optimization row counts match.
+    \item Representative query filters are documented before choosing Z-Order columns.
+    \item \texttt{DESCRIBE HISTORY} shows optimization and delete operations.
+    \item Time Travel reads the last known good version before retention cleanup.
+    \item Recovery logic is tested on a training copy, not a production table.
+    \item \texttt{VACUUM} is delayed until the recovery window and retention policy are understood.
+\end{itemize}
+
+\section{Friday: Use Case and Architecture}
+\index{small-file problem}\index{streaming ingestion}\index{Delta Lake!compaction}\index{Delta Lake!remediation}
+A streaming pipeline has appended micro-batches to a Silver events table for six months. Each micro-batch wrote many tiny files into date partitions. Analysts now report that simple filters take minutes, capacity consumption spikes during business hours, and Direct Lake reports refresh unpredictably. The table contains correct data, but the physical layout has degraded.
+
+\subsection{Symptoms}
+The small-file problem shows up in several ways. Spark jobs spend too much time listing files and scheduling tasks. SQL queries scan many file footers before reading useful rows. Metadata operations slow down. Optimization attempts may compete with streaming writes. Downstream users experience unstable latency even when daily row volume has not changed.
+
+\subsection{Remediation Strategy}
+The remediation plan has two parts: fix the existing table and prevent recurrence. First, pause or coordinate streaming writes, snapshot table history, and run partition-aware compaction for the worst partitions. Second, adjust streaming trigger intervals, batch sizing, partition strategy, and scheduled \texttt{OPTIMIZE} cadence so new tiny files do not accumulate unchecked.
+
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[
+        tiny/.style={rectangle, draw=red!60!black, thick, fill=red!8, align=center, minimum width=0.9cm, minimum height=0.45cm, font=\scriptsize},
+        big/.style={rectangle, rounded corners, draw=codegreen!60!black, thick, fill=green!8, align=center, minimum width=2.5cm, minimum height=0.9cm, font=\small\bfseries},
+        proc/.style={rectangle, rounded corners, draw=primary, thick, fill=primary!7, align=center, minimum width=3.2cm, minimum height=1.0cm, font=\small\bfseries},
+        arrow/.style={draw, thick, -Latex, draw=primary}
+    ]
+        \foreach \x/\y in {0/0.8,0.8/0.8,1.6/0.8,2.4/0.8,0/0.1,0.8/0.1,1.6/0.1,2.4/0.1,0/-0.6,0.8/-0.6,1.6/-0.6,2.4/-0.6}
+            \node[tiny] at (\x,\y) {};
+        \node[proc] (beforelabel) at (1.2, -1.55) {Millions of\\small files};
+        \node[proc] (opt) at (5.6, 0.1) {OPTIMIZE\\V-Order\\Z-Order};
+        \node[big] (b1) at (9.4, 0.75) {large file};
+        \node[big] (b2) at (9.4, -0.25) {large file};
+        \node[big] (b3) at (12.5, 0.25) {clustered layout};
+        \node[proc, fill=blue!8] (policy) at (10.9, -1.55) {Scheduled\\maintenance};
+
+        \draw[arrow] (2.9,0.1) -- (opt);
+        \draw[arrow] (opt) -- (b1);
+        \draw[arrow] (opt) -- (b2);
+        \draw[arrow] (b1) -- (b3);
+        \draw[arrow] (b2) -- (b3);
+        \draw[arrow] (policy) -- node[right, font=\scriptsize]{prevents recurrence} (b2);
+
+        \node[note, text width=12cm, align=center] at (6.3, -2.65) {Compaction fixes the accumulated file layout; revised streaming and optimization policy keeps the table healthy.};
+    \end{tikzpicture}%
+    }
+    \caption{Small-file remediation through compaction and optimized layout.}
+    \label{fig:chapter4-small-file-remediation}
+\end{figure}
+
+\subsection{Operational Runbook}
+\begin{enumerate}
+    \item Identify affected tables, partitions, file counts, average file sizes, and top user queries.
+    \item Confirm retention requirements and capture the current Delta version.
+    \item Coordinate a maintenance window or use an approach compatible with active streaming writes.
+    \item Compact the oldest and worst partitions first; validate row counts after each batch.
+    \item Apply V-Order and targeted Z-Ordering for documented query filters.
+    \item Tune streaming triggers or batch sizes so future writes produce healthier files.
+    \item Schedule recurring optimization and record metrics after every maintenance run.
+    \item Delay \texttt{VACUUM} until rollback confidence and retention requirements are satisfied.
+\end{enumerate}
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.4cm}p{4.8cm}p{4.8cm}@{}}
+\toprule
+\textbf{Evidence} & \textbf{Interpretation} & \textbf{Action} \\
+\midrule
+Millions of active files & Metadata and scheduling overhead dominate reads & Run partition-aware \texttt{OPTIMIZE} and prevent tiny future writes \\
+Queries filter by date and device & Layout should support data skipping on those columns & Consider date partitioning plus Z-Order on \texttt{device\_id} \\
+Streaming writes every few seconds & Micro-batches may create too many files & Increase trigger interval or use available output coalescing patterns \\
+History needed for audit & Cleanup cannot be aggressive & Align \texttt{VACUUM} retention with audit and restore policy \\
+\bottomrule
+\end{tabular}
+\caption{Diagnosing and remediating a degraded streaming Delta table.}
+\label{tab:chapter4-small-file-diagnosis}
+\end{table}
+
+\section{Operational Guidance for Week 4}
+Delta operations should be automated only after they are understood manually. The first maintenance run should capture baseline query time, row counts, active file counts, operation history, and table version. The automated version should emit the same evidence to a run log.
+
+\subsection{Performance and Reliability}
+Avoid optimizing blindly. Optimize high-value tables first: large Silver tables, Gold dimensions and facts used by Direct Lake, and tables with frequent appends. Keep Z-Order columns stable unless query patterns materially change. Coordinate compaction with streaming writers and avoid running expensive maintenance during peak reporting windows.
+
+\subsection{Security and Governance Checklist}
+\begin{itemize}
+    \item Restrict who can run destructive commands such as \texttt{DELETE}, \texttt{TRUNCATE}, and \texttt{VACUUM}.
+    \item Record table owners, retention policies, optimization cadence, and recovery contacts.
+    \item Do not shorten retention without understanding legal, audit, and incident-response needs.
+    \item Validate schema evolution in development before allowing new columns into shared Silver or Gold tables.
+    \item Keep optimization notebooks parameterized and free of personal workspace paths.
+\end{itemize}
+
+\section{Interview Q\&A}
+\begin{enumerate}
+    \item \textbf{Q: What are the two major physical components of a Delta table?}\\
+    A: Parquet data files store the columnar data, and the Delta transaction log records table versions, add and remove actions, schema metadata, and operation history.
+    \item \textbf{Q: Why does \texttt{OPTIMIZE} help a table with many small files?}\\
+    A: It compacts many small files into fewer larger files, reducing file-listing overhead, task scheduling overhead, and metadata pressure during reads.
+    \item \textbf{Q: When would you use Z-Ordering?}\\
+    A: Use it when important queries repeatedly filter on specific columns and colocating similar values will improve data skipping.
+    \item \textbf{Q: How is V-Order different from Z-Ordering?}\\
+    A: V-Order is a Fabric-oriented Parquet layout optimization for analytical reads, while Z-Ordering clusters rows by selected columns to improve selective filtering.
+    \item \textbf{Q: What risk does \texttt{VACUUM} introduce?}\\
+    A: It can permanently remove old unreferenced files, which may prevent Time Travel or recovery to versions that still need those files.
+    \item \textbf{Q: How should schema evolution be governed?}\\
+    A: Treat it as an intentional contract change: review the new field, test downstream impact, document the schema, and avoid silently accepting unplanned drift.
+\end{enumerate}
+
+\section{Further Reading}
+Review Microsoft documentation for Fabric Lakehouses \cite{microsoftFabricLakehouse}, OneLake \cite{microsoftOneLakeOverview}, Fabric Spark \cite{microsoftFabricSparkCompute}, V-Order \cite{microsoftFabricVOrder}, Delta table maintenance and optimization \cite{microsoftFabricOptimize,microsoftFabricVacuum}, and Fabric notebooks \cite{microsoftFabricNotebooks}. For format internals, read the Delta Lake documentation \cite{deltaLakeDocs}, the Delta Lake paper \cite{armbrust2020delta}, and Apache Parquet documentation \cite{apacheParquet}.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item Delta tables combine Parquet data files with an ordered transaction log that defines consistent table versions.
+    \item Fabric optimization is a physical layout practice: V-Order, \texttt{OPTIMIZE}, and Z-Ordering should improve reads without changing results.
+    \item The small-file problem is common after frequent appends or streaming micro-batches and should be fixed with compaction plus better write policy.
+    \item Time Travel is a recovery and debugging feature, but it depends on retained log and data files.
+    \item \texttt{VACUUM} controls storage growth by deleting obsolete files, but it must respect recovery and audit requirements.
+    \item Schema evolution should be planned and governed because Silver and Gold tables are contracts for downstream users.
+    \item Part~I closes with an integrated lakehouse that uses OneLake shortcuts, Spark transformations, Delta tables, V-Order, and a Gold star schema.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Explain why a Delta table needs both Parquet files and a transaction log.
+    \item \textbf{(Conceptual)} Compare compaction, V-Order, Z-Ordering, and partitioning. Which problem does each address?
+    \item \textbf{(Hands-on)} Create a training Delta table, run \texttt{DESCRIBE HISTORY}, and identify the operation that created the latest version.
+    \item \textbf{(Hands-on)} Run an optimization command on a non-production table and compare row counts before and after.
+    \item \textbf{(Recovery)} Simulate an accidental delete in a training copy and query the previous version with \texttt{VERSION AS OF}.
+    \item \textbf{(Operations)} Draft a retention policy that balances 30 days of recovery with storage cleanup.
+    \item \textbf{(Design)} Choose Z-Order columns for a Silver IoT table with filters by event date, device, region, and alert type. Explain your choice.
+    \item \textbf{(Interview)} In five sentences, explain the small-file problem and how you would prevent it in a streaming pipeline.
+\end{enumerate}
+
+\section{Milestone 1 Capstone: Spark-Driven Medallion Lakehouse}\label{sec:ch4-capstone}
+\index{Milestone 1 capstone}\index{capstone project!Part I}\index{medallion architecture!capstone}\index{OneLake shortcuts!capstone}\index{Star Schema}\index{Gold layer!star schema}\index{V-Order!capstone}
+
+\begin{capstonebox}
+\textbf{Mission.} Close Part~I by building a Spark-driven medallion lakehouse in Microsoft Fabric. The solution must create Bronze, Silver, and Gold lakehouses, ingest sample data through OneLake shortcuts, clean and conform data with parameterized Spark notebooks, publish a Gold star schema, and optimize Delta tables with V-Order.
+
+\textbf{Estimated time.} 6--8 hours, depending on tenant permissions, shortcut source availability, and sample-data size.
+
+\textbf{What you'll practice.}
+\begin{itemize}
+    \item Creating workspaces and lakehouses aligned to Bronze, Silver, and Gold responsibilities.
+    \item Using OneLake shortcuts to avoid unnecessary source-data copying.
+    \item Writing parameterized PySpark notebooks for repeatable Silver transformations.
+    \item Building Gold facts and dimensions from curated Silver Delta tables.
+    \item Running \texttt{OPTIMIZE} with V-Order and validating table history.
+\end{itemize}
+\end{capstonebox}
+
+\subsection*{Scenario}
+Contoso Retail wants a Part~I reference implementation for Fabric data engineering. Source files include customers, products, stores, orders, and order lines. Some data may remain in external object storage or instructor-provided locations; Fabric should expose it through OneLake shortcuts. The engineering team must land raw evidence in Bronze, clean and standardize records in Silver, and publish Gold star-schema tables for Power BI and SQL consumers.
+
+\subsection*{Requirements}
+Build a working design with these minimum elements:
+\begin{itemize}
+    \item A workspace named \texttt{fabric-de-milestone1} or an instructor-approved equivalent.
+    \item Lakehouses named \texttt{lh\_bronze}, \texttt{lh\_silver}, and \texttt{lh\_gold}, or clearly separated layer paths if the tenant limits lakehouse attachments.
+    \item OneLake shortcuts in Bronze for at least two sample sources, such as orders and products.
+    \item A parameterized Silver notebook that accepts \texttt{processing\_date} and \texttt{source\_system}.
+    \item Silver Delta tables with typed dates, deduplicated business keys, and required null checks.
+    \item Gold star-schema tables such as \texttt{dim\_customer}, \texttt{dim\_product}, \texttt{dim\_date}, \texttt{dim\_store}, and \texttt{fact\_sales}.
+    \item V-Order optimization for the major Silver and Gold Delta tables.
+    \item A short operations note covering retry unit, retention, optimization cadence, and data-quality metrics.
+\end{itemize}
+
+\subsection*{Reference Architecture}
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[
+        src/.style={rectangle, rounded corners, draw=codegray, thick, fill=white, align=center, minimum width=2.8cm, minimum height=0.95cm, font=\small\bfseries},
+        lake/.style={cylinder, shape border rotate=90, aspect=0.25, draw=primary, thick, fill=backcolour, align=center, minimum width=2.8cm, minimum height=1.25cm, font=\small},
+        proc/.style={rectangle, rounded corners, draw=primary, thick, fill=primary!7, align=center, minimum width=3.1cm, minimum height=1.0cm, font=\small\bfseries},
+        gold/.style={rectangle, rounded corners, draw=codegreen!60!black, thick, fill=green!8, align=center, minimum width=2.6cm, minimum height=0.9cm, font=\small\bfseries},
+        arrow/.style={draw, thick, -Latex, draw=primary}
+    ]
+        \node[src] (s1) at (0, 0.8) {External files\\orders};
+        \node[src] (s2) at (0, -0.8) {External files\\products};
+        \node[lake, fill=brown!12] (bronze) at (4.0, 0) {Bronze\\shortcuts};
+        \node[proc] (silvernb) at (7.8, 0) {Spark Notebook\\clean + conform};
+        \node[lake, fill=gray!15] (silver) at (11.6, 0) {Silver Delta\\typed tables};
+        \node[proc] (goldnb) at (15.4, 0) {Spark SQL\\star schema};
+        \node[lake, fill=yellow!18] (goldlake) at (19.0, 0) {Gold Delta\\V-Order};
+        \node[gold] (dims) at (22.4, 0.75) {Dimensions};
+        \node[gold] (fact) at (22.4, -0.55) {Fact Sales};
+
+        \draw[arrow] (s1) -- node[above, font=\scriptsize]{shortcut} (bronze);
+        \draw[arrow] (s2) -- node[below, font=\scriptsize]{shortcut} (bronze);
+        \draw[arrow] (bronze) -- (silvernb);
+        \draw[arrow] (silvernb) -- (silver);
+        \draw[arrow] (silver) -- (goldnb);
+        \draw[arrow] (goldnb) -- node[above, font=\scriptsize]{OPTIMIZE VORDER} (goldlake);
+        \draw[arrow] (goldlake) -- (dims);
+        \draw[arrow] (goldlake) -- (fact);
+
+        \node[note, text width=14cm, align=center] at (11.2, -2.15) {The capstone integrates OneLake storage, medallion architecture, Spark notebooks, Delta reliability, and Fabric optimization into one Part~I deliverable.};
+    \end{tikzpicture}%
+    }
+    \caption{Milestone 1 reference architecture from Bronze shortcuts to V-Order optimized Gold tables.}
+    \label{fig:chapter4-capstone-reference-architecture}
+\end{figure}
+
+\subsection*{Implementation Steps}
+\begin{enumerate}
+    \item \textbf{Create the workspace.} Create \texttt{fabric-de-milestone1} and assign the correct Fabric capacity.
+    \item \textbf{Create lakehouses.} Add \texttt{lh\_bronze}, \texttt{lh\_silver}, and \texttt{lh\_gold}. Document any tenant-specific deviations.
+    \item \textbf{Create shortcuts.} In Bronze, create OneLake shortcuts to sample orders, order lines, customers, products, and stores where available.
+    \item \textbf{Build Silver.} Use PySpark to read raw files or shortcut paths, apply explicit schemas, drop invalid rows, deduplicate keys, and write Delta tables.
+    \item \textbf{Build Gold.} Use Spark SQL or DataFrame logic to create dimensions and \texttt{fact\_sales} from Silver.
+    \item \textbf{Optimize.} Run \texttt{OPTIMIZE} with V-Order on important Silver and Gold tables.
+    \item \textbf{Validate.} Compare Bronze counts, Silver accepted and rejected counts, and Gold aggregate totals.
+    \item \textbf{Document operations.} Record retry unit, retention policy, optimization cadence, and ownership.
+\end{enumerate}
+
+\begin{lstlisting}[language=Python,caption={Parameterized Silver transformation for the Milestone 1 capstone.},label={lst:chapter4-capstone-silver-pyspark}]
+from pyspark.sql import functions as F
+from pyspark.sql.types import (
+    StructType, StructField, StringType, IntegerType, DoubleType
+)
+
+processing_date = "2026-07-31"
+source_system = "retail_sample"
+
+orders_schema = StructType([
+    StructField("order_id", StringType(), True),
+    StructField("customer_id", StringType(), True),
+    StructField("store_id", StringType(), True),
+    StructField("order_timestamp", StringType(), True),
+    StructField("order_status", StringType(), True),
+])
+
+order_lines_schema = StructType([
+    StructField("order_id", StringType(), True),
+    StructField("product_id", StringType(), True),
+    StructField("quantity", IntegerType(), True),
+    StructField("unit_price", DoubleType(), True),
+])
+
+orders_path = f"Files/bronze/shortcuts/orders/order_date={processing_date}/*.csv"
+lines_path = f"Files/bronze/shortcuts/order_lines/order_date={processing_date}/*.csv"
+
+orders_df = (
+    spark.read.option("header", "true").schema(orders_schema).csv(orders_path)
+    .withColumn("source_system", F.lit(source_system))
+    .withColumn("ingested_at", F.current_timestamp())
+    .dropDuplicates(["order_id"])
+    .dropna(subset=["order_id", "customer_id", "order_timestamp"])
+    .withColumn("order_timestamp", F.to_timestamp("order_timestamp"))
+    .withColumn("order_date", F.to_date("order_timestamp"))
+    .where(F.col("order_timestamp").isNotNull())
+)
+
+lines_df = (
+    spark.read.option("header", "true").schema(order_lines_schema).csv(lines_path)
+    .dropna(subset=["order_id", "product_id"])
+    .withColumn("quantity", F.col("quantity").cast("int"))
+    .withColumn("unit_price", F.col("unit_price").cast("double"))
+    .where((F.col("quantity") > 0) & (F.col("unit_price") >= 0))
+)
+
+orders_df.write.format("delta").mode("overwrite").saveAsTable("silver_orders")
+lines_df.write.format("delta").mode("overwrite").saveAsTable("silver_order_lines")
+\end{lstlisting}
+
+\begin{lstlisting}[language=SQL,caption={Gold star schema and V-Order optimization.},label={lst:chapter4-capstone-gold-sql}]
+CREATE OR REPLACE TABLE dim_customer AS
+SELECT DISTINCT
+    customer_id,
+    source_system
+FROM silver_orders
+WHERE customer_id IS NOT NULL;
+
+CREATE OR REPLACE TABLE dim_date AS
+SELECT DISTINCT
+    order_date,
+    YEAR(order_date) AS calendar_year,
+    MONTH(order_date) AS calendar_month,
+    DAY(order_date) AS calendar_day
+FROM silver_orders
+WHERE order_date IS NOT NULL;
+
+CREATE OR REPLACE TABLE fact_sales AS
+SELECT
+    o.order_id,
+    o.customer_id,
+    o.store_id,
+    l.product_id,
+    o.order_date,
+    l.quantity,
+    l.unit_price,
+    l.quantity * l.unit_price AS sales_amount
+FROM silver_orders o
+JOIN silver_order_lines l
+    ON o.order_id = l.order_id;
+
+OPTIMIZE silver_orders VORDER;
+OPTIMIZE silver_order_lines VORDER;
+OPTIMIZE dim_customer VORDER;
+OPTIMIZE dim_date VORDER;
+OPTIMIZE fact_sales VORDER;
+\end{lstlisting}
+
+\subsection*{Deliverables}
+Submit evidence that the Part~I milestone is complete:
+\begin{itemize}
+    \item Workspace and lakehouse names, including Bronze, Silver, and Gold boundaries.
+    \item Screenshot or exported evidence of OneLake shortcuts in Bronze.
+    \item Notebook parameters and successful Silver transformation output.
+    \item Schemas and row counts for Silver Delta tables.
+    \item Gold star-schema table list with at least one fact and three dimensions.
+    \item \texttt{DESCRIBE HISTORY} evidence showing optimization on key Delta tables.
+    \item A short operations note for retry, retention, optimization cadence, and data-quality checks.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+Use this rubric before declaring Milestone~1 complete:
+\begin{itemize}
+    \item[\(\square\)] Bronze, Silver, and Gold storage boundaries are visible and documented.
+    \item[\(\square\)] At least two Bronze data sources are exposed through OneLake shortcuts or clearly documented substitutes.
+    \item[\(\square\)] Silver notebooks use parameters rather than hardcoded personal paths.
+    \item[\(\square\)] Silver tables enforce required keys, types, and duplicate rules.
+    \item[\(\square\)] Gold contains a star schema with dimensions and \texttt{fact\_sales}.
+    \item[\(\square\)] Major Silver and Gold tables are Delta tables optimized with V-Order where supported.
+    \item[\(\square\)] Row-count reconciliation proves that rejected and accepted records are understood.
+    \item[\(\square\)] The design states retention, Time Travel, and \texttt{VACUUM} expectations.
+    \item[\(\square\)] No secrets, real customer identifiers, or personal workspace paths appear in submitted evidence.
+    \item[\(\square\)] The project demonstrates Weeks~1--4 as one coherent lakehouse workflow.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+If you finish early, extend the milestone without changing its core contract:
+\begin{itemize}
+    \item Add a quarantine table with rejection reasons for invalid Bronze records.
+    \item Add a product and store dimension with slowly changing attribute notes.
+    \item Add Time Travel validation that compares the latest Gold totals to a previous version.
+    \item Add a data-quality metrics table for each processing date.
+    \item Create a Direct Lake semantic model over the Gold star schema.
+    \item Document how the development workspace would promote to test and production.
+\end{itemize}

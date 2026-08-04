@@ -1,0 +1,397 @@
+\chapter{Getting Started: Your Microsoft Fabric Trial and Workspace}
+\index{Microsoft Fabric!getting started}\index{Fabric trial}\index{work or school account}\index{organizational account}%
+\index{tenant setting}\index{workspace!creation}\index{lakehouse!creation}\index{capacity!trial}\index{Power BI}%
+
+\begin{objectives}
+\begin{itemize}
+    \item Explain why Microsoft Fabric requires an organizational Microsoft 365 or Power BI identity rather than a personal consumer account.
+    \item Start a free Fabric trial capacity and distinguish the trial from paid Fabric F SKUs and capacity units.
+    \item Verify the tenant-level Fabric switch that allows users to create Fabric items, and identify who can enable it.
+    \item Create a workspace, assign it to the Trial capacity, and apply the appropriate workspace role for each collaborator.
+    \item Create a first lakehouse in OneLake and understand how lakehouse \texttt{Files} and \texttt{Tables} become the foundation for later chapters.
+    \item Use the browser-based Fabric experience, optional Windows tooling, and Fabric notebooks to read and write a Delta table.
+    \item Establish cost, quota, and validation guardrails before beginning Chapter~1.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+The first practical difference between Microsoft Fabric and raw infrastructure clouds appears before you create any data: Fabric starts from an organization tenant and a SaaS analytics capacity, not from a general-purpose cloud subscription.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{2.9cm}p{3.0cm}p{3.0cm}p{3.0cm}@{}}
+\toprule
+\textbf{Setup step} & \textbf{AWS} & \textbf{Azure} & \textbf{GCP} \\
+\midrule
+Free offer & Free Tier (12 mo + always free) & Free account (\$200/30 days + always free) & Free trial (\$300/90 days + Always Free) \\
+Sign-up guard & Card + root email & Card + Microsoft account & Card + Google account \\
+Identity model & IAM / IAM Identity Center & Microsoft Entra ID + RBAC & Cloud IAM \\
+Admin isolation & Never use root daily & Avoid Global Admin daily & Avoid Owner; least privilege \\
+CLI & AWS CLI v2 (\texttt{aws configure}) & Azure CLI (\texttt{az login}) & gcloud CLI (\texttt{gcloud init}) \\
+Browser shell & AWS CloudShell & Azure Cloud Shell & Cloud Shell \\
+Cost guardrail & AWS Budgets + alerts & Cost Management budgets & Budgets \& alerts \\
+Console & AWS Management Console & Azure Portal & Google Cloud Console \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+THIS book's platform, Microsoft Fabric, uses a Microsoft 365/Power BI work account plus a Fabric trial capacity (no card, org tenant) rather than an IaaS subscription; Snowflake uses a 30-day/\$400 trial (no card) guarded by Resource Monitors; MongoDB Atlas offers a forever-free M0 cluster (no card) secured by database users and an IP allowlist.
+\end{crosscloud}
+
+\begin{keyterms}
+\textbf{Organizational account}: a Microsoft Entra ID-backed work or school account, normally written as \texttt{name@organization.com}. \quad
+\textbf{Tenant}: the Microsoft 365 and Entra ID boundary that owns users, groups, admin settings, and Fabric's OneLake namespace. \quad
+\textbf{Fabric trial capacity}: a temporary Fabric capacity that lets an eligible user evaluate Fabric workloads. \quad
+\textbf{Capacity unit}: a normalized measure of Fabric compute used across Spark, SQL, pipelines, real-time workloads, and Power BI. \quad
+\textbf{Workspace}: the collaboration, permission, and capacity-assignment container for Fabric items. \quad
+\textbf{Lakehouse}: a Fabric data engineering item that exposes OneLake files, managed Delta tables, Spark, and SQL-oriented access.
+\end{keyterms}
+
+\section{Why Chapter 0 Exists}
+Chapter~1 begins with OneLake architecture. Before that architecture is useful, you need a working Fabric tenant, an enabled Fabric experience, an active capacity, a workspace assigned to that capacity, and a lakehouse where notebooks can run. This chapter builds that foundation deliberately in a Windows and PowerShell learning environment, while keeping the important distinction clear: Microsoft Fabric is a SaaS analytics platform, not an IaaS cloud account where you provision virtual networks, storage accounts, virtual machines, and Spark clusters by hand.
+
+Fabric unifies data engineering, data integration, data warehousing, real-time analytics, data science, and Power BI in one browser-based experience \cite{microsoftFabricOverview}. The platform hides many infrastructure chores, but it does not remove setup decisions. Identity, tenant settings, capacity assignment, workspace roles, cost controls, and verification still matter. A learner who skips these details often reaches Chapter~1 with a confusing symptom: the \textbf{New} button is missing, a lakehouse cannot be created, a notebook will not attach, or a workspace is quietly using the wrong capacity.
+
+\begin{notebox}
+This chapter assumes you are using Windows with PowerShell for local commands and a browser for Fabric. Fabric itself runs in the Microsoft cloud; the local machine is mostly a client for documentation, sample files, optional desktop tools, and book builds.
+\end{notebox}
+
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[
+        setup/.style={rectangle, rounded corners, draw=primary, thick, fill=primary!6, align=center, minimum width=2.7cm, minimum height=1.1cm, font=\small\bfseries},
+        verify/.style={rectangle, rounded corners, draw=codegreen!60!black, thick, fill=green!7, align=center, minimum width=2.7cm, minimum height=1.1cm, font=\small\bfseries},
+        arrow/.style={draw, thick, -Latex, draw=primary}
+    ]
+        \node[setup] (acct) at (0, 0) {Org account\\Work or school};
+        \node[setup] (tenant) at (3.3, 0) {Enable Fabric\\Tenant switch};
+        \node[setup] (trial) at (6.7, 0) {Trial capacity\\60 days};
+        \node[setup] (workspace) at (10.2, 0) {Workspace\\Assigned capacity};
+        \node[setup] (lakehouse) at (13.8, 0) {Lakehouse\\OneLake item};
+        \node[verify] (ok) at (17.1, 0) {Verify\\Notebook + Delta};
+
+        \draw[arrow] (acct) -- (tenant);
+        \draw[arrow] (tenant) -- (trial);
+        \draw[arrow] (trial) -- (workspace);
+        \draw[arrow] (workspace) -- (lakehouse);
+        \draw[arrow] (lakehouse) -- (ok);
+    \end{tikzpicture}%
+    }
+    \caption{Chapter 0 setup flow from organizational identity to a verified Fabric lakehouse.}
+    \label{fig:chapter0-setup-flow}
+\end{figure}
+
+\section{Prerequisites: Identity Before Infrastructure}
+\index{Microsoft Entra ID}\index{tenant}\index{Microsoft 365 Developer Program}\index{Power BI free license}
+The first prerequisite is not a credit card. It is an organizational identity. Fabric is attached to a Microsoft 365 and Power BI tenant backed by Microsoft Entra ID. The account must be a work or school account, such as \texttt{student@contoso.onmicrosoft.com} or \texttt{analyst@yourcompany.com}. That identity places the user inside a tenant where administrators can control Fabric settings, create or allow capacities, manage licenses, configure governance, and own OneLake.
+
+A personal Microsoft account, such as a consumer Outlook.com account, is not enough to enable Fabric by itself. A Gmail address used as a Microsoft account has the same limitation. Those accounts can sign in to consumer Microsoft services, but they do not create the organizational tenant boundary that Fabric needs for tenant settings, workspace governance, Power BI administration, and OneLake's tenant-wide namespace. In practical terms, a personal account has no Fabric tenant administrator who can turn on Fabric item creation, no organizational users or groups to assign workspace roles to, and no tenant-level OneLake home for the analytics estate.
+
+\begin{definitionbox}
+An \textbf{organizational account} is an account managed by Microsoft Entra ID in a work, school, developer, or Power BI tenant. Fabric depends on that tenant because the platform's security, administration, workspaces, capacities, and OneLake namespace are tenant-scoped.
+\end{definitionbox}
+
+\subsection{Free Ways to Obtain an Organizational Account}
+For training, the most common path is a Microsoft 365 Developer Program tenant. If you qualify, this gives you a developer Microsoft 365 tenant with administrator control for learning and app development. The exact availability and renewal rules can change, so treat it as a learning tenant rather than a permanent production environment. After it exists, you sign in with an account such as \texttt{admin@yourdevtenant.onmicrosoft.com}, open Fabric, and evaluate whether the Fabric trial option is available.
+
+A second path is a Power BI or Fabric free sign-up using a work email address. This path is appropriate when your organization allows self-service sign-up and the email domain can be associated with an organizational tenant. It is less suitable when a company blocks self-service trials or centrally manages Power BI. In that case, ask the Microsoft 365, Power BI, or Fabric administrator to enable the trial or provide a training workspace.
+
+\begin{pitfall}
+\textbf{Trying to start Fabric from a personal account.} If you sign in with a consumer Outlook.com, Hotmail, Live.com, or Gmail-backed Microsoft account, you may reach Microsoft pages but still be unable to create Fabric items. Switch to an organizational work or school account before troubleshooting capacities or workspaces.
+\end{pitfall}
+
+\subsection{Minimum Access You Need}
+For the hands-on work in this book, you need enough permission to do five things:
+\begin{enumerate}
+    \item Sign in to \url{https://app.fabric.microsoft.com} with an organizational account.
+    \item Use or start a Fabric trial capacity, or have a workspace assigned to an existing Fabric capacity.
+    \item Create a workspace, or be added to a workspace as Admin, Member, or Contributor.
+    \item Create Fabric items in that workspace, including a lakehouse and notebook.
+    \item Upload or create a small sample file in the lakehouse and run a notebook attached to it.
+\end{enumerate}
+If you are in a managed enterprise tenant, you may not personally control all five. That is normal. The setup is still valid if an administrator creates the capacity and workspace for you, then adds you as a workspace Member or Contributor.
+
+\section{Starting the Free Fabric Trial}
+\index{Fabric trial!starting}\index{capacity!trial}\index{F SKU}\index{capacity units}
+Open a browser and go to \url{https://app.fabric.microsoft.com}. Sign in with your organizational account. If your tenant allows trials and your account is eligible, the Fabric interface provides an option to start a trial. Microsoft documents Fabric trial behavior separately from paid capacity licensing \cite{microsoftFabricTrial}. The trial is commonly described as a 60-day evaluation capacity that lets you create and run Fabric items without first purchasing a paid F SKU.
+
+The trial does not mean Fabric has become a personal local tool. It creates or assigns a trial capacity in the tenant. Workspaces must use a Fabric capacity to run Fabric workloads such as lakehouses, notebooks, Data Factory pipelines, warehouses, and other Fabric items. The trial capacity is the temporary compute pool you will attach to your learning workspace.
+
+\subsection{What the Trial Includes}
+The trial capacity is meant for evaluation and hands-on learning. It enables Fabric experiences that otherwise require capacity. In this book, that means you can create a workspace, assign it to the Trial capacity, create a lakehouse, run notebooks, write Delta tables, and inspect OneLake storage behavior. The trial is shared through the tenant model: administrators and capacity settings can determine who can use it and which workspaces are assigned.
+
+A trial is not a production capacity. It expires, can be disabled by tenant policy, and may have limits that are inappropriate for real workloads. Use it to learn concepts, validate book exercises, and understand how jobs consume capacity. Do not treat it as a durable home for business data.
+
+\begin{definitionbox}
+A \textbf{Fabric capacity} is a pool of compute resources used by Fabric workloads. Paid capacities are sold as F SKUs with different amounts of compute. Capacity units, or CUs, are the normalized way to reason about consumption across different Fabric engines \cite{microsoftFabricCapacity}.
+\end{definitionbox}
+
+\subsection{Trial Capacity Versus F SKUs}
+Paid Fabric capacities are normally referred to by F SKU names, such as smaller and larger F capacities. A larger SKU provides more capacity units and can sustain more concurrent or heavier work. A trial capacity gives learners a temporary capacity so they can experience Fabric without committing to a paid SKU first. The engineering model is the same: your workspace is assigned to a capacity, workloads consume capacity, and overloaded capacity can affect responsiveness.
+
+The practical takeaway is simple. You do not buy, size, or pause the trial the way you would a paid Azure Fabric capacity, but you should still think like an engineer. A poorly designed notebook, runaway loop, accidental full scan, or repeated refresh can consume capacity and make the trial feel slow. The habits you learn on the trial carry forward to paid F SKUs.
+
+\section{Enabling Fabric at the Tenant}
+\index{Admin portal}\index{tenant settings}\index{Users can create Fabric items}\index{capacity admin}
+Starting a trial and creating items depends on tenant settings. In the Fabric or Power BI Admin portal, administrators can control whether users can create Fabric items. The setting is often described as \textbf{Users can create Fabric items} under Fabric tenant settings \cite{microsoftFabricTenantSettings}. If the switch is off for your whole organization or for your security group, the user interface may hide Fabric creation commands or show errors when you try to create a lakehouse, notebook, warehouse, or other Fabric item.
+
+Who can enable it? In a managed tenant, a Power BI administrator, Fabric administrator, or Microsoft 365 Global Administrator usually controls the relevant Admin portal setting. A Global Administrator should not be used for daily analytics work, but that role may be needed to assign the first Fabric or Power BI admin roles. After the tenant setting is enabled, day-to-day management can be delegated through Fabric administrators, capacity administrators, workspace admins, and security groups.
+
+\begin{pitfall}
+\textbf{The tenant switch is off.} If you can sign in but cannot create a lakehouse, do not immediately blame your browser, license, or notebook. Check whether the Admin portal setting \textbf{Users can create Fabric items} is enabled for your user or group. In many enterprise tenants, this is the first blocked setup step.
+\end{pitfall}
+
+\subsection{Delegating to Capacity Administrators}
+Tenant administrators should not personally manage every workspace. A cleaner model is to enable Fabric for approved security groups, create or allow capacities, then delegate capacity administration to the platform or data engineering team. Capacity admins can manage capacity assignment and monitor usage without needing full tenant administrator privileges. Workspace admins then decide who can collaborate inside each workspace.
+
+This separation matters for least privilege. A training instructor may be a capacity admin for a trial or paid learning capacity. Students may be workspace Contributors. A platform owner may be a Fabric admin. A business analyst may be a Viewer on a curated workspace. These roles are intentionally different.
+
+\section{Creating Your Workspace}
+\index{workspace!roles}\index{workspace!capacity assignment}\index{Admin role}\index{Member role}\index{Contributor role}\index{Viewer role}
+After the tenant setting and capacity are available, create the workspace that will hold the book exercises. In the Fabric portal, select \textbf{Workspaces}, choose \textbf{New workspace}, and use a name that makes the environment clear. For this book, a useful personal training name is \texttt{fabric-book-dev}. In a classroom, include a short cohort or lab identifier, such as \texttt{fabric-de-july-lab01}. Avoid names that imply production unless the workspace is truly governed as production.
+
+During or after workspace creation, assign the workspace to the Trial capacity. In the workspace settings, find the license or capacity section and choose the Trial capacity. If you do not see the trial, it may not have started, it may belong to another user, your tenant may restrict capacity assignment, or you may lack workspace admin permission. Microsoft describes workspaces as collaboration containers for Fabric items and permissions \cite{microsoftFabricWorkspaces}.
+
+\subsection{Workspace Roles}
+Workspace roles determine what collaborators can do. Use the smallest role that supports the learning task.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.0cm}p{5.2cm}p{5.0cm}@{}}
+\toprule
+\textbf{Role} & \textbf{Typical permissions} & \textbf{Training use} \\
+\midrule
+Admin & Manage workspace settings, access, and items & Instructor, lab owner, or learner in a personal tenant \\
+Member & Create and manage content, share many items, collaborate broadly & Senior learner or team lead in a shared workspace \\
+Contributor & Create and edit content but with less administrative control & Default role for hands-on builders in a controlled lab \\
+Viewer & Read and interact with published content without editing it & Reviewers, stakeholders, and learners observing demos \\
+\bottomrule
+\end{tabular}
+\caption{Common Fabric workspace roles for a learning environment.}
+\label{tab:chapter0-workspace-roles}
+\end{table}
+
+\begin{tipbox}
+For book exercises, use one dedicated development workspace. Do not mix training lakehouses with enterprise reports, certified semantic models, or production pipelines. Separation makes cleanup and troubleshooting much safer.
+\end{tipbox}
+
+\subsection{Creating Your First Lakehouse}
+Inside the workspace, select \textbf{New item} and create a \textbf{Lakehouse}. Name it \texttt{lh\_getting\_started}. Fabric creates a lakehouse item with a file area and a table area. The file area is useful for raw uploads and folders. The table area contains managed Delta tables that Fabric can expose to Spark and SQL experiences.
+
+This lakehouse lives in OneLake. OneLake is the tenant-wide logical store for Fabric \cite{microsoftOneLakeOverview}. You are not choosing a storage account, container, region-specific endpoint, or access key in the way you would with raw object storage. Fabric projects the lakehouse into OneLake under the tenant and workspace context. This is why the organizational account and tenant setup mattered at the beginning of the chapter.
+
+\begin{notebox}
+OneLake is tenant-wide, but access is not automatically tenant-wide. Users still need permission through workspaces, items, sharing, data access roles, semantic models, or other Fabric governance controls. The namespace is unified; authorization remains explicit.
+\end{notebox}
+
+\section{Tooling: Browser First, Optional Desktop Tools}
+\index{Fabric portal}\index{Power BI Desktop}\index{OneLake File Explorer}\index{notebooks}\index{PySpark}\index{REST API}
+The primary tool for this chapter is the Fabric web experience. You do not need to install Spark, Hadoop, Python, Java, the Azure CLI, or a local database to create the first lakehouse. The browser provides the workspace, lakehouse explorer, notebook editor, Spark session attachment, and item management surface. This is one of the most important differences between Fabric and a self-managed data platform.
+
+Optional tools can improve the experience on Windows:
+\begin{itemize}
+    \item \textbf{Power BI Desktop} is useful later when you build semantic models and reports locally before publishing. It is not required for creating a lakehouse.
+    \item \textbf{OneLake File Explorer for Windows} can show OneLake in File Explorer so authorized users can browse and copy files through a familiar interface. Use it carefully; it is convenient, but it does not replace data engineering discipline.
+    \item \textbf{Fabric notebooks} run inside Fabric and support PySpark for reading files, transforming data, and writing Delta tables. This book uses notebooks for many data engineering labs.
+    \item \textbf{Fabric REST APIs and command-line automation} are useful for repeatable administration and deployment where your organization supports them. For Chapter~0, the browser is enough; automation becomes more relevant after you understand the manual path.
+\end{itemize}
+
+\subsection{A First PySpark Read and Delta Write}
+After creating \texttt{lh\_getting\_started}, create a new notebook in the same workspace and attach the lakehouse. The following cell creates a tiny in-memory DataFrame, writes it as a managed Delta table in the lakehouse, then reads it back. It intentionally avoids external files so that Spark itself is the only moving part.
+
+\begin{lstlisting}[language=Python,caption={PySpark one-cell smoke test for a Fabric lakehouse.}]
+from pyspark.sql import functions as F
+
+rows = [
+    (1, "bronze", "raw file landing"),
+    (2, "silver", "clean conformed tables"),
+    (3, "gold", "business-ready metrics"),
+]
+
+layers_df = spark.createDataFrame(rows, ["layer_id", "layer_name", "purpose"])
+
+(
+    layers_df
+    .withColumn("loaded_at_utc", F.current_timestamp())
+    .write
+    .format("delta")
+    .mode("overwrite")
+    .saveAsTable("setup_layers")
+)
+
+spark.read.table("setup_layers").orderBy("layer_id").show(truncate=False)
+\end{lstlisting}
+
+The expected result is a three-row table containing \texttt{bronze}, \texttt{silver}, and \texttt{gold}, plus a timestamp column. If this works, the notebook can start Spark, attach to the lakehouse, write Delta, register a table, and read the table back.
+
+\subsection{REST and JSON Awareness}
+You do not need REST automation for the first lab, but it is useful to recognize that Fabric items and administrative operations can be represented as structured requests. The exact endpoint and API version may change, so the next listing is a conceptual JSON body for documenting a workspace setup request rather than a command to paste blindly.
+
+\begin{lstlisting}[language=json,caption={Conceptual REST/JSON setup record for a Fabric training workspace.}]
+{
+  "workspaceName": "fabric-book-dev",
+  "capacity": {
+    "assignment": "Trial",
+    "purpose": "Microsoft Fabric book exercises"
+  },
+  "items": [
+    {
+      "type": "Lakehouse",
+      "displayName": "lh_getting_started"
+    },
+    {
+      "type": "Notebook",
+      "displayName": "nb_setup_smoke_test",
+      "defaultLakehouse": "lh_getting_started"
+    }
+  ],
+  "roles": [
+    {
+      "principal": "learner group",
+      "role": "Contributor"
+    }
+  ]
+}
+\end{lstlisting}
+
+\section{Cost and Quota Guardrails}
+\index{cost management}\index{capacity metrics}\index{bursting}\index{throttling}\index{trial expiry}
+Fabric's trial removes the initial purchase step, but it does not remove finite capacity. A capacity can become busy, throttled, or temporarily burst depending on workload shape and product behavior. Interactive report usage, Spark notebooks, warehouse queries, Data Factory activities, semantic model refreshes, and real-time workloads all consume from the same capacity model. The lesson for a data engineer is to measure consumption early, even when the direct bill is zero.
+
+\subsection{Trial Expiry}
+A trial is temporary. Before relying on a workspace for more than a lab, record when the trial started, who owns it, and what should happen when it expires. If the trial ends and the workspace is not reassigned to a paid capacity, Fabric item creation and execution may stop working as expected. Export notebooks or keep source-controlled copies of important code before the trial ends.
+
+\subsection{Bursting and Throttling}
+Fabric capacities can smooth bursts, but sustained overuse eventually produces delays or throttling. A single learner can trigger this with repeated full-table writes, an accidental Cartesian join, or too many notebook reruns. In shared classes, twenty learners running the same Spark cell at once can expose capacity limits quickly. That is not a failure of Fabric; it is an operating reality of shared compute.
+
+\subsection{Paid Capacity Later}
+If you later move to paid Fabric capacity, you can scale, pause, resume, or delete capacity depending on the purchasing model and administrative controls. Pausing a paid capacity is a cost guardrail, but it also stops workloads assigned to it. Plan environment separation so development capacities can be paused safely while production capacities remain governed and monitored.
+
+\begin{tipbox}
+\textbf{Measure it.} Install or ask for access to the Microsoft Fabric Capacity Metrics app when you move beyond a solo trial. Use it to identify which workspace, item, user, or workload is consuming capacity before increasing the SKU or blaming the platform \cite{microsoftFabricMetricsApp}.
+\end{tipbox}
+
+\section{Verify the Setup}
+\index{setup verification}\index{sample file upload}\index{notebook!verification}
+A setup is complete only when it produces observable evidence. The verification path below proves four things: the workspace exists, the lakehouse exists, OneLake accepts a sample file, and Spark can read and write data.
+
+\subsection{Step 1: Create the Workspace and Lakehouse}
+Confirm that the workspace appears in the Fabric portal and is assigned to the Trial capacity. Confirm that \texttt{lh\_getting\_started} appears as a lakehouse item in that workspace. Open the lakehouse and verify that the explorer shows \texttt{Files} and \texttt{Tables}.
+
+\subsection{Step 2: Upload a Sample File to OneLake}
+Create a small CSV file on Windows using PowerShell, then upload it through the lakehouse explorer to \texttt{Files/setup}. The command below creates the local sample file in the current directory. It is local preparation only; the upload happens in the browser unless you choose an approved automation method later.
+
+\begin{lstlisting}[language={},caption={PowerShell command to create a small CSV sample file on Windows.}]
+@'
+order_id,customer_id,order_date,sales_amount
+1001,C001,2026-07-01,42.50
+1002,C002,2026-07-02,99.00
+1003,C001,2026-07-03,18.25
+'@ | Set-Content -Path .\fabric_setup_orders.csv -Encoding utf8
+\end{lstlisting}
+
+In the Fabric lakehouse, choose \textbf{Files}, create a folder named \texttt{setup}, and upload \texttt{fabric\_setup\_orders.csv}. The path should appear as \texttt{Files/setup/fabric\_setup\_orders.csv}. If you use OneLake File Explorer instead, copy the file only into the intended lakehouse folder and wait for the Fabric interface to refresh.
+
+\subsection{Step 3: Run a One-Cell Notebook}
+Create or open \texttt{nb\_setup\_smoke\_test}, attach \texttt{lh\_getting\_started}, and run the following cell.
+
+\begin{lstlisting}[language=Python,caption={PySpark verification cell that reads an uploaded CSV and writes a Delta table.}]
+from pyspark.sql import functions as F
+
+source_path = "Files/setup/fabric_setup_orders.csv"
+
+orders_df = (
+    spark.read
+    .option("header", True)
+    .option("inferSchema", True)
+    .csv(source_path)
+)
+
+verified_df = (
+    orders_df
+    .withColumn("order_date", F.to_date("order_date"))
+    .withColumn("sales_amount", F.col("sales_amount").cast("decimal(18,2)"))
+)
+
+verified_df.write.format("delta").mode("overwrite").saveAsTable("setup_orders")
+
+result_df = spark.sql("""
+SELECT
+    COUNT(*) AS row_count,
+    COUNT(DISTINCT customer_id) AS customer_count,
+    CAST(SUM(sales_amount) AS DECIMAL(18,2)) AS total_sales_amount
+FROM setup_orders
+""")
+
+result_df.show(truncate=False)
+\end{lstlisting}
+
+Expected result:
+\begin{lstlisting}[language={},caption={Expected verification output.}]
++---------+--------------+------------------+
+|row_count|customer_count|total_sales_amount|
++---------+--------------+------------------+
+|3        |2             |159.75            |
++---------+--------------+------------------+
+\end{lstlisting}
+
+If the output matches, Chapter~0 is successful. Spark read a OneLake file, converted types, wrote a managed Delta table, registered it in the lakehouse, and queried it back.
+
+\subsection{Troubleshooting Checklist}
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{4.0cm}p{4.8cm}p{4.4cm}@{}}
+\toprule
+\textbf{Symptom} & \textbf{Likely cause} & \textbf{Action} \\
+\midrule
+Cannot create Fabric item & Tenant setting is disabled or restricted & Ask Fabric or Power BI admin to enable \textbf{Users can create Fabric items} for your group \\
+No Trial capacity option & Trial not started, blocked, expired, or unavailable to user & Start trial if eligible or ask admin for capacity assignment \\
+Notebook will not attach & Lakehouse missing, capacity unavailable, or workspace not assigned & Recheck workspace capacity and default lakehouse \\
+CSV path not found & File uploaded to wrong folder or name differs & Confirm exact path under \texttt{Files/setup} \\
+Delta write fails & Spark session not ready or table permission issue & Restart session and confirm workspace role is Contributor or higher \\
+Slow or queued execution & Capacity is busy or throttled & Wait, stop unnecessary sessions, and inspect capacity metrics if available \\
+\bottomrule
+\end{tabular}
+\caption{Common Chapter 0 setup symptoms and first checks.}
+\label{tab:chapter0-troubleshooting}
+\end{table}
+
+\section{How This Setup Differs from Raw IaaS Clouds}
+In AWS, Azure, or GCP, a first data engineering lab often begins by creating a cloud subscription or project, selecting a region, enabling APIs, provisioning object storage, creating IAM roles, configuring command-line credentials, and deciding which compute service will run Spark. Fabric intentionally compresses many of those choices into a SaaS experience. You still make architecture decisions, but the first units are tenant, capacity, workspace, item, and OneLake path.
+
+That difference is useful pedagogically. You can begin with data architecture before building a platform from primitives. However, it can also mislead learners into thinking there is no infrastructure. There is infrastructure, but Microsoft operates much of it behind the SaaS boundary. Your engineering responsibilities move upward: capacity usage, workspace design, item ownership, data contracts, governance, quality, and consumption paths.
+
+\begin{notebox}
+When this book compares Fabric with Azure services, remember that Fabric is not simply ``Synapse plus Power BI.'' It is a SaaS analytics platform with shared OneLake storage, capacities, workspaces, governance, and integrated workloads. Some Azure concepts reappear, but the operating model is different.
+\end{notebox}
+
+\section{Further Reading}
+Start with Microsoft's overview of Fabric \cite{microsoftFabricOverview}, the Fabric trial documentation \cite{microsoftFabricTrial}, Fabric concepts and licenses \cite{microsoftFabricCapacity}, tenant settings for Fabric item creation \cite{microsoftFabricTenantSettings}, workspaces \cite{microsoftFabricWorkspaces}, OneLake \cite{microsoftOneLakeOverview}, lakehouses \cite{microsoftFabricLakehouse}, and the Capacity Metrics app \cite{microsoftFabricMetricsApp}. Return to these pages whenever a user-interface label changes; the concepts in this chapter are stable, but the portal wording and placement can evolve.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item Microsoft Fabric requires an organizational work or school account because tenant settings, administration, workspaces, capacities, and OneLake are tenant-scoped.
+    \item A personal Outlook.com, Hotmail, Live.com, or Gmail-backed Microsoft account cannot by itself enable a Fabric tenant for hands-on data engineering.
+    \item The Fabric trial provides a temporary capacity for evaluation; it is not a production capacity and should be monitored like shared compute.
+    \item The Admin portal setting \textbf{Users can create Fabric items} must be enabled for the relevant users or groups before lakehouses and notebooks can be created.
+    \item Workspaces are collaboration and permission containers, and they must be assigned to the Trial or another Fabric capacity for Fabric workloads.
+    \item A first lakehouse proves that OneLake is available and gives later chapters a place to store files, managed Delta tables, and notebook outputs.
+    \item Verification is complete only after you upload a sample file, run a PySpark cell, write a Delta table, and confirm the expected result.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Identity)} Write down the account you used for Fabric. Is it an organizational work or school account? Explain how you know without including private information.
+    \item \textbf{(Admin)} Find the tenant setting that controls whether users can create Fabric items. If you cannot access the Admin portal, document who in your organization owns that setting.
+    \item \textbf{(Capacity)} Start or identify the Fabric trial capacity. Record the trial start date, expected expiry date, and the workspace assigned to it.
+    \item \textbf{(Workspace)} Create \texttt{fabric-book-dev} or an equivalent training workspace. Assign it to the Trial capacity and add any collaborators with the least role they need.
+    \item \textbf{(Lakehouse)} Create \texttt{lh\_getting\_started}. Identify where \texttt{Files} and \texttt{Tables} appear in the lakehouse explorer.
+    \item \textbf{(Upload)} Create \texttt{fabric\_setup\_orders.csv} with PowerShell and upload it to \texttt{Files/setup}. Confirm the path in the Fabric portal.
+    \item \textbf{(Notebook)} Run the verification PySpark cell and confirm the expected result: three rows, two customers, and total sales of \texttt{159.75}.
+    \item \textbf{(Cost)} If you have access, open the Capacity Metrics app or ask your administrator how capacity usage is monitored. Note where you would look if notebooks became slow.
+    \item \textbf{(Setup checklist before Chapter 1)} Confirm all of the following: organizational account works; Fabric item creation is enabled; trial or paid capacity is available; workspace is assigned to capacity; lakehouse exists; sample file is uploaded; notebook smoke test passes; cleanup owner is known.
+    \item \textbf{(Interview)} In five sentences, explain why Fabric setup begins with tenant identity and capacity assignment rather than with a storage account and virtual machine.
+\end{enumerate}

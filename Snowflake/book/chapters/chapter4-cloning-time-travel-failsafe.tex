@@ -1,0 +1,574 @@
+\chapter{Zero-Copy Cloning, Time Travel, and Fail-Safe}
+\index{zero-copy cloning}\index{Time Travel}\index{Fail-safe}\index{UNDROP}\index{Week 4}%
+\begin{objectives}
+\begin{itemize}
+    \item Explain Time Travel as historical access to prior object versions with \texttt{AT} and \texttt{BEFORE}.
+    \item Distinguish user-operated Time Travel from Snowflake-managed, seven-day Fail-safe.
+    \item Describe zero-copy cloning as metadata-only duplication with copy-on-write storage behavior.
+    \item Restore an accidentally dropped table with \texttt{UNDROP} and validate historical data.
+    \item Clone a production database into QA, mutate QA data, and prove that production remains unchanged.
+    \item Design an instant DevOps staging workflow using zero-copy clones and ephemeral transient schemas.
+    \item Close Milestone 1 by integrating warehouses, permanent raw tables, transient staging, clustering, Search Optimization Service, and automated recovery testing.
+\end{itemize}
+\end{objectives}
+\begin{crosscloud}
+Data protection and instant-copy features appear across every major cloud data platform. The vocabulary changes, but data engineers still map four questions: how do I recover to a point in time, how long is history retained, how do I make a fast test copy, and what happens after a delete?
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{2.5cm}p{3.0cm}p{3.1cm}p{3.1cm}p{3.1cm}@{}}
+\toprule
+\textbf{Pattern} & \textbf{Snowflake} & \textbf{AWS} & \textbf{Azure} & \textbf{GCP and BigQuery} \\
+\midrule
+Point-in-time recovery & Time Travel with \texttt{AT} and \texttt{BEFORE}; object retention can reach 90 days on supported editions & Aurora continuous backup, RDS point-in-time restore, and S3 versioning & Azure SQL point-in-time restore plus blob soft delete and versioning & BigQuery time travel, table snapshots, and managed restore workflows \\
+Retention window & \texttt{DATA\_RETENTION\_TIME\_IN\_DAYS}; permanent objects can retain more history than transient objects & Backup retention policies and S3 lifecycle rules & SQL backup retention and blob soft-delete policies & Configurable time travel windows and snapshot expiration \\
+Copy-on-write clone & Zero-Copy Clone for databases, schemas, and tables; new writes allocate new micro-partitions & Aurora fast database cloning and snapshot copy-on-write patterns & Database copy and storage snapshots vary by service & BigQuery table clones and table snapshots provide metadata-efficient copies \\
+Undrop or soft delete & \texttt{UNDROP DATABASE}, \texttt{UNDROP SCHEMA}, and \texttt{UNDROP TABLE} within Time Travel & S3 delete markers and version restore; database PITR usually creates a new target & Blob soft delete, container soft delete, and SQL restore workflows & BigQuery undelete and restore through time travel while history remains \\
+Disaster tier & Fail-safe is non-configurable, seven days, permanent data only, and not user-queryable & Cross-region backup, snapshots, and service recovery mechanisms & Geo-redundant storage and managed backups & Regional durability, snapshots, and product-specific recovery \\
+\bottomrule
+\end{tabular}}
+\vspace{1mm}
+\textbf{Microsoft Fabric} exposes related thinking through Delta Time Travel in lakehouse tables. \textbf{MongoDB} managed deployments provide backups and point-in-time recovery, but not Snowflake-style SQL zero-copy database clones. Snowflake system function names such as \texttt{SYSTEM\$DATABASE\_STORAGE\_USAGE\_HISTORY} and \texttt{SYSTEM\$ESTIMATE\_SEARCH\_OPTIMIZATION\_COSTS} require escaped dollar signs in LaTeX prose.
+\end{crosscloud}
+\section{Week 4 Roadmap}
+Week 4 closes Part I by turning storage architecture into operational resilience. Chapter 1 introduced Snowflake's separation of storage and compute. Chapter 2 sized isolated warehouses for ETL and BI. Chapter 3 compared table types, views, clustering, materialized views, and Search Optimization Service. This chapter adds the recovery and duplication mechanics that let engineers recover from mistakes, test safely, and validate disaster-readiness without bulk-copying data \cite{snowflakeTimeTravelDocs,snowflakeFailSafeDocs,snowflakeCloneDocs}.
+
+The week follows five practical questions. Monday asks how to query historical data with Time Travel. Tuesday explains the seven-day Fail-safe tier and why it is not a normal restore tool. Wednesday studies zero-copy cloning and copy-on-write storage. Thursday combines \texttt{DROP}, \texttt{UNDROP}, \texttt{CLONE}, Time Travel queries, and storage evidence. Friday turns those mechanics into a DevOps workflow for instant staging and testing.
+\begin{keyterms}
+\textbf{Time Travel}: historical access to Snowflake object versions within retention.\quad
+\textbf{Fail-safe}: Snowflake-managed seven-day recovery protection for permanent data after Time Travel expires.\quad
+\textbf{Zero-Copy Clone}: a metadata operation that creates a new object referencing existing micro-partitions.\quad
+\textbf{Copy-on-write}: storage behavior where shared data remains shared and changed partitions are written separately.\quad
+\textbf{UNDROP}: a command family that restores dropped databases, schemas, or tables while retained metadata remains available.\quad
+\textbf{Transient schema}: a schema whose transient tables avoid Fail-safe and fit reproducible temporary environments.
+\end{keyterms}
+\section{Monday: Time Travel Mechanics and Historical Queries}
+\index{Time Travel!mechanics}\index{AT clause}\index{BEFORE clause}\index{historical query}
+Time Travel is Snowflake's user-facing historical data feature. It allows a query, clone, or restore operation to reference an earlier state of a table, schema, or database while the object's retention window remains active. Engineers use it to inspect pre-load data, recover rows after a bad \texttt{DELETE}, clone yesterday's production state for debugging, and restore dropped objects without opening a support case \cite{snowflakeTimeTravelDocs}.
+\begin{definitionbox}
+\textbf{Time Travel} is historical access to Snowflake object versions. Queries use \texttt{AT} or \texttt{BEFORE} with a timestamp, statement identifier, or offset. Restore operations such as \texttt{UNDROP} use retained object metadata after accidental drops.
+\end{definitionbox}
+The \texttt{AT} clause means ``as of this point.'' The \texttt{BEFORE} clause means ``immediately before this point.'' That distinction matters when recovering from a known bad statement. If a loader committed a destructive \texttt{DELETE}, a query \texttt{BEFORE (STATEMENT => '<query id>')} shows the table just before that statement executed. If an analyst needs a reporting snapshot at noon, \texttt{AT (TIMESTAMP => '2026-07-31 12:00:00'::TIMESTAMP\_NTZ)} is easier to explain.
+
+Retention is not unlimited. Standard Snowflake retention is configured by object and constrained by account edition. Permanent databases, schemas, and tables can use longer Time Travel retention, up to 90 days on supported editions. Transient and temporary objects have more limited retention and no Fail-safe. A recovery plan that assumes 90 days must verify the account edition, object type, and \texttt{DATA\_RETENTION\_TIME\_IN\_DAYS} value before an incident.
+\begin{notebox}
+Time Travel is not a replacement for data quality controls. It gives engineers a fast recovery path after a mistake, but it does not decide which historical state is correct. Query tags, load audit tables, and run manifests make recovery safer because they identify the bad statement or load window precisely.
+\end{notebox}
+\begin{figure}[H]
+    \centering
+    \resizebox{0.95\textwidth}{!}{%
+    \begin{tikzpicture}[
+        axis/.style={draw=codegray, thick, -Latex},
+        block/.style={rectangle, draw=primary, fill=primary!5, rounded corners, minimum height=1.0cm, text width=3.1cm, align=center, font=\scriptsize\bfseries},
+        safe/.style={rectangle, draw=codegreen!60!black, fill=green!8, rounded corners, minimum height=1.0cm, text width=3.1cm, align=center, font=\scriptsize\bfseries},
+        warn/.style={rectangle, draw=red!60!black, fill=red!7, rounded corners, minimum height=1.0cm, text width=3.1cm, align=center, font=\scriptsize\bfseries}
+    ]
+        \draw[axis] (0,0) -- (13,0) node[right,font=\scriptsize\bfseries] {time};
+        \node[block] (now) at (1.4,1.1) {Current table\\active data};
+        \node[safe] (tt) at (5.1,1.1) {Time Travel\\0--90 days by object};
+        \node[warn] (fs) at (8.8,1.1) {Fail-safe\\7 days, permanent data};
+        \node[block] (gone) at (12.0,1.1) {Expired history\\not recoverable by SQL};
+        \draw[dashed, codegray] (3.1,-0.35) -- (3.1,1.9);
+        \draw[dashed, codegray] (7.0,-0.35) -- (7.0,1.9);
+        \draw[dashed, codegray] (10.6,-0.35) -- (10.6,1.9);
+        \node[font=\scriptsize, text=codegray, align=center] at (5.1,-0.55) {user queries, clones,\\and UNDROP};
+        \node[font=\scriptsize, text=codegray, align=center] at (8.8,-0.55) {Snowflake support\\last resort};
+    \end{tikzpicture}%
+    }
+    \caption{Time Travel is the user-operable recovery window; Fail-safe follows as a Snowflake-managed last-resort tier for permanent data.}
+    \label{fig:chapter4-retention-timeline}
+\end{figure}
+\begin{tipbox}
+Store the query ID of every production load and destructive maintenance statement. Recovery by timestamp can be approximate when clocks, time zones, or overlapping jobs are involved; recovery \texttt{BEFORE} a known statement is usually cleaner.
+\end{tipbox}
+\subsection{Choosing Timestamp, Offset, or Statement}
+\index{statement identifier}\index{offset}
+Time Travel supports three common anchors. A timestamp is readable and useful for business conversations. An offset is convenient for quick checks such as ``five minutes ago.'' A statement identifier is safest for undoing a known bad operation. For production runbooks, prefer statement identifiers whenever the incident is tied to a query, task, procedure, or pipeline step.
+\begin{pitfall}
+\textbf{Assuming all objects keep 90 days of history.} Retention depends on edition, object type, and settings. A transient staging table with one day of retention cannot recover a mistake from last week, even if another permanent table in the same database keeps 90 days.
+\end{pitfall}
+\section{Tuesday: Fail-safe Storage and Last-Resort Recovery}
+\index{Fail-safe}\index{disaster recovery}\index{permanent table!Fail-safe}
+Fail-safe is often misunderstood because it protects data without behaving like a normal feature. It is not a SQL clause, not a backup browser, and not a fast self-service rollback. Fail-safe is Snowflake's non-configurable disaster-recovery tier for permanent data. After Time Travel expires, Snowflake retains protected historical data for seven additional days so Snowflake can attempt recovery in extreme scenarios \cite{snowflakeFailSafeDocs}.
+\begin{definitionbox}
+\textbf{Fail-safe} is a seven-day, Snowflake-managed recovery period for permanent objects after the Time Travel retention period ends. Customers cannot query Fail-safe directly and cannot change the seven-day period.
+\end{definitionbox}
+The operational implication is simple: design normal recovery around Time Travel, not Fail-safe. If a team drops a table and notices the problem within retention, \texttt{UNDROP} is the right tool. If a bad load overwrote data yesterday, a Time Travel clone or insert-select repair is the right tool. If retention expired and the object was permanent, Fail-safe may provide a support-assisted last resort, but it should not be the primary runbook.
+
+Fail-safe also matters for table-type decisions. Permanent tables carry stronger recovery protection and can incur storage charges associated with retained historical data. Transient tables avoid Fail-safe, which makes them attractive for rebuildable staging zones and temporary environments. The trade-off is recoverability: if a transient table is corrupted after Time Travel expires, there is no Fail-safe safety net.
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.0cm}p{3.8cm}p{3.8cm}p{3.4cm}@{}}
+\toprule
+\textbf{Feature} & \textbf{Who uses it} & \textbf{Typical operation} & \textbf{Best design use} \\
+\midrule
+Time Travel & Engineers and authorized SQL users & Query historical rows, clone prior state, or \texttt{UNDROP} & Routine recovery, debugging, audit reconstruction \\
+Fail-safe & Snowflake, usually through support & Last-resort recovery after Time Travel expires & Disaster-recovery backstop for permanent data \\
+External backup or replication & Platform team & Cross-region or cross-account continuity design & Business continuity beyond one account or region \\
+\bottomrule
+\end{tabular}
+\caption{Fail-safe complements Time Travel but does not replace user-operated recovery procedures.}
+\label{tab:chapter4-time-travel-failsafe}
+\end{table}
+\begin{notebox}
+Fail-safe is intentionally non-configurable. If a workload must avoid Fail-safe because data is reproducible and high churn, use transient objects deliberately. If a workload is a business record, use permanent objects and accept the recovery overhead.
+\end{notebox}
+\begin{pitfall}
+\textbf{Building an RTO promise on Fail-safe.} Recovery time objectives should be based on tested Time Travel, clone, replication, or backup workflows. Fail-safe is a provider-managed last resort, not an on-demand restore button.
+\end{pitfall}
+\section{Wednesday: Zero-Copy Cloning and Copy-on-Write Storage}
+\index{zero-copy cloning!mechanics}\index{copy-on-write}\index{database clone}\index{schema clone}\index{table clone}
+Zero-Copy Clone creates a new database, schema, or table by copying metadata references to existing micro-partitions rather than duplicating all stored bytes. The clone appears immediately and can be queried independently. When the original or clone changes, Snowflake writes new micro-partitions for the changed data while unchanged partitions remain shared \cite{snowflakeCloneDocs}.
+\begin{definitionbox}
+A \textbf{Zero-Copy Clone} is a metadata-only copy at creation time. It shares existing micro-partitions with the source object and uses copy-on-write behavior for later changes.
+\end{definitionbox}
+The feature is powerful because it changes how engineers think about environments. A QA database can start from production in seconds. A data scientist can experiment against a point-in-time clone without requesting a bulk export. A release pipeline can create a clean staging schema, run migrations and tests, then drop the clone. The storage cost at clone creation is near zero because the clone references existing storage. The cost appears later when either side changes and Snowflake must retain separate partitions.
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[
+        obj/.style={rectangle, draw=primary, fill=primary!5, rounded corners, minimum height=1.0cm, text width=2.8cm, align=center, font=\scriptsize\bfseries},
+        part/.style={rectangle, draw=codegreen!60!black, fill=green!8, rounded corners, minimum height=0.75cm, text width=2.2cm, align=center, font=\scriptsize},
+        newpart/.style={rectangle, draw=magenta, fill=magenta!10, rounded corners, minimum height=0.75cm, text width=2.2cm, align=center, font=\scriptsize},
+        arrow/.style={draw, thick, -Latex, draw=primary}
+    ]
+        \node[obj] (prod) at (0,1.4) {PROD table};
+        \node[obj] (qa) at (0,-1.4) {QA clone};
+        \node[part] (p1) at (4.0,2.1) {shared\\micro-partition A};
+        \node[part] (p2) at (4.0,0.7) {shared\\micro-partition B};
+        \node[part] (p3) at (4.0,-0.7) {shared\\micro-partition C};
+        \node[newpart] (q1) at (8.0,-1.4) {new QA partition\\after update};
+        \draw[arrow] (prod) -- (p1);
+        \draw[arrow] (prod) -- (p2);
+        \draw[arrow] (prod) -- (p3);
+        \draw[arrow] (qa) -- (p1);
+        \draw[arrow] (qa) -- (p2);
+        \draw[arrow] (qa) -- (p3);
+        \draw[arrow] (qa) -- (q1);
+        \node[font=\scriptsize, text=codegray, align=center] at (8.0,0.2) {Only changed data\\allocates new storage};
+    \end{tikzpicture}%
+    }
+    \caption{A zero-copy clone shares existing micro-partitions at creation and writes new storage only when data changes.}
+    \label{fig:chapter4-copy-on-write-clone}
+\end{figure}
+Clones also work with Time Travel. A team can clone a table \texttt{AT} a timestamp or \texttt{BEFORE} a bad statement, creating a repair source without overwriting current data. This is safer than immediately replacing production because analysts can validate row counts, checksums, and business totals before applying a repair.
+\begin{tipbox}
+Name clones with purpose and expiration, for example \texttt{QA\_ORDERS\_CLONE\_20260731}. Add cleanup automation or owner tags so clone storage does not grow unnoticed after tests mutate data.
+\end{tipbox}
+\subsection{Clone Boundaries and Governance}
+\index{governance!clones}\index{RBAC!clones}
+Cloning copies object definitions and data state, but it does not remove governance responsibility. Roles, grants, masking policies, row access policies, tags, and downstream shares must be reviewed in the target environment. A clone for QA should not automatically become a broad data exposure path. Use least-privilege grants and consider masked or synthetic lower-environment data when production records contain sensitive attributes.
+\begin{pitfall}
+\textbf{Confusing instant clone with free forever.} Clone creation is metadata-efficient, but divergent writes, deleted-source retention, and forgotten test data can create storage cost over time. Monitor clone age and table storage history.
+\end{pitfall}
+\section{Thursday Hands-On Project: Drop, Undrop, Clone, and Prove Storage Behavior}
+\index{hands-on project!Time Travel}\index{UNDROP!hands-on}\index{CLONE!hands-on}\index{storage measurement}
+This lab simulates two common incidents: an accidental table drop and a request for a production-like QA database. It restores the dropped table with \texttt{UNDROP}, creates a clone for QA, modifies QA data, and gathers storage evidence. Run it in a training account with an XSMALL warehouse and reduce row counts if necessary.
+\begin{pitfall}
+\textbf{Credit and data safety.} Never run destructive recovery drills in a shared production schema. Create a dedicated lab database, tag or comment it clearly, and drop it after verification if your account is credit constrained.
+\end{pitfall}
+\begin{lstlisting}[language=SQL,caption={Simulating an accidental drop and restoring the table with UNDROP.},label={lst:chapter4-drop-undrop-sql}]
+USE ROLE SYSADMIN;
+CREATE OR REPLACE DATABASE SNOWFLAKE_DE_BOOK_DR;
+CREATE OR REPLACE SCHEMA SNOWFLAKE_DE_BOOK_DR.WEEK4_RECOVERY
+  DATA_RETENTION_TIME_IN_DAYS = 3;
+CREATE OR REPLACE WAREHOUSE RECOVERY_LAB_WH
+  WAREHOUSE_SIZE = 'XSMALL'
+  AUTO_SUSPEND = 60
+  AUTO_RESUME = TRUE
+  INITIALLY_SUSPENDED = TRUE;
+USE WAREHOUSE RECOVERY_LAB_WH;
+USE DATABASE SNOWFLAKE_DE_BOOK_DR;
+USE SCHEMA WEEK4_RECOVERY;
+CREATE OR REPLACE TABLE ORDERS_PROD (
+    order_id NUMBER,
+    order_uuid STRING,
+    customer_id NUMBER,
+    order_ts TIMESTAMP_NTZ,
+    order_date DATE,
+    order_status STRING,
+    revenue NUMBER(12, 2)
+);
+INSERT INTO ORDERS_PROD
+SELECT
+    SEQ4() AS order_id,
+    UUID_STRING() AS order_uuid,
+    UNIFORM(1, 100000, RANDOM()) AS customer_id,
+    DATEADD('minute', UNIFORM(0, 60 * 24 * 14, RANDOM()),
+            '2026-07-01'::TIMESTAMP_NTZ) AS order_ts,
+    TO_DATE(order_ts) AS order_date,
+    ARRAY_CONSTRUCT('NEW', 'PAID', 'SHIPPED', 'RETURNED')[UNIFORM(0, 4, RANDOM())]::STRING AS order_status,
+    ROUND(UNIFORM(100, 100000, RANDOM()) / 100, 2) AS revenue
+FROM TABLE(GENERATOR(ROWCOUNT => 250000));
+SELECT COUNT(*) AS before_drop_rows FROM ORDERS_PROD;
+DROP TABLE ORDERS_PROD;
+-- The next query fails because the current table name is dropped.
+-- SELECT COUNT(*) FROM ORDERS_PROD;
+UNDROP TABLE ORDERS_PROD;
+SELECT COUNT(*) AS after_undrop_rows FROM ORDERS_PROD;
+SELECT order_status, COUNT(*) AS orders, SUM(revenue) AS revenue
+FROM ORDERS_PROD
+GROUP BY order_status
+ORDER BY order_status;
+\end{lstlisting}
+The first listing proves that \texttt{UNDROP} restores the table name and data while retention remains available. In a real incident, record the failed query, the \texttt{DROP} query ID, the restore time, and the validation query IDs.
+\begin{lstlisting}[language=SQL,caption={Using AT and BEFORE clauses and creating a zero-copy QA clone.},label={lst:chapter4-clone-time-travel-sql}]
+USE WAREHOUSE RECOVERY_LAB_WH;
+USE DATABASE SNOWFLAKE_DE_BOOK_DR;
+USE SCHEMA WEEK4_RECOVERY;
+SELECT CURRENT_TIMESTAMP() AS clean_checkpoint;
+SET clean_ts = (SELECT CURRENT_TIMESTAMP());
+UPDATE ORDERS_PROD
+SET order_status = 'CORRUPTED'
+WHERE order_date = '2026-07-03';
+SELECT COUNT(*) AS corrupted_rows
+FROM ORDERS_PROD
+WHERE order_status = 'CORRUPTED';
+SELECT COUNT(*) AS rows_before_update
+FROM ORDERS_PROD AT(TIMESTAMP => $clean_ts::TIMESTAMP_NTZ)
+WHERE order_status = 'CORRUPTED';
+CREATE OR REPLACE TABLE ORDERS_PROD_REPAIR_CLONE
+  CLONE ORDERS_PROD AT(TIMESTAMP => $clean_ts::TIMESTAMP_NTZ);
+SELECT COUNT(*) AS repair_clone_rows
+FROM ORDERS_PROD_REPAIR_CLONE;
+CREATE OR REPLACE DATABASE SNOWFLAKE_DE_BOOK_QA
+  CLONE SNOWFLAKE_DE_BOOK_DR;
+USE DATABASE SNOWFLAKE_DE_BOOK_QA;
+USE SCHEMA WEEK4_RECOVERY;
+UPDATE ORDERS_PROD
+SET order_status = 'QA_ONLY'
+WHERE order_id < 1000;
+SELECT order_status, COUNT(*) AS orders
+FROM ORDERS_PROD
+GROUP BY order_status
+ORDER BY order_status;
+USE DATABASE SNOWFLAKE_DE_BOOK_DR;
+USE SCHEMA WEEK4_RECOVERY;
+SELECT COUNT(*) AS prod_qa_only_rows
+FROM ORDERS_PROD
+WHERE order_status = 'QA_ONLY';
+\end{lstlisting}
+The second listing demonstrates two safety properties. First, Time Travel can build a repair clone from a clean timestamp. Second, QA can modify its cloned database without changing production. The clone starts by sharing storage with production; QA changes allocate separate micro-partitions.
+\begin{lstlisting}[language=Python,caption={Python connector script to compare storage before and after clone divergence.},label={lst:chapter4-python-storage-proof}]
+import os
+import time
+import snowflake.connector
+CONNECT_ARGS = {
+    "account": os.environ["SNOWFLAKE_ACCOUNT"],
+    "user": os.environ["SNOWFLAKE_USER"],
+    "password": os.environ["SNOWFLAKE_PASSWORD"],
+    "role": "SYSADMIN",
+    "warehouse": "RECOVERY_LAB_WH",
+}
+STORAGE_SQL = """
+SELECT table_catalog, table_schema, table_name, active_bytes, time_travel_bytes,
+       failsafe_bytes, retained_for_clone_bytes
+FROM SNOWFLAKE.ACCOUNT_USAGE.TABLE_STORAGE_METRICS
+WHERE table_catalog IN ('SNOWFLAKE_DE_BOOK_DR', 'SNOWFLAKE_DE_BOOK_QA')
+  AND table_name IN ('ORDERS_PROD', 'ORDERS_PROD_REPAIR_CLONE')
+ORDER BY table_catalog, table_schema, table_name
+"""
+def print_storage(cursor, label):
+    cursor.execute(STORAGE_SQL)
+    print("\n", label)
+    for row in cursor.fetchall():
+        print(dict(zip([column[0] for column in cursor.description], row)))
+with snowflake.connector.connect(**CONNECT_ARGS) as connection:
+    with connection.cursor() as cursor:
+        print_storage(cursor, "before QA divergence")
+        cursor.execute("USE DATABASE SNOWFLAKE_DE_BOOK_QA")
+        cursor.execute("USE SCHEMA WEEK4_RECOVERY")
+        cursor.execute("UPDATE ORDERS_PROD SET revenue = revenue * 1.01 WHERE order_id < 50000")
+        print("qa_update_query_id", cursor.sfqid)
+        time.sleep(120)
+        print_storage(cursor, "after QA divergence")
+\end{lstlisting}
+\begin{notebox}
+\texttt{SNOWFLAKE.ACCOUNT\_USAGE.TABLE\_STORAGE\_METRICS} can lag. If the proof script does not immediately show changed bytes, wait and rerun. The important observation is not exact byte count; it is that clone creation is metadata efficient and divergent writes create separate storage over time.
+\end{notebox}
+\subsection{Validation Checklist}
+\index{recovery validation}\index{storage metrics}
+A complete recovery drill records row counts before and after \texttt{UNDROP}, confirms that production did not receive QA-only changes, captures query IDs for the bad update and repair clone, and stores storage metrics before and after clone divergence. If permissions block account usage views, use \texttt{SHOW TABLES} and query history as fallback evidence, then ask an administrator for storage history export.
+\section{Friday Use Case: Instant DevOps Staging with Ephemeral Transient Schemas}
+\index{DevOps!zero-copy cloning}\index{ephemeral environment}\index{transient schema}\index{CI/CD}
+A mature data platform treats database change testing like application testing. Every pull request should have an isolated environment where migration scripts, data quality tests, and representative BI queries can run without waiting for a bulk copy. Zero-copy cloning makes that practical. The pipeline clones production or a sanitized reference database, creates a transient schema for scratch transformations, runs tests, publishes evidence, and drops the environment after approval.
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[
+        flowstep/.style={rectangle, draw=primary, fill=primary!5, rounded corners, minimum height=1.0cm, text width=2.6cm, align=center, font=\scriptsize\bfseries},
+        env/.style={rectangle, draw=codegreen!60!black, fill=green!8, rounded corners, minimum height=1.0cm, text width=2.8cm, align=center, font=\scriptsize\bfseries},
+        test/.style={rectangle, draw=magenta, fill=magenta!10, rounded corners, minimum height=1.0cm, text width=2.8cm, align=center, font=\scriptsize\bfseries},
+        cleanup/.style={rectangle, draw=red!60!black, fill=red!7, rounded corners, minimum height=1.0cm, text width=2.8cm, align=center, font=\scriptsize\bfseries},
+        arrow/.style={draw, thick, -Latex, draw=primary}
+    ]
+        \node[flowstep] (pr) at (0,0) {Pull request\\or release tag};
+        \node[env] (clone) at (3.2,0) {Zero-copy clone\\PROD to CI};
+        \node[env] (transient) at (6.4,0) {Transient schema\\scratch models};
+        \node[test] (tests) at (9.6,0) {Migrations, DQ,\\BI smoke tests};
+        \node[cleanup] (drop) at (12.8,0) {Publish evidence\\drop clone};
+        \draw[arrow] (pr) -- (clone);
+        \draw[arrow] (clone) -- (transient);
+        \draw[arrow] (transient) -- (tests);
+        \draw[arrow] (tests) -- (drop);
+        \node[font=\scriptsize, text=codegray, align=center] at (3.2,-1.05) {seconds, not hours};
+        \node[font=\scriptsize, text=codegray, align=center] at (6.4,-1.05) {no Fail-safe for\\rebuildable scratch};
+        \node[font=\scriptsize, text=codegray, align=center] at (9.6,-1.05) {query IDs and\\test report};
+    \end{tikzpicture}%
+    }
+    \caption{A clone-based DevOps workflow creates isolated staging environments quickly, tests changes, and drops ephemeral objects before storage divergence grows.}
+    \label{fig:chapter4-devops-clone-workflow}
+\end{figure}
+\subsection{Pipeline Design Pattern}
+The pipeline starts with a controlled source, usually a production-like database that already has masking and row access policies appropriate for lower environments. The job creates \texttt{CI\_<build id>} as a clone, grants a narrow role to the test runner, and creates transient schemas for intermediate models. Migration scripts then run against the clone. Data quality tests compare row counts, null rates, referential checks, and high-value dashboard totals. Finally, the pipeline stores query IDs and drops the clone.
+
+This workflow is close to zero cost at environment creation, not zero cost for all time. The pipeline should set an expiration tag, enforce maximum age, and drop failed-test environments after logs are captured. A nightly cleanup task should search for stale clone names and owners.
+\begin{tipbox}
+For CI/CD, clone only the scope needed for tests. A schema clone is often enough. A database clone is convenient for integration tests, but it expands the blast radius for grants, policies, and storage drift.
+\end{tipbox}
+\begin{pitfall}
+\textbf{Letting test clones become unofficial environments.} A clone created for one pull request should not become a shared QA database unless it receives normal ownership, monitoring, access review, and cleanup procedures.
+\end{pitfall}
+\section{Interview Q\&A}
+\subsection{Time Travel, Fail-safe, and Cloning}
+\begin{enumerate}
+    \item \textbf{Q: What is the difference between Time Travel and Fail-safe?}\\
+    A: Time Travel is user-facing historical access for queries, clones, and undrop operations. Fail-safe is a Snowflake-managed seven-day recovery tier for permanent data after Time Travel expires.
+    \item \textbf{Q: When would you use \texttt{BEFORE} instead of \texttt{AT}?}\\
+    A: Use \texttt{BEFORE} when recovering the state immediately before a known bad statement. Use \texttt{AT} for a specific timestamp, offset, or statement state.
+    \item \textbf{Q: Can Fail-safe be disabled for a permanent table?}\\
+    A: No. Permanent tables have Fail-safe protection. Use transient tables only when the data is reproducible and the loss of Fail-safe is acceptable.
+    \item \textbf{Q: Why is a zero-copy clone fast?}\\
+    A: Snowflake copies metadata references to existing micro-partitions rather than duplicating all stored data at clone creation.
+    \item \textbf{Q: When does a clone start consuming additional storage?}\\
+    A: Additional storage appears as the source or clone changes and Snowflake writes new micro-partitions or retains partitions needed by one side.
+    \item \textbf{Q: How do you recover an accidentally dropped table?}\\
+    A: Run \texttt{UNDROP TABLE} while the object remains within Time Travel retention, then validate row counts and business totals.
+    \item \textbf{Q: How can Time Travel support safer data repair?}\\
+    A: Clone the table before the bad statement, validate the clone, then use controlled SQL to repair the current table from the clean clone.
+    \item \textbf{Q: What is the biggest governance risk with clones?}\\
+    A: A clone can expose production-like data in a lower environment if grants, masking policies, row access policies, and lifecycle controls are not reviewed.
+\end{enumerate}
+\section{Further Reading}
+Snowflake's Time Travel documentation explains historical query syntax, retention settings, and restore options \cite{snowflakeTimeTravelDocs}. Snowflake's Fail-safe documentation describes the seven-day provider-managed recovery tier and its limits \cite{snowflakeFailSafeDocs}. The cloning documentation covers zero-copy clones for databases, schemas, tables, and Time Travel clones \cite{snowflakeCloneDocs}. Snowflake table type documentation remains important because permanent, transient, and temporary tables carry different Time Travel and Fail-safe behavior \cite{snowflakeTableTypesDocs}. For cross-cloud comparisons, review Aurora fast database cloning and RDS point-in-time recovery \cite{awsAuroraCloneDocs,awsRdsPitrDocs}, Azure SQL point-in-time restore and blob soft delete or versioning \cite{azureSqlPitrDocs,azureBlobSoftDeleteDocs}, and BigQuery time travel, snapshots, and table clones \cite{googleBigQueryTimeTravelDocs,googleBigQueryTableSnapshotsDocs,googleBigQueryTableClonesDocs}.
+\section*{Key Takeaways}
+\begin{itemize}
+    \item Time Travel is the primary user-operated recovery feature for historical queries, clones, and undrop operations.
+    \item \texttt{AT} targets a specific state; \texttt{BEFORE} targets the state immediately before an event and is ideal for reversing known bad statements.
+    \item Permanent objects can support longer retention, up to 90 days on supported editions, while transient and temporary objects have narrower protection.
+    \item Fail-safe is a non-configurable seven-day Snowflake disaster-recovery tier for permanent data after Time Travel expires.
+    \item Zero-Copy Clone is metadata-only at creation and uses copy-on-write storage as the source or clone diverges.
+    \item Clones are excellent for QA, debugging, recovery, and CI/CD, but they still require access control, cleanup, and storage monitoring.
+    \item Part I architecture decisions connect: warehouses isolate compute, table types define durability, clustering and SOS shape performance, and Time Travel validates recoverability.
+\end{itemize}
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Explain why Time Travel is appropriate for routine accidental-delete recovery and Fail-safe is not.
+    \item \textbf{(Conceptual)} Compare timestamp, offset, and statement anchors for Time Travel. Give one incident where each is useful.
+    \item \textbf{(Design)} Choose permanent, transient, or temporary storage for raw orders, replayable staging tables, QA scratch tables, and audit facts.
+    \item \textbf{(Hands-on)} Run \cref{lst:chapter4-drop-undrop-sql} with a smaller row count and record the before-drop and after-undrop counts.
+    \item \textbf{(Hands-on)} Modify \cref{lst:chapter4-clone-time-travel-sql} to clone \texttt{BEFORE} a captured statement identifier instead of using a timestamp variable.
+    \item \textbf{(Hands-on)} Use account usage storage metrics or administrator-provided exports to compare clone storage before and after QA updates.
+    \item \textbf{(Operations)} Draft a cleanup policy for clone databases that includes owner, expiration timestamp, maximum age, and escalation path.
+    \item \textbf{(Interview)} A release script corrupted a production fact table 20 minutes ago. Describe your recovery sequence using query IDs, Time Travel, clone validation, and final repair.
+\end{enumerate}
+\section{Milestone 1 Capstone: Multi-Tier E-Commerce Backend and Disaster Recovery}\label{sec:ch4-capstone}
+\index{Milestone 1 capstone}\index{e-commerce backend}\index{disaster recovery}\index{multi-cluster warehouse}\index{Search Optimization Service!capstone}\index{Time Travel!backup testing}
+\begin{capstonebox}
+\textbf{Mission.} Close Part I by designing an enterprise Snowflake architecture for an e-commerce backend. The design must isolate ETL and BI compute, store raw business records durably, use transient staging for replayable transformations, apply clustering and Search Optimization Service only where justified, and prove recovery readiness with an automated Time Travel backup-testing script.\par
+\textbf{Estimated time.} 8--10 hours. Use XSMALL warehouses and synthetic data in a training account. If permissions are limited, submit an implementation-ready design with runnable SQL and Python reviewed by an administrator.
+\end{capstonebox}
+\subsection*{Scenario}
+A retailer is moving its first enterprise analytics workload into Snowflake. The source systems include order captures, payment events, product catalog updates, customer profiles, and clickstream sessions. Executives require BI dashboards with predictable latency. The data engineering team needs isolated ETL capacity for batch loads and backfills. Customer support needs fast lookup by user ID and order UUID. The platform team also needs proof that accidental data loss can be detected and recovered within the configured Time Travel window.
+
+Your task is to produce the Part I reference architecture and a small working prototype. The architecture must combine the first four weeks: Snowflake's storage and compute separation, warehouse sizing and isolation, table types, clustering, Search Optimization Service, zero-copy clones, Time Travel, and Fail-safe-aware recovery planning.
+\subsection*{Requirements}
+\begin{enumerate}
+    \item Create isolated multi-cluster warehouses for ETL and BI, with conservative auto-suspend and role-specific ownership.
+    \item Store raw e-commerce data in permanent tables with explicit retention and comments documenting recovery expectations.
+    \item Build transient staging layers for replayable transformations and temporary scratch objects for session-only experiments.
+    \item Define curated order and customer tables with custom clustering keys that match recurring date and customer access patterns.
+    \item Enable Search Optimization Service on high-cardinality user ID or order UUID lookup columns only after documenting the target query family.
+    \item Create a QA clone from production-like data and prove that QA mutations do not change production.
+    \item Implement an automated Time Travel backup-testing script that creates a checkpoint, simulates damage in a lab table, validates historical recovery, and reports query IDs.
+    \item Provide monitoring, cleanup, and rollback notes for warehouses, clones, staging schemas, clustering, SOS, and recovery tests.
+\end{enumerate}
+\subsection*{Reference Architecture}
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[
+        wh/.style={rectangle, draw=primary, fill=primary!5, rounded corners, minimum height=1.0cm, text width=2.8cm, align=center, font=\scriptsize\bfseries},
+        table/.style={rectangle, draw=codegreen!60!black, fill=green!8, rounded corners, minimum height=1.0cm, text width=3.0cm, align=center, font=\scriptsize\bfseries},
+        accel/.style={rectangle, draw=magenta, fill=magenta!10, rounded corners, minimum height=1.0cm, text width=3.0cm, align=center, font=\scriptsize\bfseries},
+        dr/.style={rectangle, draw=red!60!black, fill=red!7, rounded corners, minimum height=1.0cm, text width=3.0cm, align=center, font=\scriptsize\bfseries},
+        arrow/.style={draw, thick, -Latex, draw=primary}
+    ]
+        \node[wh] (etl) at (0,2.6) {ETL multi-cluster\\warehouse};
+        \node[wh] (bi) at (0,0.6) {BI multi-cluster\\warehouse};
+        \node[table] (raw) at (3.6,2.6) {Permanent raw\\orders, payments, users};
+        \node[table] (stg) at (3.6,1.2) {Transient staging\\replayable transforms};
+        \node[table] (curated) at (7.2,1.9) {Curated facts\\clustered by date + user};
+        \node[accel] (sos) at (10.8,2.9) {SOS\\user ID + order UUID};
+        \node[accel] (clone) at (10.8,1.5) {QA zero-copy clone\\release testing};
+        \node[dr] (drill) at (10.8,0.1) {Time Travel\\backup test script};
+        \node[wh] (users) at (14.0,1.9) {BI, support,\\DataOps};
+        \draw[arrow] (etl) -- (raw);
+        \draw[arrow] (raw) -- (stg);
+        \draw[arrow] (stg) -- (curated);
+        \draw[arrow] (bi) -- (curated);
+        \draw[arrow] (curated) -- (sos);
+        \draw[arrow] (curated) -- (clone);
+        \draw[arrow] (curated) -- (drill);
+        \foreach \a in {sos,clone,drill}{\draw[arrow] (\a) -- (users);}
+    \end{tikzpicture}%
+    }
+    \caption{Milestone 1 reference architecture combining isolated warehouses, durable and transient storage layers, targeted acceleration, clone-based QA, and Time Travel recovery testing.}
+    \label{fig:chapter4-capstone-reference}
+\end{figure}
+\subsection*{Implementation Steps}
+\begin{enumerate}
+    \item Run the setup SQL in \cref{lst:chapter4-capstone-sql} in a training account. Lower row counts if needed.
+    \item Inspect table definitions and confirm which objects are permanent, transient, and clustered.
+    \item Run representative BI and support queries. Capture query IDs and note which warehouse executes each query family.
+    \item Create the QA clone and update QA-only rows. Verify that production row counts and statuses do not change.
+    \item Execute the Python recovery tester in \cref{lst:chapter4-capstone-python}. Store the JSON-like output with the capstone deliverables.
+    \item Review Fail-safe implications: raw and curated permanent tables have Fail-safe, while transient staging can be rebuilt from raw data.
+\end{enumerate}
+\begin{lstlisting}[language=SQL,caption={Milestone 1 SQL reference implementation for warehouses, storage layers, clustering, SOS, and QA clone.},label={lst:chapter4-capstone-sql}]
+USE ROLE SYSADMIN;
+CREATE OR REPLACE DATABASE ECOM_PART1_DR
+  DATA_RETENTION_TIME_IN_DAYS = 7
+  COMMENT = 'Part I capstone: permanent raw and curated e-commerce data with Time Travel drills';
+CREATE OR REPLACE WAREHOUSE ECOM_ETL_WH
+  WAREHOUSE_SIZE = 'SMALL'
+  MIN_CLUSTER_COUNT = 1
+  MAX_CLUSTER_COUNT = 2
+  SCALING_POLICY = 'ECONOMY'
+  AUTO_SUSPEND = 60
+  AUTO_RESUME = TRUE
+  INITIALLY_SUSPENDED = TRUE
+  COMMENT = 'Isolated ETL and backfill warehouse';
+CREATE OR REPLACE WAREHOUSE ECOM_BI_WH
+  WAREHOUSE_SIZE = 'XSMALL'
+  MIN_CLUSTER_COUNT = 1
+  MAX_CLUSTER_COUNT = 3
+  SCALING_POLICY = 'STANDARD'
+  AUTO_SUSPEND = 60
+  AUTO_RESUME = TRUE
+  INITIALLY_SUSPENDED = TRUE
+  COMMENT = 'Isolated BI and support lookup warehouse';
+CREATE OR REPLACE SCHEMA ECOM_PART1_DR.RAW DATA_RETENTION_TIME_IN_DAYS = 7;
+CREATE OR REPLACE TRANSIENT SCHEMA ECOM_PART1_DR.STAGE DATA_RETENTION_TIME_IN_DAYS = 1;
+CREATE OR REPLACE SCHEMA ECOM_PART1_DR.CURATED DATA_RETENTION_TIME_IN_DAYS = 7;
+USE WAREHOUSE ECOM_ETL_WH;
+CREATE OR REPLACE TABLE ECOM_PART1_DR.RAW.RAW_ORDER_EVENTS (
+    order_id NUMBER,
+    order_uuid STRING,
+    user_id NUMBER,
+    product_id NUMBER,
+    order_ts TIMESTAMP_NTZ,
+    order_date DATE,
+    channel STRING,
+    revenue NUMBER(12, 2)
+) COMMENT = 'Permanent raw order events; recover with Time Travel and Fail-safe';
+INSERT INTO ECOM_PART1_DR.RAW.RAW_ORDER_EVENTS
+SELECT
+    SEQ4(), UUID_STRING(), UNIFORM(1, 500000, RANDOM()),
+    UNIFORM(1, 100000, RANDOM()),
+    DATEADD('minute', UNIFORM(0, 60 * 24 * 45, RANDOM()), '2026-06-01'::TIMESTAMP_NTZ),
+    TO_DATE(order_ts),
+    ARRAY_CONSTRUCT('WEB', 'MOBILE', 'STORE')[UNIFORM(0, 3, RANDOM())]::STRING,
+    ROUND(UNIFORM(100, 250000, RANDOM()) / 100, 2)
+FROM TABLE(GENERATOR(ROWCOUNT => 1000000));
+CREATE OR REPLACE TRANSIENT TABLE ECOM_PART1_DR.STAGE.STG_ORDER_EVENTS AS
+SELECT * FROM ECOM_PART1_DR.RAW.RAW_ORDER_EVENTS;
+CREATE OR REPLACE TABLE ECOM_PART1_DR.CURATED.FACT_ORDERS
+  CLUSTER BY (order_date, user_id) AS
+SELECT order_id, order_uuid, user_id, product_id, order_ts, order_date, channel, revenue
+FROM ECOM_PART1_DR.STAGE.STG_ORDER_EVENTS;
+ALTER TABLE ECOM_PART1_DR.CURATED.FACT_ORDERS
+  ADD SEARCH OPTIMIZATION ON EQUALITY(user_id, order_uuid);
+USE WAREHOUSE ECOM_BI_WH;
+SELECT order_date, channel, COUNT(*) AS orders, SUM(revenue) AS revenue
+FROM ECOM_PART1_DR.CURATED.FACT_ORDERS
+WHERE order_date >= '2026-06-15'
+GROUP BY order_date, channel
+ORDER BY order_date, channel;
+CREATE OR REPLACE DATABASE ECOM_PART1_QA CLONE ECOM_PART1_DR;
+UPDATE ECOM_PART1_QA.CURATED.FACT_ORDERS
+SET channel = 'QA_ONLY'
+WHERE order_id < 1000;
+SELECT COUNT(*) AS prod_qa_only_rows
+FROM ECOM_PART1_DR.CURATED.FACT_ORDERS
+WHERE channel = 'QA_ONLY';
+\end{lstlisting}
+\begin{lstlisting}[language=Python,caption={Milestone 1 automated Time Travel backup-testing script.},label={lst:chapter4-capstone-python}]
+import os
+import snowflake.connector
+CONNECT_ARGS = {
+    "account": os.environ["SNOWFLAKE_ACCOUNT"],
+    "user": os.environ["SNOWFLAKE_USER"],
+    "password": os.environ["SNOWFLAKE_PASSWORD"],
+    "role": "SYSADMIN",
+    "warehouse": "ECOM_ETL_WH",
+    "database": "ECOM_PART1_DR",
+    "schema": "CURATED",
+}
+with snowflake.connector.connect(**CONNECT_ARGS) as connection:
+    with connection.cursor() as cursor:
+        cursor.execute("ALTER SESSION SET QUERY_TAG = 'milestone1_time_travel_drill'")
+        cursor.execute("SELECT CURRENT_TIMESTAMP()")
+        checkpoint = cursor.fetchone()[0]
+        cursor.execute("SELECT COUNT(*), SUM(revenue) FROM FACT_ORDERS")
+        baseline = cursor.fetchone()
+        cursor.execute("UPDATE FACT_ORDERS SET revenue = 0 WHERE order_id < 10000")
+        bad_query_id = cursor.sfqid
+        cursor.execute("""
+            SELECT COUNT(*), SUM(revenue)
+            FROM FACT_ORDERS AT(TIMESTAMP => %s::TIMESTAMP_NTZ)
+        """, (checkpoint,))
+        recovered = cursor.fetchone()
+        cursor.execute("""
+            CREATE OR REPLACE TABLE FACT_ORDERS_RECOVERY_TEST
+              CLONE FACT_ORDERS AT(TIMESTAMP => %s::TIMESTAMP_NTZ)
+        """, (checkpoint,))
+        clone_query_id = cursor.sfqid
+        cursor.execute("SELECT COUNT(*), SUM(revenue) FROM FACT_ORDERS_RECOVERY_TEST")
+        clone_totals = cursor.fetchone()
+        print({
+            "checkpoint": str(checkpoint),
+            "baseline": baseline,
+            "bad_query_id": bad_query_id,
+            "recovered_at_checkpoint": recovered,
+            "clone_query_id": clone_query_id,
+            "clone_totals": clone_totals,
+        })
+\end{lstlisting}
+\subsection*{Deliverables}
+\begin{itemize}
+    \item \textbf{Architecture diagram and narrative:} warehouses, raw storage, transient staging, curated facts, Search Optimization Service, QA clone, and recovery tester.
+    \item \textbf{Object inventory:} database, schemas, tables, warehouses, retention settings, table types, clustering keys, and SOS columns.
+    \item \textbf{Workload map:} ETL batch loads, BI dashboards, support point lookups, QA release tests, and recovery drills with assigned warehouses.
+    \item \textbf{Recovery evidence:} baseline totals, bad query ID, Time Travel query output, recovery clone query ID, and validation totals.
+    \item \textbf{Cost and cleanup plan:} warehouse suspend settings, stale clone cleanup, SOS monitoring, staging rebuild plan, and lab teardown commands.
+\end{itemize}
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item ETL and BI workloads use separate warehouses with auto-suspend and multi-cluster settings appropriate to their concurrency profile.
+    \item Raw e-commerce records and curated facts are permanent tables with documented Time Travel and Fail-safe expectations.
+    \item Rebuildable intermediate data is stored in transient staging layers, not permanent tables by default.
+    \item The curated fact table includes a clustering key tied to demonstrated date and user access patterns.
+    \item Search Optimization Service targets high-cardinality lookup columns and has a stated business query family.
+    \item The QA clone proves copy isolation by mutating QA rows and showing production remains unchanged.
+    \item The Time Travel backup-testing script captures a checkpoint, simulates corruption, validates historical totals, and creates a recovery clone.
+    \item The submission includes cleanup, monitoring, rollback, and ownership notes for every maintained object.
+\end{itemize}
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Add query tags for ETL, BI, support lookup, QA tests, and recovery drills, then summarize query history by tag.
+    \item Add \texttt{SYSTEM\$CLUSTERING\_INFORMATION} output for the curated fact table before and after larger loads.
+    \item Estimate Search Optimization Service cost with \texttt{SYSTEM\$ESTIMATE\_SEARCH\_OPTIMIZATION\_COSTS} before enabling SOS in a larger dataset.
+    \item Add a stored procedure or task that drops QA clones older than a tagged expiration timestamp.
+    \item Extend the disaster-recovery design with cross-account replication and a documented recovery time objective.
+\end{itemize}

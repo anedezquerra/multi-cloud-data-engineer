@@ -1,0 +1,704 @@
+\chapter{The Medallion Architecture}
+\index{medallion architecture}\index{Bronze layer}\index{Silver layer}\index{Gold layer}\index{Lakehouse}\index{Data Warehouse}\index{workspace isolation}%
+\index{financial institution}\index{Delta Lake}\index{OneLake!medallion architecture}\index{data curation}%
+
+\begin{objectives}
+\begin{itemize}
+    \item Explain the Bronze, Silver, and Gold responsibilities in a medallion architecture.
+    \item Distinguish raw landing, validated conformance, and enriched analytical curation in Microsoft Fabric.
+    \item Decide when a Fabric Lakehouse is a better serving target than a Fabric Data Warehouse, and when the warehouse is the safer choice.
+    \item Organize workspaces and lakehouses so medallion layers scale across teams, environments, domains, and compliance boundaries.
+    \item Deploy Bronze, Silver, and Gold lakehouses and prepare folder conventions for future transformations.
+    \item Use PySpark to write Delta tables across medallion layers and inspect OneLake paths.
+    \item Design a multi-workspace financial architecture that strictly isolates raw ingested logs from curated financial reports.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+The medallion pattern is not a Microsoft-only vocabulary. It is a durable data-organization idea: separate raw facts from validated facts, then publish curated business products. The implementation changes by platform, but the engineering intent stays consistent.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{3.0cm}p{3.4cm}p{4.2cm}p{3.6cm}@{}}
+\toprule
+\textbf{Concept} & \textbf{Fabric} & \textbf{AWS/Azure/GCP data lake} & \textbf{Snowflake} \\
+\midrule
+Bronze raw zone & OneLake Lakehouse such as \texttt{lh\_bronze}; raw files under \texttt{Files/bronze} and optional raw Delta tables & Object prefixes such as \texttt{s3://lake/raw/}, \texttt{abfss://lake/raw/}, or \texttt{gs://lake/raw/} & \texttt{RAW} database or schema, often loaded by Snowpipe, COPY, or external tables \\
+Silver validated zone & Lakehouse or schema holding Delta tables with types, keys, deduplication, and quality checks & Prefixes such as \texttt{/validated/} or \texttt{/staging/} with Delta, Iceberg, or Parquet contracts & \texttt{STAGING}, \texttt{CLEAN}, or \texttt{CONFORMED} schemas with transformed tables \\
+Gold curated zone & Lakehouse tables, warehouse tables, semantic models, and certified Power BI datasets & Prefixes such as \texttt{/curated/} or \texttt{/analytics/} optimized for BI and data products & \texttt{ANALYTICS}, \texttt{MART}, or presentation schemas consumed by BI tools \\
+Layer boundary & Workspace, lakehouse, folder, table, and item permissions in OneLake & Bucket, account, container, prefix, IAM, ACL, and catalog boundaries & Database, schema, role, warehouse, and masking-policy boundaries \\
+Promotion path & Dev/test/prod Fabric workspaces and deployment pipelines & Environment-specific buckets or prefixes with CI/CD and catalogs & Environment databases plus controlled role grants and cloning \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+MongoDB can express a similar progression with collections or databases such as \texttt{raw\_events}, \texttt{validated\_events}, and \texttt{analytics\_summaries}; however, document databases usually emphasize application access patterns rather than object-lake folder zones.
+\end{crosscloud}
+
+\begin{keyterms}
+\textbf{Bronze}: the raw or minimally standardized layer that preserves source fidelity. \quad
+\textbf{Silver}: the validated layer that enforces schema, removes duplicates, standardizes keys, and records quality. \quad
+\textbf{Gold}: the enriched and curated layer that serves business metrics, dimensional models, semantic models, and reports. \quad
+\textbf{Lakehouse}: the Fabric item for Spark-first open Delta-Parquet engineering. \quad
+\textbf{Warehouse}: the Fabric item for SQL-first relational modeling and serving.
+\end{keyterms}
+
+\section{Week 2 Roadmap}
+Week~2 turns the storage foundation from Chapter~1 into an operating architecture. Monday defines the medallion layers. Tuesday compares Fabric Lakehouses and Fabric Data Warehouses. Wednesday explains how to organize workspaces and lakehouses at scale. Thursday is a guided hands-on project that creates separate Bronze, Silver, and Gold lakehouses and prepares OneLake paths. Friday applies the design to a financial institution that must isolate raw ingested logs from curated financial reports.
+
+The medallion architecture is valuable because it gives data teams a shared language for trust. Bronze answers, ``What did the source send?'' Silver answers, ``What has engineering validated and conformed?'' Gold answers, ``What should the business consume?'' Databricks popularized the Bronze, Silver, Gold vocabulary for lakehouse pipelines \cite{databricksMedallion}, and Fabric makes the pattern practical with OneLake, lakehouses, Delta tables, Spark notebooks, warehouses, and Power BI \cite{microsoftFabricLakehouse,microsoftOneLakeOverview}.
+
+\begin{notebox}
+Medallion is not a law of nature. It is a contract. A small team may implement all three layers in one lakehouse; a regulated enterprise may use separate workspaces, lakehouses, capacities, domains, and security groups for each layer.
+\end{notebox}
+
+\section{Monday: Medallion Principles}
+\index{medallion architecture!principles}\index{Bronze layer!raw}\index{Silver layer!validated}\index{Gold layer!curated}
+The simplest medallion definition is a progression from raw to trusted to useful. Each layer exists because downstream consumers need a different balance between fidelity, quality, and usability. A Bronze layer should preserve evidence. A Silver layer should enforce engineering truth. A Gold layer should publish business truth.
+
+\begin{definitionbox}
+A \textbf{medallion architecture} is a layered data design that incrementally improves raw source data into validated, conformed, and curated analytical products. In Fabric, medallion layers are commonly implemented with OneLake Lakehouses, Delta tables, notebooks, pipelines, warehouses, and semantic models.
+\end{definitionbox}
+
+\subsection{Bronze: Raw Landing and Source Fidelity}
+Bronze is the first analytical landing zone. It should answer audit and replay questions: which file arrived, when did it arrive, what source produced it, what schema did it have, and can the pipeline reprocess it if transformation logic changes? Bronze may contain CSV, JSON, Avro, Parquet, or raw Delta tables. The key design principle is that Bronze should be close to the source contract and should avoid premature business interpretation.
+
+A useful Bronze table often adds ingestion metadata without changing the business payload. Examples include source file path, ingestion timestamp, batch identifier, hash values, and source system name. These fields make later debugging possible. They also preserve lineage when a Silver validation fails.
+
+\begin{tipbox}
+For regulated data, treat Bronze as evidence. Avoid overwriting raw data unless the retention policy explicitly requires it. Prefer append-only ingestion, immutable landing folders, and metadata that proves when and how records arrived.
+\end{tipbox}
+
+\subsection{Silver: Validation, Standardization, and Conformance}
+Silver is where engineering earns trust. Raw strings become typed dates, decimals, booleans, and identifiers. Duplicates are removed according to deterministic rules. Nullability expectations are checked. Source-specific codes are mapped to enterprise reference values. Personally identifiable or sensitive fields are masked, tokenized, or excluded when required by policy. Delta Lake's transaction log helps make those transformations reliable over object storage \cite{armbrust2020delta,deltaLakeDocs}.
+
+Silver tables should be boring in the best sense. They are not usually the final executive dashboard tables, but they should be reusable across multiple Gold products. Customer, account, product, branch, employee, calendar, and transaction tables often become Silver building blocks.
+
+\begin{pitfall}
+\textbf{Skipping Silver to save time.} A direct Bronze-to-report path can look fast during a demo, but it pushes schema drift, duplicate handling, invalid dates, privacy rules, and business definitions into every downstream report.
+\end{pitfall}
+
+\subsection{Gold: Enriched, Curated, and Consumption Ready}
+Gold is optimized for use. It may contain star schemas, aggregate tables, metric marts, feature sets, executive reporting tables, or semantic models. A Gold product should have an owner, definition, refresh expectation, access model, and quality signal. In Fabric, Gold may be represented by Delta tables in a lakehouse, relational tables in a warehouse, or a certified Power BI semantic model that uses Direct Lake where appropriate \cite{microsoftDirectLake}.
+
+Gold is where business language matters most. The table name \texttt{gold\_daily\_loan\_risk} means little unless the organization agrees on loan status, delinquency bucket, exposure amount, currency conversion, calendar, and risk score timing. The architecture is technical, but the value is semantic.
+
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[
+        source/.style={rectangle, rounded corners, draw=codegray, thick, fill=white, align=center, minimum width=2.6cm, minimum height=1.05cm, font=\small\bfseries},
+        medal/.style={cylinder, shape border rotate=90, aspect=0.25, draw=primary, thick, fill=backcolour, align=center, minimum width=2.7cm, minimum height=1.45cm, font=\small\bfseries},
+        process/.style={rectangle, rounded corners, draw=primary, thick, fill=primary!7, align=center, minimum width=2.9cm, minimum height=1.05cm, font=\small\bfseries},
+        consume/.style={rectangle, rounded corners, draw=codegreen!60!black, thick, fill=green!7, align=center, minimum width=2.8cm, minimum height=1.05cm, font=\small\bfseries},
+        arrow/.style={draw, thick, -Latex, draw=primary}
+    ]
+        \node[source] (src) at (0, 0) {Sources\\Apps, Files, Logs};
+        \node[medal, fill=brown!12] (bronze) at (3.7, 0) {Bronze\\Raw};
+        \node[process] (validate) at (7.3, 0) {Validate\\Type + Deduplicate};
+        \node[medal, fill=gray!15] (silver) at (10.9, 0) {Silver\\Validated};
+        \node[process] (model) at (14.5, 0) {Model\\Aggregate + Enrich};
+        \node[medal, fill=yellow!18] (gold) at (18.1, 0) {Gold\\Curated};
+        \node[consume] (serve) at (21.7, 0) {Reports\\Apps + ML};
+
+        \draw[arrow] (src) -- node[above, font=\scriptsize]{ingest} (bronze);
+        \draw[arrow] (bronze) -- node[above, font=\scriptsize]{clean} (validate);
+        \draw[arrow] (validate) -- (silver);
+        \draw[arrow] (silver) -- node[above, font=\scriptsize]{business rules} (model);
+        \draw[arrow] (model) -- (gold);
+        \draw[arrow] (gold) -- node[above, font=\scriptsize]{certify} (serve);
+
+        \node[note, text width=14cm, align=center] at (10.9, -1.65) {Each arrow should add explicit value: metadata capture, quality enforcement, conformance, enrichment, aggregation, or serving optimization.};
+    \end{tikzpicture}%
+    }
+    \caption{Bronze-to-Silver-to-Gold flow for a Fabric medallion architecture.}
+    \label{fig:chapter2-medallion-flow}
+\end{figure}
+
+\subsection{Layer Contracts}
+A layer contract states what consumers may assume. Bronze consumers may assume source fidelity and ingestion metadata, but not business correctness. Silver consumers may assume typed, validated, deduplicated, and conformed records. Gold consumers may assume business definitions, curated dimensions, certified metrics, and an intended serving path.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{2.4cm}p{4.0cm}p{4.2cm}p{3.4cm}@{}}
+\toprule
+\textbf{Layer} & \textbf{Primary promise} & \textbf{Typical checks} & \textbf{Common consumers} \\
+\midrule
+Bronze & Preserve source payload and ingestion evidence & File count, row count, schema snapshot, corrupt-record handling & Data engineers, auditors, reprocessing jobs \\
+Silver & Provide reliable conformed records & Required columns, types, duplicate keys, referential checks, privacy treatment & Engineering teams, analysts, Gold pipelines \\
+Gold & Publish business-ready products & Metric reconciliation, dimensional completeness, performance, endorsement & Power BI, finance teams, applications, executives \\
+\bottomrule
+\end{tabular}
+\caption{Layer contracts in a medallion design.}
+\label{tab:chapter2-layer-contracts}
+\end{table}
+
+\section{Tuesday: Lakehouse vs Data Warehouse in Fabric}
+\index{Lakehouse!versus warehouse}\index{Data Warehouse!Fabric}\index{SQL analytics endpoint}\index{Direct Lake}
+Fabric includes both Lakehouse and Data Warehouse items because analytical work has different shapes. The Lakehouse is Spark-first and file-aware. The Warehouse is SQL-first and relational. Both can participate in a medallion architecture, and neither is automatically superior.
+
+\begin{definitionbox}
+A \textbf{Fabric Lakehouse} is best for open Delta-Parquet engineering, notebooks, Spark transformations, files, data science, and mixed structured or semi-structured ingestion. A \textbf{Fabric Data Warehouse} is best for SQL-first relational modeling, familiar warehouse development, controlled schemas, and serving teams that primarily use T-SQL.
+\end{definitionbox}
+
+\subsection{When to Choose a Lakehouse}
+Choose a Lakehouse when the work begins with files, semi-structured data, data engineering notebooks, or Delta table transformations. Bronze and Silver are frequently lakehouse-centered because engineers need to inspect files, manage folders, process large datasets with Spark, and preserve open formats. Lakehouses are also natural when data scientists need feature exploration from the same Delta tables used by data engineers.
+
+A lakehouse does not mean ungoverned data. It simply means the primary abstraction is open files and Delta tables. Fabric's lakehouse item still participates in workspaces, OneLake, SQL analytics endpoints, semantic models, and governance metadata \cite{microsoftFabricLakehouse}.
+
+\subsection{When to Choose a Warehouse}
+Choose a Warehouse when the work is primarily relational, SQL-authored, and consumption oriented. Finance reporting, regulatory aggregates, dimensional marts, and teams with strong T-SQL practices may prefer warehouse development. A warehouse can be a strong Gold layer target when consumers expect SQL schemas, constraints of a relational serving model, and controlled access patterns.
+
+The warehouse choice can also reduce cognitive load for teams that do not need Spark. If the source is already well-modeled relational data and the transformation logic is SQL-centric, moving everything through notebooks may be unnecessary.
+
+\subsection{Decision Aid}
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{4.0cm}p{4.6cm}p{4.6cm}@{}}
+\toprule
+\textbf{Decision question} & \textbf{Prefer Lakehouse} & \textbf{Prefer Warehouse} \\
+\midrule
+Primary authoring style & PySpark, Spark SQL, notebooks, file operations & T-SQL, stored procedures, relational modeling \\
+Data shape & Raw files, JSON, CSV, Parquet, Delta, semi-structured feeds & Structured tables, facts, dimensions, SQL serving \\
+Medallion layer & Bronze and Silver by default; Gold when Direct Lake and open Delta are enough & Gold marts, finance reporting, SQL-serving products \\
+Consumer expectation & Data engineers, data scientists, mixed engines, Power BI Direct Lake & SQL analysts, BI engineers, governed relational users \\
+Change pattern & Schema discovery and iterative engineering & Stable schemas and curated consumption contracts \\
+Optimization focus & File layout, partitions, Delta transactions, Spark jobs & SQL query patterns, dimensional models, relational security \\
+\bottomrule
+\end{tabular}
+\caption{Lakehouse-versus-Warehouse decision aid for Fabric medallion design.}
+\label{tab:chapter2-lakehouse-warehouse-decision}
+\end{table}
+
+\begin{tipbox}
+A common enterprise pattern is Lakehouse for Bronze and Silver, then either Lakehouse Gold for Direct Lake semantic models or Warehouse Gold for SQL-first finance and regulatory marts. Let consumption requirements decide the Gold serving technology.
+\end{tipbox}
+
+\begin{pitfall}
+\textbf{Choosing by team preference only.} A Spark team may overuse notebooks for relational marts, while a SQL team may force raw file engineering into warehouse-shaped workflows. Choose the item type that best fits data shape, transformation style, and consumer contract.
+\end{pitfall}
+
+\section{Wednesday: Organizing Workspaces and Lakehouses at Scale}
+\index{workspace!medallion organization}\index{lakehouse!organization}\index{domain}\index{environment promotion}
+Medallion layers can be implemented inside one lakehouse, across multiple lakehouses in one workspace, or across multiple workspaces. The right boundary depends on security, team ownership, environment promotion, capacity management, and operational blast radius.
+
+\subsection{Single Lakehouse Pattern}
+A single lakehouse can contain \texttt{Files/bronze}, \texttt{Tables/silver\_*}, and \texttt{Tables/gold\_*}. This pattern is useful for training, prototypes, and small teams. It minimizes setup and makes lineage easy to see. Its weakness is that layer permissions and operational ownership are harder to separate.
+
+\subsection{Three Lakehouses in One Workspace}
+A workspace can contain \texttt{lh\_bronze}, \texttt{lh\_silver}, and \texttt{lh\_gold}. This pattern makes layer intent explicit while keeping collaboration simple. It is a good default for a domain team that shares one security boundary but wants clean medallion separation.
+
+\subsection{Multi-Workspace Pattern}
+A regulated organization may use separate workspaces such as \texttt{fin-raw-prod}, \texttt{fin-curated-prod}, and \texttt{fin-reporting-prod}. Raw ingestion teams receive access to the raw workspace. Transformation services receive controlled access to read Bronze and write Silver. Report builders receive access only to curated Gold or semantic models. This pattern has more operational overhead, but it creates stronger isolation and auditability \cite{microsoftFabricWorkspaces,microsoftDomains}.
+
+\begin{notebox}
+Workspace boundaries are not just visual organization. They affect permissions, item sharing, deployment pipelines, capacity assignment, lineage review, and incident blast radius. Use them deliberately.
+\end{notebox}
+
+\subsection{Naming, Ownership, and Promotion}
+Names should reveal layer, domain, environment, and purpose. A practical convention is \texttt{<domain>-<layer>-<env>} for workspaces and \texttt{lh\_<domain>\_<layer>} for lakehouses. Examples include \texttt{finance-bronze-dev}, \texttt{finance-silver-test}, and \texttt{finance-gold-prod}. Tables can use prefixes such as \texttt{bronze\_}, \texttt{silver\_}, and \texttt{gold\_} when multiple layers share a catalog.
+
+Ownership should be equally explicit. Bronze often belongs to ingestion or platform teams, Silver to data engineering domain teams, and Gold to business data product owners. Promotion should move definitions from development to test to production without granting developers broad write access to production raw zones.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.1cm}p{4.0cm}p{3.7cm}p{3.2cm}@{}}
+\toprule
+\textbf{Scale pattern} & \textbf{Best fit} & \textbf{Strength} & \textbf{Trade-off} \\
+\midrule
+One lakehouse & Training, proof of concept, small team & Fast setup and simple navigation & Weak layer isolation \\
+Three lakehouses & Domain team with shared security boundary & Clear medallion ownership & Requires cross-lakehouse references \\
+Multi-workspace & Regulated or multi-team enterprise & Strong isolation and blast-radius control & More governance and deployment work \\
+\bottomrule
+\end{tabular}
+\caption{Workspace and lakehouse organization patterns for medallion scale.}
+\label{tab:chapter2-workspace-patterns}
+\end{table}
+
+\section{Thursday: Hands-on Project}
+\index{hands-on lab}\index{PySpark!Delta writes}\index{OneLake!paths}\index{CSV ingestion}
+The Week~2 lab creates separate Bronze, Silver, and Gold lakehouses. You will upload a raw CSV to Bronze, prepare folder conventions, and run PySpark patterns that write Delta data to each layer. The lab is intentionally small: the goal is to practice medallion shape before adding orchestration and production data quality gates in later weeks.
+
+\subsection{Goal and Architecture}
+Create a workspace named \texttt{fabric-de-week02}. Add three lakehouses: \texttt{lh\_bronze}, \texttt{lh\_silver}, and \texttt{lh\_gold}. Upload a raw CSV file to \texttt{lh\_bronze} under \texttt{Files/bronze/raw\_csv/finance\_transactions/}. Then use a notebook attached to the lakehouses to write Bronze, Silver, and Gold Delta outputs.
+
+\begin{notebox}
+Fabric notebook path syntax can vary depending on attached lakehouses and workspace context. In a training tenant, first use the lakehouse explorer and notebook file browser to confirm paths before parameterizing production jobs.
+\end{notebox}
+
+\subsection{Step-by-Step Actions}
+\begin{enumerate}
+    \item Open Microsoft Fabric and create a workspace named \texttt{fabric-de-week02}. Assign the expected training capacity.
+    \item Create lakehouses named \texttt{lh\_bronze}, \texttt{lh\_silver}, and \texttt{lh\_gold}.
+    \item In \texttt{lh\_bronze}, create folders \texttt{Files/bronze/raw\_csv/finance\_transactions/}, \texttt{Files/bronze/quarantine/}, and \texttt{Files/bronze/metadata/}.
+    \item Upload a small raw CSV with columns such as \texttt{transaction\_id}, \texttt{account\_id}, \texttt{transaction\_date}, \texttt{amount}, \texttt{currency}, and \texttt{source\_system}.
+    \item In \texttt{lh\_silver}, reserve table names such as \texttt{silver\_finance\_transactions} and \texttt{silver\_account\_daily\_balance}.
+    \item In \texttt{lh\_gold}, reserve table names such as \texttt{gold\_daily\_cash\_movement} and \texttt{gold\_currency\_exposure}.
+    \item Create a notebook named \texttt{nb\_week02\_medallion\_setup}. Attach the three lakehouses if your Fabric experience supports multiple attachments; otherwise run one layer at a time with the appropriate default lakehouse.
+    \item Run the following PySpark patterns, adjusting paths for your tenant and sample file.
+\end{enumerate}
+
+\begin{lstlisting}[language=Python,caption={PySpark pattern for reading raw CSV and writing Delta outputs to Bronze, Silver, and Gold.},label={lst:chapter2-pyspark-medallion-writes}]
+from pyspark.sql import functions as F
+
+raw_path = "Files/bronze/raw_csv/finance_transactions/*.csv"
+
+raw_df = (
+    spark.read
+    .option("header", "true")
+    .option("inferSchema", "false")
+    .csv(raw_path)
+)
+
+bronze_df = (
+    raw_df
+    .withColumn("ingested_at", F.current_timestamp())
+    .withColumn("source_file", F.input_file_name())
+)
+
+bronze_df.write.format("delta").mode("overwrite").saveAsTable(
+    "bronze_finance_transactions_raw"
+)
+
+silver_df = (
+    bronze_df
+    .select(
+        F.col("transaction_id").cast("string").alias("transaction_id"),
+        F.col("account_id").cast("string").alias("account_id"),
+        F.to_date("transaction_date").alias("transaction_date"),
+        F.col("amount").cast("decimal(18,2)").alias("amount"),
+        F.upper(F.col("currency")).alias("currency"),
+        F.col("source_system").cast("string").alias("source_system"),
+        "ingested_at",
+        "source_file",
+    )
+    .where(F.col("transaction_id").isNotNull())
+    .where(F.col("account_id").isNotNull())
+    .where(F.col("transaction_date").isNotNull())
+    .dropDuplicates(["transaction_id"])
+)
+
+silver_df.write.format("delta").mode("overwrite").saveAsTable(
+    "silver_finance_transactions"
+)
+
+gold_df = (
+    silver_df
+    .groupBy("transaction_date", "currency")
+    .agg(
+        F.count("*").alias("transaction_count"),
+        F.sum("amount").alias("net_amount"),
+        F.sum(F.when(F.col("amount") >= 0, F.col("amount")).otherwise(F.lit(0))).alias("credits"),
+        F.sum(F.when(F.col("amount") < 0, F.col("amount")).otherwise(F.lit(0))).alias("debits"),
+    )
+    .withColumn("gold_loaded_at", F.current_timestamp())
+)
+
+gold_df.write.format("delta").mode("overwrite").saveAsTable(
+    "gold_daily_cash_movement"
+)
+\end{lstlisting}
+
+The next listing records folder and OneLake path conventions. Use it as a notebook cell, deployment note, or runbook fragment. It keeps names explicit before automation is introduced.
+
+\begin{lstlisting}[language=Python,caption={Folder and OneLake path convention helper for Week 2.},label={lst:chapter2-path-conventions}]
+workspace = "fabric-de-week02"
+lakehouses = {
+    "bronze": "lh_bronze",
+    "silver": "lh_silver",
+    "gold": "lh_gold",
+}
+
+path_conventions = [
+    "Files/bronze/raw_csv/finance_transactions/",
+    "Files/bronze/quarantine/",
+    "Files/bronze/metadata/",
+    "Tables/bronze_finance_transactions_raw",
+    "Tables/silver_finance_transactions",
+    "Tables/gold_daily_cash_movement",
+]
+
+for layer, lakehouse in lakehouses.items():
+    print(f"{layer}: {workspace}/{lakehouse}")
+
+for path in path_conventions:
+    print(path)
+\end{lstlisting}
+
+\subsection{Optional Spark SQL Validation}
+After the writes complete, validate row counts and simple totals. These checks do not prove financial correctness, but they confirm that each layer exists and is queryable.
+
+\begin{lstlisting}[language=SQL,caption={Spark SQL validation for Week 2 medallion tables.}]
+SELECT 'bronze' AS layer, COUNT(*) AS row_count
+FROM bronze_finance_transactions_raw
+UNION ALL
+SELECT 'silver' AS layer, COUNT(*) AS row_count
+FROM silver_finance_transactions
+UNION ALL
+SELECT 'gold' AS layer, COUNT(*) AS row_count
+FROM gold_daily_cash_movement;
+\end{lstlisting}
+
+\subsection{Validation Checklist}
+\begin{itemize}
+    \item The workspace exists and contains \texttt{lh\_bronze}, \texttt{lh\_silver}, and \texttt{lh\_gold}.
+    \item A raw CSV is uploaded only to the Bronze raw folder.
+    \item Bronze output preserves source fields plus ingestion metadata.
+    \item Silver output casts types, filters invalid keys, removes duplicate transaction identifiers, and writes Delta.
+    \item Gold output summarizes daily cash movement by date and currency.
+    \item Folder conventions are documented without secrets or connection strings.
+\end{itemize}
+
+\section{Friday: Use Case and Architecture}
+\index{financial institution}\index{workspace isolation}\index{regulatory reporting}\index{raw logs}\index{curated reports}
+A financial institution ingests raw application logs, payment events, customer interaction events, and operational telemetry. The raw logs may contain sensitive identifiers, operational secrets, IP addresses, device identifiers, and unfiltered message text. Finance and risk teams need curated reports about transaction volume, exception rates, settlement timeliness, and control failures. They must not receive broad access to raw logs.
+
+\subsection{Architecture Strategy}
+The design separates raw ingestion from curated reporting through workspaces. \texttt{fin-raw-prod} contains Bronze lakehouses and ingestion notebooks. \texttt{fin-validated-prod} contains Silver validation tables and quality outcomes. \texttt{fin-reporting-prod} contains Gold reporting tables, a warehouse or semantic model, and certified reports. Access flows forward through controlled jobs and item sharing; business users never receive direct access to the raw workspace.
+
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[
+        ws/.style={rectangle, rounded corners, draw=primary, thick, fill=primary!6, align=center, minimum width=4.1cm, minimum height=2.0cm, font=\small\bfseries},
+        lake/.style={cylinder, shape border rotate=90, aspect=0.25, draw=primary, thick, fill=backcolour, align=center, minimum width=2.4cm, minimum height=1.2cm, font=\small},
+        user/.style={rectangle, rounded corners, draw=codegreen!60!black, thick, fill=green!7, align=center, minimum width=2.7cm, minimum height=1.0cm, font=\small\bfseries},
+        deny/.style={draw=red!70!black, very thick, dashed, -Latex},
+        arrow/.style={draw, thick, -Latex, draw=primary}
+    ]
+        \node[ws] (raw) at (0, 0) {fin-raw-prod\\Bronze Raw Logs};
+        \node[lake, fill=brown!12] (rawlake) at (0, -1.7) {lh\\raw};
+        \node[ws] (validated) at (5.4, 0) {fin-validated-prod\\Silver Validation};
+        \node[lake, fill=gray!15] (silverlake) at (5.4, -1.7) {lh\\silver};
+        \node[ws] (reporting) at (10.8, 0) {fin-reporting-prod\\Gold Reports};
+        \node[lake, fill=yellow!18] (goldlake) at (10.8, -1.7) {lh/wh\\gold};
+        \node[user] (engineers) at (0, 2.3) {Ingestion\\Engineers};
+        \node[user] (risk) at (10.8, 2.3) {Finance + Risk\\Consumers};
+
+        \draw[arrow] (engineers) -- (raw);
+        \draw[arrow] (raw) -- node[above, font=\scriptsize]{validated pipeline} (validated);
+        \draw[arrow] (validated) -- node[above, font=\scriptsize]{curated publish} (reporting);
+        \draw[arrow] (reporting) -- (risk);
+        \draw[deny] (risk) to[bend left=18] node[above, font=\scriptsize, text=red!70!black]{no raw access} (raw);
+
+        \node[note, text width=12.5cm, align=center] at (5.4, -3.15) {Workspace isolation prevents report users from browsing raw logs while still allowing governed, forward-only medallion publication.};
+    \end{tikzpicture}%
+    }
+    \caption{Multi-workspace isolation pattern for financial medallion architecture.}
+    \label{fig:chapter2-financial-isolation}
+\end{figure}
+
+\subsection{Design Decisions}
+Raw logs remain in the Bronze workspace with restricted permissions because they may contain sensitive or irrelevant operational detail. Silver jobs parse, classify, mask, deduplicate, and validate events. Gold tables expose only approved metrics, dimensions, and report-ready aggregates. The organization can certify Gold semantic models without granting report builders access to raw messages.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.3cm}p{5.0cm}p{5.0cm}@{}}
+\toprule
+\textbf{Concern} & \textbf{Isolation decision} & \textbf{Medallion impact} \\
+\midrule
+Raw log sensitivity & Restrict \texttt{fin-raw-prod} to ingestion operators and controlled service principals & Bronze stores evidence but is not broadly browsable \\
+Validation ownership & Data engineering owns \texttt{fin-validated-prod} and publishes quality results & Silver becomes the trusted reuse layer \\
+Reporting access & Finance and risk users access \texttt{fin-reporting-prod} only & Gold contains approved metrics and semantic models \\
+Incident response & Raw workspace access can be audited separately & Investigations do not require report workspace permissions \\
+\bottomrule
+\end{tabular}
+\caption{Financial institution decisions for strict medallion isolation.}
+\label{tab:chapter2-financial-decisions}
+\end{table}
+
+\section{Operational Guidance for Week 2}
+A medallion design becomes real only when ownership and controls match the diagrams. Every layer should have an owner, retention expectation, quality expectation, and consumer policy. A missing policy will eventually become a production incident: either raw data leaks too widely, Silver quality is assumed without evidence, or Gold reports drift from definitions.
+
+\subsection{Quality and Observability}
+Quality checks should become more strict as data moves forward. Bronze checks prove ingestion completeness. Silver checks prove validity and conformance. Gold checks prove business reconciliation. Fabric capacity monitoring also matters because inefficient transformations can consume shared capacity units \cite{microsoftFabricMetricsApp}.
+
+\begin{lstlisting}[language=Python,caption={Small quality gate for Silver transaction data.}]
+from pyspark.sql import functions as F
+
+required_columns = [
+    "transaction_id",
+    "account_id",
+    "transaction_date",
+    "amount",
+    "currency",
+]
+
+missing_columns = sorted(set(required_columns) - set(silver_df.columns))
+if missing_columns:
+    raise ValueError(f"Missing required columns: {missing_columns}")
+
+quality_df = silver_df.select(
+    F.count("*").alias("rows"),
+    F.sum(F.col("transaction_id").isNull().cast("int")).alias("null_transaction_ids"),
+    F.countDistinct("transaction_id").alias("distinct_transactions"),
+    F.sum(F.col("amount").isNull().cast("int")).alias("null_amounts"),
+)
+
+quality_df.show(truncate=False)
+\end{lstlisting}
+
+\subsection{Security Checklist}
+\begin{itemize}
+    \item Limit Bronze workspace membership to ingestion operators and approved service principals.
+    \item Store curated outputs in a separate workspace when raw data contains sensitive or unfiltered fields.
+    \item Use item sharing, semantic model permissions, and workspace roles intentionally rather than relying on naming conventions.
+    \item Remove raw message text, secrets, tokens, and unnecessary identifiers before Gold publication.
+    \item Record lineage from Gold reports back to Silver validation tables and Bronze ingestion batches.
+    \item Audit who can create shortcuts or copy raw folders into less restricted workspaces.
+\end{itemize}
+
+\section{Interview Q\&A}
+\begin{enumerate}
+    \item \textbf{Q: What problem does the medallion architecture solve?}\\
+    A: It separates source fidelity, engineering validation, and business consumption so teams know which data is raw, which data is trusted, and which data is certified for decisions.
+    \item \textbf{Q: What belongs in Bronze?}\\
+    A: Raw or minimally standardized source data, ingestion metadata, source file paths, batch identifiers, and enough evidence to replay or audit ingestion.
+    \item \textbf{Q: What makes Silver different from Bronze?}\\
+    A: Silver applies schema enforcement, type casting, deduplication, key standardization, privacy treatment, and quality checks.
+    \item \textbf{Q: What makes Gold different from Silver?}\\
+    A: Gold adds business definitions, aggregations, dimensional models, semantic models, performance tuning, and certification for consumption.
+    \item \textbf{Q: When would you choose a Fabric Warehouse for Gold?}\\
+    A: Choose it when the Gold product is SQL-first, relational, finance-oriented, or consumed by teams that expect controlled warehouse schemas.
+    \item \textbf{Q: Why might a financial institution split medallion layers across workspaces?}\\
+    A: Separate workspaces enforce stronger access boundaries, limit raw data exposure, reduce blast radius, and support audited promotion from raw logs to curated reports.
+\end{enumerate}
+
+\section{Further Reading}
+Review Microsoft's Fabric overview \cite{microsoftFabricOverview}, OneLake overview \cite{microsoftOneLakeOverview}, lakehouse documentation \cite{microsoftFabricLakehouse}, workspace guidance \cite{microsoftFabricWorkspaces}, domains \cite{microsoftDomains}, Direct Lake \cite{microsoftDirectLake}, and capacity metrics \cite{microsoftFabricMetricsApp}. For lakehouse theory and storage reliability, read the medallion architecture overview \cite{databricksMedallion}, the Delta Lake paper \cite{armbrust2020delta}, Delta Lake documentation \cite{deltaLakeDocs}, and the lakehouse architecture paper \cite{armbrust2021lakehouse}.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item Bronze preserves source fidelity and ingestion evidence; it should not be treated as business-ready data.
+    \item Silver validates, conforms, deduplicates, types, and secures data so it can be reused safely.
+    \item Gold publishes curated business products through lakehouse tables, warehouses, semantic models, and reports.
+    \item Lakehouses are best for Spark-first, file-aware, open Delta-Parquet engineering; warehouses are best for SQL-first relational serving.
+    \item Workspace and lakehouse boundaries should reflect ownership, security, environment promotion, and operational blast radius.
+    \item Regulated scenarios often require multi-workspace isolation so raw logs and curated reports have different access models.
+    \item Every medallion layer needs an owner, contract, quality expectation, and documented consumer policy.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Define Bronze, Silver, and Gold in your own words. Include one example table for each layer.
+    \item \textbf{(Conceptual)} Explain why preserving source fidelity in Bronze can be more important than cleaning data immediately.
+    \item \textbf{(Design)} Choose Lakehouse or Warehouse for a Gold monthly finance mart. Justify the decision using authoring style, consumers, and security.
+    \item \textbf{(Design)} Draft a workspace naming convention for development, test, and production medallion workspaces in a bank.
+    \item \textbf{(Hands-on)} Create the three Week~2 lakehouses and upload a sample CSV to the Bronze raw folder.
+    \item \textbf{(Hands-on)} Modify \cref{lst:chapter2-pyspark-medallion-writes} to quarantine rows with missing \texttt{transaction\_id} instead of dropping them silently.
+    \item \textbf{(Operational)} Write a runbook checklist for promoting a Silver table to Gold, including quality, owner approval, and access review.
+    \item \textbf{(Interview)} In four sentences, defend why raw financial logs should not be exposed directly to report authors.
+\end{enumerate}
+
+\section{Capstone Project: Financial Medallion with Workspace Isolation}\label{sec:ch2-capstone}
+\index{capstone project}\index{financial medallion}\index{workspace isolation}\index{Bronze layer}\index{Gold layer}\index{security}
+
+\begin{capstonebox}
+\textbf{Mission.} Build an end-to-end medallion architecture for a financial institution. The architecture must isolate raw ingested logs from curated financial reports by using separate Fabric workspaces and medallion lakehouses. Your implementation should prove that raw events can be landed, validated, curated, and reported without giving report consumers direct access to raw log folders.
+
+\textbf{Estimated time.} 4--6 hours, depending on tenant permissions, available sample data, and whether your class uses separate development and production workspaces.
+
+\textbf{What you'll practice.}
+\begin{itemize}
+    \item Creating medallion workspaces for raw, validated, and reporting layers.
+    \item Landing raw financial logs in a restricted Bronze lakehouse.
+    \item Validating and masking data into a Silver Delta table.
+    \item Publishing a Gold aggregate for finance and risk reporting.
+    \item Documenting access boundaries, lineage, and acceptance criteria for a regulated data product.
+\end{itemize}
+\end{capstonebox}
+
+\subsection*{Scenario}
+A financial institution operates digital banking, card processing, loan servicing, and fraud-monitoring platforms. Each platform emits operational logs and transaction events. Raw files may include account identifiers, user agents, IP addresses, exception text, internal service names, and operational metadata. Finance and risk teams need curated metrics about transaction volume, rejected payments, settlement timeliness, high-risk exception categories, and daily exposure. They must not browse raw logs because raw events may contain sensitive or irrelevant operational details.
+
+Your job is to design and implement the smallest production-shaped medallion that proves separation of duties. The ingestion team owns raw landing. The data engineering team owns validation. Finance owns curated reporting definitions. Access must flow forward through governed transformations, not through broad workspace membership.
+
+\subsection*{Requirements}
+Build a working Fabric design with these minimum elements:
+\begin{itemize}
+    \item A restricted workspace named \texttt{fin-raw-dev} or \texttt{fin-raw-prod} with a Bronze lakehouse named \texttt{lh\_fin\_bronze}.
+    \item A validation workspace named \texttt{fin-validated-dev} or \texttt{fin-validated-prod} with a Silver lakehouse named \texttt{lh\_fin\_silver}.
+    \item A reporting workspace named \texttt{fin-reporting-dev} or \texttt{fin-reporting-prod} with a Gold lakehouse or warehouse named \texttt{lh\_fin\_gold} or \texttt{wh\_fin\_gold}.
+    \item A raw folder path \texttt{Files/bronze/raw\_logs/payment\_events/} that contains sample CSV or JSON events.
+    \item A Silver Delta table named \texttt{silver\_payment\_events} with typed fields, duplicate removal, and sensitive-field treatment.
+    \item A Gold table named \texttt{gold\_daily\_payment\_controls} with daily metrics suitable for finance and risk reports.
+    \item Documentation proving that report consumers need access only to the reporting workspace or semantic model.
+    \item No secrets, keys, tokens, connection strings, or real personal data in notebooks, screenshots, or exported files.
+\end{itemize}
+
+\subsection*{Reference Architecture}
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[
+        capws/.style={rectangle, rounded corners, draw=primary, thick, fill=primary!6, align=center, minimum width=4.2cm, minimum height=2.15cm, font=\small\bfseries},
+        capstore/.style={cylinder, shape border rotate=90, aspect=0.25, draw=primary, thick, fill=backcolour, align=center, minimum width=2.5cm, minimum height=1.3cm, font=\small},
+        capuser/.style={rectangle, rounded corners, draw=codegreen!60!black, thick, fill=green!7, align=center, minimum width=3.0cm, minimum height=1.0cm, font=\small\bfseries},
+        caparrow/.style={draw, thick, -Latex, draw=primary},
+        capdeny/.style={draw=red!70!black, very thick, dashed, -Latex}
+    ]
+        \node[capuser] (sources) at (-4.8, 0) {Banking Systems\\Logs + Events};
+        \node[capws] (rawws) at (0, 0) {Workspace: fin-raw\\Restricted Bronze};
+        \node[capstore, fill=brown!12] (bronze) at (0, -1.85) {lh\_fin\\bronze};
+        \node[capws] (silverws) at (5.3, 0) {Workspace: fin-validated\\Engineering Silver};
+        \node[capstore, fill=gray!15] (silver) at (5.3, -1.85) {lh\_fin\\silver};
+        \node[capws] (goldws) at (10.6, 0) {Workspace: fin-reporting\\Curated Gold};
+        \node[capstore, fill=yellow!18] (gold) at (10.6, -1.85) {lh/wh\\gold};
+        \node[capuser] (consumers) at (15.4, 0) {Finance + Risk\\Reports};
+
+        \draw[caparrow] (sources) -- node[above, font=\scriptsize]{ingest} (rawws);
+        \draw[caparrow] (rawws) -- node[above, font=\scriptsize]{read controlled} (silverws);
+        \draw[caparrow] (silverws) -- node[above, font=\scriptsize]{publish curated} (goldws);
+        \draw[caparrow] (goldws) -- node[above, font=\scriptsize]{consume} (consumers);
+        \draw[capdeny] (consumers) to[bend left=25] node[above, font=\scriptsize, text=red!70!black]{denied} (rawws);
+
+        \node[note, text width=13.6cm, align=center] at (5.3, -3.35) {The capstone proves forward-only trust: raw evidence is retained, Silver quality is documented, and Gold reports expose only approved financial metrics.};
+    \end{tikzpicture}%
+    }
+    \caption{Reference architecture for the financial medallion capstone.}
+    \label{fig:chapter2-capstone-reference-architecture}
+\end{figure}
+
+\subsection*{Implementation Steps}
+\begin{enumerate}
+    \item \textbf{Create workspaces.} Create \texttt{fin-raw-dev}, \texttt{fin-validated-dev}, and \texttt{fin-reporting-dev}. If your tenant permits only one workspace, simulate the boundary with three lakehouses and document the production workspace split.
+    \item \textbf{Create lakehouses.} Add \texttt{lh\_fin\_bronze}, \texttt{lh\_fin\_silver}, and \texttt{lh\_fin\_gold}. Use a warehouse for Gold if your team chooses SQL-first reporting.
+    \item \textbf{Create raw folders.} In Bronze, create \texttt{Files/bronze/raw\_logs/payment\_events/}, \texttt{Files/bronze/quarantine/}, and \texttt{Files/bronze/metadata/}.
+    \item \textbf{Upload sample events.} Use instructor-provided synthetic logs or create a small CSV with payment event identifiers, timestamps, account identifiers, amount, currency, status, exception category, and channel.
+    \item \textbf{Write Bronze and Silver.} Run the first notebook listing to preserve raw ingestion metadata and create \texttt{silver\_payment\_events}.
+    \item \textbf{Write Gold.} Run the second listing to create \texttt{gold\_daily\_payment\_controls} for reporting.
+    \item \textbf{Document access.} Record which personas can access each workspace and explain why report consumers do not need raw workspace membership.
+    \item \textbf{Validate lineage.} Capture row counts for raw, Silver, and Gold outputs and explain any rejected or quarantined records.
+\end{enumerate}
+
+\begin{lstlisting}[language=Python,caption={Capstone Bronze-to-Silver PySpark transformation with sensitive-field treatment.},label={lst:chapter2-capstone-bronze-silver}]
+from pyspark.sql import functions as F
+
+raw_path = "Files/bronze/raw_logs/payment_events/*.csv"
+
+raw_events_df = (
+    spark.read
+    .option("header", "true")
+    .option("inferSchema", "false")
+    .csv(raw_path)
+)
+
+bronze_events_df = (
+    raw_events_df
+    .withColumn("ingested_at", F.current_timestamp())
+    .withColumn("source_file", F.input_file_name())
+)
+
+bronze_events_df.write.format("delta").mode("overwrite").saveAsTable(
+    "bronze_payment_events_raw"
+)
+
+silver_payment_events_df = (
+    bronze_events_df
+    .select(
+        F.col("event_id").cast("string").alias("event_id"),
+        F.col("payment_id").cast("string").alias("payment_id"),
+        F.sha2(F.col("account_id").cast("string"), 256).alias("account_hash"),
+        F.to_timestamp("event_timestamp").alias("event_timestamp"),
+        F.to_date("event_timestamp").alias("event_date"),
+        F.col("amount").cast("decimal(18,2)").alias("amount"),
+        F.upper(F.col("currency")).alias("currency"),
+        F.upper(F.col("status")).alias("status"),
+        F.col("exception_category").cast("string").alias("exception_category"),
+        F.col("channel").cast("string").alias("channel"),
+        "ingested_at",
+        "source_file",
+    )
+    .where(F.col("event_id").isNotNull())
+    .where(F.col("payment_id").isNotNull())
+    .where(F.col("event_timestamp").isNotNull())
+    .dropDuplicates(["event_id"])
+)
+
+silver_payment_events_df.write.format("delta").mode("overwrite").saveAsTable(
+    "silver_payment_events"
+)
+\end{lstlisting}
+
+\begin{lstlisting}[language=Python,caption={Capstone Silver-to-Gold PySpark aggregate for financial controls.},label={lst:chapter2-capstone-silver-gold}]
+from pyspark.sql import functions as F
+
+gold_daily_controls_df = (
+    silver_payment_events_df
+    .groupBy("event_date", "currency", "channel")
+    .agg(
+        F.count("*").alias("event_count"),
+        F.countDistinct("payment_id").alias("payment_count"),
+        F.sum("amount").alias("gross_amount"),
+        F.sum(F.when(F.col("status") == "REJECTED", 1).otherwise(0)).alias("rejected_count"),
+        F.sum(F.when(F.col("exception_category").isNotNull(), 1).otherwise(0)).alias("exception_count"),
+    )
+    .withColumn(
+        "rejection_rate",
+        F.col("rejected_count") / F.when(F.col("event_count") == 0, None).otherwise(F.col("event_count")),
+    )
+    .withColumn("gold_loaded_at", F.current_timestamp())
+)
+
+gold_daily_controls_df.write.format("delta").mode("overwrite").saveAsTable(
+    "gold_daily_payment_controls"
+)
+
+gold_daily_controls_df.orderBy("event_date", "currency", "channel").show(50, truncate=False)
+\end{lstlisting}
+
+If Gold is implemented as a warehouse table, use a SQL validation query after loading or shortcuting the curated data into the SQL-serving layer.
+
+\begin{lstlisting}[language=SQL,caption={Capstone SQL validation for curated financial control metrics.}]
+SELECT
+    event_date,
+    currency,
+    SUM(event_count) AS event_count,
+    SUM(rejected_count) AS rejected_count,
+    SUM(exception_count) AS exception_count
+FROM gold_daily_payment_controls
+GROUP BY event_date, currency
+ORDER BY event_date, currency;
+\end{lstlisting}
+
+\subsection*{Deliverables}
+Submit evidence that the architecture and implementation are complete:
+\begin{itemize}
+    \item Workspace names, lakehouse or warehouse names, and capacity assignment notes.
+    \item Screenshot or exported evidence of the Bronze raw folder and the Silver and Gold tables.
+    \item Notebook output showing row counts for Bronze, Silver, and Gold.
+    \item Schema for \texttt{silver\_payment\_events}, including which sensitive fields were hashed, removed, or retained.
+    \item Schema for \texttt{gold\_daily\_payment\_controls}, including metric definitions.
+    \item Access matrix listing ingestion engineers, data engineers, finance report authors, risk consumers, and administrators.
+    \item A short explanation of why report consumers do not need access to \texttt{fin-raw-dev} or \texttt{fin-raw-prod}.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+Use this rubric before declaring the capstone complete:
+\begin{itemize}
+    \item[\(\square\)] Raw files are stored only in the Bronze raw path.
+    \item[\(\square\)] Bronze data includes ingestion metadata such as load timestamp and source file.
+    \item[\(\square\)] Silver data casts types, removes duplicate event identifiers, and handles sensitive account identifiers.
+    \item[\(\square\)] Gold data contains only curated metrics required for finance and risk reporting.
+    \item[\(\square\)] Report consumers can use Gold outputs without direct raw workspace access.
+    \item[\(\square\)] The access matrix shows different personas for raw ingestion, validation, and reporting.
+    \item[\(\square\)] Row counts are reconciled or rejected records are explained.
+    \item[\(\square\)] No secrets, credentials, tokens, real account identifiers, or unnecessary personal data appear in submitted artifacts.
+    \item[\(\square\)] The final architecture explains how data moves forward from Bronze to Silver to Gold.
+    \item[\(\square\)] The design states whether Gold is served from a Lakehouse, Warehouse, semantic model, or a combination.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+If you finish early, extend the capstone while preserving strict isolation:
+\begin{itemize}
+    \item Add a quarantine table for invalid payment events and report rejection reasons by source file.
+    \item Add a reference table for currency validation and reject unsupported currency codes.
+    \item Build a small Power BI semantic model over \texttt{gold\_daily\_payment\_controls} and document whether Direct Lake is appropriate.
+    \item Split development and production into separate workspace sets and describe a deployment-pipeline promotion path.
+    \item Add sensitivity labels or item-level notes that identify raw, validated, and curated assets.
+    \item Add a reconciliation check that compares total Bronze payment identifiers with Silver accepted plus quarantined identifiers.
+\end{itemize}

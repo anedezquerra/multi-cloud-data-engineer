@@ -1,0 +1,544 @@
+\chapter{Tables, Views, Materialized Views, and Search Optimization}
+\index{tables}\index{views}\index{materialized views}\index{Search Optimization Service}\index{Week 3}%
+\begin{objectives}
+\begin{itemize}
+    \item Compare permanent, transient, and temporary tables by persistence, session scope, Time Travel, Fail-safe, and recovery implications.
+    \item Explain when standard views, secure views, and materialized views improve governance, abstraction, or query speed.
+    \item Describe Search Optimization Service as an access path for selective point lookups on high-cardinality predicates.
+    \item Build an ETL staging pattern with transient tables, a daily aggregation materialized view, and search optimization on a UUID column.
+    \item Use SQL and Python benchmarks to measure latency, scanned data, and credit trade-offs for table and acceleration choices.
+    \item Evaluate Automatic Clustering, materialized views, Search Optimization Service, and result cache for an e-commerce analytics layer.
+    \item Design a capstone acceleration strategy that balances credit cost, freshness, storage overhead, and query latency.
+\end{itemize}
+\end{objectives}
+\begin{crosscloud}
+Snowflake table and view acceleration features fit a larger cloud analytics pattern: keep one logical model, then add access paths, precomputed results, or cache layers only where workload evidence justifies the cost. The names differ across platforms, but engineers still ask the same questions: which data is persisted, which result is precomputed, which predicate is accelerated, and which cache is safe to rely on?
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{2.6cm}p{3.0cm}p{3.0cm}p{3.0cm}p{3.0cm}@{}}
+\toprule
+\textbf{Concept} & \textbf{Snowflake} & \textbf{AWS Redshift} & \textbf{Azure Synapse} & \textbf{GCP BigQuery} \\
+\midrule
+Materialized view & Materialized Views maintained by Snowflake for eligible deterministic queries & Materialized views with refresh and query rewrite support & Materialized views in dedicated SQL pools for precomputed aggregations & Materialized views with automatic refresh and optimizer rewrite \\
+Point-lookup acceleration & Search Optimization Service for selective predicates on high-cardinality columns & Sort keys, distribution choices, zone maps, and selective materialized views & Ordered clustered columnstore design, replicated dimensions, and statistics & Search indexes for point lookups and text-like search on supported data \\
+Transient and temporary tables & Permanent, transient, and temporary table types with different retention and Fail-safe behavior & Temporary tables and persistent tables; no direct Fail-safe equivalent & Temporary tables, external tables, and dedicated pool tables & Temporary tables, expiring tables, and dataset-level default expiration \\
+Caching & Persisted result cache, warehouse local cache, metadata pruning & RA3 managed storage cache and result cache behavior in serverless contexts & Result-set caching and data movement caches & BI Engine, result cache, storage cache, and slot-level execution optimizations \\
+\bottomrule
+\end{tabular}}
+\vspace{1mm}
+\textbf{Microsoft Fabric} adds another variant: Direct Lake tables can avoid SQL warehouse import for some Power BI workloads, while Fabric warehouse endpoints still expose familiar relational acceleration questions. \textbf{MongoDB} is a useful operational contrast: indexes are explicit access paths over document collections rather than warehouse-managed materialized relational projections. In Snowflake documentation and SQL, system functions such as \texttt{SYSTEM\$ESTIMATE\_SEARCH\_OPTIMIZATION\_COSTS} contain a dollar sign; in LaTeX prose that token must be escaped.
+\end{crosscloud}
+\section{Week 3 Roadmap}
+Week 3 moves from compute sizing to physical and logical data structures. Chapter 2 showed that virtual warehouses govern execution capacity. This chapter shows how table type, view type, and access-path design determine how much useful work that compute performs. The central lesson is that acceleration is not one feature. It is a portfolio: table persistence controls durability and recovery cost, views control abstraction and security, materialized views precompute recurring results, Search Optimization Service accelerates selective lookups, clustering improves pruning for range and join patterns, and caches remove repeated work when eligibility rules permit \cite{snowflakeTablesDocs,snowflakeViewsDocs,snowflakeMaterializedViewsDocs,snowflakeSearchOptimizationDocs}.
+The week follows five practical questions. Monday asks which table type belongs in durable marts, transient ETL stages, and session-scoped scratch work. Tuesday compares view types, including secure views and materialized views. Wednesday explains Search Optimization Service for point lookups on high-cardinality columns. Thursday implements a hands-on staging and acceleration lab. Friday turns the mechanics into a cost-performance decision framework for an e-commerce analytics layer.
+\begin{keyterms}
+\textbf{Permanent table}: the default durable Snowflake table type, with Time Travel and Fail-safe protection according to account edition and retention settings.\quad
+\textbf{Transient table}: a persistent table without Fail-safe, commonly used for reproducible staging or intermediate data.\quad
+\textbf{Temporary table}: a session-scoped table that disappears when the session ends.\quad
+\textbf{Secure view}: a view designed to protect query definition and reduce data-exposure side channels.\quad
+\textbf{Materialized view}: a Snowflake-maintained persisted result for an eligible query definition.\quad
+\textbf{Search Optimization Service}: a Snowflake-managed access path that accelerates highly selective lookups.
+\end{keyterms}
+\section{Monday: Permanent, Transient, and Temporary Tables}
+\index{permanent table}\index{transient table}\index{temporary table}\index{Time Travel}\index{Fail-safe}
+Snowflake table type is an architectural choice, not a naming preference. A permanent table favors recoverability and durable business truth. A transient table favors lower storage-protection overhead for data that can be regenerated. A temporary table favors session isolation and short-lived scratch processing. The same columns and SQL can appear in all three, but their lifecycle and recovery promises differ \cite{snowflakeTableTypesDocs}.
+\begin{definitionbox}
+A \textbf{table type} defines persistence and recovery behavior. Permanent tables are durable objects with Time Travel and Fail-safe. Transient tables persist across sessions and support Time Travel, but they do not have Fail-safe. Temporary tables are visible only within the creating session and are automatically dropped at session end.
+\end{definitionbox}
+Permanent tables should hold curated facts, dimensions, conformed reference data, audit data, and data products that downstream teams trust. They justify stronger recovery because accidental deletes, bad merges, or corrupted loads may have business impact. Time Travel can restore prior versions within the configured retention window. Fail-safe is a Snowflake-managed last-resort recovery period after Time Travel expires; it is not a user query feature, but it increases protection for permanent data.
+Transient tables are ideal for reproducible ETL staging, derived intermediates, and backfill work where the source system or upstream permanent layer can rebuild the data. They can survive across sessions and task runs, unlike temporary tables, but they avoid Fail-safe. That makes them attractive for high-churn staging zones where keeping every intermediate fragment under full disaster-recovery protection would waste storage dollars.
+Temporary tables are best for one session's scratch state: notebook exploration, stored procedure scratch tables, small intermediate joins, and test harnesses. They can shadow permanent table names within the session, so engineers must be careful when debugging. A temporary table that worked in a notebook may not exist for the orchestration session that runs the production task.
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{2.4cm}p{3.2cm}p{3.2cm}p{3.2cm}p{2.6cm}@{}}
+\toprule
+\textbf{Type} & \textbf{Persistence} & \textbf{Time Travel} & \textbf{Fail-safe} & \textbf{Best use} \\
+\midrule
+Permanent & Persists until dropped & Configurable retention by edition and object settings & Yes, Snowflake-managed recovery after Time Travel & Curated marts, dimensions, facts, audit records \\
+Transient & Persists until dropped & Supported, usually with shorter retention choices & No Fail-safe & ETL staging, rebuildable intermediate tables \\
+Temporary & Session-scoped; dropped when session ends & Available only while the table exists in the session & No Fail-safe & Scratch work, notebook experiments, procedure internals \\
+\bottomrule
+\end{tabular}
+\caption{Snowflake table types trade recoverability and durability for lower overhead and narrower scope.}
+\label{tab:chapter3-table-types}
+\end{table}
+\begin{figure}[H]
+    \centering
+    \resizebox{0.95\textwidth}{!}{%
+    \begin{tikzpicture}[
+        axis/.style={draw=codegray, thick, -Latex},
+        block/.style={rectangle, draw=primary, fill=primary!5, rounded corners, minimum height=1.1cm, text width=3.2cm, align=center, font=\scriptsize\bfseries},
+        weak/.style={rectangle, draw=codegray, fill=backcolour, rounded corners, minimum height=1.0cm, text width=3.0cm, align=center, font=\scriptsize},
+        strong/.style={rectangle, draw=codegreen!60!black, fill=green!8, rounded corners, minimum height=1.0cm, text width=3.0cm, align=center, font=\scriptsize}
+    ]
+        \draw[axis] (0,0) -- (12,0) node[right,font=\scriptsize\bfseries] {more durable recovery};
+        \node[weak] (tmp) at (2,1.0) {Temporary table\\session only\\no Fail-safe};
+        \node[block] (trans) at (6,1.0) {Transient table\\persistent staging\\Time Travel, no Fail-safe};
+        \node[strong] (perm) at (10,1.0) {Permanent table\\business record\\Time Travel + Fail-safe};
+        \draw[dashed, codegray] (3.6,-0.25) -- (3.6,1.8);
+        \draw[dashed, codegray] (8.0,-0.25) -- (8.0,1.8);
+        \node[font=\scriptsize, text=codegray, align=center] at (2,-0.55) {lowest recovery\\lowest persistence};
+        \node[font=\scriptsize, text=codegray, align=center] at (6,-0.55) {rebuildable\\pipeline state};
+        \node[font=\scriptsize, text=codegray, align=center] at (10,-0.55) {highest protection\\highest accountability};
+    \end{tikzpicture}%
+    }
+    \caption{Table type selection forms a persistence and recovery spectrum from session scratch work to protected business data.}
+    \label{fig:chapter3-table-type-spectrum}
+\end{figure}
+\begin{tipbox}
+Use transient tables when the data can be recreated deterministically from upstream sources. Use permanent tables when downstream users would expect recovery support, auditability, and stronger operational protection.
+\end{tipbox}
+\begin{pitfall}
+\textbf{Using transient tables for irreplaceable data.} A transient table can reduce protection overhead, but it removes Fail-safe. If the upstream feed cannot be replayed or the table is the system of record for analytics, permanent storage is safer.
+\end{pitfall}
+\subsection{Retention, Cloning, and Staging Design}
+\index{retention}\index{zero-copy cloning}\index{ETL staging}
+Retention settings and zero-copy cloning interact with table type. Permanent objects can retain historical versions longer, while transient objects intentionally narrow recovery exposure. For ETL staging, a common pattern is to land raw immutable files externally or in a permanent raw table, then transform into transient stage tables that can be truncated and rebuilt. Final curated facts and aggregates then land in permanent tables or secure semantic views.
+\begin{notebox}
+A transient staging table is not a substitute for a raw data retention strategy. If source files are deleted and the transient table is corrupted, there may be no recovery path. Keep the replay source durable before optimizing staging cost.
+\end{notebox}
+\section{Tuesday: Standard Views, Secure Views, and Materialized Views}
+\index{standard view}\index{secure view}\index{materialized view}\index{view maintenance}
+Views separate logical access from physical storage. A standard view stores a SQL definition and executes against underlying objects at query time. A secure view adds protections for data sharing and governance-sensitive definitions. A materialized view stores query results and Snowflake maintains those results as base data changes. The engineering question is whether the view is primarily an abstraction, a security boundary, or a performance object \cite{snowflakeViewsDocs,snowflakeSecureViewsDocs,snowflakeMaterializedViewsDocs}.
+\begin{definitionbox}
+A \textbf{standard view} is a logical query definition. A \textbf{secure view} is a protected query definition for sensitive data sharing or governance. A \textbf{materialized view} is a persisted, maintained result set designed to speed eligible queries at the cost of storage and maintenance credits.
+\end{definitionbox}
+Standard views are excellent for semantic consistency: rename columns, centralize joins, hide raw ingestion details, and present conformed analytics logic. They do not precompute results. If a standard view scans a billion-row fact table, the consuming query still pays the execution cost unless result cache, pruning, or other acceleration features help.
+Secure views are used when the definition itself or intermediate evaluation could expose sensitive information. They are common in data sharing, masking designs, row filtering, and governed marts. Because secure views can constrain optimizer behavior to preserve security guarantees, they should be reserved for sensitive boundaries rather than used automatically for every semantic view.
+Materialized views are performance objects. They work best when many queries repeatedly request the same filtered, projected, or aggregated result over changing base data. Snowflake maintains the materialized result, which can improve read latency but creates storage and maintenance overhead. A materialized view that is rarely queried, changes constantly, or duplicates a cheap result-cache hit can cost more than it saves.
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{2.7cm}p{3.6cm}p{3.9cm}p{3.3cm}@{}}
+\toprule
+\textbf{View type} & \textbf{Primary purpose} & \textbf{Performance behavior} & \textbf{Operational caution} \\
+\midrule
+Standard view & Semantic abstraction and reuse & Executes underlying query at runtime & Can hide expensive joins or scans from users \\
+Secure view & Controlled data exposure and protected definitions & May trade some optimization freedom for security semantics & Use for genuine governance boundaries \\
+Materialized view & Precomputed acceleration for recurring patterns & Stores and maintains results for eligible query rewrite & Adds storage and maintenance credits \\
+\bottomrule
+\end{tabular}
+\caption{View type should follow intent: abstraction, security, or maintained acceleration.}
+\label{tab:chapter3-view-types}
+\end{table}
+\begin{tipbox}
+Start with a standard view for semantic reuse. Upgrade to a secure view when the view is a security boundary. Add a materialized view only after query history shows repeated, expensive patterns that match a stable definition.
+\end{tipbox}
+\subsection{Maintenance Overhead Versus Query Speed}
+\index{query speed}\index{maintenance overhead}
+Materialized views shift work from query time to maintenance time. That is a good trade when many users repeatedly query the same daily revenue aggregate, and freshness requirements allow Snowflake to maintain the result efficiently. It is a poor trade when the base table receives constant small changes, query shapes are unpredictable, or users rarely hit the materialized definition.
+\begin{pitfall}
+\textbf{Materializing every dashboard query.} Materialized views are not free indexes. Each one increases storage and maintenance work. Favor a small number of high-value, repeatedly used aggregates and validate them with query history.
+\end{pitfall}
+\section{Wednesday: Search Optimization Service for Point Lookups}
+\index{Search Optimization Service}\index{point lookup}\index{high-cardinality column}\index{UUID}
+Search Optimization Service, often abbreviated SOS, is a Snowflake-managed access path that improves performance for selective predicates. It is especially useful when queries search for a few values in a large table and micro-partition pruning alone cannot narrow the scan enough. Typical examples include lookup by order UUID, device identifier, customer token, email hash, or other high-cardinality columns \cite{snowflakeSearchOptimizationDocs}.
+\begin{definitionbox}
+\textbf{Search Optimization Service} maintains search access paths for a table so that highly selective filters can find matching micro-partitions more directly. It is designed for point lookups and selective predicates, not for broad scans or general aggregation acceleration.
+\end{definitionbox}
+SOS does not replace good data modeling, clustering, or materialized views. It answers a narrower question: can Snowflake avoid scanning large portions of a table when a predicate targets one or a small set of values? If a dashboard computes revenue by day for every region, a materialized view may help. If a support analyst enters one order UUID into an operational analytics screen, SOS may help. If most queries filter on a date range and join by customer, clustering may help.
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[
+        q/.style={rectangle, draw=primary, fill=primary!5, rounded corners, minimum height=1.0cm, text width=2.8cm, align=center, font=\scriptsize\bfseries},
+        path/.style={rectangle, draw=magenta, fill=magenta!10, rounded corners, minimum height=1.0cm, text width=3.1cm, align=center, font=\scriptsize\bfseries},
+        mp/.style={rectangle, draw=codegreen!60!black, fill=green!8, rounded corners, minimum height=0.8cm, text width=2.2cm, align=center, font=\scriptsize},
+        skip/.style={rectangle, draw=codegray, fill=backcolour, rounded corners, minimum height=0.8cm, text width=2.2cm, align=center, font=\scriptsize},
+        arrow/.style={draw, thick, -Latex, draw=primary}
+    ]
+        \node[q] (query) at (0,0) {Predicate\\order\_uuid = value};
+        \node[path] (sos) at (3.8,0) {SOS search access path\\high-cardinality map};
+        \node[mp] (m1) at (7.6,1.5) {Micro-partition\\candidate};
+        \node[skip] (m2) at (7.6,0.5) {Micro-partition\\skipped};
+        \node[mp] (m3) at (7.6,-0.5) {Micro-partition\\candidate};
+        \node[skip] (m4) at (7.6,-1.5) {Micro-partition\\skipped};
+        \node[q] (wh) at (11.0,0) {Warehouse scans\\few candidates};
+        \draw[arrow] (query) -- (sos);
+        \foreach \m in {m1,m2,m3,m4}{\draw[arrow] (sos) -- (\m);}
+        \draw[arrow] (m1) -- (wh);
+        \draw[arrow] (m3) -- (wh);
+    \end{tikzpicture}%
+    }
+    \caption{Search Optimization Service adds a Snowflake-managed access path so selective predicates can target candidate micro-partitions instead of broad table scans.}
+    \label{fig:chapter3-sos-access-path}
+\end{figure}
+\begin{notebox}
+Use \texttt{SYSTEM\$ESTIMATE\_SEARCH\_OPTIMIZATION\_COSTS} before enabling SOS on large production tables. The estimate is not a substitute for measurement, but it supports responsible review before adding maintenance cost.
+\end{notebox}
+\subsection{When SOS Is a Poor Fit}
+SOS is less compelling for low-cardinality predicates such as status, channel, or country when each value matches a large fraction of the table. It is also less useful when the query already prunes well through clustering or date partition locality, when the result cache serves repeated exact SQL, or when the workload is dominated by full-table aggregations. For these cases, materialized views, clustering, warehouse sizing, or SQL rewrite may be more effective.
+\begin{pitfall}
+\textbf{Treating SOS as a universal index.} Search optimization is selective-query acceleration. If a predicate returns millions of rows, SOS may add maintenance cost without meaningful latency improvement.
+\end{pitfall}
+\section{Thursday Hands-On Project: Staging Tables, Materialized Views, and Search Optimization}
+\index{hands-on project}\index{transient staging}\index{materialized view!daily aggregation}\index{Search Optimization Service!hands-on}
+The lab creates transient staging tables for ETL, loads synthetic e-commerce events, creates a daily materialized view, and enables Search Optimization Service on a high-cardinality UUID column. The Python script then runs simple measurements for a daily aggregate and a point lookup. Use a training account and small warehouses first. Disable cached results during measurement when you want execution behavior rather than result-cache reuse.
+\begin{pitfall}
+\textbf{Credit safety.} Materialized views and Search Optimization Service can consume maintenance credits after initial setup. Run the lab on modest row counts, collect evidence, and drop or suspend objects when finished if your account is credit constrained.
+\end{pitfall}
+\begin{lstlisting}[language=SQL,caption={Creating transient staging tables, a materialized view, and Search Optimization Service.},label={lst:chapter3-staging-mv-sos-sql}]
+USE ROLE SYSADMIN;
+CREATE OR REPLACE DATABASE SNOWFLAKE_DE_BOOK;
+CREATE OR REPLACE SCHEMA SNOWFLAKE_DE_BOOK.WEEK3_ACCELERATION;
+CREATE OR REPLACE WAREHOUSE ACCELERATION_LAB_WH
+  WAREHOUSE_SIZE = 'XSMALL'
+  AUTO_SUSPEND = 60
+  AUTO_RESUME = TRUE
+  INITIALLY_SUSPENDED = TRUE;
+USE WAREHOUSE ACCELERATION_LAB_WH;
+USE DATABASE SNOWFLAKE_DE_BOOK;
+USE SCHEMA WEEK3_ACCELERATION;
+CREATE OR REPLACE TRANSIENT TABLE STG_ORDER_EVENTS (
+    order_uuid STRING,
+    customer_id NUMBER,
+    product_id NUMBER,
+    event_ts TIMESTAMP_NTZ,
+    event_date DATE,
+    channel STRING,
+    region STRING,
+    quantity NUMBER,
+    revenue NUMBER(12, 2)
+);
+INSERT INTO STG_ORDER_EVENTS
+SELECT
+    UUID_STRING() AS order_uuid,
+    UNIFORM(1, 250000, RANDOM()) AS customer_id,
+    UNIFORM(1, 50000, RANDOM()) AS product_id,
+    DATEADD('second', UNIFORM(0, 60 * 60 * 24 * 30, RANDOM()),
+            '2026-07-01'::TIMESTAMP_NTZ) AS event_ts,
+    TO_DATE(event_ts) AS event_date,
+    ARRAY_CONSTRUCT('WEB', 'STORE', 'MOBILE')[UNIFORM(0, 3, RANDOM())]::STRING AS channel,
+    ARRAY_CONSTRUCT('NORTH', 'SOUTH', 'EAST', 'WEST')[UNIFORM(0, 4, RANDOM())]::STRING AS region,
+    UNIFORM(1, 6, RANDOM()) AS quantity,
+    ROUND(UNIFORM(100, 500000, RANDOM()) / 100, 2) AS revenue
+FROM TABLE(GENERATOR(ROWCOUNT => 2000000));
+CREATE OR REPLACE TABLE ORDER_EVENTS AS
+SELECT * FROM STG_ORDER_EVENTS;
+CREATE OR REPLACE MATERIALIZED VIEW MV_DAILY_REVENUE AS
+SELECT
+    event_date,
+    region,
+    channel,
+    COUNT(*) AS order_events,
+    SUM(quantity) AS units,
+    SUM(revenue) AS revenue
+FROM ORDER_EVENTS
+GROUP BY event_date, region, channel;
+ALTER TABLE ORDER_EVENTS ADD SEARCH OPTIMIZATION ON EQUALITY(order_uuid);
+ALTER SESSION SET USE_CACHED_RESULT = FALSE;
+SELECT *
+FROM MV_DAILY_REVENUE
+WHERE event_date BETWEEN '2026-07-10' AND '2026-07-16'
+ORDER BY event_date, region, channel;
+SELECT *
+FROM ORDER_EVENTS
+WHERE order_uuid = (SELECT order_uuid FROM ORDER_EVENTS LIMIT 1);
+\end{lstlisting}
+The SQL creates a transient staging table first, then promotes the synthetic data to a durable permanent table used by the materialized view and SOS. In a production pipeline, the permanent table would be a curated fact table fed by deterministic loads. The transient table would be truncated, replaced, or recreated for each batch.
+\begin{lstlisting}[language=Python,caption={Python connector benchmark for daily aggregation and UUID point lookup.},label={lst:chapter3-python-benchmark}]
+import os
+import statistics
+import time
+import snowflake.connector
+CONNECT_ARGS = {
+    "account": os.environ["SNOWFLAKE_ACCOUNT"],
+    "user": os.environ["SNOWFLAKE_USER"],
+    "password": os.environ["SNOWFLAKE_PASSWORD"],
+    "role": "SYSADMIN",
+    "warehouse": "ACCELERATION_LAB_WH",
+    "database": "SNOWFLAKE_DE_BOOK",
+    "schema": "WEEK3_ACCELERATION",
+}
+QUERIES = {
+    "daily_mv": """
+        SELECT event_date, region, channel, revenue
+        FROM MV_DAILY_REVENUE
+        WHERE event_date BETWEEN '2026-07-10' AND '2026-07-16'
+        ORDER BY event_date, region, channel
+    """,
+    "uuid_lookup": """
+        SELECT *
+        FROM ORDER_EVENTS
+        WHERE order_uuid = %s
+    """,
+}
+def timed(cursor, label, sql, params=None):
+    started = time.perf_counter()
+    cursor.execute(sql, params or ())
+    rows = cursor.fetchall()
+    elapsed = time.perf_counter() - started
+    return {"label": label, "query_id": cursor.sfqid,
+            "rows": len(rows), "elapsed_seconds": round(elapsed, 3)}
+with snowflake.connector.connect(**CONNECT_ARGS) as connection:
+    with connection.cursor() as cursor:
+        cursor.execute("ALTER SESSION SET USE_CACHED_RESULT = FALSE")
+        cursor.execute("SELECT order_uuid FROM ORDER_EVENTS LIMIT 1")
+        order_uuid = cursor.fetchone()[0]
+        results = []
+        for _ in range(5):
+            results.append(timed(cursor, "daily_mv", QUERIES["daily_mv"]))
+            results.append(timed(cursor, "uuid_lookup", QUERIES["uuid_lookup"], (order_uuid,)))
+for label in sorted({row["label"] for row in results}):
+    elapsed = [row["elapsed_seconds"] for row in results if row["label"] == label]
+    print(label, "median", statistics.median(elapsed), "all", elapsed)
+for row in results:
+    print(row)
+\end{lstlisting}
+\begin{tipbox}
+Capture query IDs from the Python output and inspect them in query history. Client elapsed time is useful, but the Snowflake profile shows partitions scanned, bytes scanned, pruning, spills, and whether the query shape actually used the intended acceleration.
+\end{tipbox}
+\subsection{Measurement Checklist}
+\index{benchmarking}\index{query profile}
+For the materialized view, compare the same daily aggregate against the base table and the materialized view with cached results disabled. For SOS, compare point lookups before and after enabling search optimization, allowing time for maintenance to complete. Record whether the lookup returns one row, a few rows, or a large fraction of the table. Broad predicates are a poor SOS test.
+\section{Friday Use Case: Cost Versus Performance in an E-Commerce Analytics Layer}
+\index{e-commerce analytics}\index{Automatic Clustering}\index{cost performance trade-off}
+An e-commerce platform usually has several query families. Executives want daily revenue by channel and region. Support teams search for one order UUID. Merchandising analysts filter product and date ranges. Data scientists scan broader customer behavior windows. A single acceleration feature cannot optimize all of these queries. The platform team must choose where to pay maintenance credits and where to rely on warehouse sizing, pruning, or cache behavior.
+\subsection{Decision Framework}
+Automatic Clustering is strongest when predicates and joins repeatedly benefit from physical locality, especially range filters over large tables that are not naturally well clustered. Materialized views are strongest for recurring aggregates or projections that many queries reuse. Search Optimization Service is strongest for high-cardinality point lookups. The result cache is strongest for repeated identical query text over unchanged data. Warehouse scaling is strongest when the query is already well designed but needs more execution capacity or concurrency relief \cite{snowflakeAutomaticClusteringDocs,snowflakeMaterializedViewsDocs,snowflakeSearchOptimizationDocs}.
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[
+        workload/.style={rectangle, draw=primary, fill=primary!5, rounded corners, minimum height=1.0cm, text width=2.9cm, align=center, font=\scriptsize\bfseries},
+        accel/.style={rectangle, draw=magenta, fill=magenta!10, rounded corners, minimum height=1.0cm, text width=3.0cm, align=center, font=\scriptsize\bfseries},
+        cost/.style={rectangle, draw=codegreen!60!black, fill=green!8, rounded corners, minimum height=1.0cm, text width=3.0cm, align=center, font=\scriptsize},
+        arrow/.style={draw, thick, -Latex, draw=primary}
+    ]
+        \node[workload] (dash) at (0,2.4) {Daily revenue dashboard\\same aggregate};
+        \node[workload] (support) at (0,0.8) {Support lookup\\one order UUID};
+        \node[workload] (merch) at (0,-0.8) {Merchandising analysis\\date + product range};
+        \node[workload] (adhoc) at (0,-2.4) {Data science\\broad exploration};
+        \node[accel] (mv) at (4.2,2.4) {Materialized view\\precompute aggregate};
+        \node[accel] (sos) at (4.2,0.8) {Search Optimization\\point lookup};
+        \node[accel] (cluster) at (4.2,-0.8) {Automatic Clustering\\pruning locality};
+        \node[accel] (wh) at (4.2,-2.4) {Warehouse + cache\\scan capacity};
+        \node[cost] (latency) at (8.4,1.4) {Lower latency\\for matched pattern};
+        \node[cost] (credits) at (8.4,-1.4) {Maintenance or compute credits\\must be justified};
+        \foreach \a/\b in {dash/mv,support/sos,merch/cluster,adhoc/wh}{\draw[arrow] (\a) -- (\b);}
+        \foreach \a in {mv,sos,cluster,wh}{\draw[arrow] (\a) -- (latency); \draw[arrow] (\a) -- (credits);}
+    \end{tikzpicture}%
+    }
+    \caption{E-commerce analytics acceleration should match query families: materialized views for recurring aggregates, SOS for point lookups, clustering for pruning, and warehouses for broad compute.}
+    \label{fig:chapter3-ecommerce-acceleration}
+\end{figure}
+\begin{notebox}
+The best acceleration choice is often a combination. A daily revenue materialized view can serve dashboards while SOS serves support lookups on the same fact table, and clustering helps range filters. The risk is not combining features; the risk is enabling them without measurement and ownership.
+\end{notebox}
+\subsection{Cost Review Questions}
+Before approving an acceleration feature, ask four questions. First, what query family will it accelerate and how often does that family run? Second, what is the current latency and business impact? Third, what storage or maintenance credits will the feature add? Fourth, what simpler alternative exists: SQL rewrite, better predicates, a right-sized warehouse, cache-friendly dashboard cadence, or a narrower semantic view?
+\begin{pitfall}
+\textbf{Optimizing the loudest query instead of the most valuable query.} A single slow ad-hoc query may not deserve a maintained access path. Prioritize repeatable workloads with clear owners, measurable latency goals, and enough frequency to amortize maintenance cost.
+\end{pitfall}
+\section{Interview Q\&A}
+\subsection{Tables, Views, and Search Optimization}
+\begin{enumerate}
+    \item \textbf{Q: When would you use a transient table instead of a permanent table?}\\
+    A: Use a transient table for persistent but rebuildable data such as ETL staging or intermediate transforms where Fail-safe protection is not required.
+    \item \textbf{Q: Why are temporary tables risky in orchestration code?}\\
+    A: They exist only for the creating session. A table created in a notebook session will not be available to a separate task or scheduler session.
+    \item \textbf{Q: What is the difference between a standard view and a materialized view?}\\
+    A: A standard view stores a SQL definition and runs at query time. A materialized view stores and maintains results to accelerate eligible queries.
+    \item \textbf{Q: When should you choose a secure view?}\\
+    A: Choose it when the view is a security or data-sharing boundary and the definition or evaluation behavior must be protected.
+    \item \textbf{Q: What workload is a strong fit for Search Optimization Service?}\\
+    A: Highly selective point lookups on high-cardinality columns, such as finding one order UUID in a large fact table.
+    \item \textbf{Q: Does SOS replace clustering?}\\
+    A: No. SOS targets selective lookups. Clustering improves pruning for recurring range, join, or grouping patterns where physical locality matters.
+    \item \textbf{Q: Why can materialized views increase cost?}\\
+    A: They add storage and Snowflake must maintain them as base data changes, so they should be justified by repeated query savings.
+    \item \textbf{Q: How do you validate that an acceleration feature worked?}\\
+    A: Capture query IDs, disable cached results for execution tests, compare before and after profiles, and inspect elapsed time, bytes scanned, partitions scanned, and maintenance cost.
+\end{enumerate}
+\section{Further Reading}
+Snowflake's table type documentation explains permanent, transient, and temporary object behavior, including Time Travel and Fail-safe implications \cite{snowflakeTableTypesDocs}. Snowflake's view documentation covers standard and secure views, while the materialized view documentation explains supported definitions, refresh behavior, optimizer use, and maintenance considerations \cite{snowflakeViewsDocs,snowflakeSecureViewsDocs,snowflakeMaterializedViewsDocs}. Search Optimization Service documentation describes supported predicate types, cost estimation, and access-path maintenance \cite{snowflakeSearchOptimizationDocs}. For cross-platform comparisons, review Redshift materialized views and sort-key design \cite{awsRedshiftMaterializedViewsDocs,awsRedshiftSortKeysDocs}, Synapse materialized views and result-set caching \cite{azureSynapseMaterializedViewsDocs,azureSynapseResultSetCachingDocs}, and BigQuery materialized views, BI Engine, and search indexes \cite{googleBigQueryMaterializedViewsDocs,googleBigQueryBIEngineDocs,googleBigQuerySearchIndexesDocs}.
+\section*{Key Takeaways}
+\begin{itemize}
+    \item Permanent, transient, and temporary tables differ mainly by lifecycle, Time Travel, and Fail-safe expectations.
+    \item Transient tables are strong ETL staging objects when upstream data can be replayed; they are risky for irreplaceable business records.
+    \item Standard views provide semantic abstraction, secure views protect sensitive boundaries, and materialized views precompute recurring query results.
+    \item Materialized views improve reads only when their maintenance and storage costs are justified by repeated workload savings.
+    \item Search Optimization Service accelerates selective point lookups on high-cardinality columns; it is not a universal index.
+    \item Automatic Clustering, materialized views, SOS, result cache, and warehouse scaling solve different performance problems.
+    \item Every acceleration decision should include query-history evidence, cost ownership, rollback criteria, and cache-aware benchmarking.
+\end{itemize}
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Compare permanent, transient, and temporary tables for a raw landing table, an ETL staging table, and a curated sales fact.
+    \item \textbf{(Conceptual)} Explain why Fail-safe matters for permanent business data but may be unnecessary for reproducible staging tables.
+    \item \textbf{(Design)} Choose standard, secure, or materialized views for a public dashboard, a partner data share, and a recurring daily revenue aggregate.
+    \item \textbf{(Hands-on)} Run \cref{lst:chapter3-staging-mv-sos-sql} with a smaller row count, then identify the objects created and classify each by purpose.
+    \item \textbf{(Hands-on)} Compare the daily aggregation against the base table and the materialized view with \texttt{USE\_CACHED\_RESULT = FALSE}.
+    \item \textbf{(Hands-on)} Enable Search Optimization Service on a UUID column and compare point lookup query profiles before and after maintenance completes.
+    \item \textbf{(Operations)} Draft a cleanup plan that drops lab materialized views, tables, and warehouses without affecting shared schemas.
+    \item \textbf{(Interview)} A dashboard is slow and uses a date filter, a region filter, and a revenue aggregation. Explain when you would test clustering, a materialized view, SOS, or a larger warehouse.
+\end{enumerate}
+\section{Capstone Project: E-Commerce Analytics Acceleration Strategy}\label{sec:ch3-capstone}
+\index{capstone project}\index{e-commerce analytics!capstone}\index{materialized view!capstone}\index{Search Optimization Service!capstone}\index{Automatic Clustering!capstone}
+\begin{capstonebox}
+\textbf{Mission.} Design and benchmark an e-commerce analytics acceleration strategy that balances materialized views, Search Optimization Service, Automatic Clustering, result cache, and warehouse capacity against credit cost and latency. You will classify query families, build acceleration candidates, run controlled measurements, and recommend which features deserve production ownership.
+\textbf{Estimated time.} 5--7 hours. Use XSMALL or SMALL warehouses and modest synthetic data first. Enable Search Optimization Service and materialized views only in a training account or with explicit approval.
+\end{capstonebox}
+\subsection*{Scenario}
+A retail company operates a Snowflake e-commerce analytics layer over orders, products, customers, and clickstream events. Executives need daily revenue dashboards under five seconds. Customer support must find one order by UUID during a phone call. Merchandising analysts filter by product category and date range. Data scientists run broader exploratory scans that tolerate slower responses. The current platform uses one large fact table, several standard views, and a right-sized BI warehouse, but latency varies and the team is considering Automatic Clustering, materialized views, and Search Optimization Service.
+Your task is to design the acceleration strategy and defend it with benchmark evidence. The final design must avoid enabling every feature everywhere. It should identify which query families deserve maintained structures, which can rely on pruning or cache, and which should remain warehouse-driven exploratory workloads.
+\subsection*{Requirements}
+Complete the following requirements in a training account or produce an implementation-ready design if account permissions are limited:
+\begin{enumerate}
+    \item Create or specify a durable \texttt{ORDER\_EVENTS} fact table and transient staging tables for replayable ETL loads.
+    \item Define at least three query families: daily dashboard aggregate, UUID support lookup, and product/date merchandising analysis.
+    \item Build a materialized view for daily revenue by date, region, and channel.
+    \item Enable Search Optimization Service on a high-cardinality order UUID column, after estimating costs where permissions allow.
+    \item Evaluate whether Automatic Clustering on date and product attributes is justified for the merchandising workload.
+    \item Run cache-aware before-and-after tests and collect query IDs, elapsed time, bytes scanned, partitions scanned, and relevant maintenance observations.
+    \item Estimate monthly credits or qualitative credit risk for MV maintenance, SOS maintenance, clustering, and warehouse execution.
+    \item Recommend a production rollout with ownership, monitoring, rollback, and cleanup criteria.
+\end{enumerate}
+\subsection*{Reference Architecture}
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[
+        src/.style={rectangle, draw=primary, fill=primary!5, rounded corners, minimum height=1.0cm, text width=2.5cm, align=center, font=\scriptsize\bfseries},
+        table/.style={rectangle, draw=codegreen!60!black, fill=green!8, rounded corners, minimum height=1.0cm, text width=3.0cm, align=center, font=\scriptsize\bfseries},
+        accel/.style={rectangle, draw=magenta, fill=magenta!10, rounded corners, minimum height=1.0cm, text width=3.0cm, align=center, font=\scriptsize\bfseries},
+        obs/.style={rectangle, draw=red!60!black, fill=red!7, rounded corners, minimum height=1.0cm, text width=2.8cm, align=center, font=\scriptsize},
+        arrow/.style={draw, thick, -Latex, draw=primary}
+    ]
+        \node[src] (files) at (0,1.8) {Order files\\or streams};
+        \node[table] (stg) at (3.4,1.8) {Transient staging\\rebuildable ETL};
+        \node[table] (fact) at (6.8,1.8) {Permanent fact\\ORDER\_EVENTS};
+        \node[accel] (mv) at (10.2,3.0) {MV daily revenue\\dashboard};
+        \node[accel] (sos) at (10.2,1.8) {SOS on UUID\\support lookup};
+        \node[accel] (cluster) at (10.2,0.6) {Clustering candidate\\date + product};
+        \node[src] (users) at (13.4,1.8) {BI, support,\\merchandising};
+        \node[obs] (history) at (6.8,-0.8) {Query history\\latency + scans};
+        \node[obs] (cost) at (10.2,-0.8) {Cost review\\maintenance credits};
+        \draw[arrow] (files) -- (stg);
+        \draw[arrow] (stg) -- (fact);
+        \foreach \a in {mv,sos,cluster}{\draw[arrow] (fact) -- (\a); \draw[arrow] (\a) -- (users);}
+        \draw[arrow] (fact) -- (history);
+        \draw[arrow] (history) -- (cost);
+    \end{tikzpicture}%
+    }
+    \caption{Capstone architecture for testing e-commerce acceleration features against a permanent fact table fed by transient ETL staging.}
+    \label{fig:chapter3-capstone-reference}
+\end{figure}
+\subsection*{Implementation Steps}
+\begin{enumerate}
+    \item Run the setup SQL in \cref{lst:chapter3-capstone-setup-sql}. Reduce row counts if your account has strict credit limits.
+    \item Use the benchmark driver in \cref{lst:chapter3-capstone-python} to capture query IDs and elapsed time for dashboard, support, and merchandising query families.
+    \item Create the materialized view and enable SOS. If permitted, run \texttt{SELECT SYSTEM\$ESTIMATE\_SEARCH\_OPTIMIZATION\_COSTS('ORDER\_EVENTS')} before enabling SOS.
+    \item Repeat benchmark runs with cached results disabled and compare Snowflake query profiles.
+    \item Estimate production cost by multiplying query frequency and maintenance behavior by expected business usage.
+\end{enumerate}
+\begin{lstlisting}[language=SQL,caption={Capstone setup SQL for e-commerce acceleration candidates.},label={lst:chapter3-capstone-setup-sql}]
+USE ROLE SYSADMIN;
+CREATE OR REPLACE DATABASE ECOM_ACCELERATION_DB;
+CREATE OR REPLACE SCHEMA ECOM_ACCELERATION_DB.ANALYTICS;
+CREATE OR REPLACE WAREHOUSE ECOM_ACCELERATION_WH
+  WAREHOUSE_SIZE = 'XSMALL'
+  AUTO_SUSPEND = 60
+  AUTO_RESUME = TRUE
+  INITIALLY_SUSPENDED = TRUE;
+USE WAREHOUSE ECOM_ACCELERATION_WH;
+USE DATABASE ECOM_ACCELERATION_DB;
+USE SCHEMA ANALYTICS;
+CREATE OR REPLACE TRANSIENT TABLE STG_ORDER_EVENTS AS
+SELECT
+    UUID_STRING() AS order_uuid,
+    DATEADD('second', UNIFORM(0, 60 * 60 * 24 * 60, RANDOM()),
+            '2026-06-01'::TIMESTAMP_NTZ) AS order_ts,
+    TO_DATE(order_ts) AS order_date,
+    UNIFORM(1, 500000, RANDOM()) AS customer_id,
+    UNIFORM(1, 75000, RANDOM()) AS product_id,
+    ARRAY_CONSTRUCT('WEB', 'STORE', 'MOBILE')[UNIFORM(0, 3, RANDOM())]::STRING AS channel,
+    ARRAY_CONSTRUCT('NORTH', 'SOUTH', 'EAST', 'WEST')[UNIFORM(0, 4, RANDOM())]::STRING AS region,
+    ROUND(UNIFORM(100, 750000, RANDOM()) / 100, 2) AS revenue
+FROM TABLE(GENERATOR(ROWCOUNT => 3000000));
+CREATE OR REPLACE TABLE ORDER_EVENTS AS
+SELECT * FROM STG_ORDER_EVENTS;
+CREATE OR REPLACE MATERIALIZED VIEW MV_DAILY_CHANNEL_REVENUE AS
+SELECT order_date, region, channel, COUNT(*) AS orders, SUM(revenue) AS revenue
+FROM ORDER_EVENTS
+GROUP BY order_date, region, channel;
+ALTER TABLE ORDER_EVENTS ADD SEARCH OPTIMIZATION ON EQUALITY(order_uuid);
+ALTER TABLE ORDER_EVENTS CLUSTER BY (order_date, product_id);
+\end{lstlisting}
+\begin{lstlisting}[language=Python,caption={Capstone benchmark driver for dashboard, support, and merchandising query families.},label={lst:chapter3-capstone-python}]
+import os
+import time
+import snowflake.connector
+CONNECT_ARGS = {
+    "account": os.environ["SNOWFLAKE_ACCOUNT"],
+    "user": os.environ["SNOWFLAKE_USER"],
+    "password": os.environ["SNOWFLAKE_PASSWORD"],
+    "role": "SYSADMIN",
+    "warehouse": "ECOM_ACCELERATION_WH",
+    "database": "ECOM_ACCELERATION_DB",
+    "schema": "ANALYTICS",
+}
+QUERIES = {
+    "dashboard_mv": """
+        SELECT order_date, region, channel, revenue
+        FROM MV_DAILY_CHANNEL_REVENUE
+        WHERE order_date BETWEEN '2026-06-15' AND '2026-06-30'
+    """,
+    "support_lookup": """
+        SELECT * FROM ORDER_EVENTS WHERE order_uuid = %s
+    """,
+    "merchandising_range": """
+        SELECT product_id, COUNT(*) AS orders, SUM(revenue) AS revenue
+        FROM ORDER_EVENTS
+        WHERE order_date BETWEEN '2026-06-15' AND '2026-06-30'
+          AND product_id BETWEEN 10000 AND 20000
+        GROUP BY product_id
+        ORDER BY revenue DESC
+        LIMIT 100
+    """,
+}
+def run(cursor, label, sql, params=None):
+    started = time.perf_counter()
+    cursor.execute(sql, params or ())
+    cursor.fetchall()
+    elapsed = round(time.perf_counter() - started, 3)
+    print({"label": label, "query_id": cursor.sfqid, "elapsed_seconds": elapsed})
+with snowflake.connector.connect(**CONNECT_ARGS) as connection:
+    with connection.cursor() as cursor:
+        cursor.execute("ALTER SESSION SET USE_CACHED_RESULT = FALSE")
+        cursor.execute("SELECT order_uuid FROM ORDER_EVENTS LIMIT 1")
+        order_uuid = cursor.fetchone()[0]
+        run(cursor, "dashboard_mv", QUERIES["dashboard_mv"])
+        run(cursor, "support_lookup", QUERIES["support_lookup"], (order_uuid,))
+        run(cursor, "merchandising_range", QUERIES["merchandising_range"])
+\end{lstlisting}
+\subsection*{Deliverables}
+Submit a concise acceleration design packet:
+\begin{itemize}
+    \item \textbf{Query-family inventory:} dashboard aggregates, support lookups, merchandising filters, data-science scans, frequency, owner, and latency target.
+    \item \textbf{Feature matrix:} candidate feature, target table or view, expected benefit, maintenance cost, rollback command, and owner.
+    \item \textbf{Benchmark evidence:} query IDs, elapsed time, partitions scanned, bytes scanned, cache settings, and before-and-after observations.
+    \item \textbf{Cost model:} estimated monthly impact for MV maintenance, SOS maintenance, clustering, and warehouse execution.
+    \item \textbf{Recommendation memo:} what to enable now, what to defer, what to monitor, and what condition triggers removal.
+\end{itemize}
+\subsection*{Acceptance Criteria}
+Your capstone is complete when the submission satisfies this rubric:
+\begin{itemize}
+    \item Each query family has a stated latency goal, owner, and expected frequency.
+    \item The materialized view targets a recurring aggregate and is not used as a generic dashboard dumping ground.
+    \item SOS targets a high-cardinality lookup column and is tested with selective predicates.
+    \item Clustering is evaluated for range and product filters with pruning evidence, not enabled blindly.
+    \item Cached-result effects are disclosed and at least one benchmark run disables cached results.
+    \item Query history or profiles support all performance claims.
+    \item Credit and storage trade-offs are discussed for every maintained acceleration feature.
+    \item A cleanup and rollback plan exists for materialized views, SOS, clustering, warehouses, and lab data.
+\end{itemize}
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Add query tags for each query family and aggregate query history by tag.
+    \item Use \texttt{SYSTEM\$CLUSTERING\_INFORMATION} to compare clustering depth before and after clustering changes.
+    \item Compare a secure semantic view over the fact table with a standard view and document when secure views are justified.
+    \item Add a dashboard refresh simulation and measure result-cache benefits separately from materialized view benefits.
+    \item Build a teardown script that drops lab objects and verifies no Search Optimization Service maintenance remains enabled.
+\end{itemize}

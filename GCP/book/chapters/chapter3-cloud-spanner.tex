@@ -1,0 +1,730 @@
+\chapter{Global Relational Scaling: Cloud Spanner}
+\index{Cloud Spanner}\index{NewSQL}\index{TrueTime}\index{external consistency}\index{Paxos}\index{interleaved tables}\index{multi-region databases}
+
+\begin{objectives}
+\begin{itemize}
+    \item Explain Cloud Spanner architecture, including instances, nodes, processing units, splits, replicas, leaders, Paxos, and TrueTime.
+    \item Describe how Cloud Spanner provides strong global consistency and external consistency for relational transactions.
+    \item Design schemas with primary keys, interleaved tables, secondary indexes, and foreign keys while avoiding hot spots.
+    \item Use query execution plans, Key Visualizer, statistics, and indexing strategy to tune Spanner performance.
+    \item Create a multi-region Spanner instance, build an interleaved e-commerce cart schema, and load 10,000 synthetic records.
+    \item Evaluate a globally distributed payment-processing ledger that requires 99.999\% availability and zero data loss across continents.
+    \item Build a capstone architecture for a globally consistent payment ledger on multi-region Spanner with operations, validation, and recovery evidence.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+Globally distributed transactional databases are marketed differently across clouds, but the design questions are portable: consistency model, write placement, replica quorum, horizontal scale, latency, and relational compatibility.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{2.5cm}p{2.7cm}p{2.7cm}p{2.7cm}p{2.7cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{GCP} & \textbf{AWS} & \textbf{Azure} & \textbf{Traditional sharded RDBMS} \\
+\midrule
+Globally consistent OLTP & Cloud Spanner with external consistency and SQL & Aurora Global Database for low-latency global reads; Aurora DSQL for distributed SQL & Cosmos DB with strong consistency for NoSQL APIs & Usually application-managed two-phase commit or eventual reconciliation \\
+Horizontal scale & Automatic splits across nodes and replicas & Cluster and regional replicas; DSQL partitions distributed data & Partitioned containers and global distribution & Manual shards, resharding, and routing layer \\
+Synchronous replication & Paxos quorum across replicas & Region-aware replication varies by product and mode & Configurable consistency and multi-region writes & Often limited to one region or expensive cross-shard coordination \\
+External consistency / time & TrueTime commit timestamps order transactions globally & Service-specific transaction ordering; no direct TrueTime equivalent & Strong consistency can linearize reads within configured regions & Application timestamps rarely prove external consistency \\
+Schema modeling & Relational tables, primary keys, secondary indexes, interleaving, foreign keys & Relational models in Aurora; distributed SQL model in DSQL & NoSQL containers, partition keys, and consistency levels & Normalized tables inside shards; cross-shard foreign keys are hard \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+MongoDB sharded clusters can distribute document workloads and Snowflake can replicate analytical data, but neither is a direct drop-in for globally consistent relational OLTP. MongoDB usually trades relational constraints for document flexibility, while Snowflake is analytical rather than a low-latency transaction processor.
+\end{crosscloud}
+
+\begin{keyterms}
+\textbf{Cloud Spanner}: Google Cloud's fully managed, horizontally scalable relational database with strong consistency and high availability.
+\textbf{TrueTime}: Google's bounded-time API that lets Spanner assign commit timestamps with known uncertainty.
+\textbf{External consistency}: guarantee that if transaction A commits before transaction B starts, B receives a later timestamp and observes A where appropriate.
+\textbf{Split}: contiguous key range that Spanner can move or replicate independently for scale.
+\textbf{Interleaved table}: child table whose rows are physically colocated with a parent row by primary key prefix.
+\textbf{Leader replica}: replica that coordinates writes for a Paxos group.
+\end{keyterms}
+
+\section{Week 3 Roadmap}
+Week~3 moves from regional relational services to a database built for global transactional scale. Cloud Spanner is the GCP service to evaluate when the business needs relational semantics, SQL, horizontal scaling, synchronous replication, and high availability beyond a single region \cite{googlecloudspannerdocs}. It is not merely a bigger Cloud SQL instance. It changes how engineers think about primary keys, transactions, locality, indexes, and operational evidence.
+
+Monday introduces nodes, processing units, splits, replicas, Paxos, TrueTime, and strong global consistency. Tuesday focuses on schema design with primary keys, interleaved tables, foreign keys, and secondary indexes. Wednesday studies performance tuning, query plans, leader placement, statistics, and hot-spot avoidance. Thursday builds a multi-region Spanner lab with an interleaved shopping-cart schema and 10,000 synthetic rows. Friday applies the patterns to a payment-processing ledger that requires 99.999\% availability and zero data loss across continents.
+
+\begin{definitionbox}
+\textbf{Cloud Spanner} is a managed relational database that combines SQL, transactions, schema, and strong consistency with horizontal scaling and synchronous replication. It was designed from the Spanner research system described by Google, where TrueTime and Paxos make globally ordered commits practical at large scale \cite{corbett2012spanner}.
+\end{definitionbox}
+
+\section{Monday: Spanner Concepts and Strong Consistency}
+\index{Cloud Spanner!architecture}\index{TrueTime}\index{Paxos}\index{strong consistency}\index{external consistency}
+
+\subsection{Instances, Nodes, Processing Units, and Databases}
+A Spanner instance is the administrative container for one or more databases. The instance configuration chooses a regional or multi-region topology, which determines where replicas live and which regions can serve reads and writes. Capacity is allocated in nodes or processing units. A node is a larger capacity unit; processing units allow finer increments for smaller workloads. Capacity affects CPU, storage throughput, and the amount of work Spanner can process concurrently, but it does not change the fundamental consistency model.
+
+Spanner stores data in splits. A split is a contiguous range of primary keys that can be moved, replicated, and served independently. As data grows or traffic patterns change, Spanner can split ranges and distribute them across servers. This is why primary-key design matters: the primary key defines the physical ordering of rows, and the ordering determines whether writes spread evenly or concentrate on a narrow hot range.
+
+\begin{notebox}
+Spanner removes many database administration tasks, but it does not remove data modeling. Poor primary keys, unbounded transactions, and inefficient secondary indexes can still create latency and cost problems.
+\end{notebox}
+
+\subsection{Replicas, Leaders, and Paxos Quorums}
+\index{Cloud Spanner!replicas}\index{leader replica}
+Every split is replicated. For each Paxos group, one replica acts as leader and coordinates writes. A write commits only after a quorum agrees, which protects against losing committed data when a replica or zone fails. Regional configurations keep replicas inside one region for lower write latency. Multi-region configurations place replicas across multiple regions to improve availability and global read locality, at the cost of higher write latency because consensus crosses longer network distances.
+
+\begin{definitionbox}
+\textbf{Paxos} is a consensus protocol family that lets distributed replicas agree on a value even when some replicas fail. In Spanner, Paxos helps ensure that committed writes survive replica failures and that a majority quorum decides the ordered history for each key range.
+\end{definitionbox}
+
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[
+        client/.style={rectangle, rounded corners, draw=primary, thick, fill=primary!5, text width=2.8cm, minimum height=1.0cm, align=center, font=\small\bfseries},
+        replica/.style={cylinder, shape border rotate=90, aspect=0.25, draw=primary, thick, fill=primary!10, text width=2.6cm, minimum height=1.35cm, align=center, font=\small\bfseries},
+        witness/.style={cylinder, shape border rotate=90, aspect=0.25, draw=codegray, thick, fill=backcolour, text width=2.5cm, minimum height=1.2cm, align=center, font=\small\bfseries},
+        time/.style={rectangle, rounded corners, draw=codegreen!60!black, thick, fill=green!7, text width=2.8cm, minimum height=0.9cm, align=center, font=\footnotesize\bfseries},
+        arrow/.style={-{Stealth[length=2.5mm]}, draw=primary, thick},
+        dasharrow/.style={-{Stealth[length=2.5mm]}, draw=codegray, thick, dashed}
+    ]
+        \node[client] (app) at (0,0) {Payment\\Service};
+        \node[replica] (leader) at (4.0,1.4) {Leader\\Replica\\Americas};
+        \node[replica] (r2) at (8.0,2.0) {Replica\\Europe};
+        \node[replica] (r3) at (8.0,-0.2) {Replica\\Asia};
+        \node[witness] (witness) at (4.0,-1.6) {Witness /\\Read Replica};
+        \node[time] (tt) at (12.0,0.8) {TrueTime\\Bounded\\Uncertainty};
+
+        \draw[arrow] (app) -- node[above, font=\footnotesize]{read-write transaction} (leader);
+        \draw[arrow] (leader) -- node[above, font=\footnotesize]{Paxos prepare / accept} (r2);
+        \draw[arrow] (leader) -- node[below, font=\footnotesize]{Paxos prepare / accept} (r3);
+        \draw[dasharrow] (leader) -- (witness);
+        \draw[dasharrow] (tt) -- node[above, font=\footnotesize]{commit timestamp after uncertainty bound} (leader);
+        \draw[dasharrow] (tt) -- (r2);
+        \draw[dasharrow] (tt) -- (r3);
+    \end{tikzpicture}%
+    }
+    \caption{Spanner combines Paxos replication with TrueTime commit timestamps to provide globally ordered transactions.}
+    \label{fig:spanner-truetime-paxos}
+\end{figure}
+
+\subsection{TrueTime and External Consistency}
+\index{TrueTime!external consistency}
+TrueTime exposes a time interval rather than a single perfect clock reading. The interval contains the real current time with bounded uncertainty. Spanner uses this bound when assigning commit timestamps. Before a transaction is externally visible, Spanner waits long enough to ensure that later transactions receive later timestamps. This commit-wait technique is one reason Spanner can provide external consistency across distributed replicas.
+
+\begin{definitionbox}
+\textbf{External consistency} is stronger than ordinary serializability. It preserves real-time ordering: if one transaction commits before another transaction begins, the second transaction is ordered after the first.
+\end{definitionbox}
+
+Strong global consistency is especially valuable for ledgers, entitlements, inventory allocation, identity state, and idempotency records. Without it, engineers often add application-level locks, reconciliation jobs, and regional conflict resolution. Spanner does not make latency disappear, but it gives a precise consistency contract that simplifies correctness-sensitive designs.
+
+\begin{pitfall}
+Do not choose Spanner only because a database is large. Choose it when the workload needs horizontal relational scale, high availability, strong consistency, or global distribution. For one-region departmental databases, Cloud SQL or AlloyDB may be simpler and cheaper.
+\end{pitfall}
+
+\section{Tuesday: Schema Design, Primary Keys, Interleaving, and Indexing}
+\index{Cloud Spanner!schema design}\index{primary key}\index{interleaved tables}\index{secondary indexes}\index{foreign keys}
+
+\subsection{Primary Keys Define Physical Locality}
+In Spanner, primary-key order is physical design. Rows with nearby primary-key values tend to live near each other until the range splits. This helps range scans and parent-child access patterns, but it can hurt write scalability when the leading key is monotonically increasing. For example, using a timestamp as the first primary-key column can concentrate all new writes into the newest range. Better designs place a high-cardinality business identifier, hash bucket, tenant identifier, or region-aware prefix before time when write distribution matters.
+
+\begin{tipbox}
+Start primary-key design from access patterns and write distribution. Ask: Which queries must be fast? Which rows are read together? Which column changes monotonically? Which tenant, account, or merchant could become hot?
+\end{tipbox}
+
+\subsection{Interleaved Tables}
+\index{Cloud Spanner!interleaving}
+Interleaved tables physically colocate child rows with a parent row by sharing the parent primary-key prefix. An order table can be interleaved under a customer table; order lines can be interleaved under orders. This is useful when child rows are usually read with their parent and when the child lifecycle follows the parent lifecycle. It is less useful for independent child records that are frequently scanned by a different access path.
+
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[
+        row/.style={rectangle, draw=primary, thick, fill=primary!6, text width=3.1cm, minimum height=0.8cm, align=center, font=\footnotesize\bfseries},
+        child/.style={rectangle, draw=codegreen!60!black, thick, fill=green!7, text width=3.1cm, minimum height=0.8cm, align=center, font=\footnotesize},
+        idx/.style={rectangle, rounded corners, draw=magenta, thick, fill=magenta!8, text width=3.0cm, minimum height=0.9cm, align=center, font=\footnotesize\bfseries},
+        arrow/.style={-{Stealth[length=2.5mm]}, draw=primary, thick},
+        dasharrow/.style={-{Stealth[length=2.5mm]}, draw=codegray, thick, dashed}
+    ]
+        \node[row] (cart1) at (0,2.0) {Carts\\CartId=C100};
+        \node[child] (item1) at (0,0.9) {CartItems\\C100, SKU-1};
+        \node[child] (item2) at (0,0.0) {CartItems\\C100, SKU-2};
+        \node[row] (cart2) at (4.0,2.0) {Carts\\CartId=C200};
+        \node[child] (item3) at (4.0,0.9) {CartItems\\C200, SKU-8};
+        \node[child] (item4) at (4.0,0.0) {CartItems\\C200, SKU-9};
+        \node[idx] (index) at (9.0,1.0) {Secondary Index\\By CustomerId\\or UpdatedAt};
+
+        \draw[arrow] (cart1) -- (item1);
+        \draw[arrow] (item1) -- (item2);
+        \draw[arrow] (cart2) -- (item3);
+        \draw[arrow] (item3) -- (item4);
+        \draw[dasharrow] (cart1) -- (index);
+        \draw[dasharrow] (cart2) -- (index);
+    \end{tikzpicture}%
+    }
+    \caption{Interleaving stores child rows near parent rows while secondary indexes support alternate access paths.}
+    \label{fig:spanner-interleaved-cart-layout}
+\end{figure}
+
+\begin{notebox}
+Interleaving is not the same as a foreign key. Foreign keys enforce referential integrity. Interleaving influences physical locality and optional cascade behavior. A design can use one, both, or neither depending on access and integrity requirements.
+\end{notebox}
+
+\subsection{Secondary Indexes and Covering Reads}
+\index{Cloud Spanner!indexes}
+Secondary indexes provide alternate sort orders and lookup paths. They are essential when queries filter by columns that are not the leading primary-key columns. However, every index is another structure that must be maintained synchronously during writes. Too few indexes cause full scans; too many indexes increase write cost and storage. A covering index can store additional columns so Spanner can answer a query from the index without joining back to the base table.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.0cm}p{4.8cm}p{4.8cm}@{}}
+\toprule
+\textbf{Design choice} & \textbf{Best fit} & \textbf{Caution} \\
+\midrule
+Random or hashed leading key & High write distribution for large tenants or accounts & Range queries may need a secondary index or bucket fan-out \\
+Tenant then entity key & Multi-tenant isolation and tenant-scoped reads & One very large tenant can still become hot \\
+Timestamp suffix & Recent-history scans inside a parent or tenant & Timestamp as leading key can hot spot writes \\
+Interleaved child table & Parent-child reads and lifecycle coupling & Deep hierarchies and large parents can concentrate traffic \\
+Covering secondary index & Low-latency reads by alternate predicate & Extra write latency, storage, and consistency cost \\
+\bottomrule
+\end{tabular}
+\caption{Spanner schema design trade-offs.}
+\label{tab:spanner-schema-tradeoffs}
+\end{table}
+
+\section{Wednesday: Performance Tuning and Plans}
+\index{Cloud Spanner!performance}\index{query execution plan}\index{hot spots}\index{Key Visualizer}\index{query optimizer}
+
+\subsection{Reading Query Plans}
+Spanner query plans show scans, joins, distributed unions, filters, sorting, and row counts. A healthy point lookup uses the primary key or a selective index. A suspicious plan scans far more rows than it returns, sorts large intermediate results, or performs distributed work for a query that should be tenant-local. Use the Google Cloud console, query statistics tables, and the command-line tools to compare the plan with the intended access path \cite{googlecloudspannerquerydocs}.
+
+\begin{definitionbox}
+\textbf{Selectivity} describes how much a predicate narrows the candidate rows. A highly selective predicate, such as a unique payment identifier, should use a key or index. A low-selectivity predicate, such as status equals open across all merchants, may still scan many rows.
+\end{definitionbox}
+
+\subsection{Hot Spots and Split Health}
+Hot spots happen when a small key range receives a disproportionate share of reads or writes. Common causes include monotonically increasing primary keys, a single global counter row, a popular tenant with no distribution strategy, or an index whose leading column has low cardinality. Key Visualizer helps detect hot key ranges, while metrics expose CPU, latency, lock waits, and transaction aborts \cite{googlecloudspannerkeyvisualizer}.
+
+\begin{pitfall}
+A secondary index can hot spot even when the base table is well distributed. If every new transaction writes an index entry with the same leading status or current timestamp range, the index becomes the bottleneck.
+\end{pitfall}
+
+\subsection{Transactions, Mutations, and Latency}
+Read-write transactions acquire locks and coordinate commits through the leader. Keep them short, deterministic, and limited to rows that must be atomically changed together. Large analytical reads, export jobs, and backfills should use partitioned reads, Dataflow connectors, or BigQuery exports rather than long transactions. For idempotent ingestion, store request identifiers and business keys so retries can safely detect already committed work.
+
+\begin{tipbox}
+Tune from evidence. Capture the SQL text, parameters, query plan, latency percentile, rows scanned, rows returned, CPU, lock wait, and index choices before changing schema. Then compare the same evidence after the change.
+\end{tipbox}
+
+\section{Thursday Hands-On Project: Multi-Region Cart Lab}
+\index{hands-on project}\index{Cloud Spanner!multi-region}\index{interleaved schema}\index{synthetic data}
+This lab creates a multi-region Spanner instance, defines an interleaved cart schema, and loads 10,000 synthetic cart-item records. Use a sandbox project, replace placeholders, and delete resources when finished. Commands are written for Windows PowerShell.
+
+\begin{notebox}
+Multi-region Spanner instances can incur meaningful cost. Use the smallest capacity suitable for the lab, set a cleanup reminder, and verify that no production project or billing account is used.
+\end{notebox}
+
+\subsection{PowerShell Preparation and Instance Creation}
+\begin{lstlisting}[language=bash,caption={Creating a multi-region Cloud Spanner instance from PowerShell.}]
+$env:PROJECT_ID = "my-gcp-spanner-lab"
+$env:INSTANCE_ID = "cart-global-lab"
+$env:DATABASE_ID = "cartdb"
+$env:INSTANCE_CONFIG = "nam3"
+$env:PROCESSING_UNITS = "1000"
+
+gcloud config set project $env:PROJECT_ID
+
+gcloud services enable spanner.googleapis.com
+
+gcloud spanner instances create $env:INSTANCE_ID `
+  --config=$env:INSTANCE_CONFIG `
+  --description="Global cart lab" `
+  --processing-units=$env:PROCESSING_UNITS
+
+gcloud spanner databases create $env:DATABASE_ID `
+  --instance=$env:INSTANCE_ID
+\end{lstlisting}
+
+\subsection{Interleaved Cart Schema}
+\begin{lstlisting}[language=bash,caption={Creating an interleaved e-commerce cart schema with DDL.}]
+$ddl = @'
+CREATE TABLE Carts (
+  CartId STRING(36) NOT NULL,
+  CustomerId STRING(36) NOT NULL,
+  HomeRegion STRING(16) NOT NULL,
+  Status STRING(16) NOT NULL,
+  CreatedAt TIMESTAMP NOT NULL OPTIONS (allow_commit_timestamp=true),
+  UpdatedAt TIMESTAMP NOT NULL OPTIONS (allow_commit_timestamp=true),
+) PRIMARY KEY (CartId);
+
+CREATE TABLE CartItems (
+  CartId STRING(36) NOT NULL,
+  LineId STRING(36) NOT NULL,
+  Sku STRING(64) NOT NULL,
+  Quantity INT64 NOT NULL,
+  UnitPrice NUMERIC NOT NULL,
+  AddedAt TIMESTAMP NOT NULL OPTIONS (allow_commit_timestamp=true),
+) PRIMARY KEY (CartId, LineId),
+  INTERLEAVE IN PARENT Carts ON DELETE CASCADE;
+
+CREATE INDEX CartsByCustomerUpdated
+ON Carts(CustomerId, UpdatedAt DESC)
+STORING (Status, HomeRegion);
+'@
+
+$ddl | gcloud spanner databases ddl update $env:DATABASE_ID `
+  --instance=$env:INSTANCE_ID `
+  --ddl-file=-
+\end{lstlisting}
+
+\subsection{Python Synthetic Load}
+The Python client uses batches to insert 1,000 carts and 10,000 cart items. In production, prefer service-account credentials, workload identity, and controlled batch sizes matched to latency and mutation limits.
+
+\begin{lstlisting}[language=Python,caption={Loading 10,000 synthetic records into Cloud Spanner with google-cloud-spanner.}]
+import os
+import random
+import uuid
+from decimal import Decimal
+
+from google.cloud import spanner
+from google.cloud.spanner_v1 import COMMIT_TIMESTAMP
+
+
+PROJECT_ID = os.environ["PROJECT_ID"]
+INSTANCE_ID = os.environ.get("INSTANCE_ID", "cart-global-lab")
+DATABASE_ID = os.environ.get("DATABASE_ID", "cartdb")
+CART_COUNT = 1000
+ITEMS_PER_CART = 10
+REGIONS = ["americas", "europe", "asia"]
+STATUSES = ["ACTIVE", "ABANDONED", "CHECKED_OUT"]
+
+
+def chunked(values, size):
+    for start in range(0, len(values), size):
+        yield values[start:start + size]
+
+
+def main() -> None:
+    client = spanner.Client(project=PROJECT_ID)
+    instance = client.instance(INSTANCE_ID)
+    database = instance.database(DATABASE_ID)
+
+    carts = []
+    items = []
+    for cart_number in range(CART_COUNT):
+        cart_id = str(uuid.uuid4())
+        customer_id = str(uuid.uuid4())
+        carts.append((
+            cart_id,
+            customer_id,
+            random.choice(REGIONS),
+            random.choice(STATUSES),
+            COMMIT_TIMESTAMP,
+            COMMIT_TIMESTAMP,
+        ))
+        for line_number in range(ITEMS_PER_CART):
+            items.append((
+                cart_id,
+                f"line-{line_number:02d}",
+                f"SKU-{random.randint(1, 5000):05d}",
+                random.randint(1, 5),
+                Decimal(random.randrange(100, 25000)) / Decimal("100"),
+                COMMIT_TIMESTAMP,
+            ))
+
+    with database.batch() as batch:
+        batch.insert(
+            table="Carts",
+            columns=("CartId", "CustomerId", "HomeRegion", "Status", "CreatedAt", "UpdatedAt"),
+            values=carts,
+        )
+
+    for item_chunk in chunked(items, 1000):
+        with database.batch() as batch:
+            batch.insert(
+                table="CartItems",
+                columns=("CartId", "LineId", "Sku", "Quantity", "UnitPrice", "AddedAt"),
+                values=item_chunk,
+            )
+
+    print({"carts": len(carts), "cart_items": len(items)})
+
+
+if __name__ == "__main__":
+    main()
+\end{lstlisting}
+
+\subsection{Query Plan Check and Cleanup}
+\begin{lstlisting}[language=bash,caption={Checking sample query plans and deleting lab resources.}]
+gcloud spanner databases execute-sql $env:DATABASE_ID `
+  --instance=$env:INSTANCE_ID `
+  --sql="SELECT CartId, Status FROM Carts WHERE CustomerId = 'replace-customer-id'"
+
+gcloud spanner databases execute-sql $env:DATABASE_ID `
+  --instance=$env:INSTANCE_ID `
+  --query-mode=PLAN `
+  --sql="SELECT c.CartId, i.Sku, i.Quantity FROM Carts c JOIN CartItems i USING (CartId) WHERE c.CartId = 'replace-cart-id'"
+
+gcloud spanner instances delete $env:INSTANCE_ID --quiet
+\end{lstlisting}
+
+\section{Friday Use Case: Global Payment Ledger}
+\index{payment ledger}\index{financial transactions}\index{zero data loss}\index{99.999 percent availability}
+
+\subsection{Scenario}
+A payment processor authorizes purchases in North America, Europe, and Asia. Merchants require low-latency authorization, regulators require immutable ledger evidence, and the business requires 99.999\% availability with zero data loss across continents. A regional outage must not lose committed debits, credits, holds, refunds, or idempotency records. The ledger must support strict account balance correctness, globally unique transaction identifiers, and audit reads by compliance teams.
+
+\subsection{Architecture Pattern}
+The core ledger belongs in a multi-region Spanner instance. Payment APIs write idempotency records, ledger entries, and account-balance deltas in read-write transactions. Regional service tiers route requests to nearby endpoints, but the database maintains one globally consistent transaction history. Pub/Sub and Dataflow can stream committed ledger facts to BigQuery for analytics, while Cloud Monitoring and audit logs provide operational evidence.
+
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[
+        edge/.style={rectangle, rounded corners, draw=codegray, thick, fill=white, text width=2.5cm, minimum height=0.9cm, align=center, font=\small\bfseries},
+        svc/.style={rectangle, rounded corners, draw=primary, thick, fill=primary!6, text width=2.7cm, minimum height=1.0cm, align=center, font=\small\bfseries},
+        db/.style={cylinder, shape border rotate=90, aspect=0.25, draw=primary, thick, fill=primary!10, text width=3.0cm, minimum height=1.4cm, align=center, font=\small\bfseries},
+        ana/.style={rectangle, rounded corners, draw=magenta, thick, fill=magenta!8, text width=2.7cm, minimum height=1.0cm, align=center, font=\small\bfseries},
+        arrow/.style={-{Stealth[length=2.5mm]}, draw=primary, thick},
+        dasharrow/.style={-{Stealth[length=2.5mm]}, draw=codegray, thick, dashed}
+    ]
+        \node[edge] (na) at (0,2.0) {Americas\\Merchants};
+        \node[edge] (eu) at (0,0.0) {Europe\\Merchants};
+        \node[edge] (apac) at (0,-2.0) {Asia\\Merchants};
+        \node[svc] (api) at (4.0,0) {Regional\\Payment APIs\\Idempotent Writes};
+        \node[db] (spanner) at (8.2,0) {Cloud Spanner\\Multi-Region\\Ledger};
+        \node[ana] (pubsub) at (12.0,1.4) {Pub/Sub\\Ledger Events};
+        \node[ana] (bq) at (12.0,-0.2) {BigQuery\\Risk and Finance};
+        \node[ana] (ops) at (12.0,-1.8) {Monitoring\\Audit Logs\\SLOs};
+
+        \draw[arrow] (na) -- (api);
+        \draw[arrow] (eu) -- (api);
+        \draw[arrow] (apac) -- (api);
+        \draw[arrow] (api) -- node[above, font=\footnotesize]{read-write transactions} (spanner);
+        \draw[dasharrow] (spanner) -- (pubsub);
+        \draw[dasharrow] (pubsub) -- (bq);
+        \draw[dasharrow] (ops) -- (spanner);
+    \end{tikzpicture}%
+    }
+    \caption{A multi-continent payment ledger uses Spanner for globally consistent OLTP and streams committed facts to analytics systems.}
+    \label{fig:global-payment-ledger}
+\end{figure}
+
+\subsection{Correctness Controls}
+Ledger transactions should be append-only where possible. Instead of updating historical entries, write reversing entries and preserve immutable facts. Use a unique payment request identifier for idempotency, a ledger-entry table keyed by account and commit timestamp or sequence, and balance rows updated transactionally only when the invariant must be enforced immediately. For analytics, replicate committed facts downstream rather than running heavy reports against the OLTP leader.
+
+\begin{tipbox}
+For payment systems, availability is not enough. The design must prove no committed transaction is lost, no duplicate request is double-applied, and every balance can be reconstructed from the ledger.
+\end{tipbox}
+
+\section{Security, Operations, and Cost Notes}
+\index{Cloud Spanner!security}\index{IAM}\index{CMEK}\index{cost governance}
+Use least-privilege IAM roles, database roles, audit logging, CMEK where required, VPC Service Controls for sensitive perimeters, and Secret Manager for application configuration. Monitor CPU utilization by priority, storage, leader regions, request latency, transaction aborts, lock wait, query latency, rows scanned, and backup status. Use change streams or exports for downstream analytics rather than broad scans on the transactional database.
+
+\begin{notebox}
+Spanner cost is driven by provisioned capacity, storage, backups, change streams, network traffic, and inefficient queries. Because capacity is always on, label instances and export billing data so global OLTP cost is visible by product, environment, and tenant.
+\end{notebox}
+
+\section{Interview Q\&A}
+\subsection{Concepts and Trade-offs}
+\begin{enumerate}
+    \item \textbf{Q: What problem does TrueTime solve in Spanner?}\\
+    A: TrueTime gives Spanner a bounded uncertainty interval for real time. Spanner uses commit wait so transaction timestamps respect real-time ordering, enabling external consistency.
+
+    \item \textbf{Q: Why can a monotonically increasing primary key hurt Spanner performance?}\\
+    A: New writes concentrate at the end of one key range, creating a hot split. A higher-cardinality leading key, hash bucket, or tenant-aware design distributes writes better.
+
+    \item \textbf{Q: When should you use an interleaved table?}\\
+    A: Use interleaving when child rows are usually read with the parent and share the parent lifecycle. Avoid it when children are independently scanned or one parent can become extremely large and hot.
+
+    \item \textbf{Q: How is Spanner different from Cloud SQL read replicas?}\\
+    A: Cloud SQL replicas are asynchronous read copies of a primary database. Spanner synchronously replicates data with consensus and exposes strong consistency across distributed replicas.
+
+    \item \textbf{Q: What evidence would you review before adding an index?}\\
+    A: Query text, parameters, execution plan, rows scanned, rows returned, latency, CPU, lock wait, and current index usage. Add the smallest index that improves the measured access path.
+\end{enumerate}
+
+\section{Further Reading}
+Read the Cloud Spanner documentation for current instance, database, schema, query, backup, and operations guidance \cite{googlecloudspannerdocs}. Review schema design best practices before choosing primary keys, interleaving, and indexes \cite{googlecloudspannerschemadocs}. Study query execution plans and optimizer documentation for performance tuning \cite{googlecloudspannerquerydocs}. Use Key Visualizer and monitoring documentation to identify hot spots and operational anomalies \cite{googlecloudspannerkeyvisualizer}. Read the original Spanner paper to understand the research foundations behind TrueTime, Paxos, and external consistency \cite{corbett2012spanner}.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item Spanner is a globally consistent relational database, not a larger single-node database.
+    \item TrueTime and Paxos let Spanner provide externally consistent transactions across distributed replicas.
+    \item Primary keys define physical locality, so schema design directly affects scalability and latency.
+    \item Interleaved tables colocate parent-child rows, while secondary indexes provide alternate access paths at synchronous write cost.
+    \item Query plans, Key Visualizer, metrics, and transaction statistics should guide performance tuning.
+    \item Multi-region Spanner is a strong fit for ledgers, entitlements, and other global systems that require zero data loss and strong consistency.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Explain external consistency and how it differs from ordinary eventual consistency.
+    \item \textbf{(Conceptual)} Compare regional Spanner, multi-region Spanner, Cloud SQL HA, and a traditional sharded relational database.
+    \item \textbf{(Design)} Propose a primary key for a global payments table and explain how it avoids write hot spots.
+    \item \textbf{(Design)} Decide whether carts and cart items should be interleaved for three different e-commerce access patterns.
+    \item \textbf{(Hands-on)} Create a sandbox multi-region Spanner instance and verify its instance configuration.
+    \item \textbf{(Hands-on)} Load 10,000 synthetic cart records and inspect a query plan for a cart lookup.
+    \item \textbf{(Performance)} Identify two indexes that could hot spot and redesign their leading columns.
+    \item \textbf{(Architecture)} Extend the payment-ledger use case with monitoring, audit logging, backup, restore, and analytics export requirements.
+\end{enumerate}
+
+\section{Capstone Project: Globally Consistent Payment Ledger on Cloud Spanner}\label{sec:ch3-capstone}
+\index{capstone project}\index{payment ledger!capstone}\index{Cloud Spanner!capstone}\index{zero data loss}
+
+\begin{capstonebox}
+\textbf{Mission:} Design and prototype a globally consistent payment ledger on multi-region Cloud Spanner. Your solution must preserve zero data loss for committed transactions, support idempotent payment requests, survive a continental outage scenario, and produce auditable evidence for finance, risk, and compliance teams.
+
+\textbf{Estimated time:} 6--8 hours.
+
+\textbf{What you'll practice:}
+\begin{itemize}
+    \item Creating a multi-region Spanner instance and payment-ledger database.
+    \item Designing account, payment request, ledger entry, and balance tables with scalable primary keys.
+    \item Implementing idempotent read-write transactions in Python.
+    \item Creating secondary indexes for operational lookup without hot-spotting writes.
+    \item Defining monitoring, backup, restore, and analytics export evidence for zero data loss.
+    \item Producing a reference architecture, implementation transcript, acceptance criteria, and residual-risk statement.
+\end{itemize}
+\end{capstonebox}
+
+\subsection*{Scenario}
+Globex Payments processes merchant card and wallet transactions in the Americas, Europe, and Asia. The current platform keeps one primary relational database per continent and reconciles conflicts overnight. Duplicate authorizations, delayed refunds, and inconsistent account holds have become unacceptable. Leadership wants one globally consistent ledger that can prove every committed debit and credit survives regional failures.
+
+\subsection*{Requirements}
+\begin{itemize}
+    \item Deploy a multi-region Cloud Spanner instance appropriate for a production payment ledger.
+    \item Design tables for accounts, payment requests, ledger entries, account balances, and audit checkpoints.
+    \item Enforce idempotency so retried authorization requests cannot double-post.
+    \item Preserve zero data loss for committed transactions through synchronous replication and tested backups.
+    \item Support merchant, account, request, and time-range lookups with measured indexes and query plans.
+    \item Export committed ledger facts to BigQuery or another analytical system without overloading OLTP transactions.
+    \item Document IAM, database roles, CMEK, audit logging, monitoring, alert thresholds, and incident runbooks.
+    \item Provide validation evidence for balance reconstruction, duplicate suppression, transaction ordering, and restore testing.
+\end{itemize}
+
+\subsection*{Reference Architecture}
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[
+        client/.style={rectangle, rounded corners, draw=codegray, thick, fill=white, text width=2.7cm, minimum height=0.95cm, align=center, font=\small\bfseries},
+        svc/.style={rectangle, rounded corners, draw=primary, thick, fill=primary!6, text width=2.8cm, minimum height=1.0cm, align=center, font=\small\bfseries},
+        db/.style={cylinder, shape border rotate=90, aspect=0.25, draw=primary, thick, fill=primary!10, text width=3.0cm, minimum height=1.4cm, align=center, font=\small\bfseries},
+        sec/.style={rectangle, rounded corners, draw=codegreen!60!black, thick, fill=green!7, text width=2.7cm, minimum height=0.95cm, align=center, font=\small\bfseries},
+        ana/.style={rectangle, rounded corners, draw=magenta, thick, fill=magenta!8, text width=2.8cm, minimum height=0.95cm, align=center, font=\small\bfseries},
+        arrow/.style={-{Stealth[length=2.5mm]}, draw=primary, thick},
+        dasharrow/.style={-{Stealth[length=2.5mm]}, draw=codegray, thick, dashed}
+    ]
+        \node[client] (merchant) at (0,1.5) {Merchant\\Checkout};
+        \node[client] (wallet) at (0,-0.2) {Wallet /\\Card Network};
+        \node[svc] (api) at (3.5,0.6) {Global Load\\Balancing\\Payment API};
+        \node[sec] (secrets) at (3.5,-1.3) {IAM\\Secrets\\CMEK};
+        \node[db] (spanner) at (7.5,0.6) {Cloud Spanner\\Multi-Region\\Ledger};
+        \node[ana] (changes) at (11.5,1.7) {Change Streams\\or Export};
+        \node[ana] (bq) at (11.5,0.1) {BigQuery\\Finance\\Risk};
+        \node[ana] (ops) at (11.5,-1.5) {Monitoring\\Backups\\Runbooks};
+
+        \draw[arrow] (merchant) -- (api);
+        \draw[arrow] (wallet) -- (api);
+        \draw[arrow] (api) -- node[above, font=\footnotesize]{idempotent transaction} (spanner);
+        \draw[dasharrow] (secrets) -- (api);
+        \draw[dasharrow] (secrets) -- (spanner);
+        \draw[dasharrow] (spanner) -- (changes);
+        \draw[dasharrow] (changes) -- (bq);
+        \draw[dasharrow] (ops) -- (spanner);
+    \end{tikzpicture}%
+    }
+    \caption{Capstone reference architecture for a globally consistent payment ledger on multi-region Spanner.}
+    \label{fig:ch3-capstone-payment-ledger}
+\end{figure}
+
+\subsection*{Implementation Steps}
+\begin{enumerate}
+    \item \textbf{Create the Spanner instance, database, and ledger schema.} Replace all placeholders and use a sandbox project first.
+
+\begin{lstlisting}[language=bash,caption={Capstone Spanner payment-ledger database and schema creation.}]
+$env:PROJECT_ID = "my-gcp-ledger-capstone"
+$env:INSTANCE_ID = "global-ledger-prod"
+$env:DATABASE_ID = "ledgerdb"
+$env:INSTANCE_CONFIG = "nam-eur-asia1"
+$env:PROCESSING_UNITS = "1000"
+
+gcloud config set project $env:PROJECT_ID
+gcloud services enable spanner.googleapis.com
+
+gcloud spanner instances create $env:INSTANCE_ID `
+  --config=$env:INSTANCE_CONFIG `
+  --description="Globally consistent payment ledger" `
+  --processing-units=$env:PROCESSING_UNITS
+
+gcloud spanner databases create $env:DATABASE_ID `
+  --instance=$env:INSTANCE_ID
+
+$ddl = @'
+CREATE TABLE Accounts (
+  AccountId STRING(36) NOT NULL,
+  MerchantId STRING(36) NOT NULL,
+  HomeRegion STRING(16) NOT NULL,
+  Currency STRING(3) NOT NULL,
+  CreatedAt TIMESTAMP NOT NULL OPTIONS (allow_commit_timestamp=true),
+) PRIMARY KEY (AccountId);
+
+CREATE TABLE PaymentRequests (
+  RequestId STRING(64) NOT NULL,
+  AccountId STRING(36) NOT NULL,
+  MerchantId STRING(36) NOT NULL,
+  Amount NUMERIC NOT NULL,
+  Currency STRING(3) NOT NULL,
+  Status STRING(16) NOT NULL,
+  CreatedAt TIMESTAMP NOT NULL OPTIONS (allow_commit_timestamp=true),
+) PRIMARY KEY (RequestId);
+
+CREATE TABLE LedgerEntries (
+  AccountId STRING(36) NOT NULL,
+  EntryId STRING(36) NOT NULL,
+  RequestId STRING(64) NOT NULL,
+  Direction STRING(6) NOT NULL,
+  Amount NUMERIC NOT NULL,
+  Currency STRING(3) NOT NULL,
+  CommittedAt TIMESTAMP NOT NULL OPTIONS (allow_commit_timestamp=true),
+) PRIMARY KEY (AccountId, EntryId),
+  INTERLEAVE IN PARENT Accounts ON DELETE NO ACTION;
+
+CREATE TABLE AccountBalances (
+  AccountId STRING(36) NOT NULL,
+  Currency STRING(3) NOT NULL,
+  AvailableBalance NUMERIC NOT NULL,
+  UpdatedAt TIMESTAMP NOT NULL OPTIONS (allow_commit_timestamp=true),
+) PRIMARY KEY (AccountId, Currency);
+
+CREATE INDEX PaymentRequestsByMerchant
+ON PaymentRequests(MerchantId, CreatedAt DESC)
+STORING (Status, Amount, Currency);
+'@
+
+$ddl | gcloud spanner databases ddl update $env:DATABASE_ID `
+  --instance=$env:INSTANCE_ID `
+  --ddl-file=-
+\end{lstlisting}
+
+    \item \textbf{Prototype idempotent posting logic.} The transaction first checks the request identifier, then writes the request, ledger entry, and balance update atomically.
+
+\begin{lstlisting}[language=Python,caption={Idempotent payment posting with a Spanner read-write transaction.}]
+import os
+import uuid
+from decimal import Decimal
+
+from google.cloud import spanner
+from google.cloud.spanner_v1 import COMMIT_TIMESTAMP
+
+
+PROJECT_ID = os.environ["PROJECT_ID"]
+INSTANCE_ID = os.environ.get("INSTANCE_ID", "global-ledger-prod")
+DATABASE_ID = os.environ.get("DATABASE_ID", "ledgerdb")
+
+
+def post_payment(transaction, request_id, account_id, merchant_id, amount, currency):
+    existing = list(transaction.execute_sql(
+        "SELECT Status FROM PaymentRequests WHERE RequestId = @request_id",
+        params={"request_id": request_id},
+        param_types={"request_id": spanner.param_types.STRING},
+    ))
+    if existing:
+        return {"request_id": request_id, "status": existing[0][0], "duplicate": True}
+
+    entry_id = str(uuid.uuid4())
+    balance_rows = list(transaction.execute_sql(
+        """
+        SELECT AvailableBalance
+        FROM AccountBalances
+        WHERE AccountId = @account_id AND Currency = @currency
+        """,
+        params={"account_id": account_id, "currency": currency},
+        param_types={
+            "account_id": spanner.param_types.STRING,
+            "currency": spanner.param_types.STRING,
+        },
+    ))
+    current_balance = balance_rows[0][0] if balance_rows else Decimal("0")
+    new_balance = current_balance + amount
+
+    transaction.insert(
+        table="PaymentRequests",
+        columns=("RequestId", "AccountId", "MerchantId", "Amount", "Currency", "Status", "CreatedAt"),
+        values=[(request_id, account_id, merchant_id, amount, currency, "POSTED", COMMIT_TIMESTAMP)],
+    )
+    transaction.insert(
+        table="LedgerEntries",
+        columns=("AccountId", "EntryId", "RequestId", "Direction", "Amount", "Currency", "CommittedAt"),
+        values=[(account_id, entry_id, request_id, "CREDIT", amount, currency, COMMIT_TIMESTAMP)],
+    )
+    transaction.insert_or_update(
+        table="AccountBalances",
+        columns=("AccountId", "Currency", "AvailableBalance", "UpdatedAt"),
+        values=[(account_id, currency, new_balance, COMMIT_TIMESTAMP)],
+    )
+    return {"request_id": request_id, "status": "POSTED", "duplicate": False}
+
+
+def main() -> None:
+    client = spanner.Client(project=PROJECT_ID)
+    database = client.instance(INSTANCE_ID).database(DATABASE_ID)
+    result = database.run_in_transaction(
+        post_payment,
+        request_id="merchant-123-order-456",
+        account_id="acct-001",
+        merchant_id="merchant-123",
+        amount=Decimal("42.50"),
+        currency="USD",
+    )
+    print(result)
+
+
+if __name__ == "__main__":
+    main()
+\end{lstlisting}
+
+    \item \textbf{Capture operations evidence.} Record query plans, backup configuration, and restore-test notes as part of the project transcript.
+
+\begin{lstlisting}[language=bash,caption={Operational evidence commands for the payment-ledger capstone.}]
+gcloud spanner databases execute-sql $env:DATABASE_ID `
+  --instance=$env:INSTANCE_ID `
+  --query-mode=PLAN `
+  --sql="SELECT RequestId, Status FROM PaymentRequests WHERE MerchantId = 'merchant-123' ORDER BY CreatedAt DESC LIMIT 20"
+
+gcloud spanner backups create ledgerdb-backup-$(Get-Date -Format yyyyMMddHHmm) `
+  --instance=$env:INSTANCE_ID `
+  --database=$env:DATABASE_ID `
+  --retention-period=7d
+
+gcloud spanner backups list --instance=$env:INSTANCE_ID
+\end{lstlisting}
+\end{enumerate}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item A one-page architecture summary explaining why Spanner is required instead of Cloud SQL, AlloyDB, or a sharded RDBMS.
+    \item The completed reference diagram or an equivalent diagram showing merchants, payment APIs, Spanner, security controls, analytics export, monitoring, and backups.
+    \item DDL and command transcript proving instance creation, schema deployment, indexes, backup configuration, and cleanup plan.
+    \item Python or pseudocode evidence for idempotent posting and duplicate-request suppression.
+    \item Query-plan evidence for merchant lookup, account ledger lookup, and balance reconstruction.
+    \item A zero-data-loss runbook covering regional failure, restore testing, alert response, and post-incident reconciliation.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item The Spanner instance uses a multi-region configuration and an explicit capacity plan.
+    \item Primary keys distribute writes while preserving efficient account-ledger and merchant-request access.
+    \item Payment posting is idempotent and writes request, ledger, and balance records in one read-write transaction.
+    \item The design documents how committed transactions survive replica or regional failures.
+    \item Validation reconstructs balances from ledger entries and proves duplicate requests are not double-applied.
+    \item Monitoring covers latency percentiles, abort rates, CPU, lock wait, storage, hot splits, backup status, and failed exports.
+    \item Analytics uses change streams, export, or controlled replication rather than unbounded OLTP scans.
+    \item Secrets, credentials, payment identifiers, and customer data are protected in commands, logs, and screenshots.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Add change streams from Spanner into Dataflow and BigQuery for near-real-time risk scoring.
+    \item Implement double-entry accounting with debit and credit entries that must balance within each transaction.
+    \item Add a reconciliation notebook that rebuilds account balances from immutable ledger entries.
+    \item Create a synthetic load test that measures p50, p95, and p99 authorization latency by region.
+    \item Add a backup restore rehearsal into a separate Spanner instance and validate row counts and ledger totals.
+    \item Estimate monthly cost for capacity, storage, backups, change streams, network transfer, monitoring, and analytics export.
+\end{itemize}

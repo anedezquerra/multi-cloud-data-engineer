@@ -1,0 +1,671 @@
+\chapter{Relational Databases: Azure SQL and PostgreSQL}
+\index{Azure SQL Database}\index{Azure Database for PostgreSQL}\index{PostgreSQL}\index{Azure SQL Managed Instance}\index{Hyperscale}\index{serverless database}\index{geo-replication}\index{auto-failover groups}%
+\begin{objectives}
+\begin{itemize}
+    \item Compare Azure SQL Database purchasing models, including DTU, vCore, Serverless, and Hyperscale.
+    \item Explain how Azure Database for PostgreSQL Flexible Server provides managed PostgreSQL operations and high availability.
+    \item Design active geo-replication and auto-failover groups for relational workloads with clear RPO and RTO expectations.
+    \item Deploy an Azure SQL Database Serverless tier, create a geo-replica, and simulate failover using Azure CLI and Python.
+    \item Plan a zero-downtime migration from an on-premises SQL Server monolith to Azure SQL Managed Instance.
+    \item Evaluate managed relational database patterns across AWS, Azure, and GCP for portability and interview readiness.
+    \item Build a high-availability, geo-replicated Azure SQL platform that supports a SQL Server to Managed Instance cutover.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+Managed relational databases use the same operating pattern across clouds: the provider runs backups, patching, storage durability, and high-availability plumbing while engineers retain responsibility for schema design, workload isolation, identity, network access, observability, and cost.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{3.1cm}p{3.2cm}p{3.4cm}p{3.2cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{AWS} & \textbf{Azure} & \textbf{GCP} \\
+\midrule
+Managed relational & RDS / Aurora & Azure SQL / Azure DB for PostgreSQL & Cloud SQL / AlloyDB \\
+Scale-out relational & Aurora & Azure SQL Hyperscale & AlloyDB \\
+High availability & Multi-AZ & Zone-redundant HA / auto-failover groups & Regional HA \\
+Read replicas & RDS replicas / Aurora replicas & Azure SQL replicas / PostgreSQL read replicas & Cloud SQL replicas / AlloyDB read pools \\
+Global / geo & Aurora Global Database & Active geo-replication / geo-replicas & Cross-region replicas \\
+Migration & DMS + SCT & Azure Database Migration Service & GCP DMS \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+MongoDB Atlas, Microsoft Fabric warehouses, and Snowflake databases echo the same managed-service lesson: teams still design data contracts, security, failover behavior, and cost controls even when the provider abstracts servers.
+\end{crosscloud}
+
+\begin{keyterms}
+\textbf{DTU}: a blended Azure SQL purchasing unit representing CPU, memory, reads, and writes.\quad
+\textbf{vCore}: a purchasing model that exposes compute cores, hardware family, and storage choices.\quad
+\textbf{Serverless}: an Azure SQL compute tier that auto-scales and can auto-pause for intermittent workloads.\quad
+\textbf{Hyperscale}: an Azure SQL architecture that separates compute from a distributed storage layer for very large databases.\quad
+\textbf{Flexible Server}: the current managed PostgreSQL deployment model with zone-aware HA options.
+\end{keyterms}
+
+\section{Week 2 Overview: Relational Engines in a Data Engineering Platform}
+Relational databases remain central to data engineering. Operational systems publish transactions from SQL Server, PostgreSQL, Oracle, and MySQL. Analytical pipelines land change data capture events into lakes. Dimension models, reference data, master data, orchestration metadata, and serving APIs frequently depend on relational semantics. A data engineer who only knows object storage and Spark will struggle when source systems require transactional consistency, query tuning, migration windows, stored procedures, and disaster-recovery runbooks.
+\index{relational database}\index{transactional consistency}\index{change data capture}
+
+Azure provides several managed relational choices. \textbf{Azure SQL Database} is a platform-as-a-service relational database based on the SQL Server engine. \textbf{Azure SQL Managed Instance} provides broader SQL Server compatibility for instance-level features. \textbf{Azure Database for PostgreSQL Flexible Server} provides managed open-source PostgreSQL with Azure identity, networking, backups, and high availability \cite{microsoft2025azuresqldb,microsoft2025postgresflexible}. The engineer's job is not to memorize product names, but to map workload requirements to service boundaries.
+
+\begin{definitionbox}
+A \textbf{managed relational database} is a database service where the cloud provider automates infrastructure operations such as host provisioning, storage durability, backup orchestration, patching, and high-availability components, while the customer owns schema, permissions, queries, workload design, data protection requirements, and application behavior.
+\end{definitionbox}
+
+\begin{notebox}
+Relational service selection is often a compatibility decision before it is a performance decision. If the application requires SQL Server Agent jobs, cross-database queries, CLR, Service Broker, or near instance-level parity, evaluate Azure SQL Managed Instance before assuming single-database Azure SQL Database is enough.
+\end{notebox}
+
+\section{Monday: Azure SQL Database Purchasing Models}
+\index{Azure SQL Database!purchasing models}\index{DTU}\index{vCore}\index{serverless}\index{Hyperscale}
+
+\subsection{DTU and vCore Models}
+Azure SQL Database offers two primary purchasing models: DTU and vCore \cite{microsoft2025sqldbPurchasing}. The DTU model bundles CPU, memory, reads, and writes into a single unit. It is convenient for smaller workloads, early prototypes, and teams that want a simple knob. Its weakness is diagnostic opacity: when a workload is constrained, a DTU percentage does not immediately say whether CPU, log throughput, memory grants, or IO latency is the root cause.
+
+The vCore model exposes compute cores, hardware family, service tier, and storage configuration more directly. It aligns better with enterprise sizing, reserved capacity, Azure Hybrid Benefit, and conversations with database administrators who already reason in cores, memory, and IO. General Purpose separates compute from remote storage for balanced cost. Business Critical uses local SSD replicas for low-latency IO and higher availability. Hyperscale uses a different distributed storage architecture.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.0cm}p{4.5cm}p{5.0cm}@{}}
+\toprule
+\textbf{Model} & \textbf{Best fit} & \textbf{Trade-off} \\
+\midrule
+DTU & Simple workloads, early applications, predictable small databases & Blended metric can hide which resource is saturated \\
+vCore & Enterprise sizing, reserved capacity, hybrid licensing, clearer resource reasoning & Requires more explicit capacity planning \\
+Serverless & Intermittent applications, development, unpredictable low duty cycle workloads & Cold starts and auto-pause settings must match application expectations \\
+Hyperscale & Very large databases, rapid scale, fast restore, read scale-out & Different operational limits and feature behavior require validation \\
+\bottomrule
+\end{tabular}
+\caption{Azure SQL purchasing choices should follow workload pattern, compatibility, and operating model rather than habit.}
+\label{tab:azure-sql-purchasing}
+\end{table}
+
+\begin{tipbox}
+When migrating a production SQL Server workload, begin with observed baselines: peak CPU, memory pressure, data file size, log generation rate, tempdb use, longest queries, wait statistics, maintenance windows, and business RPO/RTO. Do not size only by database size.
+\end{tipbox}
+
+\subsection{Serverless for Variable Demand}
+Azure SQL Database Serverless is a compute tier in the vCore model that automatically scales compute within configured limits and can auto-pause after an inactivity delay \cite{microsoft2025sqlServerless}. Billing is based on compute used per second and storage allocated. It is useful for development databases, departmental applications, bursty APIs, training labs, and infrequently used operational stores.
+
+Serverless is not a universal cost saver. If an application is always active, provisioned compute may be cheaper and more predictable. If a database auto-pauses, the first connection after inactivity must resume compute. Applications with strict latency service-level objectives may need a minimum vCore setting or disabled auto-pause. Workloads with background health checks may never pause.
+
+\begin{pitfall}
+\textbf{Treating auto-pause as free savings.} Auto-pause changes user experience. Test connection retry logic, login timeouts, monitoring probes, and application pools before using Serverless for anything user-facing.
+\end{pitfall}
+
+\subsection{Hyperscale Architecture}
+Hyperscale supports very large Azure SQL databases by separating compute nodes from a distributed storage subsystem with page servers and log services \cite{microsoft2025sqlHyperscale}. Compute replicas read pages from the storage layer and cache hot pages locally. The log service sequences writes and enables fast restore because data pages already live in distributed storage. Read scale-out replicas can serve reporting traffic without overloading the primary compute.
+
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[node distance=1.4cm]
+        \node[stage] (app) {Applications\\and ETL};
+        \node[stage, right=1.8cm of app] (primary) {Primary\\compute};
+        \node[stage, above right=0.7cm and 1.8cm of primary] (replica1) {Named / read\\replica};
+        \node[stage, below right=0.7cm and 1.8cm of primary] (replica2) {HA\\replica};
+        \node[tool, right=2.0cm of primary] (log) {Log\\service};
+        \node[store, right=1.8cm of log] (pages) {Page servers\\distributed storage};
+        \node[doc, below=1.5cm of pages] (backup) {Snapshot\\backup};
+        \draw[arrow] (app) -- (primary);
+        \draw[arrow] (primary) -- (log);
+        \draw[arrow] (log) -- (pages);
+        \draw[biarrow] (primary) -- (replica1);
+        \draw[biarrow] (primary) -- (replica2);
+        \draw[arrow] (pages) -- (backup);
+        \begin{scope}[on background layer]
+            \node[draw=primary!40, dashed, rounded corners, fit=(primary)(replica1)(replica2)(log)(pages)(backup), inner sep=10pt, label={[font=\small\bfseries\color{primary}]above:Azure SQL Hyperscale service boundary}] {};
+        \end{scope}
+    \end{tikzpicture}%
+    }
+    \caption{Azure SQL Hyperscale separates compute from log and page storage so large databases can scale and restore differently from traditional monolithic storage.}
+    \label{fig:azure-sql-hyperscale}
+\end{figure}
+
+\section{Tuesday: Azure Database for PostgreSQL Flexible Server and High Availability}
+\index{Azure Database for PostgreSQL}\index{Flexible Server}\index{PostgreSQL!high availability}\index{zone-redundant HA}
+
+\subsection{Flexible Server as the Default PostgreSQL Model}
+Azure Database for PostgreSQL Flexible Server is the managed PostgreSQL deployment option used for most new Azure PostgreSQL workloads \cite{microsoft2025postgresflexible}. It provides configurable compute and storage, automatic backups, point-in-time restore, maintenance windows, private networking, read replicas, and high-availability options. Because it runs community PostgreSQL, application portability is usually stronger than with proprietary engines, but extensions, version support, parameter settings, and operational limits must still be checked.
+
+Flexible Server separates concerns that on-premises teams often blend together. Azure owns host replacement, storage durability, backups, and platform patching. The application team owns schema migrations, connection pooling, query plans, vacuum behavior, bloat management, extension choice, and transaction design. PostgreSQL performance failures in the cloud are still often ordinary PostgreSQL failures: missing indexes, unbounded transactions, chatty connections, overloaded temp files, or poor statistics.
+
+\begin{definitionbox}
+\textbf{Flexible Server high availability} provisions a standby server that can take over when the primary becomes unavailable. Zone-redundant HA places standby capacity in a different availability zone when the region supports zones; same-zone HA focuses on local resilience with lower network latency.
+\end{definitionbox}
+
+\subsection{High Availability and Backups}
+High availability and backups solve different problems. HA reduces outage duration when a node or zone fails. Backups restore data to a previous point in time after corruption, accidental delete, bad deployments, or application mistakes. A standby faithfully replicates bad data changes; backups allow recovery before those changes. Data engineers must include both in the architecture.
+
+\begin{notebox}
+PostgreSQL HA failover changes the server endpoint target, but applications still need connection retry behavior. Use connection pooling carefully: stale connections can make a healthy failover look like an application outage.
+\end{notebox}
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.1cm}p{4.6cm}p{4.9cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{What it provides} & \textbf{What it does not provide} \\
+\midrule
+Zone-redundant HA & Standby in another availability zone and automated failover & Protection from bad SQL, accidental drops, or cross-region disaster \\
+Point-in-time restore & Recovery to a prior timestamp within backup retention & Zero data loss after a primary-region outage \\
+Read replica & Read scale-out and reporting isolation & Synchronous HA or automatic application cutover by itself \\
+Maintenance window & Predictable platform patching window & Application release governance or schema migration safety \\
+\bottomrule
+\end{tabular}
+\caption{PostgreSQL operational controls must be combined to meet availability and recoverability goals.}
+\label{tab:postgres-ha-backups}
+\end{table}
+
+\subsection{Designing PostgreSQL for Data Engineering}
+PostgreSQL often appears in data platforms as a metadata store, operational data mart, feature-serving database, orchestration catalog, or domain service database. The design should choose indexes for access patterns, keep transactions short, use connection pooling, monitor vacuum, and isolate reporting from write-heavy workloads. Read replicas are valuable for BI or extraction workloads, but replica lag must be measured before using them for near-real-time pipelines.
+
+\begin{tipbox}
+For ingestion-heavy PostgreSQL workloads, track write-ahead-log generation, autovacuum lag, dead tuples, lock waits, checkpoint behavior, and replica lag. These signals are often more useful than a generic CPU chart.
+\end{tipbox}
+
+\section{Wednesday: Active Geo-Replication and Auto-Failover Groups}
+\index{active geo-replication}\index{auto-failover groups}\index{disaster recovery}\index{read replica}\index{RPO}\index{RTO}
+
+\subsection{Active Geo-Replication}
+Active geo-replication creates up to four readable secondary databases in different regions for Azure SQL Database \cite{microsoft2025activeGeoReplication}. Replication is asynchronous. The secondary can support read-only workloads and can be promoted during disaster recovery. Because replication is asynchronous, the platform can lose the most recent committed transactions during a regional disaster. The business must decide whether that RPO is acceptable.
+
+Active geo-replication is database-scoped. It is excellent when one critical database needs a readable copy in another region. However, many applications use several databases together. If those databases must fail over as a unit, an auto-failover group is usually a better control-plane abstraction.
+
+\begin{pitfall}
+\textbf{Ignoring consistency across databases.} If an application writes to five databases, failing over only one database can create broken business state. Group related databases and test the full application, not only the database endpoint.
+\end{pitfall}
+
+\subsection{Auto-Failover Groups}
+Auto-failover groups provide a listener endpoint and group-level failover for one or more databases on Azure SQL Database logical servers or SQL Managed Instances \cite{microsoft2025failoverGroups}. Applications connect to a read-write listener and optionally a read-only listener. During failover, the listener redirects to the new primary. This lowers DNS and connection-string complexity, but it does not remove the need for retries, idempotent writes, and operational decision authority.
+
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[node distance=1.3cm]
+        \node[stage] (app) {Application\\connection string};
+        \node[tool, right=1.6cm of app] (listener) {Failover group\\read-write listener};
+        \node[store, right=1.8cm of listener] (primary) {Primary SQL\\East US};
+        \node[store, right=2.2cm of primary] (secondary) {Secondary SQL\\West US};
+        \node[tool, above=1.2cm of secondary] (readonly) {Read-only\\listener};
+        \node[doc, below=1.2cm of primary] (policy) {Grace period\\failover policy};
+        \node[doc, below=1.2cm of secondary] (runbook) {DR runbook\\RPO / RTO};
+        \draw[arrow] (app) -- (listener);
+        \draw[arrow] (listener) -- (primary);
+        \draw[arrow] (readonly) -- (secondary);
+        \draw[arrow] (primary) -- node[above,font=\scriptsize\itshape]{async replication} (secondary);
+        \draw[arrow] (policy) -- (listener);
+        \draw[arrow] (runbook) -- (secondary);
+    \end{tikzpicture}%
+    }
+    \caption{Azure SQL auto-failover groups provide listener endpoints over asynchronously replicated databases for regional resilience.}
+    \label{fig:auto-failover-group}
+\end{figure}
+
+\subsection{Testing Failover Without Fooling Yourself}
+A failover test should include more than pressing a button. Capture baseline lag, pause nonessential writes, run synthetic transactions, fail over, reconnect through the listener, validate data, observe application retries, and fail back only after leadership approves. If the database feeds ETL, test downstream idempotency: a pipeline may reread rows or miss rows if watermark logic is not designed for failover.
+
+\begin{notebox}
+Disaster recovery is a socio-technical process. Azure can provide replicas and listeners, but people still decide when to fail over, how much data loss is acceptable, who communicates impact, and how systems return to normal.
+\end{notebox}
+
+\section{Thursday Hands-on Project: Serverless Azure SQL with Geo-Replica and Failover}
+\index{hands-on lab}\index{Azure CLI}\index{Python SDK}\index{geo-replica!Azure SQL}
+This lab deploys an Azure SQL logical server, a Serverless database, a secondary server in another region, and a geo-replica. It then uses Python to write and validate a small workload before a manual failover simulation. Run it only in a sandbox subscription and delete the resource group when finished.
+
+\begin{notebox}
+The examples are written for Windows PowerShell with Azure CLI. Replace server names with globally unique names and use a strong administrator password stored outside source control.
+\end{notebox}
+
+\begin{lstlisting}[language=bash,caption={Deploying Azure SQL Database Serverless and creating a geo-replica with Azure CLI.},label={lst:ch2-sql-serverless-cli}]
+az login
+az account set --subscription "00000000-0000-0000-0000-000000000000"
+
+$rg = "rg-de-azure-book-week2"
+$primaryLocation = "eastus"
+$secondaryLocation = "westus"
+$primaryServer = "sql-week2-primary-001"
+$secondaryServer = "sql-week2-secondary-001"
+$db = "sqldb-orders-serverless"
+$admin = "sqladminuser"
+$password = Read-Host "SQL admin password" -AsSecureString
+$plainPassword = [Runtime.InteropServices.Marshal]::PtrToStringAuto(
+  [Runtime.InteropServices.Marshal]::SecureStringToBSTR($password))
+
+az group create `
+  --name $rg `
+  --location $primaryLocation
+
+az sql server create `
+  --name $primaryServer `
+  --resource-group $rg `
+  --location $primaryLocation `
+  --admin-user $admin `
+  --admin-password $plainPassword
+
+az sql server create `
+  --name $secondaryServer `
+  --resource-group $rg `
+  --location $secondaryLocation `
+  --admin-user $admin `
+  --admin-password $plainPassword
+
+az sql db create `
+  --resource-group $rg `
+  --server $primaryServer `
+  --name $db `
+  --edition GeneralPurpose `
+  --compute-model Serverless `
+  --family Gen5 `
+  --capacity 2 `
+  --min-capacity 0.5 `
+  --auto-pause-delay 60 `
+  --zone-redundant false
+
+az sql db replica create `
+  --resource-group $rg `
+  --server $primaryServer `
+  --name $db `
+  --partner-resource-group $rg `
+  --partner-server $secondaryServer
+\end{lstlisting}
+
+Open firewall access only for a controlled client IP or private network. The simple rule below is a lab convenience and should not be copied into production without review.
+
+\begin{lstlisting}[language=bash,caption={Adding a narrow client firewall rule and checking replica state.},label={lst:ch2-sql-firewall-cli}]
+$clientIp = (Invoke-RestMethod -Uri "https://api.ipify.org")
+
+az sql server firewall-rule create `
+  --resource-group $rg `
+  --server $primaryServer `
+  --name "client-ip" `
+  --start-ip-address $clientIp `
+  --end-ip-address $clientIp
+
+az sql server firewall-rule create `
+  --resource-group $rg `
+  --server $secondaryServer `
+  --name "client-ip" `
+  --start-ip-address $clientIp `
+  --end-ip-address $clientIp
+
+az sql db replica list-links `
+  --resource-group $rg `
+  --server $primaryServer `
+  --name $db `
+  --output table
+\end{lstlisting}
+
+The Python snippet creates a table, inserts a row, and reads it back. Install \texttt{pyodbc} only in a local lab environment with the Microsoft ODBC Driver for SQL Server available.
+
+\begin{lstlisting}[language=Python,caption={Validating a write before failover with Python and pyodbc.},label={lst:ch2-python-sql-write}]
+import os
+import pyodbc
+
+server = os.environ["AZURE_SQL_SERVER"]
+database = os.environ.get("AZURE_SQL_DATABASE", "sqldb-orders-serverless")
+username = os.environ["AZURE_SQL_USER"]
+password = os.environ["AZURE_SQL_PASSWORD"]
+
+connection_string = (
+    "Driver={ODBC Driver 18 for SQL Server};"
+    f"Server=tcp:{server}.database.windows.net,1433;"
+    f"Database={database};Uid={username};Pwd={password};"
+    "Encrypt=yes;TrustServerCertificate=no;Connection Timeout=30;"
+)
+
+with pyodbc.connect(connection_string) as conn:
+    cursor = conn.cursor()
+    cursor.execute("""
+        IF OBJECT_ID('dbo.orders') IS NULL
+        CREATE TABLE dbo.orders (
+            order_id int NOT NULL PRIMARY KEY,
+            status nvarchar(40) NOT NULL,
+            updated_at datetime2 NOT NULL DEFAULT sysutcdatetime()
+        )
+    """)
+    cursor.execute("""
+        MERGE dbo.orders AS target
+        USING (SELECT 1001 AS order_id, N'paid' AS status) AS source
+        ON target.order_id = source.order_id
+        WHEN MATCHED THEN UPDATE SET status = source.status,
+             updated_at = sysutcdatetime()
+        WHEN NOT MATCHED THEN INSERT (order_id, status)
+             VALUES (source.order_id, source.status);
+    """)
+    conn.commit()
+    row = cursor.execute(
+        "SELECT order_id, status FROM dbo.orders WHERE order_id = 1001"
+    ).fetchone()
+    print(row.order_id, row.status)
+\end{lstlisting}
+
+After validating the primary, simulate regional failover by promoting the replica. Update the Python environment variable to the secondary server and rerun the read query.
+
+\begin{lstlisting}[language=bash,caption={Simulating regional failover by promoting the geo-replica.},label={lst:ch2-sql-failover-cli}]
+az sql db replica set-primary `
+  --resource-group $rg `
+  --server $secondaryServer `
+  --name $db
+
+$env:AZURE_SQL_SERVER = $secondaryServer
+$env:AZURE_SQL_DATABASE = $db
+python .\validate-orders.py
+\end{lstlisting}
+
+\begin{pitfall}
+\textbf{Failover without client testing.} A database can promote successfully while applications still fail because connection strings, DNS, firewall rules, secret stores, or retry policies still point to the old region.
+\end{pitfall}
+
+\section{Friday Use Case: Zero-Downtime Migration to Azure SQL Managed Instance}
+\index{Azure SQL Managed Instance}\index{zero-downtime migration}\index{Azure Database Migration Service}\index{SQL Server migration}
+
+\subsection{Scenario}
+A retailer runs a monolithic on-premises SQL Server that supports orders, inventory, billing, and customer service. The database is 6 TB, uses SQL Server Agent jobs, linked-server dependencies, cross-database queries, and several vendor stored procedures. The business wants to move to Azure with almost no downtime. Azure SQL Managed Instance is selected because it provides high SQL Server compatibility while reducing infrastructure operations \cite{microsoft2025sqlmi}.
+
+Zero downtime is an aspiration, not a magic switch. The practical target is a short controlled cutover window with continuous replication before the switch. The migration team must assess compatibility, remediate blockers, establish private connectivity, provision Managed Instance, migrate logins and jobs, seed data, replicate changes, rehearse cutover, freeze risky releases, and validate application behavior after DNS or connection-string changes.
+
+\begin{definitionbox}
+\textbf{Azure SQL Managed Instance} is a managed SQL Server-compatible platform-as-a-service deployment option that preserves many instance-level capabilities while Azure operates the underlying infrastructure, patching, backups, and availability components.
+\end{definitionbox}
+
+\subsection{Migration Architecture}
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[node distance=1.2cm]
+        \node[stage] (users) {Users and\\applications};
+        \node[store, right=1.6cm of users] (onprem) {On-prem SQL\\monolith};
+        \node[tool, above right=0.8cm and 1.6cm of onprem] (assess) {Data Migration\\Assistant};
+        \node[tool, right=1.8cm of onprem] (dms) {Azure Database\\Migration Service};
+        \node[store, right=1.8cm of dms] (mi) {Azure SQL\\Managed Instance};
+        \node[doc, below=1.2cm of onprem] (backup) {Full + log\\backups};
+        \node[doc, below=1.2cm of dms] (cutover) {Cutover\\runbook};
+        \node[stage, below=1.2cm of mi] (reports) {ADF / BI /\\downstream data};
+        \draw[arrow] (users) -- (onprem);
+        \draw[arrow] (onprem) -- (dms);
+        \draw[arrow] (dms) -- node[above,font=\scriptsize]{continuous sync} (mi);
+        \draw[arrow] (assess) -- (onprem);
+        \draw[arrow] (backup) -- (dms);
+        \draw[arrow] (cutover) -- (mi);
+        \draw[arrow] (mi) -- (reports);
+    \end{tikzpicture}%
+    }
+    \caption{Zero-downtime migration pattern from an on-premises SQL Server monolith to Azure SQL Managed Instance using assessment, seeding, continuous synchronization, and controlled cutover.}
+    \label{fig:sql-mi-migration}
+\end{figure}
+
+\subsection{Cutover Runbook}
+The runbook begins weeks before migration night. Data Migration Assistant or Azure Migrate assessments identify unsupported features, deprecated syntax, collation issues, SQL Agent job dependencies, and performance risks. Network teams validate ExpressRoute or VPN paths. Security teams create Microsoft Entra groups, managed identities, private DNS zones, and Key Vault entries. DBAs rehearse restore and synchronization. Data engineers validate downstream extract jobs, watermark logic, and reporting latency.
+
+During the final cutover, the team freezes writes or places the application in maintenance mode, lets replication catch up, validates row counts and checksums, promotes Managed Instance, updates connection endpoints, starts smoke tests, watches error rates, and confirms downstream pipelines. Rollback must be explicit: either point applications back to on-premises before new writes occur in Azure, or accept Azure as the system of record and remediate forward.
+
+\begin{tipbox}
+For near-zero downtime, rehearse the exact cutover multiple times with production-like data and timing. The first successful migration should never be the production migration.
+\end{tipbox}
+
+\section{Architectural Decision Record Template}
+\index{architectural decision record}
+A Week 2 ADR should capture engine choice, compatibility constraints, purchasing model, HA pattern, backup retention, geo-replication, failover authority, private networking, identity model, migration approach, and cost controls. Include alternatives: Azure SQL Database, SQL Managed Instance, PostgreSQL Flexible Server, self-managed virtual machines, and cross-cloud options. The ADR is strongest when it records rejected options and why they were rejected.
+
+\section{Operational Deep Dive: Performance, Identity, and Observability}
+\index{query performance}\index{managed identity}\index{observability}
+Relational platforms fail through ordinary engineering gaps. Queries miss indexes, statistics go stale, connection pools saturate, transactions hold locks, deployments change query plans, and extract jobs create accidental denial of service. Azure adds tools such as Query Store, automatic tuning, metrics, diagnostic logs, alerts, Microsoft Defender for SQL, and Azure Monitor, but the team still needs ownership.
+
+Identity should prefer Microsoft Entra ID, managed identities, group-based RBAC, and contained database users where supported. Avoid embedding SQL administrator passwords in pipelines. Network access should use private endpoints or private link patterns for production. Observability should include CPU, storage, log IO, deadlocks, failed connections, long-running queries, replica lag, failover events, backup state, and cost by environment.
+
+\begin{pitfall}
+\textbf{Letting ETL act like an unbounded user.} A nightly extraction that scans every table can starve the operational workload. Use read replicas, change tracking, CDC, batching, and workload windows rather than brute-force reads.
+\end{pitfall}
+
+\section{Troubleshooting Patterns}
+\index{troubleshooting}\index{connection pooling}\index{replica lag}
+Common relational incidents fall into five groups. Connectivity failures require checking firewall rules, private DNS, TLS settings, credentials, and listener names. Performance failures require Query Store, wait statistics, indexes, plans, and workload changes. HA failures require examining failover events and client retry logic. Replication surprises require checking lag, unsupported operations, and region availability. Migration failures require compatibility reports, login mappings, SQL Agent jobs, linked servers, and collation differences.
+
+A disciplined response avoids broad fixes. Do not scale from two vCores to thirty-two vCores before checking whether a missing index caused the outage. Do not disable firewall rules because one pipeline cannot connect. Do not force failover until you know replication lag and business impact. As with storage, small precise changes preserve trust.
+
+\section{Week 2 Lab Rubric}
+\index{rubric}
+A complete Week 2 submission includes Azure CLI deployment evidence, a diagram of primary and secondary relational regions, Python validation output before and after failover, an ADR explaining purchasing and HA choices, and a migration runbook for the Managed Instance scenario.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.0cm}p{5.0cm}p{5.0cm}@{}}
+\toprule
+\textbf{Criterion} & \textbf{Meets expectation} & \textbf{Needs improvement} \\
+\midrule
+Model selection & DTU, vCore, Serverless, and Hyperscale trade-offs are explained & Service tier chosen without workload evidence \\
+HA / DR & Geo-replication, failover groups, RPO, and RTO are documented & Replica assumed to solve all application recovery \\
+Hands-on & CLI creates database and replica; Python validates data before and after failover & Commands are portal-only or validation is missing \\
+Security & Private access, Entra ID, least privilege, and secrets hygiene are addressed & Broad firewall or admin password habits remain \\
+Migration & Managed Instance cutover has assessment, sync, validation, rollback, and downstream checks & Migration is described as a one-step restore \\
+\bottomrule
+\end{tabular}
+\caption{Week 2 rubric for relational database architecture and hands-on deliverables.}
+\label{tab:week2-rubric}
+\end{table}
+
+\section{Interview Q\&A}
+\subsection{Concepts and Trade-offs}
+\begin{enumerate}
+    \item \textbf{Q: When would you choose vCore over DTU for Azure SQL Database?}\\
+    A: Choose vCore when you need explicit control over cores, hardware family, storage, reserved capacity, hybrid licensing, or enterprise capacity planning.
+    \item \textbf{Q: Why is Serverless not always cheaper?}\\
+    A: Always-active workloads may pay continuously, auto-pause may never trigger, and cold-start latency can force a minimum compute setting.
+    \item \textbf{Q: What makes Hyperscale different from Business Critical?}\\
+    A: Hyperscale separates compute from distributed page and log storage for very large databases and fast restore; Business Critical focuses on local SSD replicas and low-latency IO.
+    \item \textbf{Q: What does PostgreSQL Flexible Server HA protect against?}\\
+    A: It reduces outage from server or zone failures, but it does not protect against bad application writes; backups and PITR are still required.
+    \item \textbf{Q: Why use an auto-failover group instead of only active geo-replication?}\\
+    A: A failover group provides listener endpoints and group-level failover for related databases, simplifying application connection management.
+    \item \textbf{Q: What is the largest risk in a zero-downtime SQL Server migration?}\\
+    A: Unrehearsed cutover dependencies: compatibility gaps, logins, jobs, connection strings, downstream ETL, and rollback rules can break despite successful data copy.
+\end{enumerate}
+
+\section{Further Reading}
+Start with Azure SQL Database documentation \cite{microsoft2025azuresqldb}, purchasing model guidance \cite{microsoft2025sqldbPurchasing}, Serverless \cite{microsoft2025sqlServerless}, and Hyperscale \cite{microsoft2025sqlHyperscale}. Review Azure Database for PostgreSQL Flexible Server \cite{microsoft2025postgresflexible} and its high-availability concepts \cite{microsoft2025postgresHA}. For regional resilience, read active geo-replication \cite{microsoft2025activeGeoReplication} and auto-failover groups \cite{microsoft2025failoverGroups}. For migration, study Azure SQL Managed Instance \cite{microsoft2025sqlmi}, Azure Database Migration Service \cite{microsoft2025dms}, and the Data Migration Assistant \cite{microsoft2025dma}. Use the Azure Well-Architected Framework \cite{microsoft2025wellarchitected} to evaluate reliability, security, operational excellence, performance, and cost.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item Azure SQL Database purchasing models differ by abstraction: DTU is blended, vCore is explicit, Serverless is elastic for intermittent demand, and Hyperscale changes storage architecture.
+    \item PostgreSQL Flexible Server provides managed operations, but PostgreSQL fundamentals such as indexes, vacuum, transactions, and connection pooling still matter.
+    \item HA, backups, read replicas, active geo-replication, and failover groups solve different reliability problems.
+    \item Asynchronous geo-replication requires explicit RPO acceptance and application-level retry, idempotency, and validation.
+    \item Zero-downtime migration depends on assessment, rehearsal, continuous sync, cutover governance, rollback rules, and downstream data validation.
+    \item Managed database services reduce infrastructure toil; they do not remove schema, security, performance, observability, or DR ownership.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Compare DTU and vCore for a 200 GB order-processing database. Which model gives clearer capacity planning and why?
+    \item \textbf{(Conceptual)} Explain when Azure SQL Serverless is appropriate and list two application behaviors that can prevent auto-pause savings.
+    \item \textbf{(Conceptual)} Draw the difference between Azure SQL active geo-replication and an auto-failover group.
+    \item \textbf{(Hands-on)} Run the Serverless Azure SQL deployment in a sandbox and capture evidence of the database compute model and replica link.
+    \item \textbf{(Hands-on)} Modify the Python validation script to insert ten orders, fail over, and confirm all ten rows exist on the promoted replica.
+    \item \textbf{(Hands-on)} Create a PostgreSQL Flexible Server design checklist that includes HA, backups, private access, parameter changes, and read replicas.
+    \item \textbf{(Design)} Choose between Azure SQL Database, Azure SQL Managed Instance, and PostgreSQL Flexible Server for a vendor application with SQL Agent jobs and cross-database queries.
+    \item \textbf{(Design)} Write a zero-downtime migration runbook for the retailer scenario, including rollback criteria and downstream ETL validation.
+\end{enumerate}
+
+\section{Capstone Project: HA Geo-Replicated Azure SQL Platform for Managed Instance Cutover}\label{sec:ch2-capstone}
+\index{capstone project}\index{Azure SQL platform}\index{Managed Instance cutover}\index{high availability}\index{geo-replicated platform}
+
+\begin{capstonebox}
+\textbf{Mission:} Design and prototype a high-availability, geo-replicated Azure SQL platform that supports a controlled SQL Server to Azure SQL Managed Instance cutover. Your solution must combine assessment, private networking, continuous migration, failover design, validation, and operational evidence.
+
+\textbf{Estimated time:} 5--7 hours.
+
+\textbf{What you will practice:}
+\begin{itemize}
+    \item Selecting Azure SQL Managed Instance when instance-level SQL Server compatibility matters.
+    \item Designing regional resilience with failover groups, backups, PITR, monitoring, and application retry behavior.
+    \item Preparing a near-zero-downtime migration using assessment, seeding, continuous synchronization, and cutover rehearsal.
+    \item Validating data integrity, downstream ETL behavior, and rollback criteria.
+    \item Producing evidence suitable for an architecture review and migration go/no-go meeting.
+\end{itemize}
+\end{capstonebox}
+
+\subsection*{Scenario}
+A financial services company must move its 4 TB on-premises SQL Server monolith to Azure SQL Managed Instance. The application supports payments, customer service, finance reconciliation, and regulatory reporting. Planned downtime is limited to 30 minutes. The platform must be resilient to zone failure and prepared for regional failover. Data engineers own downstream extracts into ADLS Gen2 and must prove that the cutover will not duplicate or lose data in the lake.
+
+\subsection*{Requirements}
+\begin{itemize}
+    \item \textbf{Compatibility:} Use Azure SQL Managed Instance because the workload depends on SQL Server Agent jobs, cross-database queries, and high SQL Server surface-area compatibility.
+    \item \textbf{High availability:} Use a Business Critical or General Purpose configuration with documented zone redundancy where supported and clear maintenance windows.
+    \item \textbf{Geo-resilience:} Design an auto-failover group between primary and secondary Managed Instances and state asynchronous replication RPO assumptions.
+    \item \textbf{Migration:} Use Azure Database Migration Service or a documented backup and log-shipping style approach for initial load plus continuous synchronization.
+    \item \textbf{Security:} Use private endpoints or delegated subnet integration, Microsoft Entra groups, Key Vault for secrets, TLS, auditing, and least-privilege roles.
+    \item \textbf{Validation:} Reconcile row counts, checksums for critical tables, SQL Agent job behavior, application smoke tests, and downstream ETL watermarks.
+    \item \textbf{Operations:} Provide monitoring alerts, failover authority, rollback criteria, communication plan, and cleanup steps for obsolete on-premises dependencies.
+\end{itemize}
+
+\subsection*{Reference Architecture}
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[node distance=1.2cm]
+        \node[stage] (app) {Application\\traffic};
+        \node[store, right=1.4cm of app] (source) {On-prem SQL\\Server};
+        \node[tool, above=1.1cm of source] (assess) {DMA / Azure\\Migrate};
+        \node[tool, right=1.7cm of source] (dms) {Database\\Migration Service};
+        \node[store, right=1.7cm of dms] (mi1) {Primary Managed\\Instance};
+        \node[store, right=2.0cm of mi1] (mi2) {Secondary Managed\\Instance};
+        \node[tool, above=1.1cm of mi1] (fog) {Auto-failover\\group listener};
+        \node[store, below=1.2cm of mi1] (lake) {ADLS Gen2\\downstream lake};
+        \node[doc, below=1.2cm of source] (runbook) {Cutover and\\rollback runbook};
+        \node[doc, below=1.2cm of mi2] (monitor) {Monitor + audit\\DR evidence};
+        \draw[arrow] (app) -- (source);
+        \draw[arrow] (assess) -- (source);
+        \draw[arrow] (source) -- (dms);
+        \draw[arrow] (dms) -- node[above,font=\scriptsize]{seed + continuous sync} (mi1);
+        \draw[arrow] (mi1) -- node[above,font=\scriptsize\itshape]{async replication} (mi2);
+        \draw[arrow] (fog) -- (mi1);
+        \draw[arrow] (fog) -- (mi2);
+        \draw[arrow] (mi1) -- (lake);
+        \draw[arrow] (runbook) -- (dms);
+        \draw[arrow] (monitor) -- (mi2);
+    \end{tikzpicture}%
+    }
+    \caption{Capstone reference architecture for a high-availability Azure SQL Managed Instance migration with continuous sync, failover group, downstream lake validation, and operational evidence.}
+    \label{fig:ch2-capstone-mi-cutover}
+\end{figure}
+
+\subsection*{Implementation Steps}
+Use a sandbox subscription for the prototype. Managed Instance deployments can take significant time and incur cost, so adapt names and sizes to your lab constraints. The snippets below show the structure rather than a production sizing recommendation.
+
+\begin{enumerate}
+    \item \textbf{Create resource group and plan the Managed Instance network.} Managed Instance requires a dedicated subnet with appropriate delegation and network controls.
+\begin{lstlisting}[language=bash,caption={PowerShell plus Azure CLI skeleton for Managed Instance network preparation.},label={lst:ch2-capstone-network-cli}]
+az login
+az account set --subscription "00000000-0000-0000-0000-000000000000"
+
+$rg = "rg-sqlmi-cutover-capstone"
+$location = "eastus"
+$vnet = "vnet-sqlmi-cutover"
+$subnet = "snet-managed-instance"
+$nsg = "nsg-sqlmi-cutover"
+$routeTable = "rt-sqlmi-cutover"
+
+az group create `
+  --name $rg `
+  --location $location
+
+az network vnet create `
+  --resource-group $rg `
+  --location $location `
+  --name $vnet `
+  --address-prefixes 10.40.0.0/16 `
+  --subnet-name $subnet `
+  --subnet-prefixes 10.40.1.0/24
+
+az network nsg create `
+  --resource-group $rg `
+  --location $location `
+  --name $nsg
+
+az network route-table create `
+  --resource-group $rg `
+  --location $location `
+  --name $routeTable
+
+az network vnet subnet update `
+  --resource-group $rg `
+  --vnet-name $vnet `
+  --name $subnet `
+  --network-security-group $nsg `
+  --route-table $routeTable `
+  --delegations Microsoft.Sql/managedInstances
+\end{lstlisting}
+
+    \item \textbf{Prototype the primary Managed Instance and capture configuration.} Use Azure Portal, Bicep, Terraform, or Azure CLI according to organizational standards. The key deliverable is reproducible evidence: SKU, storage, collation, time zone, subnet, administrator model, backup retention, auditing, and maintenance window.
+\begin{lstlisting}[language=bash,caption={Managed Instance creation skeleton and configuration evidence commands.},label={lst:ch2-capstone-mi-cli}]
+$mi = "mi-sql-cutover-primary-001"
+$admin = "sqlmiadmin"
+$password = Read-Host "Managed Instance admin password" -AsSecureString
+$plainPassword = [Runtime.InteropServices.Marshal]::PtrToStringAuto(
+  [Runtime.InteropServices.Marshal]::SecureStringToBSTR($password))
+$subnetId = az network vnet subnet show `
+  --resource-group $rg `
+  --vnet-name $vnet `
+  --name $subnet `
+  --query id `
+  --output tsv
+
+az sql mi create `
+  --resource-group $rg `
+  --name $mi `
+  --location $location `
+  --subnet $subnetId `
+  --admin-user $admin `
+  --admin-password $plainPassword `
+  --license-type BasePrice `
+  --storage 256GB `
+  --capacity 4 `
+  --tier GeneralPurpose `
+  --family Gen5
+
+az sql mi show `
+  --resource-group $rg `
+  --name $mi `
+  --query "{name:name,state:state,sku:sku.name,storage:storageSizeInGB,subnet:subnetId}" `
+  --output table
+\end{lstlisting}
+
+    \item \textbf{Plan the geo-replicated cutover.} Create a secondary Managed Instance in the paired region, configure an auto-failover group, and require application teams to connect through the listener. Document RPO expectations because replication is asynchronous.
+    \item \textbf{Run assessment and migration rehearsal.} Execute Data Migration Assistant reports, remediate blockers, seed a copy with Azure Database Migration Service, start continuous sync, and measure lag during normal and peak workloads.
+    \item \textbf{Validate data and downstream pipelines.} Before cutover, compare critical table row counts, checksums, SQL Agent jobs, permissions, and ETL watermarks. After cutover, run application smoke tests and the downstream ADLS Gen2 extraction validation.
+\end{enumerate}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item Architecture diagram showing on-premises SQL Server, DMS or migration tooling, primary Managed Instance, secondary Managed Instance, failover group listener, private network, Key Vault, monitoring, and ADLS Gen2 downstream consumers.
+    \item ADR explaining why Azure SQL Managed Instance was selected and why Azure SQL Database, PostgreSQL Flexible Server, and SQL Server on virtual machines were rejected.
+    \item Reproducible deployment snippets or infrastructure-as-code for network, Managed Instance, auditing, backup retention, and failover group configuration.
+    \item Migration runbook covering assessment, remediation, seed load, continuous sync, pre-cutover checks, cutover, validation, rollback, and communication.
+    \item Evidence pack with assessment results, row-count reconciliation, checksum queries, failover test output, application smoke-test results, and downstream ETL validation.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item Managed Instance is justified by documented SQL Server compatibility requirements.
+    \item Network design uses a dedicated subnet and avoids public administrative habits for production.
+    \item HA, backup retention, PITR, failover group, RPO, and RTO are explicitly documented.
+    \item Migration process includes initial load, continuous synchronization, measured lag, and at least one rehearsal.
+    \item Cutover plan includes freeze window, final sync validation, listener or connection-string switch, smoke tests, and rollback criteria.
+    \item Downstream data engineering jobs have validated watermarks so cutover does not duplicate or skip records.
+    \item Security design uses least privilege, Key Vault, auditing, and group-based access instead of shared administrator credentials.
+    \item Evidence is complete enough for a go/no-go meeting and for another engineer to reproduce the lab with changed names.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Add a Bicep or Terraform implementation for the full Managed Instance network and primary instance.
+    \item Build a failover drill script that records listener endpoint, replication role, application smoke-test status, and elapsed recovery time.
+    \item Add Query Store baseline capture before and after migration to compare top queries and regressions.
+    \item Use Microsoft Defender for SQL, vulnerability assessment, and audit logs to build a security evidence appendix.
+    \item Add a downstream CDC pipeline that writes to ADLS Gen2 and proves idempotent replay across cutover.
+    \item Estimate three-year cost for General Purpose versus Business Critical, reserved capacity, Azure Hybrid Benefit, and secondary-region DR.
+\end{itemize}

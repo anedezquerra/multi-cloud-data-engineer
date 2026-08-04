@@ -1,0 +1,961 @@
+\chapter{Amazon S3 and Storage Foundations}
+\index{Amazon S3}\index{object storage}\index{storage classes}\index{durability}\index{availability}%
+\index{lifecycle policies}\index{versioning}\index{Object Lock}\index{replication}\index{DataSync}\index{Storage Gateway}\index{Snow Family}%
+\begin{objectives}
+\begin{itemize}
+    \item Explain Amazon S3's object-storage architecture, namespace model, durability model, availability model, and strong consistency guarantees.
+    \item Compare S3 Standard, Standard-IA, One Zone-IA, Glacier Instant Retrieval, Glacier Flexible Retrieval, and Glacier Deep Archive for data engineering workloads.
+    \item Design lifecycle, versioning, Object Lock, legal hold, and replication policies that match retention, recovery, and compliance requirements.
+    \item Choose among AWS DataSync, Storage Gateway, and the AWS Snow Family for online, hybrid, and offline migration scenarios.
+    \item Deploy a bucket with the AWS CLI, configure a 30-day transition to Glacier Flexible Retrieval, and connect S3 event notifications to Amazon SQS.
+    \item Design a multi-region healthcare disaster-recovery storage architecture for 10 PB of medical-imaging data under HIPAA-style constraints.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+Although this book teaches \textbf{AWS}, the Week~1 storage foundations map almost one-to-one onto the other clouds---learn one mental model and carry it everywhere.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{2.8cm}p{3.0cm}p{3.0cm}p{3.0cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{AWS} & \textbf{Azure} & \textbf{GCP} \\
+\midrule
+Object storage & Amazon S3 & ADLS Gen2 / Blob & Cloud Storage \\
+Hot tier & S3 Standard & Hot & Standard \\
+Infrequent access & S3 Standard-IA & Cool / Cold & Nearline \\
+Archive (instant) & Glacier Instant Retrieval & Cold & Coldline \\
+Deep archive & Glacier Deep Archive & Archive & Archive \\
+Lifecycle rules & Lifecycle policies & Lifecycle management & Object Lifecycle Mgmt \\
+Versioning & S3 Versioning & Blob versioning & Object Versioning \\
+Immutability (WORM) & Object Lock & Immutable blob storage & Bucket Lock \\
+Cross-region copy & CRR / SRR & Object replication (GRS) & Dual/multi-region + Transfer \\
+Online transfer & DataSync & AzCopy & Storage Transfer Service \\
+Offline transfer & Snow Family & Data Box & Transfer Appliance \\
+\addlinespace
+Design durability & 11 nines & 11 nines (LRS) / 16 (GRS) & 11 nines \\
+Availability SLA & 99.9\% (Standard) & 99.9\% (RA-GRS read 99.99\%) & 99.95\% (multi-region) \\
+Encryption at rest & SSE-S3 / SSE-KMS / SSE-C & SSE + CMK via Key Vault & Google-managed / CMEK / CSEK \\
+Access control & IAM \& bucket policies, ACLs & Azure RBAC, SAS, POSIX ACLs & IAM, ACLs, signed URLs \\
+Pricing levers & Storage + requests + egress + retrieval & Storage + operations + egress + retrieval & Storage + operations + egress + retrieval \\
+Consistency & Strong read-after-write & Strong read-after-write & Strong (global) \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+Beyond raw object storage, the same layer reappears as a managed abstraction: \textbf{Fabric OneLake} is a tenant-wide lake built on ADLS Gen2 (Delta--Parquet), \textbf{Snowflake} persists data as immutable micro-partitions on the provider's object store, and \textbf{MongoDB}'s WiredTiger is a node-local engine rather than object storage---the contrast is itself instructive.
+\end{crosscloud}
+
+\section{Week 1 Roadmap and Mental Model}
+Amazon Simple Storage Service (Amazon S3) is the base layer of most AWS data engineering architectures. It is the landing zone for raw extracts, the durable system of record for data lakes, the staging layer for Redshift and EMR, the archive tier for infrequently accessed records, and the integration point for event-driven pipelines. The service looks simple because its core API is small: create buckets, put objects, get objects, list keys, attach metadata, and apply policies. The engineering challenge is not memorizing API names; it is matching S3's storage semantics to data lifecycle, governance, cost, and reliability goals \cite{awsS3UserGuide,awsWellArchitectedAnalytics}.
+
+A useful starting model is that S3 separates the concerns usually bundled inside a file system. The \emph{bucket} is a regional administrative container. The \emph{object key} is a string used for lookup and organization. The \emph{object body} is immutable for a given version. Metadata, tags, access policies, encryption settings, lifecycle rules, event notifications, and replication rules sit around those objects as managed controls. Data engineers use those controls to turn inexpensive object storage into a governed analytical platform.
+\index{bucket}\index{object key}\index{metadata}\index{tags}
+
+\begin{definitionbox}
+\textbf{Amazon S3} is a regional object storage service. It stores data as objects inside buckets, exposes API-based access rather than block-device semantics, and provides features for access control, encryption, lifecycle management, replication, retention, and event notification.
+\end{definitionbox}
+
+\begin{keyterms}
+\textbf{Object}: bytes plus metadata, tags, and a key. \textbf{Bucket}: regional namespace and policy boundary. \textbf{Prefix}: leading portion of a key used for organization and request distribution. \textbf{Version}: immutable historical instance of an object when versioning is enabled. \textbf{Storage class}: economic and operational placement for an object.
+\end{keyterms}
+
+\section{Monday: S3 Architecture and Storage Classes}
+\subsection{Object Storage, Not a Shared File System}
+S3 is not POSIX storage. It does not expose in-place mutation, directory locks, or append semantics. A key such as \texttt{raw/xray/2026/07/30/study-001.dcm} may look like a path, but S3 treats it as a key string. Console folders are a user-interface convention based on delimiters. This distinction matters for Spark, Glue, Athena, and Redshift Spectrum because those engines discover data by listing prefixes and reading objects rather than traversing a local file system.
+\index{prefix}\index{POSIX}\index{data lake}
+
+For data engineering, the non-POSIX model is a strength. It allows S3 to store very large numbers of objects, serve high request rates, decouple compute from storage, and become the durable substrate for a lakehouse architecture \cite{armbrust2021lakehouse}. It also means writers must use commit protocols and table formats carefully. A failed writer cannot rely on renaming a temporary directory atomically in the way a local file system might.
+
+\begin{pitfall}
+\textbf{Treating S3 like a local file system.} Directory renames, small-file-heavy workloads, and append-in-place assumptions can create slow listings, expensive request patterns, and broken table commits. Design for object immutability, partition-aware prefixes, and idempotent writers.
+\end{pitfall}
+
+\subsection{Regional Buckets and Global Names}
+Each S3 bucket has a globally unique name and belongs to one AWS Region. Objects stay in that Region unless replication, transfer, or client code moves them. This regional boundary is a compliance and architecture decision: it affects latency, data residency, KMS key choice, disaster recovery, and downstream service placement. A bucket name should be stable and descriptive, but not leak sensitive data; for example, use \texttt{acme-health-imaging-prod-us-east-1} rather than patient or project names.
+\index{Region}\index{data residency}\index{KMS}
+
+\begin{notebox}
+Strong service durability does not remove the need for architecture-level recovery design. Region choice, replication, versioning, backup policy, and access controls are still your responsibility under the AWS shared-responsibility model.
+\end{notebox}
+
+\subsection{Durability and Availability}
+AWS designs S3 for extremely high durability by redundantly storing objects across multiple Availability Zones in a Region for most storage classes \cite{awsS3UserGuide}. Durability is the probability that stored data is not lost. Availability is the probability that a request can be served when needed. These are related but different: an object can remain durably stored even during an availability impairment that prevents a client from reading it immediately.
+\index{durability}\index{availability}\index{Availability Zone}
+
+\begin{definitionbox}
+\textbf{Durability} measures resistance to data loss over time. \textbf{Availability} measures readiness to serve requests at a point in time. S3 storage-class selection must consider both, plus retrieval latency, minimum storage duration, retrieval fees, and resilience to Availability Zone loss.
+\end{definitionbox}
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.2cm}p{3.4cm}p{3.2cm}p{4.0cm}@{}}
+\toprule
+\textbf{Storage class} & \textbf{Primary use} & \textbf{Access pattern} & \textbf{Design caution} \\
+\midrule
+S3 Standard & Active data lakes, landing zones, analytics staging & Frequent, low-latency access & Highest storage price among listed classes; still usually right for hot data \\
+S3 Standard-IA & Durable multi-AZ storage for infrequent access & Millisecond access, lower storage cost & Retrieval fee and minimum storage duration make it poor for short-lived data \\
+S3 One Zone-IA & Re-creatable infrequent data & Millisecond access in one AZ & Lower resilience; do not use for the only copy of critical data \\
+S3 Glacier Instant Retrieval & Rarely accessed archive needing milliseconds & Millisecond archive access & Retrieval pricing and minimum duration require careful modeling \\
+S3 Glacier Flexible Retrieval & Long-lived archive with minutes-to-hours retrieval & Expedited, standard, or bulk retrieval & Not appropriate for interactive analytics \\
+S3 Glacier Deep Archive & Lowest-cost deep archive & Hours-scale retrieval & Retrieval planning and restore operations must be operationalized \\
+\bottomrule
+\end{tabular}
+\caption{Storage-class choice as a workload and risk decision, not merely a price decision.}
+\label{tab:s3-storage-classes}
+\end{table}
+
+\subsection{Consistency Model}
+Modern S3 provides strong read-after-write consistency for puts and deletes of objects, and strong consistency for list operations after writes \cite{awsS3Consistency}. If a successful \texttt{PUT} returns, a subsequent \texttt{GET} or \texttt{LIST} should observe that change. This simplifies data-lake pipelines compared with older patterns that inserted sleep intervals or extra metadata stores purely to compensate for eventual list behavior.
+\index{consistency}\index{read-after-write consistency}\index{list consistency}
+
+\begin{tipbox}
+Strong consistency simplifies pipeline correctness, but it does not make multi-object transactions automatic. If a job writes 10,000 objects and fails halfway, S3 will consistently show the partial result. Table formats, manifests, job bookmarks, and idempotent orchestration still matter.
+\end{tipbox}
+
+\section{Choosing a Storage Class for Data Engineering}
+Storage class is a lifecycle attribute. It should follow the data's access pattern and risk profile over time. A common analytical object might begin in S3 Standard while ingestion, validation, profiling, and downstream consumption are active. After 30 or 90 days, it might transition to Standard-IA or Glacier Instant Retrieval. After a legal or business retention threshold, it might move to Glacier Flexible Retrieval or Deep Archive. For a reproducible intermediate dataset, One Zone-IA may be acceptable; for medical records or financial records, it usually is not.
+\index{access pattern}\index{retrieval fee}\index{minimum storage duration}
+
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[
+        class/.style={rectangle, rounded corners, draw=primary, thick, fill=primary!6, align=center, minimum width=3.0cm, minimum height=1.1cm, font=\small\bfseries},
+        archive/.style={rectangle, rounded corners, draw=orange!80!black, thick, fill=orange!10, align=center, minimum width=3.0cm, minimum height=1.1cm, font=\small\bfseries},
+        lifenote/.style={font=\footnotesize\itshape, text=codegray},
+        flow/.style={-{Latex[length=2.5mm]}, draw=primary, thick}
+    ]
+        \node[class] (standard) at (0,0) {S3 Standard\\0--30 days};
+        \node[class] (ia) at (4.0,0) {Standard-IA\\30--180 days};
+        \node[archive] (gir) at (8.0,0) {Glacier Instant\\Retrieval};
+        \node[archive] (gfr) at (12.0,0) {Glacier Flexible\\Retrieval};
+        \node[archive] (gda) at (16.0,0) {Glacier Deep\\Archive};
+        \draw[flow] (standard) -- node[above,lifenote]{lifecycle rule} (ia);
+        \draw[flow] (ia) -- node[above,lifenote]{rare access} (gir);
+        \draw[flow] (gir) -- node[above,lifenote]{archive} (gfr);
+        \draw[flow] (gfr) -- node[above,lifenote]{long retention} (gda);
+        \node[lifenote, align=center] at (8,-1.5) {Cost decreases left-to-right, but retrieval latency, retrieval fees, and operational planning generally increase.};
+    \end{tikzpicture}%
+    }
+    \caption{A storage-class lifecycle path for analytical and archival objects. Actual thresholds must be justified by access data, compliance needs, and retrieval objectives.}
+    \label{fig:s3-lifecycle-transitions}
+\end{figure}
+
+\section{Tuesday: Lifecycle, Versioning, Object Lock, and Replication}
+\subsection{Lifecycle Policies}
+Lifecycle rules automate transitions and expirations. A rule can target a bucket, prefix, tag, object size, current versions, noncurrent versions, incomplete multipart uploads, or delete markers. In a data lake, lifecycle rules are often applied by zone. Raw data might be retained longer than curated derivatives. Temporary job output might expire after a few days. Audit logs might transition to archive but never be deleted until the retention period ends.
+\index{lifecycle policy}\index{noncurrent version}\index{multipart upload}
+
+\begin{notebox}
+Lifecycle is not a backup strategy by itself. Expiration rules delete data intentionally. Use versioning, replication, backup policy, and retention controls for recovery from accidental deletion or malicious overwrite.
+\end{notebox}
+
+\subsection{Versioning}
+S3 Versioning keeps multiple variants of an object under the same key. A normal delete creates a delete marker rather than immediately destroying prior versions. Versioning is a foundation for recovery, replication, and Object Lock. It is also a cost multiplier when pipelines rewrite large partitions repeatedly. Data engineers should pair versioning with lifecycle rules for noncurrent versions, monitoring, and explicit restore procedures.
+\index{versioning}\index{delete marker}\index{recovery}
+
+\begin{pitfall}
+\textbf{Enabling versioning without noncurrent-version lifecycle.} A job that repeatedly overwrites a 500 GB partition can silently retain every historical version. This may be exactly what compliance requires, but if it is accidental, storage cost will grow quickly.
+\end{pitfall}
+
+\subsection{Object Lock: Governance, Compliance, and Legal Hold}
+S3 Object Lock provides write-once-read-many controls for object versions when the bucket is created with Object Lock support and versioning is enabled \cite{awsS3ObjectLock}. In governance mode, privileged users with specific permissions can bypass retention. In compliance mode, protected object versions cannot be overwritten or deleted by any user, including the root account, until retention expires. Legal hold is an independent hold flag that prevents overwrite or deletion until removed by an authorized principal.
+\index{Object Lock}\index{governance mode}\index{compliance mode}\index{legal hold}\index{WORM}
+
+\begin{definitionbox}
+\textbf{Governance mode} protects objects while allowing explicitly authorized bypass for administrative workflows. \textbf{Compliance mode} prevents deletion or overwrite until the retention date expires. \textbf{Legal hold} has no fixed expiration date; it remains until an authorized user removes it.
+\end{definitionbox}
+
+\begin{tipbox}
+For regulated datasets, design Object Lock before ingestion. Some settings must be enabled at bucket creation, and compliance mode is intentionally difficult to undo. Test policies in a non-production account before applying retention to irreplaceable data.
+\end{tipbox}
+
+\subsection{S3 Replication: SRR and CRR}
+S3 Replication copies objects automatically according to rules \cite{awsS3Replication}. Same-Region Replication (SRR) is useful for account separation, log aggregation, data sovereignty within a Region, and different ownership or encryption boundaries. Cross-Region Replication (CRR) is used for disaster recovery, lower-latency regional access, regulatory isolation, or multi-region analytical platforms. Replication is asynchronous, so designs must define a recovery point objective (RPO), monitor replication lag, and decide whether delete markers and existing objects are included.
+\index{Same-Region Replication}\index{Cross-Region Replication}\index{RPO}\index{replication lag}
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.0cm}p{4.7cm}p{5.6cm}@{}}
+\toprule
+\textbf{Feature} & \textbf{Use it when} & \textbf{Question to ask in review} \\
+\midrule
+Lifecycle transition & Access declines predictably & What retrieval objective and minimum-duration charge apply? \\
+Lifecycle expiration & Data has a clear disposal date & Who approved deletion and how is it audited? \\
+Versioning & Accidental overwrite or delete must be recoverable & How are noncurrent versions aged and monitored? \\
+Object Lock & WORM retention is required & Governance or compliance mode, and who can bypass? \\
+Legal hold & Litigation or investigation requires indefinite hold & What process removes the hold and records approval? \\
+SRR & Same-region separation is needed & Is the target account, owner, and KMS key correct? \\
+CRR & Regional disaster recovery is needed & What RPO, RTO, encryption, and failover process are tested? \\
+\bottomrule
+\end{tabular}
+\caption{S3 management features mapped to operational review questions.}
+\label{tab:s3-management-features}
+\end{table}
+
+\section{Wednesday: Migration and Hybrid Storage}
+\subsection{AWS DataSync}
+AWS DataSync is a managed online transfer service for moving data between on-premises storage, edge locations, other clouds, and AWS storage services such as S3, EFS, and FSx \cite{awsDataSyncGuide}. It is appropriate when a network path exists and ongoing or incremental synchronization is needed. DataSync handles parallelization, verification, scheduling, bandwidth limits, and task reporting. For data engineers, it is often the cleanest path for moving existing file shares into S3 landing zones while preserving metadata required by downstream processing.
+\index{AWS DataSync}\index{online migration}\index{incremental transfer}
+
+\subsection{AWS Storage Gateway}
+AWS Storage Gateway is a hybrid cloud storage service. File Gateway presents file protocols backed by S3. Volume Gateway presents block storage with cloud-backed snapshots. Tape Gateway presents a virtual tape library for backup applications \cite{awsStorageGatewayGuide}. Storage Gateway is not merely a migration tool; it is a bridge for workloads that cannot immediately be rewritten to native object APIs.
+\index{Storage Gateway}\index{File Gateway}\index{Volume Gateway}\index{Tape Gateway}\index{hybrid cloud}
+
+\begin{definitionbox}
+\textbf{File Gateway} maps NFS or SMB file access to S3 objects. \textbf{Volume Gateway} provides iSCSI block volumes with snapshots. \textbf{Tape Gateway} emulates tape workflows for backup software while storing virtual tapes in AWS.
+\end{definitionbox}
+
+\subsection{AWS Snow Family}
+The AWS Snow Family supports offline or edge transfer when networks are too slow, too expensive, unreliable, or unavailable \cite{awsSnowFamilyGuide}. Snowcone is a small rugged device for edge and limited transfer. Snowball Edge supports larger transfer and edge compute. Snowmobile is a truck-scale option for extremely large migrations. Offline migration does not remove data-engineering responsibilities: you still need inventory, chain of custody, encryption, verification, cutover planning, and reconciliation.
+\index{Snowcone}\index{Snowball}\index{Snowmobile}\index{offline migration}\index{edge compute}
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.2cm}p{4.8cm}p{5.3cm}@{}}
+\toprule
+\textbf{Migration option} & \textbf{Best fit} & \textbf{Trade-off} \\
+\midrule
+DataSync & Online, repeatable transfer with available bandwidth & Requires network connectivity; large first loads may still take time \\
+File Gateway & Applications need NFS/SMB while AWS stores objects & File semantics can hide object-layout choices; not a substitute for native data-lake design \\
+Volume Gateway & Block workloads and snapshot workflows & Less natural for analytical object processing \\
+Tape Gateway & Existing backup software expects tapes & Good transition path; not an analytical ingestion pattern \\
+Snowcone & Edge sites, small rugged transfers, constrained environments & Operational handling and shipping time \\
+Snowball Edge & Large offline transfer or edge processing & Requires device logistics, job planning, validation \\
+Snowmobile & Massive data-center-scale migration & Specialized engagement; heavy operational planning \\
+\bottomrule
+\end{tabular}
+\caption{Migration and hybrid-storage options for AWS data engineering foundations.}
+\label{tab:migration-options}
+\end{table}
+
+\begin{tipbox}
+Estimate migration time before choosing a service. A 10 PB migration over a 1 Gbps link can take years after overhead and contention. Offline transfer may be the only practical first-load path, followed by DataSync or application replication for deltas.
+\end{tipbox}
+
+\section{Thursday Hands-on Project: Bucket, Lifecycle, and Events}
+This lab creates an S3 bucket, enables versioning, applies a 30-day transition to S3 Glacier Flexible Retrieval, creates an SQS queue, and configures S3 event notifications. It is intentionally CLI-first so that the same actions can be automated later in CloudFormation, CDK, Terraform, or CI/CD. Replace names, account IDs, and Regions before running.
+\index{AWS CLI}\index{SQS event notification}\index{Glacier Flexible Retrieval}
+
+\begin{notebox}
+The commands below create billable AWS resources. Use a sandbox account, set a unique bucket name, and delete resources after testing. Bucket names are globally unique; append your initials, account alias, or a random suffix.
+\end{notebox}
+
+\begin{lstlisting}[language=bash,caption={AWS CLI setup for an S3 bucket with versioning, lifecycle transition, SQS queue, and S3 event notification.},label={lst:s3-cli-lab}]
+# PowerShell users can run these commands from a shell with AWS CLI v2 configured.
+# Replace the values before running.
+REGION="us-east-1"
+ACCOUNT_ID="123456789012"
+BUCKET="aws-master-data-engineer-week1-123456789012"
+QUEUE="s3-ingest-events-week1"
+
+aws s3api create-bucket \
+  --bucket "$BUCKET" \
+  --region "$REGION"
+
+aws s3api put-bucket-versioning \
+  --bucket "$BUCKET" \
+  --versioning-configuration Status=Enabled
+
+cat > lifecycle.json <<'JSON'
+{
+  "Rules": [
+    {
+      "ID": "transition-raw-objects-to-glacier-after-30-days",
+      "Status": "Enabled",
+      "Filter": { "Prefix": "raw/" },
+      "Transitions": [
+        { "Days": 30, "StorageClass": "GLACIER" }
+      ],
+      "NoncurrentVersionTransitions": [
+        { "NoncurrentDays": 30, "StorageClass": "GLACIER" }
+      ],
+      "AbortIncompleteMultipartUpload": { "DaysAfterInitiation": 7 }
+    }
+  ]
+}
+JSON
+
+aws s3api put-bucket-lifecycle-configuration \
+  --bucket "$BUCKET" \
+  --lifecycle-configuration file://lifecycle.json
+
+QUEUE_URL=$(aws sqs create-queue \
+  --queue-name "$QUEUE" \
+  --attributes VisibilityTimeout=60 \
+  --query QueueUrl \
+  --output text)
+
+QUEUE_ARN=$(aws sqs get-queue-attributes \
+  --queue-url "$QUEUE_URL" \
+  --attribute-names QueueArn \
+  --query 'Attributes.QueueArn' \
+  --output text)
+\end{lstlisting}
+
+\begin{lstlisting}[language=bash,caption={Continuing the AWS CLI event-notification configuration.},label={lst:s3-cli-lab-continued}]
+cat > sqs-policy.json <<JSON
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AllowS3ToSendObjectCreatedEvents",
+      "Effect": "Allow",
+      "Principal": { "Service": "s3.amazonaws.com" },
+      "Action": "sqs:SendMessage",
+      "Resource": "$QUEUE_ARN",
+      "Condition": {
+        "ArnLike": { "aws:SourceArn": "arn:aws:s3:::$BUCKET" },
+        "StringEquals": { "aws:SourceAccount": "$ACCOUNT_ID" }
+      }
+    }
+  ]
+}
+JSON
+
+aws sqs set-queue-attributes \
+  --queue-url "$QUEUE_URL" \
+  --attributes Policy="$(cat sqs-policy.json)"
+
+cat > notification.json <<JSON
+{
+  "QueueConfigurations": [
+    {
+      "Id": "send-raw-object-created-events-to-sqs",
+      "QueueArn": "$QUEUE_ARN",
+      "Events": ["s3:ObjectCreated:*"],
+      "Filter": {
+        "Key": {
+          "FilterRules": [
+            { "Name": "prefix", "Value": "raw/" }
+          ]
+        }
+      }
+    }
+  ]
+}
+JSON
+
+aws s3api put-bucket-notification-configuration \
+  --bucket "$BUCKET" \
+  --notification-configuration file://notification.json
+
+printf 'study_id,modality\n001,XRAY\n' > sample.csv
+aws s3 cp sample.csv "s3://$BUCKET/raw/xray/sample.csv"
+aws sqs receive-message --queue-url "$QUEUE_URL" --max-number-of-messages 1
+\end{lstlisting}
+
+\begin{pitfall}
+\textbf{Copying Bash syntax directly into PowerShell.} The listing uses portable shell conventions for compactness. In native PowerShell, assign variables with \texttt{\$REGION = 'us-east-1'} and create JSON files with here-strings. The AWS CLI calls are the important part.
+\end{pitfall}
+
+The lifecycle JSON in \cref{lst:lifecycle-json} is the minimal policy extracted from the lab. It transitions current and noncurrent objects under \texttt{raw/} after 30 days and aborts incomplete multipart uploads after seven days.
+
+\begin{lstlisting}[language=json,caption={Lifecycle configuration for a 30-day transition to S3 Glacier Flexible Retrieval.},label={lst:lifecycle-json}]
+{
+  "Rules": [
+    {
+      "ID": "transition-raw-objects-to-glacier-after-30-days",
+      "Status": "Enabled",
+      "Filter": { "Prefix": "raw/" },
+      "Transitions": [
+        { "Days": 30, "StorageClass": "GLACIER" }
+      ],
+      "NoncurrentVersionTransitions": [
+        { "NoncurrentDays": 30, "StorageClass": "GLACIER" }
+      ],
+      "AbortIncompleteMultipartUpload": { "DaysAfterInitiation": 7 }
+    }
+  ]
+}
+\end{lstlisting}
+
+\subsection{Boto3 Verification and Event Reader}
+The Python snippet below checks versioning, lifecycle rules, and SQS events. In production, this logic would belong in integration tests or deployment verification, not in an ad hoc notebook.
+
+\begin{lstlisting}[language=Python,caption={Boto3 verification for S3 lifecycle and SQS event delivery.},label={lst:boto3-verify}]
+import json
+import os
+
+import boto3
+
+region = os.environ.get("AWS_REGION", "us-east-1")
+bucket = os.environ["BUCKET"]
+queue_url = os.environ["QUEUE_URL"]
+
+s3 = boto3.client("s3", region_name=region)
+sqs = boto3.client("sqs", region_name=region)
+
+versioning = s3.get_bucket_versioning(Bucket=bucket)
+assert versioning.get("Status") == "Enabled", versioning
+
+lifecycle = s3.get_bucket_lifecycle_configuration(Bucket=bucket)
+rules = {rule["ID"]: rule for rule in lifecycle["Rules"]}
+rule = rules["transition-raw-objects-to-glacier-after-30-days"]
+assert rule["Transitions"][0]["Days"] == 30
+assert rule["Transitions"][0]["StorageClass"] == "GLACIER"
+
+s3.put_object(
+    Bucket=bucket,
+    Key="raw/xray/boto3-smoke-test.txt",
+    Body=b"week 1 smoke test\n",
+    ContentType="text/plain",
+)
+
+messages = sqs.receive_message(
+    QueueUrl=queue_url,
+    MaxNumberOfMessages=1,
+    WaitTimeSeconds=10,
+).get("Messages", [])
+
+if not messages:
+    raise RuntimeError("No S3 event arrived in SQS within 10 seconds")
+
+body = json.loads(messages[0]["Body"])
+record = body["Records"][0]
+print(record["eventName"], record["s3"]["object"]["key"])
+\end{lstlisting}
+
+\section{Friday Use Case: Healthcare Disaster-Recovery Storage Architecture}
+A healthcare provider processes 10 PB of X-ray images. The platform must ingest studies from hospitals, preserve original DICOM objects, support analytics and ML labeling, survive a regional outage, and maintain HIPAA-style controls for encryption, access, audit, retention, and deletion. The storage architecture should be conservative: raw medical images are irreplaceable, regulated, and expensive to reacquire.
+\index{healthcare}\index{HIPAA}\index{disaster recovery}\index{DICOM}\index{encryption}
+
+\subsection{Requirements and Assumptions}
+Assume the primary Region is \texttt{us-east-1} and the recovery Region is \texttt{us-west-2}. Images arrive from hospitals through private network links, DataSync agents, and occasional Snowball Edge jobs for backfills. The provider requires server-side encryption with customer-managed KMS keys, least-privilege access, audit logs, Object Lock for raw images, CRR for regional recovery, lifecycle transition for cost control, and a tested failover runbook. The target RPO is measured in minutes for online ingestion and in the shipping interval for offline backfills. The RTO depends on downstream processing, not only S3 object availability.
+
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[
+        zone/.style={rectangle, rounded corners, draw=primary, thick, fill=primary!3, minimum width=7.2cm, minimum height=5.5cm},
+        svc/.style={rectangle, rounded corners, draw=primary, thick, fill=white, align=center, minimum width=2.3cm, minimum height=0.85cm, font=\scriptsize\bfseries},
+        secure/.style={rectangle, rounded corners, draw=red!60!black, thick, fill=red!5, align=center, minimum width=2.3cm, minimum height=0.85cm, font=\scriptsize\bfseries},
+        drstore/.style={cylinder, draw=primary, shape border rotate=90, aspect=0.25, fill=primary!10, minimum height=1.35cm, text width=2.2cm, align=center, font=\scriptsize\bfseries},
+        flow/.style={-{Latex[length=2mm]}, draw=primary, thick},
+        repl/.style={-{Latex[length=2mm]}, draw=orange!85!black, thick, dashed}
+    ]
+        \node[zone, label={[font=\small\bfseries\color{primary}]above:Primary Region: us-east-1}] (primary) at (0,0) {};
+        \node[zone, label={[font=\small\bfseries\color{primary}]above:Recovery Region: us-west-2}] (recovery) at (8.6,0) {};
+
+        \node[svc] (hosp) at (-4.7,1.6) {Hospitals\\PACS};
+        \node[svc] (datasync) at (-2.1,1.6) {DataSync\\Agent};
+        \node[svc] (snow) at (-2.1,0.2) {Snowball\\Backfill};
+        \node[drstore] (raw1) at (0.4,1.2) {Raw DICOM\\S3 + Object Lock};
+        \node[drstore] (cur1) at (0.4,-1.1) {Curated\\S3};
+        \node[svc] (glue1) at (3.0,0.0) {Glue/EMR\\Processing};
+        \node[secure] (kms1) at (3.0,1.9) {KMS + IAM\\CloudTrail};
+        \node[secure] (lake1) at (3.0,-2.0) {Lake Formation\\Catalog};
+
+        \node[drstore] (raw2) at (8.0,1.2) {Replica Raw\\S3 + Object Lock};
+        \node[drstore] (cur2) at (8.0,-1.1) {Replica Curated\\S3};
+        \node[svc] (glue2) at (10.7,0.0) {Warm Standby\\Glue/EMR};
+        \node[secure] (kms2) at (10.7,1.9) {Regional KMS\\CloudTrail};
+        \node[secure] (lake2) at (10.7,-2.0) {Replica Catalog\\Runbook};
+
+        \draw[flow] (hosp) -- (datasync);
+        \draw[flow] (datasync) -- (raw1);
+        \draw[flow] (snow) -- (raw1);
+        \draw[flow] (raw1) -- (glue1);
+        \draw[flow] (glue1) -- (cur1);
+        \draw[flow] (kms1) -- (raw1);
+        \draw[flow] (lake1) -- (cur1);
+        \draw[repl] (raw1) -- node[above,font=\scriptsize\bfseries,text=orange!85!black]{CRR + RTC monitor} (raw2);
+        \draw[repl] (cur1) -- node[below,font=\scriptsize\bfseries,text=orange!85!black]{CRR} (cur2);
+        \draw[flow] (raw2) -- (glue2);
+        \draw[flow] (glue2) -- (cur2);
+        \draw[flow] (kms2) -- (raw2);
+        \draw[flow] (lake2) -- (cur2);
+    \end{tikzpicture}%
+    }
+    \caption{A multi-region compliant disaster-recovery storage architecture for 10 PB of healthcare imaging data. Replication protects regional availability; Object Lock, KMS, IAM, Lake Formation, and CloudTrail support compliance controls.}
+    \label{fig:healthcare-dr-architecture}
+\end{figure}
+
+\subsection{Architecture Decisions}
+\textbf{Landing and retention.} Raw DICOM images land in a primary S3 bucket with versioning and Object Lock enabled. Compliance mode may be justified for legally mandated immutable retention, but governance mode may be safer during early rollout if the organization still needs an authorized break-glass path. Legal holds are reserved for investigations or litigation.
+
+\textbf{Encryption and key management.} Buckets require server-side encryption with AWS KMS customer-managed keys. Primary and replica Regions use separate regional keys. Key policies are limited to ingestion roles, processing roles, security administrators, and replication roles. CloudTrail data events are enabled for sensitive buckets and delivered to a separate log archive account.
+
+\textbf{Replication and recovery.} CRR copies raw and curated objects to the recovery Region. The replication role must be permitted to use both source and destination KMS keys. Replication metrics and alarms track lag. The failover runbook includes DNS or application endpoint changes, catalog validation, processing job activation, and a reconciliation process for objects written near the outage window.
+
+\textbf{Lifecycle and cost.} Raw images remain in S3 Standard during active diagnosis, annotation, and model training windows. After an access-based threshold, they transition to Glacier Instant Retrieval or Glacier Flexible Retrieval depending on clinical retrieval requirements. Deep Archive is considered only for records with hours-scale retrieval objectives. Curated analytical derivatives may have shorter retention because they can be regenerated from locked raw data.
+
+\textbf{Ingestion at 10 PB scale.} Online hospital feeds use DataSync when network connectivity and scheduling are feasible. Historical backfills use Snowball Edge jobs to avoid impractical transfer windows. All transfer paths write manifests, checksums, and reconciliation reports to S3 so missing studies can be identified before source systems are decommissioned.
+
+\begin{pitfall}
+\textbf{Replicating data without replicating operations.} A second-region bucket is not a disaster-recovery plan by itself. You must also replicate or recreate KMS access, IAM roles, Glue Catalog metadata, Lake Formation grants, monitoring, event routing, runbooks, and operator training.
+\end{pitfall}
+
+\section{Interview Q\&A}
+\subsection{Concepts and Trade-offs}
+\begin{enumerate}
+    \item \textbf{Q: Why is S3 a better foundation for a data lake than local disks attached to a cluster?}\\
+    A: S3 decouples durable storage from ephemeral compute, allows multiple engines to read the same data, and supports lifecycle, replication, encryption, and policy controls independently of a cluster.
+    \item \textbf{Q: When would you avoid One Zone-IA?}\\
+    A: Avoid it for the only copy of critical or regulated data because it stores data in one Availability Zone. It is better for re-creatable derivatives or secondary copies.
+    \item \textbf{Q: What does strong consistency solve, and what does it not solve?}\\
+    A: It ensures completed object writes and lists are visible immediately. It does not create multi-object transactions or repair failed jobs that produce partial datasets.
+    \item \textbf{Q: Governance mode or compliance mode for Object Lock?}\\
+    A: Governance mode allows authorized bypass and is useful when administrative exception processes are required. Compliance mode is stronger WORM retention and should be used only when the retention policy is certain.
+    \item \textbf{Q: DataSync or Snowball for 10 PB?}\\
+    A: Snowball or a specialized Snow Family approach is usually required for initial bulk transfer unless dedicated bandwidth is enormous. DataSync can handle ongoing deltas afterward.
+\end{enumerate}
+
+\section{Further Reading}
+Start with the Amazon S3 User Guide for bucket, object, lifecycle, encryption, event, and replication behavior \cite{awsS3UserGuide}. Review AWS guidance on S3 storage classes before setting transitions \cite{awsS3StorageClasses}, and study strong consistency semantics for pipeline correctness \cite{awsS3Consistency}. For retention design, read S3 Object Lock documentation \cite{awsS3ObjectLock}; for disaster-recovery copying, read S3 Replication documentation \cite{awsS3Replication}. For migration planning, compare DataSync \cite{awsDataSyncGuide}, Storage Gateway \cite{awsStorageGatewayGuide}, and the Snow Family \cite{awsSnowFamilyGuide}. The AWS Well-Architected Analytics Lens gives broader review questions for reliability, operational excellence, security, performance, and cost \cite{awsWellArchitectedAnalytics}. For distributed-system background, Dynamo remains a classic paper on highly available storage design \cite{decandia2007dynamo}; for the lakehouse direction of modern analytics platforms, see Armbrust et al. \cite{armbrust2021lakehouse}.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item S3 is the durable object-storage foundation for many AWS data engineering architectures, but it is not a POSIX file system.
+    \item Storage-class choice must balance access frequency, retrieval latency, retrieval fees, minimum duration, resilience, and compliance.
+    \item Strong consistency simplifies ingestion and listing logic, but multi-object correctness still requires idempotent jobs and table-aware commit patterns.
+    \item Lifecycle rules control cost and disposal; versioning, Object Lock, legal hold, and replication control recovery and retention.
+    \item DataSync, Storage Gateway, and Snow Family solve different migration problems: online sync, hybrid protocol bridge, and offline or edge transfer.
+    \item A compliant disaster-recovery design includes data, keys, policies, metadata, monitoring, runbooks, and tested failover operations.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Explain the difference between durability and availability. Give one S3 design decision that improves each.
+    \item \textbf{(Conceptual)} A team wants all objects to transition to Glacier Deep Archive after seven days. List three questions you would ask before approving the rule.
+    \item \textbf{(Hands-on)} Run the Thursday lab in a sandbox account. Capture the bucket versioning status, lifecycle configuration, and one SQS event message as evidence.
+    \item \textbf{(Hands-on)} Modify the lifecycle rule so objects under \texttt{tmp/} expire after seven days while objects under \texttt{raw/} transition after 30 days. Validate with \texttt{aws s3api get-bucket-lifecycle-configuration}.
+    \item \textbf{(Design)} Design prefixes and lifecycle rules for a lake with \texttt{raw/}, \texttt{validated/}, \texttt{curated/}, and \texttt{sandbox/} zones. State retention, storage class, and deletion policy for each.
+    \item \textbf{(Design)} Choose DataSync, File Gateway, Snowball Edge, or a combination for a 600 TB on-premises radiology archive with a 500 Mbps link. Justify the migration timeline and cutover plan.
+    \item \textbf{(Governance)} Compare Object Lock governance mode, compliance mode, and legal hold for medical-image retention. Include the operational risk of choosing the wrong mode.
+    \item \textbf{(Architecture)} Extend \cref{fig:healthcare-dr-architecture} with Athena, Redshift Spectrum, or SageMaker consumers. Describe how access would be governed without exposing raw images broadly.
+\end{enumerate}
+
+\section{Capstone Project: A Compliant Multi-Region Medical Image Data Lake on S3}\label{sec:ch1-capstone}
+\index{capstone project}\index{medical imaging data lake}\index{S3 Object Lock!capstone}\index{Cross-Region Replication!capstone}\index{SQS event notification!capstone}
+
+\begin{capstonebox}
+\textbf{Mission.} Design, implement, and verify a compliant multi-region S3 data lake for medical X-ray images. Your platform must ingest raw images, preserve immutable versions, encrypt data with customer-managed keys, transition objects through cost-optimized storage classes, replicate protected data to a disaster-recovery Region, and publish ingest events to Amazon SQS.
+
+\textbf{Estimated time.} 4--6 hours in a sandbox AWS account, plus optional time for cost modeling and security review.
+
+\textbf{What you\textquotesingle{}ll practice.}
+\begin{itemize}
+    \item Selecting S3 storage classes and lifecycle transitions for hot, warm, archive, and deep-archive medical-image data.
+    \item Enabling versioning, S3 Object Lock in compliance mode, and legal holds for WORM retention.
+    \item Configuring SSE-KMS encryption, least-privilege IAM, Cross-Region Replication, and S3 event notifications to SQS.
+    \item Verifying the design with AWS CLI commands, lifecycle JSON, replication configuration, and a Python/Boto3 smoke test.
+\end{itemize}
+\end{capstonebox}
+
+\subsection*{Scenario}
+A regional healthcare provider is consolidating 10 PB of historical and newly generated X-ray images into an S3-backed data lake. The source systems include hospital PACS archives, imaging-center uploads, radiology workflow applications, and periodic research exports. Raw files are treated as regulated medical records: they may contain protected health information, must be encrypted at rest, must be retained without tampering, and must remain recoverable after operator error or a regional service disruption.
+
+The business also faces cost pressure. Keeping all 10 PB in S3 Standard forever is simple but wasteful once studies age out of active clinical workflows. At the same time, moving records too quickly into deep archive can violate retrieval expectations for patient care, audits, research reproducibility, or litigation. Your design must therefore combine durability, compliance, disaster recovery, observability, and lifecycle economics instead of optimizing only for the lowest storage price.
+
+Assume the primary Region is \texttt{us-east-1}, the disaster-recovery Region is \texttt{us-west-2}, and the organization already has AWS CLI v2, Python, Boto3, and appropriate sandbox permissions. Use globally unique bucket names, separate customer-managed KMS keys per Region, and non-production retention values while testing. For a real compliance deployment, retention periods and legal-hold procedures must be approved by legal, security, privacy, and records-management teams.
+
+\subsection*{Requirements}
+\textbf{Functional requirements.}
+\begin{itemize}
+    \item Create a primary S3 bucket for raw X-ray images and a disaster-recovery bucket in a second Region.
+    \item Enable versioning on both buckets because S3 Object Lock and replication depend on versioned object history.
+    \item Enable S3 Object Lock on the primary bucket at creation time, configure default retention in compliance mode, and demonstrate a legal hold on at least one test object.
+    \item Require server-side encryption with AWS KMS customer-managed keys for all objects. Use a primary-region key for the source bucket and a separate recovery-region key for the replica bucket.
+    \item Apply lifecycle transitions for objects under \texttt{raw/xray/}: S3 Standard for active ingestion, S3 Standard-IA after 30 days, and S3 Glacier Deep Archive after 365 days. Include noncurrent-version transitions so overwritten versions do not remain indefinitely in hot storage.
+    \item Configure Cross-Region Replication from the primary bucket to the disaster-recovery bucket, including encrypted objects and Object Lock metadata where applicable \cite{awsS3Replication,awsS3ObjectLock}.
+    \item Configure S3 event notifications so every \texttt{s3:ObjectCreated:*} event under \texttt{raw/xray/} sends a message to an SQS queue.
+    \item Provide a least-privilege IAM design for ingestion, verification, replication, security administration, and read-only audit roles.
+\end{itemize}
+
+\textbf{Non-functional requirements.}
+\begin{itemize}
+    \item Durability must rely on S3 multi-AZ storage in each Region plus CRR for regional disaster recovery.
+    \item Recovery objectives must be explicit: target a minutes-scale RPO for online ingestion, document that CRR is asynchronous, and define an RTO that includes KMS, IAM, catalog, application, and queue reconfiguration.
+    \item Compliance controls must prevent destructive changes to protected object versions during the retention period. Compliance mode is intentionally irreversible until the retention date expires, so testing must use short-lived, non-production retention only.
+    \item Access must follow least privilege. Ingestion can write but not delete protected records; audit can list and read metadata; replication can read source versions and write replicas; security administrators can manage policies without broad data access.
+    \item Operations must include verification evidence: bucket versioning status, Object Lock configuration, lifecycle rules, replication status, KMS encryption, legal-hold status, and one SQS event message.
+    \item Cost controls must explain why each lifecycle threshold exists and must identify retrieval-latency risk before using Glacier Deep Archive \cite{awsS3StorageClasses}.
+\end{itemize}
+
+\subsection*{Reference Architecture}
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[
+        actor/.style={rectangle, rounded corners, draw=primary, thick, fill=primary!7, align=center, minimum width=2.6cm, minimum height=0.9cm, font=\small\bfseries},
+        bucket/.style={cylinder, shape border rotate=90, aspect=0.25, draw=primary, thick, fill=blue!6, align=center, text width=2.9cm, minimum height=1.55cm, font=\small\bfseries},
+        control/.style={rectangle, rounded corners, draw=red!60!black, thick, fill=red!5, align=center, minimum width=2.6cm, minimum height=0.9cm, font=\footnotesize\bfseries},
+        archive/.style={rectangle, rounded corners, draw=orange!85!black, thick, fill=orange!9, align=center, minimum width=2.8cm, minimum height=0.9cm, font=\footnotesize\bfseries},
+        queue/.style={rectangle, rounded corners, draw=codegreen!55!black, thick, fill=green!6, align=center, minimum width=2.4cm, minimum height=0.9cm, font=\footnotesize\bfseries},
+        flow/.style={-{Latex[length=2.5mm]}, draw=primary, thick},
+        repl/.style={-{Latex[length=2.5mm]}, draw=orange!85!black, thick, dashed}
+    ]
+        \node[actor] (ingest) at (0,1.5) {Hospital ingest\\DataSync / API};
+        \node[bucket] (primary) at (3.7,1.5) {Primary S3 bucket\\encrypted, versioned\\Object Lock};
+        \node[control] (kms) at (3.7,3.45) {SSE-KMS + IAM\\least privilege};
+        \node[archive] (standard) at (7.4,2.6) {S3 Standard\\0--30 days};
+        \node[archive] (ia) at (7.4,1.5) {Standard-IA\\30--365 days};
+        \node[archive] (gda) at (7.4,0.4) {Glacier Deep Archive\\365+ days};
+        \node[bucket] (dr) at (11.2,1.5) {DR S3 bucket\\us-west-2\\replica KMS key};
+        \node[queue] (sqs) at (3.7,-1.0) {SQS queue\\ingest events};
+        \node[control] (ops) at (11.2,-1.0) {Monitoring\\replication lag\\runbook};
+
+        \draw[flow] (ingest) -- node[above,font=\scriptsize]{\texttt{PutObject}} (primary);
+        \draw[flow] (kms) -- (primary);
+        \draw[flow] (primary) -- node[above,font=\scriptsize]{lifecycle policy} (standard);
+        \draw[flow] (standard) -- (ia);
+        \draw[flow] (ia) -- (gda);
+        \draw[repl] (primary) -- node[above,font=\scriptsize\bfseries,text=orange!85!black]{CRR} (dr);
+        \draw[flow] (primary) -- node[left,font=\scriptsize]{ObjectCreated} (sqs);
+        \draw[flow] (dr) -- (ops);
+    \end{tikzpicture}%
+    }
+    \caption{Capstone reference architecture for a compliant multi-region medical-image data lake on S3. The primary bucket receives encrypted, versioned, immutable objects; lifecycle rules manage cost; CRR creates a disaster-recovery copy; S3 event notifications feed SQS for downstream processing.}
+    \label{fig:ch1-capstone-medical-image-lake}
+\end{figure}
+
+\subsection*{Implementation Steps}
+\begin{enumerate}
+    \item \textbf{Prepare names and Regions.} Choose globally unique bucket names and record your AWS account ID. In PowerShell, set variables for the primary Region, recovery Region, source bucket, destination bucket, queue name, retention days, and IAM role names. Keep all names free of patient identifiers.
+    \item \textbf{Create KMS keys.} Create one customer-managed KMS key in each Region. The source key must allow the ingestion and replication roles to encrypt and decrypt as required. The destination key must allow the replication role to encrypt replicas. In production, key policies should separate key administration from data use.
+    \item \textbf{Create Object-Lock-enabled buckets.} Object Lock must be enabled when the bucket is created. Enable versioning on both buckets immediately, then configure default retention on the primary bucket in compliance mode. Use a short test retention period in a sandbox.
+    \item \textbf{Apply encryption and lifecycle.} Configure default SSE-KMS encryption and apply lifecycle JSON for current and noncurrent versions under \texttt{raw/xray/}. The example transitions current objects to Standard-IA after 30 days and Glacier Deep Archive after 365 days, while moving noncurrent versions on their own schedule.
+    \item \textbf{Configure replication.} Create an IAM role trusted by S3, attach a scoped replication policy, and apply a replication configuration that handles encrypted objects. Verify that the destination bucket uses the recovery-region KMS key.
+    \item \textbf{Configure SQS ingest events.} Create an SQS queue, attach a queue policy allowing only the source bucket to send messages, and configure S3 event notifications for object-created events under \texttt{raw/xray/}.
+    \item \textbf{Ingest and verify.} Upload a sample object with KMS encryption, set a legal hold on that object version, confirm replication status, and consume the SQS notification. Record screenshots or command output as evidence.
+\end{enumerate}
+
+\begin{lstlisting}[language=bash,caption={PowerShell-oriented AWS CLI commands for the capstone S3 data lake. Replace every placeholder before running.},label={lst:ch1-capstone-cli}]
+# Run from Windows PowerShell with AWS CLI v2 configured.
+$PrimaryRegion = "us-east-1"
+$DrRegion = "us-west-2"
+$AccountId = "123456789012"
+$SourceBucket = "medical-xray-primary-123456789012"
+$DestBucket = "medical-xray-dr-123456789012"
+$QueueName = "medical-xray-ingest-events"
+$ReplicationRoleName = "s3-medical-xray-replication-role"
+$SourceKmsKeyArn = "arn:aws:kms:us-east-1:123456789012:key/source-key-id"
+$DestKmsKeyArn = "arn:aws:kms:us-west-2:123456789012:key/dest-key-id"
+
+aws s3api create-bucket `
+  --bucket $SourceBucket `
+  --region $PrimaryRegion `
+  --object-lock-enabled-for-bucket
+
+aws s3api create-bucket `
+  --bucket $DestBucket `
+  --region $DrRegion `
+  --create-bucket-configuration LocationConstraint=$DrRegion `
+  --object-lock-enabled-for-bucket
+
+aws s3api put-bucket-versioning `
+  --bucket $SourceBucket `
+  --versioning-configuration Status=Enabled
+
+aws s3api put-bucket-versioning `
+  --bucket $DestBucket `
+  --region $DrRegion `
+  --versioning-configuration Status=Enabled
+
+$ObjectLockJson = @"
+{
+  "ObjectLockEnabled": "Enabled",
+  "Rule": {
+    "DefaultRetention": {
+      "Mode": "COMPLIANCE",
+      "Days": 30
+    }
+  }
+}
+"@
+$ObjectLockJson | Set-Content -Path object-lock.json -Encoding ascii
+
+aws s3api put-object-lock-configuration `
+  --bucket $SourceBucket `
+  --object-lock-configuration file://object-lock.json
+
+$LifecycleJson = @"
+{
+  "Rules": [
+    {
+      "ID": "raw-xray-standard-to-ia-to-deep-archive",
+      "Status": "Enabled",
+      "Filter": { "Prefix": "raw/xray/" },
+      "Transitions": [
+        { "Days": 30, "StorageClass": "STANDARD_IA" },
+        { "Days": 365, "StorageClass": "DEEP_ARCHIVE" }
+      ],
+      "NoncurrentVersionTransitions": [
+        { "NoncurrentDays": 30, "StorageClass": "STANDARD_IA" },
+        { "NoncurrentDays": 365, "StorageClass": "DEEP_ARCHIVE" }
+      ],
+      "AbortIncompleteMultipartUpload": { "DaysAfterInitiation": 7 }
+    }
+  ]
+}
+"@
+$LifecycleJson | Set-Content -Path lifecycle-capstone.json -Encoding ascii
+
+aws s3api put-bucket-lifecycle-configuration `
+  --bucket $SourceBucket `
+  --lifecycle-configuration file://lifecycle-capstone.json
+
+$SourceEncryptionJson = @"
+{
+  "Rules": [
+    {
+      "ApplyServerSideEncryptionByDefault": {
+        "SSEAlgorithm": "aws:kms",
+        "KMSMasterKeyID": "$SourceKmsKeyArn"
+      },
+      "BucketKeyEnabled": true
+    }
+  ]
+}
+"@
+$SourceEncryptionJson | Set-Content -Path source-encryption.json -Encoding ascii
+
+aws s3api put-bucket-encryption `
+  --bucket $SourceBucket `
+  --server-side-encryption-configuration file://source-encryption.json
+
+$QueueUrl = aws sqs create-queue `
+  --queue-name $QueueName `
+  --region $PrimaryRegion `
+  --query QueueUrl `
+  --output text
+
+$QueueArn = aws sqs get-queue-attributes `
+  --queue-url $QueueUrl `
+  --attribute-names QueueArn `
+  --query 'Attributes.QueueArn' `
+  --output text
+
+$SqsPolicyJson = @"
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AllowOnlyPrimaryBucketEvents",
+      "Effect": "Allow",
+      "Principal": { "Service": "s3.amazonaws.com" },
+      "Action": "sqs:SendMessage",
+      "Resource": "$QueueArn",
+      "Condition": {
+        "ArnLike": { "aws:SourceArn": "arn:aws:s3:::$SourceBucket" },
+        "StringEquals": { "aws:SourceAccount": "$AccountId" }
+      }
+    }
+  ]
+}
+"@
+$SqsPolicyJson | Set-Content -Path sqs-policy-capstone.json -Encoding ascii
+
+aws sqs set-queue-attributes `
+  --queue-url $QueueUrl `
+  --attributes Policy="$(Get-Content -Raw sqs-policy-capstone.json)"
+
+$NotificationJson = @"
+{
+  "QueueConfigurations": [
+    {
+      "Id": "raw-xray-object-created-to-sqs",
+      "QueueArn": "$QueueArn",
+      "Events": ["s3:ObjectCreated:*"],
+      "Filter": {
+        "Key": {
+          "FilterRules": [
+            { "Name": "prefix", "Value": "raw/xray/" }
+          ]
+        }
+      }
+    }
+  ]
+}
+"@
+$NotificationJson | Set-Content -Path notification-capstone.json -Encoding ascii
+
+aws s3api put-bucket-notification-configuration `
+  --bucket $SourceBucket `
+  --notification-configuration file://notification-capstone.json
+\end{lstlisting}
+
+The replication policy is intentionally separated from the first listing because it is the easiest place to over-permission a role. The policy must allow the role to read source versions, read Object Lock metadata, decrypt source objects when required, replicate objects and tags, and encrypt destination replicas with the destination KMS key.
+
+\begin{lstlisting}[language=json,caption={Skeleton replication configuration for encrypted medical-image objects. Replace role and KMS values before use.},label={lst:ch1-capstone-replication-json}]
+{
+  "Role": "arn:aws:iam::123456789012:role/s3-medical-xray-replication-role",
+  "Rules": [
+    {
+      "ID": "replicate-raw-xray-to-dr-region",
+      "Status": "Enabled",
+      "Priority": 1,
+      "DeleteMarkerReplication": { "Status": "Disabled" },
+      "Filter": { "Prefix": "raw/xray/" },
+      "SourceSelectionCriteria": {
+        "SseKmsEncryptedObjects": { "Status": "Enabled" }
+      },
+      "Destination": {
+        "Bucket": "arn:aws:s3:::medical-xray-dr-123456789012",
+        "StorageClass": "STANDARD",
+        "EncryptionConfiguration": {
+          "ReplicaKmsKeyID": "arn:aws:kms:us-west-2:123456789012:key/dest-key-id"
+        },
+        "Metrics": {
+          "Status": "Enabled",
+          "EventThreshold": { "Minutes": 15 }
+        },
+        "ReplicationTime": {
+          "Status": "Enabled",
+          "Time": { "Minutes": 15 }
+        }
+      }
+    }
+  ]
+}
+\end{lstlisting}
+
+After creating and attaching the replication role policy, apply the replication configuration with the AWS CLI. Then run a Boto3 smoke test that uploads a sample object, records its version ID, applies a legal hold, verifies encryption and Object Lock metadata, checks for a replication status value, and reads the SQS event.
+
+\begin{lstlisting}[language=Python,caption={Boto3 ingestion and verification snippet for the capstone.},label={lst:ch1-capstone-boto3}]
+import json
+import os
+import time
+from pathlib import Path
+
+import boto3
+
+primary_region = os.environ.get("PRIMARY_REGION", "us-east-1")
+dr_region = os.environ.get("DR_REGION", "us-west-2")
+source_bucket = os.environ["SOURCE_BUCKET"]
+dest_bucket = os.environ["DEST_BUCKET"]
+queue_url = os.environ["QUEUE_URL"]
+kms_key_arn = os.environ["SOURCE_KMS_KEY_ARN"]
+
+s3 = boto3.client("s3", region_name=primary_region)
+s3_dr = boto3.client("s3", region_name=dr_region)
+sqs = boto3.client("sqs", region_name=primary_region)
+
+key = "raw/xray/capstone-study-0001.dcm"
+body = b"synthetic DICOM placeholder for capstone validation\n"
+
+put_response = s3.put_object(
+    Bucket=source_bucket,
+    Key=key,
+    Body=body,
+    ServerSideEncryption="aws:kms",
+    SSEKMSKeyId=kms_key_arn,
+    ContentType="application/dicom",
+    Metadata={"study-id": "capstone-study-0001", "modality": "xray"},
+)
+version_id = put_response["VersionId"]
+
+s3.put_object_legal_hold(
+    Bucket=source_bucket,
+    Key=key,
+    VersionId=version_id,
+    LegalHold={"Status": "ON"},
+)
+
+head = s3.head_object(Bucket=source_bucket, Key=key, VersionId=version_id)
+assert head["ServerSideEncryption"] == "aws:kms"
+assert head["SSEKMSKeyId"] == kms_key_arn
+
+lock = s3.get_object_legal_hold(
+    Bucket=source_bucket,
+    Key=key,
+    VersionId=version_id,
+)
+assert lock["LegalHold"]["Status"] == "ON"
+
+versioning = s3.get_bucket_versioning(Bucket=source_bucket)
+assert versioning.get("Status") == "Enabled"
+
+object_lock = s3.get_object_lock_configuration(Bucket=source_bucket)
+mode = object_lock["ObjectLockConfiguration"]["Rule"]["DefaultRetention"]["Mode"]
+assert mode == "COMPLIANCE"
+
+for attempt in range(12):
+    replica = s3.head_object(Bucket=source_bucket, Key=key, VersionId=version_id)
+    status = replica.get("ReplicationStatus", "PENDING")
+    if status in {"COMPLETED", "FAILED", "REPLICA"}:
+        print(f"replication status: {status}")
+        break
+    time.sleep(10)
+else:
+    print("replication status still pending after smoke-test wait")
+
+try:
+    s3_dr.head_object(Bucket=dest_bucket, Key=key)
+    print("destination object is visible")
+except s3_dr.exceptions.ClientError as exc:
+    print(f"destination check not complete yet: {exc.response['Error']['Code']}")
+
+messages = sqs.receive_message(
+    QueueUrl=queue_url,
+    MaxNumberOfMessages=1,
+    WaitTimeSeconds=10,
+).get("Messages", [])
+if not messages:
+    raise RuntimeError("No S3 ObjectCreated notification arrived in SQS")
+
+payload = json.loads(messages[0]["Body"])
+record = payload["Records"][0]
+assert record["s3"]["bucket"]["name"] == source_bucket
+assert record["s3"]["object"]["key"] == key
+print("verified event:", record["eventName"], record["s3"]["object"]["key"])
+
+Path("capstone-verification.json").write_text(
+    json.dumps(
+        {
+            "bucket": source_bucket,
+            "key": key,
+            "version_id": version_id,
+            "legal_hold": "ON",
+            "object_lock_mode": mode,
+            "event_name": record["eventName"],
+        },
+        indent=2,
+    ),
+    encoding="utf-8",
+)
+\end{lstlisting}
+
+\subsection*{Deliverables}
+Submit a concise engineering packet containing the following artifacts:
+\begin{itemize}
+    \item A one-page architecture summary with primary Region, disaster-recovery Region, bucket names, KMS-key strategy, RPO, RTO, and lifecycle thresholds.
+    \item The final lifecycle JSON, Object Lock configuration, replication configuration, SQS queue policy, and S3 notification configuration.
+    \item IAM policy excerpts for ingestion, replication, audit, and security administration roles, with a short least-privilege explanation for each role.
+    \item Command output or screenshots showing versioning enabled, Object Lock compliance retention configured, legal hold enabled on one object version, lifecycle rules present, and default SSE-KMS encryption active.
+    \item Evidence of successful ingestion: object key, version ID, KMS key ID, metadata, SQS event message, and replication status or replication-lag observation.
+    \item A cleanup plan for sandbox resources, including queues, IAM roles, temporary JSON files, test objects after retention expires, and KMS key deletion scheduling where appropriate.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+Use this checklist to self-grade the capstone before submitting:
+\begin{itemize}
+    \item The source bucket was created with Object Lock support and has versioning enabled.
+    \item The destination bucket is in a different Region and has versioning enabled before replication is configured.
+    \item Default bucket encryption uses SSE-KMS with a customer-managed key, not unencrypted objects or ad hoc client-side encryption.
+    \item Object Lock default retention is configured in compliance mode for the test prefix or bucket, and the submission explains why production retention values require formal approval.
+    \item At least one uploaded object version has legal hold enabled and the evidence includes its version ID.
+    \item Lifecycle rules transition current versions from S3 Standard to Standard-IA and then to Glacier Deep Archive, with noncurrent-version handling and incomplete multipart upload cleanup.
+    \item CRR is configured for \texttt{raw/xray/}, includes encrypted-object handling, and uses a destination KMS key in the recovery Region.
+    \item S3 event notifications send \texttt{s3:ObjectCreated:*} events for \texttt{raw/xray/} to SQS, and the queue policy restricts sends to the source bucket and account.
+    \item IAM policies are scoped by bucket ARN, prefix, KMS key, and role purpose. Broad administrative wildcards are justified only for temporary sandbox setup roles, not steady-state data access.
+    \item Verification evidence includes AWS CLI or Boto3 output for versioning, lifecycle, Object Lock, legal hold, encryption, SQS event receipt, and replication status.
+    \item The architecture explains retrieval-latency trade-offs for Standard-IA and Glacier Deep Archive instead of treating lifecycle as a pure cost-saving feature.
+    \item The disaster-recovery plan covers data, keys, permissions, monitoring, catalog dependencies, application cutover, and post-failover reconciliation.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Use S3 Batch Operations to apply tags, legal holds, or retention settings to a manifest of historical objects after validating the workflow on a small sample.
+    \item Run Amazon Macie discovery jobs on a controlled prefix to identify possible protected health information or other sensitive fields in metadata exports before broad analytics access is granted.
+    \item Build a cost model for 10 PB across S3 Standard, Standard-IA, Glacier Instant Retrieval, Glacier Flexible Retrieval, and Glacier Deep Archive. Include request charges, retrieval charges, minimum storage duration, replication storage, KMS requests, and data transfer assumptions.
+    \item Enable S3 Storage Lens and define dashboard metrics for object count, bytes by storage class, incomplete multipart uploads, noncurrent-version growth, encrypted-object coverage, and replication health.
+    \item Add EventBridge or Lambda processing downstream of SQS to write an immutable ingest manifest containing object key, version ID, checksum, KMS key ID, study metadata, and replication status.
+    \item Prototype a failover drill: disable writes to the primary application path, validate replica availability in the recovery Region, switch a read-only consumer to the DR bucket, and document the reconciliation steps required before failing back.
+\end{itemize}
+

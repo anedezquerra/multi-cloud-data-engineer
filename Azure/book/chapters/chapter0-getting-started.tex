@@ -1,0 +1,461 @@
+\chapter{Getting Started: Your Azure Free Account and Environment}
+\index{Azure free account}\index{Azure Portal}\index{Microsoft account}\index{Microsoft Entra ID}\index{Azure RBAC}\index{Azure CLI}\index{Azure PowerShell}\index{Azure Cloud Shell}\index{Cost Management}\index{budget}\index{resource group}%
+
+\lstdefinelanguage{PowerShell}{
+    morekeywords={az,Connect-AzAccount,Set-AzContext,Get-AzContext,Install-Module,New-AzResourceGroup,Get-AzResourceGroup,Remove-AzResourceGroup,New-AzStorageAccount,Get-AzStorageAccount,Remove-AzStorageAccount,Write-Host,if,else,foreach,New-Guid,Select-Object,ConvertTo-Json},
+    sensitive=false,
+    morestring=[b]",
+    morestring=[b]'
+}
+
+\begin{objectives}
+\begin{itemize}
+    \item Create an Azure free account, understand the \$200 credit window, and distinguish free credit, 12-month free services, and always-free tiers.
+    \item Explain the Azure tenant, subscription, resource group, and resource hierarchy used throughout this book.
+    \item Secure the lab identity with Microsoft Entra ID, MFA, Azure RBAC, least privilege, and separated administrative accounts.
+    \item Install and authenticate Azure CLI on Windows PowerShell, and recognize Azure PowerShell and Azure Cloud Shell alternatives.
+    \item Configure cost guardrails with Microsoft Cost Management budgets, alerts, tags, and cleanup routines before deploying labs.
+    \item Apply the book's default region, naming, and tagging conventions to make every exercise reproducible and easy to delete.
+    \item Verify the environment by creating, listing, and deleting a resource group and storage account from PowerShell.
+\end{itemize}
+\end{objectives}
+
+\begin{keyterms}
+\textbf{Tenant}: a Microsoft Entra ID directory that stores identities, groups, applications, and security policies.\quad
+\textbf{Subscription}: an Azure billing and management boundary that contains resource groups and resources.\quad
+\textbf{Resource group}: a logical lifecycle container for Azure resources that are deployed, tagged, authorized, and deleted together.\quad
+\textbf{Azure RBAC}: the role-based authorization system that grants actions over Azure scopes.\quad
+\textbf{Budget}: a Microsoft Cost Management rule that tracks spending and sends alerts when thresholds are crossed.
+\end{keyterms}
+
+\section{Why Chapter 0 Exists}
+A data engineering book should not begin with an expensive Spark cluster or a production data lake. It should begin with a controlled account, a known command-line environment, a least-privilege identity, a budget, and a cleanup habit. Most cloud accidents in early learning projects are not caused by advanced distributed-systems failures. They are caused by using the wrong subscription, leaving a resource group running, granting a broad role to make an error disappear, or forgetting that globally unique services continue to bill after the tutorial window closes.
+
+This chapter establishes the operating baseline for every Azure exercise in the book. The environment is intentionally Windows plus PowerShell because that is the assumed local shell for this training repository. Azure CLI commands are shown in PowerShell syntax when variables or line continuation are needed. Azure Cloud Shell remains useful when a local machine cannot install software, but the preferred workflow for repeatable labs is a local terminal, a named subscription, a standard resource group prefix, and explicit cleanup.
+
+\begin{definitionbox}
+A \textbf{preliminary cloud environment} is the smallest secure setup that lets you deploy, inspect, measure, and delete learning resources without relying on production credentials or guesswork.
+\end{definitionbox}
+
+\begin{notebox}
+Azure product names change over time. Azure Active Directory is now \textbf{Microsoft Entra ID}. Older documentation, screenshots, and exam material may still say Azure AD, but this book uses Microsoft Entra ID except when quoting legacy names.
+\end{notebox}
+
+\section{Creating an Azure Free Account}
+\index{Azure free account!credit}\index{Azure subscription}\index{Microsoft account}\index{Azure Portal!sign-up}
+
+\subsection{What the Free Account Includes}
+Microsoft's Azure free account is designed for learning, evaluation, and small experiments. At sign-up time, Microsoft commonly offers three distinct benefits: a \$200 credit that can be used during the first 30 days, selected popular services free for 12 months, and always-free service quantities that continue as long as the account remains eligible \cite{microsoft2025azureFreeAccount}. These benefits are related but not identical. The \$200 credit is a short introductory balance. The 12-month services are service-specific allowances. Always-free tiers are ongoing limits for selected services, often with monthly quotas.
+
+For this book, the free account is sufficient for many foundational labs if you create only the requested resources, choose modest SKUs, and delete resource groups after each exercise. It is not a blank check: every create command should have a matching cleanup step.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.0cm}p{5.1cm}p{5.0cm}@{}}
+\toprule
+\textbf{Free-account item} & \textbf{What it means} & \textbf{Engineering caution} \\
+\midrule
+\$200 credit & Introductory credit for eligible Azure charges during the first 30 days & Credit can be exhausted quickly by large compute, premium storage, or forgotten services \\
+12-month free services & Popular services have limited free quantities for 12 months & Only the listed quantity and SKU are free; exceeding limits bills normally \\
+Always-free tiers & Selected services have ongoing free monthly allowances & Quotas reset by service rules and may not cover realistic data workloads \\
+Spending limit & Some free or credit subscriptions prevent charges beyond credit until upgraded & Upgrading or changing offer type can remove the safety net \\
+\bottomrule
+\end{tabular}
+\caption{The Azure free account combines time-limited credit, service-specific allowances, and ongoing free quotas.}
+\label{tab:azure-free-offer}
+\end{table}
+
+\subsection{Sign-up Walkthrough}
+Begin at the Azure free account page and choose \textit{Start free}. You need a Microsoft account, such as an Outlook account or another email address registered as a Microsoft account. Microsoft asks for contact information, phone verification, agreement to terms, and a payment card. The card is used for identity verification and fraud prevention. For a free account, Microsoft states that you are not automatically charged unless you explicitly upgrade or exceed an offer that permits billing \cite{microsoft2025azureFreeAccount}.
+
+A practical sign-up sequence is:
+
+\begin{enumerate}
+    \item Open the Azure free account page in a private browser window so an existing work or school login does not accidentally select the wrong tenant.
+    \item Sign in with the Microsoft account that will own the learning environment. If you already have an organizational Azure account, keep it separate from this book's lab account unless your instructor says otherwise.
+    \item Complete identity verification with phone and card. Use a card you are authorized to use, and record who owns the account in your lab notebook.
+    \item Open the Azure Portal and confirm that a subscription exists under \textit{Subscriptions}. Copy the subscription name and subscription ID.
+    \item Immediately create a budget, enable MFA, and decide a naming prefix before deploying the first technical resource.
+\end{enumerate}
+
+\begin{pitfall}
+\textbf{Using the wrong tenant during sign-up.} Many learners have a personal Microsoft account and a work or school account with the same email address. If the portal asks whether to use a personal or work account, pause and verify which identity should own the labs. Deploying into an employer tenant can create policy, billing, and cleanup problems.
+\end{pitfall}
+
+\subsection{The Azure Resource Hierarchy}
+Azure resources live in a hierarchy. At the identity layer, Microsoft Entra ID provides the tenant that contains users, groups, applications, and service principals. At the Azure management layer, management groups can organize multiple subscriptions. A subscription contains resource groups. A resource group contains resources such as storage accounts, key vaults, factories, workspaces, and virtual networks \cite{microsoft2025accountHierarchy}.
+
+For this book, the most important scopes are subscription, resource group, and resource. The subscription is the billing and policy boundary for the labs. The resource group is the disposable unit for each chapter or week. The resource is the actual service instance. If you deploy every chapter into a clearly named resource group, cleanup is normally one command: delete that group.
+
+\begin{figure}[H]
+    \centering
+    \resizebox{0.95\textwidth}{!}{%
+    \begin{tikzpicture}[node distance=1.5cm]
+        \node[stage] (tenant) {Microsoft Entra ID\\Tenant};
+        \node[stage, right=1.8cm of tenant] (sub) {Azure\\Subscription};
+        \node[stage, right=1.8cm of sub] (rg) {Resource Group\\\texttt{rg-de-azbook-ch00-dev}};
+        \node[store, right=1.8cm of rg] (storage) {Storage\\Account};
+        \node[tool, below=1.1cm of storage] (budget) {Budget +\\Alerts};
+        \node[doc, below=1.1cm of rg] (tags) {Tags\\owner, env, chapter};
+        \draw[arrow] (tenant) -- node[above,font=\scriptsize]{identity} (sub);
+        \draw[arrow] (sub) -- node[above,font=\scriptsize]{billing + policy} (rg);
+        \draw[arrow] (rg) -- node[above,font=\scriptsize]{lifecycle} (storage);
+        \draw[arrow] (tags) -- (rg);
+        \draw[arrow] (budget) -- (storage);
+    \end{tikzpicture}%
+    }
+    \caption{Chapter 0 setup flow from identity and subscription selection to a tagged, budgeted lab resource group.}
+    \label{fig:chapter0-setup-flow}
+\end{figure}
+
+\begin{tipbox}
+Treat the resource group as the learning lab's blast-radius boundary. A predictable resource group name lets you review all resources, export a deployment record, and delete the complete lab without hunting through the portal.
+\end{tipbox}
+
+\section{Securing Identity Before Deploying Resources}
+\index{Microsoft Entra ID}\index{MFA}\index{least privilege}\index{Global Administrator}\index{service principal}\index{Azure RBAC!roles}
+
+\subsection{Microsoft Entra ID and Administrative Separation}
+Microsoft Entra ID is Azure's identity platform for users, groups, enterprise applications, service principals, conditional access, and MFA \cite{microsoft2025entra}. In a new personal learning tenant, you may be the only user. In an organization, the tenant may already have administrators, policies, and approved groups. Either way, do not normalize daily work as a highly privileged administrator.
+
+The \textbf{Global Administrator} role is a tenant-wide Microsoft Entra role. It can manage identity settings and many administrative functions across the tenant. It is not the right role for running day-to-day data engineering commands. Daily work should use a normal user account with only the Azure RBAC permissions needed in the lab subscription or resource group. Administrative accounts should be reserved for administrative actions, protected with MFA, and monitored.
+
+\begin{definitionbox}
+\textbf{Least privilege} means granting an identity only the minimum actions, data access, and scope required to complete a task, for only as long as the task requires.
+\end{definitionbox}
+
+\subsection{Azure RBAC Roles for Labs}
+Azure RBAC controls management-plane access at scopes such as subscription, resource group, or resource \cite{microsoft2025rbac}. The common built-in roles are:
+
+\begin{itemize}
+    \item \textbf{Owner}: can manage resources and assign access to others. Use sparingly because it can delegate privileges.
+    \item \textbf{Contributor}: can create and manage resources but cannot grant access. This is often sufficient for a learner working inside a dedicated lab resource group.
+    \item \textbf{Reader}: can view resources but cannot change them. Use for reviewers, auditors, and safe inspection.
+\end{itemize}
+
+Data services often have separate data-plane roles. For example, managing a storage account is different from reading blobs inside it. Later chapters distinguish roles such as \texttt{Storage Blob Data Reader} and \texttt{Storage Blob Data Contributor}. Chapter 0 focuses on management-plane setup so that later labs can explain data-plane permissions in context.
+
+\begin{pitfall}
+\textbf{Solving every error with Owner.} Granting Owner at the subscription level may make a command succeed, but it hides the real boundary: missing RBAC, missing data-plane role, missing ACL, wrong subscription, or blocked network path. Broad permissions are hard to audit and easy to forget.
+\end{pitfall}
+
+\subsection{Create a Least-Privileged User or Service Principal}
+For an individual learning account, the first identity goal is separation. Use one account for emergency administration and a different daily account for labs when your tenant license and permissions allow it. In an organization, ask for a dedicated lab subscription or resource group and a role assignment scoped to that boundary.
+
+A service principal is an application identity used by automation. It is useful for CI/CD and non-interactive scripts, but it must be protected like any credential. For early manual labs, prefer interactive user login with MFA. Use a service principal only when a lab requires automation and store secrets in the approved secret store, not in source files or screenshots.
+
+\begin{lstlisting}[language=PowerShell,caption={Creating a resource-group scoped service principal with Azure CLI from PowerShell.},label={lst:create-sp-rg-scope}]
+# Run only after creating the resource group and confirming the scope.
+$subscriptionId = "00000000-0000-0000-0000-000000000000"
+$rg = "rg-de-azbook-ch00-dev"
+$scope = "/subscriptions/$subscriptionId/resourceGroups/$rg"
+
+az ad sp create-for-rbac `
+  --name "sp-de-azbook-ch00-dev" `
+  --role Contributor `
+  --scopes $scope
+
+# Store the output securely. Do not commit appId, password, or tenant.
+\end{lstlisting}
+
+The command returns credentials once. If you lose the secret, create a new one rather than searching terminal history or files. Later chapters prefer managed identity where Azure compute supports it.
+
+\subsection{Enable MFA}
+Enable MFA before you deploy resources. MFA reduces the risk that a stolen password becomes a working cloud credential. In a personal Microsoft account, configure two-step verification or the Microsoft Authenticator app through account security settings. In a Microsoft Entra tenant, use the Entra admin center or Security Defaults when appropriate. Organizations normally enforce MFA through Conditional Access policies.
+
+\begin{notebox}
+MFA is not a replacement for least privilege. A phished account with MFA fatigue approval and subscription Owner rights can still create resources, assign roles, or delete evidence. Use MFA, scoped roles, budgets, and logs together.
+\end{notebox}
+
+\section{Installing and Authenticating Tooling on Windows}
+\index{Azure CLI!Windows}\index{Azure PowerShell}\index{Az module}\index{Azure Cloud Shell}\index{PowerShell}
+
+\subsection{Azure CLI on Windows}
+Azure CLI is the primary command-line tool used in this book. It works across platforms and is well supported by Azure documentation \cite{microsoft2025azureCliInstall}. On Windows, install it with the Microsoft Installer package, with \texttt{winget}, or from Microsoft's installation page. After installation, open a new PowerShell window so the updated \texttt{PATH} is available.
+
+\begin{lstlisting}[language=PowerShell,caption={Installing Azure CLI and signing in from Windows PowerShell.},label={lst:install-az-cli}]
+# Option A: install with Windows Package Manager.
+winget install --exact --id Microsoft.AzureCLI
+
+# Confirm the CLI is available.
+az version
+
+# Browser-based sign-in. Complete MFA in the browser when prompted.
+az login
+
+# List subscriptions visible to this identity.
+az account list --output table
+
+# Select the subscription used for this book.
+az account set --subscription "00000000-0000-0000-0000-000000000000"
+
+# Confirm the selected subscription.
+az account show --output table
+\end{lstlisting}
+
+If \texttt{az login} opens a browser for the wrong account, sign out of the browser or use a private browser session. If your organization requires device-code login, Azure CLI will display a code and URL. Complete the flow with the approved identity.
+
+\begin{tipbox}
+Pin the active subscription in every new terminal session before running destructive commands. A short \texttt{az account show --output table} is cheaper than deleting a resource group from the wrong subscription.
+\end{tipbox}
+
+\subsection{Azure PowerShell as an Alternative}
+Azure PowerShell is a PowerShell-native module family named \texttt{Az}. It is excellent when an organization standardizes on PowerShell scripts, Desired State Configuration, or administrative automation \cite{microsoft2025azurePowerShell}. This book uses Azure CLI for consistency, but Azure PowerShell is a first-class alternative.
+
+\begin{lstlisting}[language=PowerShell,caption={Installing the Az module and selecting a subscription.},label={lst:install-az-module}]
+# Run PowerShell as a normal user unless your module path requires elevation.
+Install-Module -Name Az -Scope CurrentUser -Repository PSGallery -Force
+
+Connect-AzAccount
+
+Set-AzContext -Subscription "00000000-0000-0000-0000-000000000000"
+
+Get-AzContext | Select-Object Name, Subscription, Tenant
+\end{lstlisting}
+
+Do not mix Azure CLI and Azure PowerShell contexts without checking both. \texttt{az account set} affects Azure CLI. \texttt{Set-AzContext} affects Azure PowerShell. They may point to different subscriptions in the same terminal.
+
+\subsection{Azure Cloud Shell}
+Azure Cloud Shell is a browser-based shell hosted by Microsoft and available from the Azure Portal \cite{microsoft2025cloudShell}. It includes Azure CLI and Azure PowerShell, requires no local installation, and authenticates with the portal session. It is useful for locked-down workstations, quick inspections, and demonstrations.
+
+Cloud Shell is not the same as your local machine. It has its own file system, mounted storage, installed tools, and network path. For book labs, local PowerShell gives you clearer control over files in this repository. Use Cloud Shell when local installation is blocked, but copy important commands and outputs back into your lab notes.
+
+\section{Cost Guardrails}
+\index{Microsoft Cost Management}\index{budget!alerts}\index{spending limit}\index{cost analysis}\index{tags!cost allocation}
+
+\subsection{Spending Limit, Budgets, and Alerts}
+Cost control starts before deployment. Azure free and credit-based subscriptions may have a spending limit that prevents charges beyond the available credit until the subscription is upgraded or the offer changes. Do not rely on that limit as your only protection. Spending limits are offer-specific, and some resources can consume credit rapidly. Microsoft Cost Management provides cost analysis, budgets, forecasts, and alerts \cite{microsoft2025costBudgets}.
+
+A budget does not usually stop resources by itself. It alerts when actual or forecasted cost crosses thresholds. That alert is valuable because it gives you time to delete, resize, pause, or investigate resources before a small mistake becomes a large bill. For learning subscriptions, create a monthly budget with early thresholds such as 25\%, 50\%, 75\%, and 90\%.
+
+\begin{tipbox}
+\textbf{Measure it.} Every chapter that creates Azure resources should end with two measurements: current resources in the lab resource group and current or forecasted cost in Cost Management. If you cannot measure it, assume it can bill.
+\end{tipbox}
+
+\subsection{Create a Budget from PowerShell}
+The following listing creates a lab resource group and a monthly budget at subscription scope. Replace the email address, subscription ID, and amount with your own values. The budget amount is intentionally small for a learning environment.
+
+\begin{lstlisting}[language=PowerShell,caption={Creating a tagged resource group and subscription budget with Azure CLI.},label={lst:create-budget}]
+$subscriptionId = "00000000-0000-0000-0000-000000000000"
+$location = "eastus"
+$rg = "rg-de-azbook-ch00-dev"
+$budgetName = "budget-de-azbook-monthly"
+$alertEmail = "student@example.com"
+$startDate = "2026-08-01"
+$endDate = "2027-08-01"
+
+az account set --subscription $subscriptionId
+
+az group create `
+  --name $rg `
+  --location $location `
+  --tags project=azure-book environment=dev chapter=chapter0 owner=student
+
+az consumption budget create `
+  --budget-name $budgetName `
+  --amount 25 `
+  --time-grain Monthly `
+  --time-period start-date=$startDate end-date=$endDate `
+  --category Cost `
+  --notifications `
+    actual25 enabled true operator GreaterThan threshold 25 contact-emails $alertEmail `
+    actual50 enabled true operator GreaterThan threshold 50 contact-emails $alertEmail `
+    forecast90 enabled true operator GreaterThan threshold 90 contact-emails $alertEmail
+\end{lstlisting}
+
+If your Azure CLI version rejects the notification syntax, create the budget in the portal under \textit{Cost Management + Billing} and document the same thresholds.
+
+\subsection{Cost Analysis Workflow}
+Cost Analysis in the Azure Portal lets you group spending by service, resource group, location, tag, and meter. For this book, use three views repeatedly. First, group by resource group to confirm that lab spending is isolated. Second, group by service name to see whether storage, compute, networking, or monitoring is driving cost. Third, filter by tag so you can verify that your naming and tagging strategy is working.
+
+\begin{pitfall}
+\textbf{Assuming deletion stops every charge immediately.} Some meters are delayed, some retained data bills until removed, and some services create hidden supporting resources. After deleting a lab, check Cost Analysis over the next day and verify the resource group no longer exists.
+\end{pitfall}
+
+\section{Regions, Naming, and Tagging Used by This Book}
+\index{Azure region}\index{naming convention}\index{tags}\index{eastus}
+
+\subsection{Default Region}
+Unless a chapter says otherwise, this book uses \texttt{eastus} as the default region because it is widely available and commonly supports data platform services. If \texttt{eastus} is unavailable in your subscription, choose a nearby region that supports the required service and record the substitution. Do not mix regions casually inside a lab. Cross-region data movement, private endpoints, availability zones, and service availability all affect behavior and cost.
+
+\begin{notebox}
+Azure service availability varies by region and subscription type. If a command fails because a SKU is unavailable, choose the nearest supported region and keep the rest of the resource names and tags unchanged.
+\end{notebox}
+
+\subsection{Naming Conventions}
+Azure naming rules differ by resource type. Resource groups can contain hyphens. Storage account names must be globally unique, 3--24 characters, lowercase letters and numbers only. Key vault names, Data Factory names, Synapse workspaces, and Databricks workspaces each have their own constraints. Microsoft's Cloud Adoption Framework recommends predictable names with components such as resource type, workload, environment, region, and instance number \cite{microsoft2025naming}.
+
+This book uses the following learning convention:
+
+\begin{itemize}
+    \item \textbf{Resource group}: \texttt{rg-de-azbook-chNN-dev}, such as \texttt{rg-de-azbook-ch00-dev}.
+    \item \textbf{Storage account}: \texttt{stdeazbkchNNxxxx}, where \texttt{xxxx} is a short unique suffix.
+    \item \textbf{Location}: \texttt{eastus} unless the chapter or subscription requires another region.
+    \item \textbf{Environment tag}: \texttt{environment=dev} for all book labs.
+    \item \textbf{Chapter tag}: \texttt{chapter=chapter0}, \texttt{chapter=chapter1}, and so on.
+\end{itemize}
+
+Do not place sensitive information in names or tags. Resource names, DNS names, logs, and billing exports may be visible to operators or external systems.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.0cm}p{4.0cm}p{5.8cm}@{}}
+\toprule
+\textbf{Tag} & \textbf{Example} & \textbf{Purpose} \\
+\midrule
+\texttt{project} & \texttt{azure-book} & Groups all learning resources for reporting \\
+\texttt{environment} & \texttt{dev} & Separates labs from production or shared sandboxes \\
+\texttt{chapter} & \texttt{chapter0} & Enables chapter-level cost and cleanup review \\
+\texttt{owner} & \texttt{student} & Identifies who should receive cleanup questions \\
+\texttt{delete-after} & \texttt{2026-08-07} & Creates a human-readable cleanup expectation \\
+\bottomrule
+\end{tabular}
+\caption{Tags make cost allocation, cleanup, and operational ownership visible.}
+\label{tab:chapter0-tags}
+\end{table}
+
+\section{Verify the Setup}
+\index{verification}\index{storage account!create}\index{resource group!delete}\index{Azure CLI!account show}
+
+\subsection{Account and Subscription Check}
+Open a new Windows PowerShell terminal. The first verification is to prove that Azure CLI is installed, authenticated, and targeting the intended subscription.
+
+\begin{lstlisting}[language=PowerShell,caption={Verifying the selected Azure subscription.},label={lst:verify-account}]
+az version
+az login
+az account show --query "{name:name, id:id, tenantId:tenantId, user:user.name}" --output table
+\end{lstlisting}
+
+Expected output resembles the following. Your subscription name, ID, tenant ID, and user will differ.
+
+\begin{lstlisting}[language=bash,caption={Expected shape of account verification output.},label={lst:verify-account-output}]
+Name                 Id                                    TenantId                              User
+-------------------  ------------------------------------  ------------------------------------  -------------------
+Azure subscription 1  00000000-0000-0000-0000-000000000000  11111111-1111-1111-1111-111111111111  student@example.com
+\end{lstlisting}
+
+\subsection{Create a Resource Group and Storage Account}
+The following lab creates a tagged resource group and a standard locally redundant storage account. The storage account name must be globally unique, so the script appends a short random suffix. The account uses inexpensive settings appropriate for a setup test. Chapter 1 creates a more complete ADLS Gen2 account.
+
+\begin{lstlisting}[language=PowerShell,caption={Creating a temporary resource group and storage account.},label={lst:create-verify-resources}]
+$location = "eastus"
+$rg = "rg-de-azbook-ch00-dev"
+$suffix = (New-Guid).Guid.Replace("-", "").Substring(0, 6).ToLower()
+$storage = "stdeazbkch00$suffix"
+
+az group create `
+  --name $rg `
+  --location $location `
+  --tags project=azure-book environment=dev chapter=chapter0 owner=student
+
+az storage account create `
+  --name $storage `
+  --resource-group $rg `
+  --location $location `
+  --sku Standard_LRS `
+  --kind StorageV2 `
+  --https-only true `
+  --min-tls-version TLS1_2 `
+  --allow-blob-public-access false `
+  --tags project=azure-book environment=dev chapter=chapter0 owner=student
+
+az storage account list `
+  --resource-group $rg `
+  --query "[].{name:name, location:location, sku:sku.name, httpsOnly:enableHttpsTrafficOnly}" `
+  --output table
+\end{lstlisting}
+
+Expected output resembles:
+
+\begin{lstlisting}[language=bash,caption={Expected shape of storage account listing output.},label={lst:create-verify-output}]
+Name               Location    Sku           HttpsOnly
+-----------------  ----------  ------------  ---------
+stdeazbkch00a1b2c3 eastus      Standard_LRS  True
+\end{lstlisting}
+
+If the command reports that the storage account name is unavailable, rerun the script or choose a different suffix. If it reports that the region or SKU is unavailable, change \texttt{eastus} to another supported region and record the difference.
+
+\subsection{Delete the Verification Resource Group}
+Cleanup is part of verification, not an optional afterthought. Delete the resource group and confirm that it is gone.
+
+\begin{lstlisting}[language=PowerShell,caption={Deleting the temporary verification resource group.},label={lst:delete-verify-resources}]
+$rg = "rg-de-azbook-ch00-dev"
+
+az group delete --name $rg --yes --no-wait
+
+# Wait a few minutes, then verify deletion status.
+az group exists --name $rg
+\end{lstlisting}
+
+The final command returns \texttt{false} when deletion has completed. If it returns \texttt{true}, wait and run it again. Some services take several minutes to delete.
+
+\begin{tipbox}
+For every later chapter, save three pieces of evidence: creation command or deployment file, validation output, and cleanup output. This habit makes labs reproducible and protects against surprise bills.
+\end{tipbox}
+
+\section{Cross-Cloud Setup Equivalence}
+\begin{crosscloud}
+{\footnotesize
+\begin{tabular}{@{}p{2.9cm}p{3.0cm}p{3.0cm}p{3.0cm}@{}}
+\toprule
+\textbf{Setup step} & \textbf{AWS} & \textbf{Azure} & \textbf{GCP} \\
+\midrule
+Free offer & Free Tier (12 mo + always free) & Free account (\$200/30 days + always free) & Free trial (\$300/90 days + Always Free) \\
+Sign-up guard & Card + root email & Card + Microsoft account & Card + Google account \\
+Identity model & IAM / IAM Identity Center & Microsoft Entra ID + RBAC & Cloud IAM \\
+Admin isolation & Never use root daily & Avoid Global Admin daily & Avoid Owner; least privilege \\
+CLI & AWS CLI v2 (\texttt{aws configure}) & Azure CLI (\texttt{az login}) & gcloud CLI (\texttt{gcloud init}) \\
+Browser shell & AWS CloudShell & Azure Cloud Shell & Cloud Shell \\
+Cost guardrail & AWS Budgets + alerts & Cost Management budgets & Budgets \& alerts \\
+Console & AWS Management Console & Azure Portal & Google Cloud Console \\
+\bottomrule
+\end{tabular}}
+
+Microsoft Fabric uses a Microsoft 365/Power BI work account plus a Fabric trial capacity (no card, org tenant); Snowflake uses a 30-day/\$400 trial (no card) guarded by Resource Monitors; MongoDB Atlas offers a forever-free M0 cluster (no card) secured by database users and an IP allowlist.
+\end{crosscloud}
+
+\section{Environment Checklist Before Chapter 1}
+\index{checklist}\index{Chapter 1 preparation}
+A complete Chapter 0 environment has the following evidence:
+
+\begin{enumerate}
+    \item Azure free account or approved organizational sandbox subscription exists.
+    \item Subscription ID and tenant ID are recorded in a private lab notebook.
+    \item MFA is enabled for the account used to access Azure.
+    \item Daily lab identity is not a Global Administrator account when separation is possible.
+    \item Azure CLI runs from Windows PowerShell and \texttt{az account show} displays the intended subscription.
+    \item Optional Azure PowerShell \texttt{Az} module is installed if your organization requires PowerShell-native automation.
+    \item Monthly budget exists with at least one alert that reaches your email address.
+    \item Default region is selected, normally \texttt{eastus}, or a documented substitute is chosen.
+    \item Naming and tagging conventions are written down before resources are deployed.
+    \item Verification resource group and storage account were created, listed, and deleted successfully.
+\end{enumerate}
+
+\section{Further Reading}
+Start with the Azure free account overview \cite{microsoft2025azureFreeAccount}, then review the Azure resource organization hierarchy \cite{microsoft2025accountHierarchy}. For identity and access, read Microsoft Entra ID fundamentals \cite{microsoft2025entra} and Azure RBAC documentation \cite{microsoft2025rbac}. For tooling, use the Azure CLI installation guide \cite{microsoft2025azureCliInstall}, Azure PowerShell installation guide \cite{microsoft2025azurePowerShell}, and Azure Cloud Shell overview \cite{microsoft2025cloudShell}. For guardrails, review Microsoft Cost Management budgets \cite{microsoft2025costBudgets}, the Azure Well-Architected Framework \cite{microsoft2025wellarchitected}, the Cloud Adoption Framework \cite{microsoft2025caf}, and Azure naming guidance \cite{microsoft2025naming}.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item The Azure free account combines introductory credit, selected 12-month free services, and always-free quotas; each has limits.
+    \item Azure resources are easiest to manage when subscriptions, resource groups, tags, budgets, and cleanup commands are planned before deployment.
+    \item Microsoft Entra ID provides identity, while Azure RBAC grants scoped management permissions; daily work should avoid Global Administrator and broad Owner access.
+    \item Azure CLI is the default tool for this book on Windows PowerShell; Azure PowerShell and Azure Cloud Shell are valid alternatives.
+    \item Budgets alert; they do not replace measurement, cleanup, and conservative service selection.
+    \item Chapter 1 should begin only after account selection, MFA, CLI authentication, budget alerts, naming conventions, and cleanup verification are complete.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Explain the difference between a Microsoft Entra tenant, an Azure subscription, a resource group, and a resource. Give one example of each from your setup.
+    \item \textbf{(Conceptual)} Why is Global Administrator inappropriate for daily data engineering work? Contrast it with Contributor at resource-group scope.
+    \item \textbf{(Hands-on)} Install Azure CLI on Windows, run \texttt{az login}, select the book subscription, and capture \texttt{az account show --output table}.
+    \item \textbf{(Hands-on)} Create the Chapter 0 verification resource group and storage account. Save the command output and confirm that required tags exist.
+    \item \textbf{(Hands-on)} Delete the verification resource group and prove that \texttt{az group exists --name rg-de-azbook-ch00-dev} returns \texttt{false}.
+    \item \textbf{(Cost)} Create a monthly budget with alerts. Record the amount, thresholds, contact email, and where you will check Cost Analysis after each chapter.
+    \item \textbf{(Security)} Enable MFA and write a short note describing how you would recover access if your primary authenticator device is lost.
+    \item \textbf{(Design)} Propose a naming and tagging convention for a team of five learners sharing one subscription. Include owner, chapter, environment, and delete-after tags.
+    \item \textbf{(Troubleshooting)} List three signs that Azure CLI is pointed at the wrong subscription. For each, state the command you would run to confirm or fix it.
+    \item \textbf{(Preparation checklist)} Before starting Chapter 1, verify: account created, MFA enabled, CLI authenticated, subscription selected, budget configured, default region chosen, naming convention recorded, Chapter 0 resources deleted, and Cost Analysis reviewed.
+\end{enumerate}

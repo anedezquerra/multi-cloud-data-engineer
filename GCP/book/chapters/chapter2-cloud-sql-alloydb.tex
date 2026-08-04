@@ -1,0 +1,649 @@
+\chapter{Relational Databases: Cloud SQL and AlloyDB}
+\index{Cloud SQL}\index{AlloyDB}\index{PostgreSQL}\index{high availability}\index{read replicas}\index{Database Migration Service}\index{private IP}
+
+\begin{objectives}
+\begin{itemize}
+    \item Explain Cloud SQL architecture for managed PostgreSQL, MySQL, and SQL Server workloads in Google Cloud.
+    \item Design regional high availability, automatic failover, backups, point-in-time recovery, and read replicas for relational systems.
+    \item Use Database Migration Service and private IP connectivity to move source databases into Cloud SQL with minimal downtime.
+    \item Describe AlloyDB for PostgreSQL, including its disaggregated storage, columnar engine, and machine learning integrations.
+    \item Implement an HA Cloud SQL for PostgreSQL instance, create a read replica, and simulate failover using PowerShell-friendly \texttt{gcloud} commands.
+    \item Build Python client checks that validate primary and replica connectivity during a hands-on relational database lab.
+    \item Design a zero-downtime ERP migration to Cloud SQL with an AlloyDB analytics replica for operational reporting.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+Managed relational services use different product names, but the architectural vocabulary is portable: engine compatibility, HA placement, replicas, migration tooling, and analytics acceleration.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{2.8cm}p{3.0cm}p{3.0cm}p{3.0cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{AWS} & \textbf{Azure} & \textbf{GCP} \\
+\midrule
+Managed relational & RDS / Aurora & Azure SQL / Azure Database for PostgreSQL & Cloud SQL / AlloyDB \\
+Scale-out or accelerated & Aurora & Hyperscale & AlloyDB columnar engine \\
+High availability & Multi-AZ & Zone-redundant HA & Regional HA \\
+Read replicas & RDS replicas / Aurora readers & Read replicas / geo-replicas & Cloud SQL read replicas / AlloyDB read pools \\
+Migration & DMS + SCT & Azure DMS & Database Migration Service \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+MongoDB Atlas, Microsoft Fabric, and Snowflake are useful analogs but not direct replacements. MongoDB Atlas targets document workloads, Fabric combines analytics services over OneLake, and Snowflake separates compute from storage for warehousing. Cloud SQL and AlloyDB remain the default GCP choices when the source of truth is relational and transactional.
+\end{crosscloud}
+
+\begin{keyterms}
+\textbf{Cloud SQL}: Google Cloud's managed relational database service for PostgreSQL, MySQL, and SQL Server.
+\textbf{Regional HA}: Cloud SQL configuration with a standby instance in another zone of the same region.
+\textbf{Read replica}: asynchronously replicated instance used for read scaling, reporting, or regional read locality.
+\textbf{Database Migration Service}: managed service for migrating databases to Cloud SQL and AlloyDB with continuous replication.
+\textbf{Private IP}: connectivity pattern that keeps database traffic on private Google Cloud networking rather than public addresses.
+\textbf{AlloyDB}: PostgreSQL-compatible managed database designed for high performance, availability, and analytics acceleration.
+\end{keyterms}
+
+\section{Week 2 Roadmap}
+Week~2 moves from object storage into the transactional systems that feed analytical platforms. Most data engineering projects begin with operational data in relational databases: customers, orders, invoices, inventory, account balances, workflow states, and audit events. A professional data engineer must understand how those systems stay available, how replicas lag, how migrations preserve consistency, and how analytical offloading prevents reporting from hurting online transactions.
+
+This chapter uses Cloud SQL for managed relational operations and AlloyDB for PostgreSQL-compatible workloads that need higher throughput or embedded analytical acceleration. Monday establishes Cloud SQL architecture, high availability, and replicas. Tuesday focuses on Database Migration Service and private IP networking. Wednesday introduces AlloyDB, its columnar engine, and machine learning integration. Thursday builds an HA PostgreSQL lab with a replica and failover drill. Friday applies the patterns to a zero-downtime ERP migration.
+
+\begin{definitionbox}
+\textbf{Cloud SQL} is a fully managed relational database service that handles provisioning, maintenance, backups, replication, and high availability for supported database engines. It reduces undifferentiated administration, but schema design, transaction boundaries, connection management, and migration correctness remain engineering responsibilities \cite{googlecloudsqldocs}.
+\end{definitionbox}
+
+\section{Monday: Cloud SQL Architecture, High Availability, and Read Replicas}
+\index{Cloud SQL!architecture}\index{regional HA}\index{read replica}\index{failover}
+
+\subsection{Managed Architecture}
+Cloud SQL wraps familiar relational engines with a managed control plane. You still choose an engine version, machine shape, storage size, region, network access, backup window, maintenance window, and database flags. Google Cloud manages host provisioning, patch orchestration, storage growth when configured, monitoring integration, backups, and failover mechanics. Applications connect through standard database protocols, the Cloud SQL Auth Proxy, private IP, public IP with authorized networks, or language connectors.
+
+\begin{notebox}
+Managed does not mean ownerless. Application teams still own schema migrations, query efficiency, index strategy, connection pooling, transaction isolation choices, failover testing, and business recovery procedures.
+\end{notebox}
+
+For data engineers, Cloud SQL often appears in three roles. First, it is an operational source that exports change data into pipelines. Second, it is a serving store for metadata, workflow state, and small application datasets. Third, it is a migration target when an on-premises database must move quickly without replatforming. In all three roles, reliability comes from combining database features with network design, IAM, monitoring, and runbooks.
+
+\subsection{Regional High Availability}
+\index{Cloud SQL!high availability}
+Cloud SQL regional high availability creates a primary instance and a standby instance in different zones of the same region. The standby is not a read target. It exists to take over when the primary zone or host becomes unhealthy. Persistent disk replication and managed failover are designed to reduce recovery time compared with restoring from backup, but applications must still reconnect and retry safely.
+
+\begin{definitionbox}
+\textbf{High availability} improves service continuity after infrastructure failure. It is not the same as disaster recovery. Regional HA protects against zonal failure inside one region; cross-region DR requires backups, replicas, export plans, or a separate architecture.
+\end{definitionbox}
+
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[
+        app/.style={rectangle, rounded corners, draw=primary, thick, fill=primary!5, text width=2.7cm, minimum height=1.0cm, align=center, font=\small\bfseries},
+        db/.style={cylinder, shape border rotate=90, aspect=0.25, draw=primary, thick, fill=primary!10, text width=2.8cm, minimum height=1.4cm, align=center, font=\small\bfseries},
+        standby/.style={cylinder, shape border rotate=90, aspect=0.25, draw=codegray, thick, fill=backcolour, text width=2.8cm, minimum height=1.4cm, align=center, font=\small\bfseries},
+        net/.style={rectangle, rounded corners, draw=codegreen!60!black, thick, fill=green!7, text width=2.8cm, minimum height=0.9cm, align=center, font=\footnotesize\bfseries},
+        arrow/.style={-{Stealth[length=2.5mm]}, draw=primary, thick},
+        dasharrow/.style={-{Stealth[length=2.5mm]}, draw=codegray, thick, dashed}
+    ]
+        \node[app] (app) at (0,0) {Application\\Connection Pool};
+        \node[net] (proxy) at (3.5,0) {Cloud SQL\\Connector / Proxy};
+        \node[db] (primary) at (7.0,1.2) {Primary\\Zone A};
+        \node[standby] (standby) at (7.0,-1.5) {Standby\\Zone B};
+        \node[app] (monitor) at (11.0,0) {Monitoring\\Backups\\Runbook};
+
+        \draw[arrow] (app) -- (proxy);
+        \draw[arrow] (proxy) -- (primary);
+        \draw[dasharrow] (primary) -- node[right, font=\footnotesize]{synchronous regional HA} (standby);
+        \draw[dasharrow] (standby) -- node[below, font=\footnotesize]{promotion during failover} (proxy);
+        \draw[dasharrow] (monitor) -- (primary);
+        \draw[dasharrow] (monitor) -- (standby);
+    \end{tikzpicture}%
+    }
+    \caption{Cloud SQL regional HA places a standby in another zone and requires client reconnection after failover.}
+    \label{fig:cloud-sql-regional-ha}
+\end{figure}
+
+\begin{pitfall}
+Failover testing often reveals application bugs, not database bugs. Hard-coded IP addresses, missing retry logic, oversized connection pools, long transactions, and non-idempotent writes can turn a managed failover into an application outage.
+\end{pitfall}
+
+\subsection{Backups and Point-in-Time Recovery}
+Backups protect against logical failure: accidental deletes, destructive deployments, corrupt data loads, or ransomware. High availability keeps the service running after infrastructure failure, but it faithfully replicates bad transactions. Point-in-time recovery uses write-ahead logs or binary logs to restore to a selected moment inside the retention window. Production designs should document backup retention, restore targets, restore testing cadence, encryption, and who can initiate recovery.
+
+\begin{tipbox}
+Treat restore tests as a production control. A backup that has never been restored is an assumption. Schedule a non-production restore, run data quality checks, and record elapsed time against the recovery time objective.
+\end{tipbox}
+
+\subsection{Read Replicas}
+\index{Cloud SQL!read replicas}\index{replication lag}
+Cloud SQL read replicas use asynchronous replication. They improve read scale, isolate analytical queries, and can provide regional read locality. They do not guarantee zero-lag reads. A reporting dashboard that reads from a replica may show slightly stale results, which is usually acceptable for analytics but dangerous for payment confirmation, inventory decrement, or idempotency checks.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.2cm}p{4.8cm}p{4.6cm}@{}}
+\toprule
+\textbf{Pattern} & \textbf{Best fit} & \textbf{Caution} \\
+\midrule
+Regional HA standby & Zonal failure protection for primary database & Standby is not readable and does not replace backups \\
+Same-region read replica & Reporting, read scale, operational dashboards & Replica lag and extra cost \\
+Cross-region read replica & Geographic read locality or DR seed & Network cost, lag, and promotion runbook \\
+Backup restore & Logical recovery or environment cloning & Restore time and validation effort \\
+\bottomrule
+\end{tabular}
+\caption{Cloud SQL reliability and scale patterns.}
+\label{tab:cloud-sql-reliability-patterns}
+\end{table}
+
+\section{Tuesday: Database Migration Service and Private IP Connections}
+\index{Database Migration Service}\index{private services access}\index{private IP}\index{database migration}
+
+\subsection{Migration Phases}
+Database Migration Service (DMS) supports migrations into Cloud SQL and AlloyDB by combining initial load with change replication for compatible sources \cite{googleclouddmsdocs}. A typical migration has five phases: assessment, connectivity, full load, continuous replication, and cutover. Assessment verifies engine version, extensions, character sets, unsupported objects, stored procedures, large tables, and downtime constraints. Connectivity establishes secure paths from the source to Google Cloud. Full load copies existing data. Continuous replication applies changes while applications still write to the source. Cutover stops writes, drains replication lag, validates data, and redirects applications.
+
+\begin{notebox}
+Migration success is measured by business continuity, not only bytes copied. The cutover plan must include freeze windows, rollback criteria, DNS or configuration changes, application smoke tests, and stakeholder sign-off.
+\end{notebox}
+
+\subsection{Private IP and Private Services Access}
+\index{VPC}\index{private services access}
+Private IP connections keep database traffic inside private networking. For Cloud SQL, private IP requires VPC configuration and private services access. Applications running on GCE, GKE, Cloud Run with appropriate VPC access, Dataflow, or Composer can connect without exposing the database through a public address. Private connectivity reduces attack surface and simplifies compliance narratives, but it introduces routing, DNS, firewall, and peering considerations.
+
+\begin{definitionbox}
+\textbf{Private services access} connects a consumer VPC to Google-managed services by using allocated internal address ranges. Cloud SQL private IP depends on this pattern so that instances receive private addresses reachable from selected VPC clients \cite{googlecloudsqlprivateip}.
+\end{definitionbox}
+
+\begin{pitfall}
+A private IP database is not automatically secure. Poor IAM, broad network reachability, weak passwords, missing SSL requirements, or overprivileged service accounts can still expose data. Private IP is one layer in a defense-in-depth design.
+\end{pitfall}
+
+\subsection{DMS Design Checklist}
+Before creating a migration job, document source credentials, network path, replication user privileges, schema conversion needs, table exclusions, large object handling, trigger behavior, sequence synchronization, replication slot cleanup, and performance limits. For PostgreSQL migrations, verify logical replication settings and extensions. For MySQL, verify binary logging and row-based replication settings. For SQL Server, confirm the supported path and downtime expectation.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.0cm}p{4.6cm}p{4.8cm}@{}}
+\toprule
+\textbf{Area} & \textbf{Question} & \textbf{Evidence} \\
+\midrule
+Compatibility & Are engine version, extensions, and schema objects supported? & Assessment report and remediation list \\
+Connectivity & Can DMS reach the source and destination privately? & VPC, VPN, firewall, and connection profile tests \\
+Replication & Can changes be captured continuously? & Source replication settings and lag dashboard \\
+Validation & Do row counts, checksums, and application tests pass? & Reconciliation report and sign-off \\
+Cutover & How are writes frozen and clients redirected? & Runbook with rollback criteria \\
+\bottomrule
+\end{tabular}
+\caption{Database Migration Service readiness checklist.}
+\label{tab:dms-readiness}
+\end{table}
+
+\section{Wednesday: AlloyDB for PostgreSQL, Columnar Engine, and ML Integration}
+\index{AlloyDB!PostgreSQL}\index{columnar engine}\index{machine learning}
+
+\subsection{Why AlloyDB Exists}
+AlloyDB is a PostgreSQL-compatible managed database designed for demanding enterprise workloads \cite{googlecloudalloydbdocs}. It separates compute from a distributed storage layer, supports automated backups and high availability, and adds Google-engineered performance features. For data engineers, AlloyDB is attractive when teams want PostgreSQL compatibility but need stronger performance, read scaling, or mixed operational and analytical capability than a conventional managed instance can provide.
+
+\begin{tipbox}
+Use Cloud SQL when the workload needs managed relational simplicity and broad engine options. Evaluate AlloyDB when PostgreSQL compatibility is required and the workload is performance-sensitive, analytically active, or expected to grow beyond a conventional single-instance pattern.
+\end{tipbox}
+
+\subsection{Columnar Engine}
+\index{AlloyDB!columnar engine}
+Traditional row storage is efficient for transactional lookups and updates because all columns of a row are near each other. Analytical queries often scan a few columns across many rows. AlloyDB's columnar engine accelerates suitable analytical queries by storing and processing selected data in a column-oriented format while preserving PostgreSQL compatibility for applications. This can reduce the need to offload every operational report into a separate warehouse immediately, though BigQuery remains the preferred platform for large-scale analytical warehousing.
+
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[
+        app/.style={rectangle, rounded corners, draw=primary, thick, fill=primary!5, text width=2.8cm, minimum height=1.0cm, align=center, font=\small\bfseries},
+        row/.style={cylinder, shape border rotate=90, aspect=0.25, draw=primary, thick, fill=primary!10, text width=2.8cm, minimum height=1.35cm, align=center, font=\small\bfseries},
+        col/.style={rectangle, rounded corners, draw=codegreen!60!black, thick, fill=green!7, text width=3.0cm, minimum height=1.0cm, align=center, font=\small\bfseries},
+        wh/.style={rectangle, rounded corners, draw=magenta, thick, fill=magenta!8, text width=2.8cm, minimum height=1.0cm, align=center, font=\small\bfseries},
+        arrow/.style={-{Stealth[length=2.5mm]}, draw=primary, thick},
+        dasharrow/.style={-{Stealth[length=2.5mm]}, draw=codegray, thick, dashed}
+    ]
+        \node[app] (oltp) at (0,1.2) {ERP Writes\\Transactions};
+        \node[row] (primary) at (4.0,1.2) {AlloyDB\\Row Store};
+        \node[col] (columnar) at (8.0,1.2) {Columnar Engine\\Hot Analytical Columns};
+        \node[app] (reports) at (12.0,1.2) {Operational\\Reports};
+        \node[wh] (bq) at (8.0,-1.6) {BigQuery\\Enterprise Analytics};
+
+        \draw[arrow] (oltp) -- (primary);
+        \draw[arrow] (primary) -- (columnar);
+        \draw[arrow] (columnar) -- (reports);
+        \draw[dasharrow] (primary) -- node[right, font=\footnotesize]{CDC / ETL} (bq);
+        \draw[dasharrow] (reports) -- node[right, font=\footnotesize]{heavy analytics graduate here} (bq);
+    \end{tikzpicture}%
+    }
+    \caption{AlloyDB can serve transactions from PostgreSQL-compatible row storage while accelerating selected analytical scans with a columnar engine.}
+    \label{fig:alloydb-columnar-engine}
+\end{figure}
+
+\subsection{ML Integration}
+\index{AlloyDB!ML integration}
+AlloyDB supports integrations that bring machine learning closer to PostgreSQL data, including vector search and model invocation patterns documented by Google Cloud \cite{googlecloudalloydbai}. These capabilities are useful when an application needs low-latency retrieval, semantic search, or lightweight predictive features near operational data. They should not turn the transactional database into an uncontrolled feature store. Training pipelines, large-scale feature computation, and governed model deployment still belong in services such as BigQuery, Dataflow, and Vertex AI.
+
+\begin{pitfall}
+Do not run every dashboard, vector search, and batch feature job against the primary transactional database. Even accelerated systems have concurrency, cost, and operational limits. Isolate workloads with read pools, replicas, BigQuery exports, and clear service-level objectives.
+\end{pitfall}
+
+\section{Thursday Hands-On Project: HA Cloud SQL PostgreSQL, Read Replica, and Failover}
+\index{hands-on project}\index{Cloud SQL!PostgreSQL}\index{failover test}
+This lab deploys a regional HA Cloud SQL for PostgreSQL instance, creates a read replica, runs a simple Python connectivity test, and invokes a managed failover. Use a sandbox project, replace every placeholder, and delete resources afterward to avoid charges. Commands are written for Windows PowerShell.
+
+\begin{notebox}
+Cloud SQL HA instances and replicas incur cost. Use a small machine type in a training project, choose a short lab window, and record cleanup commands before creating resources.
+\end{notebox}
+
+\subsection{PowerShell Preparation and HA Instance Creation}
+\begin{lstlisting}[language=bash,caption={Creating an HA Cloud SQL for PostgreSQL instance with private IP placeholders.}]
+$env:PROJECT_ID = "my-gcp-db-lab"
+$env:REGION = "us-central1"
+$env:NETWORK = "default"
+$env:INSTANCE = "erp-pg-ha-lab"
+$env:REPLICA = "erp-pg-ha-lab-replica"
+$env:DB_NAME = "erp"
+$env:DB_USER = "erp_app"
+$env:DB_PASSWORD = "ChangeMe-Use-Secret-Manager"
+
+gcloud config set project $env:PROJECT_ID
+
+gcloud services enable sqladmin.googleapis.com servicenetworking.googleapis.com
+
+gcloud compute addresses create google-managed-services-$env:NETWORK `
+  --global `
+  --purpose=VPC_PEERING `
+  --prefix-length=16 `
+  --network=$env:NETWORK
+
+gcloud services vpc-peerings connect `
+  --service=servicenetworking.googleapis.com `
+  --ranges=google-managed-services-$env:NETWORK `
+  --network=$env:NETWORK
+
+gcloud sql instances create $env:INSTANCE `
+  --database-version=POSTGRES_15 `
+  --region=$env:REGION `
+  --availability-type=REGIONAL `
+  --tier=db-custom-2-7680 `
+  --storage-type=SSD `
+  --storage-size=20GB `
+  --network=$env:NETWORK `
+  --no-assign-ip `
+  --backup-start-time=03:00 `
+  --enable-point-in-time-recovery `
+  --maintenance-window-day=SUN `
+  --maintenance-window-hour=4
+
+gcloud sql databases create $env:DB_NAME --instance=$env:INSTANCE
+
+gcloud sql users create $env:DB_USER `
+  --instance=$env:INSTANCE `
+  --password=$env:DB_PASSWORD
+\end{lstlisting}
+
+\subsection{Read Replica and Failover Drill}
+\begin{lstlisting}[language=bash,caption={Creating a read replica, checking status, and simulating failover.}]
+gcloud sql instances create $env:REPLICA `
+  --master-instance-name=$env:INSTANCE `
+  --region=$env:REGION `
+  --tier=db-custom-2-7680
+
+gcloud sql instances describe $env:INSTANCE `
+  --format="yaml(name,region,gceZone,secondaryGceZone,availabilityType,state,ipAddresses)"
+
+gcloud sql instances describe $env:REPLICA `
+  --format="yaml(name,masterInstanceName,replicaNames,state,ipAddresses)"
+
+# Run during an approved lab window. Applications must reconnect after failover.
+gcloud sql instances failover $env:INSTANCE
+
+gcloud sql operations list `
+  --instance=$env:INSTANCE `
+  --limit=5
+\end{lstlisting}
+
+\subsection{Python Connectivity Check}
+The following snippet assumes the Cloud SQL Auth Proxy or connector path provides a local PostgreSQL endpoint. In production, store credentials in Secret Manager and use IAM-authenticated connectors where possible.
+
+\begin{lstlisting}[language=Python,caption={Validating PostgreSQL connectivity before and after a Cloud SQL failover.}]
+import os
+import time
+
+import psycopg
+
+
+def connect_once(label: str) -> None:
+    conninfo = {
+        "host": os.environ.get("PGHOST", "127.0.0.1"),
+        "port": os.environ.get("PGPORT", "5432"),
+        "dbname": os.environ.get("PGDATABASE", "erp"),
+        "user": os.environ.get("PGUSER", "erp_app"),
+        "password": os.environ["PGPASSWORD"],
+        "connect_timeout": 10,
+    }
+    with psycopg.connect(**conninfo) as conn:
+        with conn.cursor() as cur:
+            cur.execute("select current_database(), now()")
+            database_name, current_time = cur.fetchone()
+            print({"label": label, "database": database_name, "time": str(current_time)})
+
+
+if __name__ == "__main__":
+    for attempt in range(1, 6):
+        try:
+            connect_once(label=f"attempt-{attempt}")
+            break
+        except psycopg.OperationalError as exc:
+            print({"attempt": attempt, "status": "retrying", "error": str(exc)})
+            time.sleep(10)
+\end{lstlisting}
+
+\subsection{Cleanup}
+\begin{lstlisting}[language=bash,caption={Deleting lab Cloud SQL resources after validation.}]
+gcloud sql instances delete $env:REPLICA --quiet
+gcloud sql instances delete $env:INSTANCE --quiet
+\end{lstlisting}
+
+\section{Friday Use Case and Architecture: Zero-Downtime ERP Migration}
+\index{ERP migration}\index{zero-downtime migration}\index{cutover}\index{change data capture}
+
+\subsection{Scenario}
+A manufacturing company runs a monolithic on-premises ERP on PostgreSQL. The ERP manages purchasing, inventory, production orders, finance, and customer shipments. Executives want the platform moved to Google Cloud without a disruptive weekend outage. Reporting queries currently run on the same database as transactions and regularly slow month-end close. The target architecture must use Cloud SQL for transactional continuity, Database Migration Service for continuous replication, private connectivity for security, and AlloyDB for accelerated operational analytics.
+
+\subsection{Migration Architecture}
+The smallest safe plan is not a big-bang rewrite. Keep the ERP application behavior stable, migrate the database first, and offload heavy reads. Establish VPN or Interconnect from the data center to Google Cloud, create DMS connection profiles, perform initial load, enable continuous replication, validate row counts and checksums, rehearse cutover, freeze writes, drain lag, promote Cloud SQL, and redirect the ERP application. After stabilization, replicate selected tables or change streams into AlloyDB and BigQuery for analytics.
+
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[
+        src/.style={rectangle, rounded corners, draw=codegray, thick, fill=white, text width=2.7cm, minimum height=1.0cm, align=center, font=\small\bfseries},
+        svc/.style={rectangle, rounded corners, draw=primary, thick, fill=primary!6, text width=2.9cm, minimum height=1.0cm, align=center, font=\small\bfseries},
+        db/.style={cylinder, shape border rotate=90, aspect=0.25, draw=primary, thick, fill=primary!10, text width=2.9cm, minimum height=1.35cm, align=center, font=\small\bfseries},
+        ana/.style={rectangle, rounded corners, draw=magenta, thick, fill=magenta!8, text width=2.8cm, minimum height=1.0cm, align=center, font=\small\bfseries},
+        arrow/.style={-{Stealth[length=2.5mm]}, draw=primary, thick},
+        dasharrow/.style={-{Stealth[length=2.5mm]}, draw=codegray, thick, dashed}
+    ]
+        \node[src] (erpapp) at (0,1.3) {On-Prem ERP\\Application};
+        \node[db] (source) at (0,-1.3) {On-Prem\\PostgreSQL};
+        \node[svc] (network) at (3.6,0) {VPN /\\Interconnect\\Private IP};
+        \node[svc] (dms) at (7.0,-1.3) {Database\\Migration\\Service};
+        \node[db] (cloudsql) at (10.6,0) {Cloud SQL\\PostgreSQL\\Regional HA};
+        \node[ana] (alloy) at (14.0,1.2) {AlloyDB\\Analytics\\Replica};
+        \node[ana] (bq) at (14.0,-1.2) {BigQuery\\Warehouse};
+
+        \draw[arrow] (erpapp) -- node[above, font=\footnotesize]{after cutover} (network);
+        \draw[arrow] (network) -- (cloudsql);
+        \draw[arrow] (source) -- (dms);
+        \draw[arrow] (dms) -- node[below, font=\footnotesize]{full load + CDC} (cloudsql);
+        \draw[dasharrow] (cloudsql) -- (alloy);
+        \draw[dasharrow] (cloudsql) -- (bq);
+    \end{tikzpicture}%
+    }
+    \caption{Zero-downtime ERP migration using DMS, private connectivity, Cloud SQL HA, and AlloyDB analytics offload.}
+    \label{fig:erp-migration-architecture}
+\end{figure}
+
+\subsection{Cutover and Validation}
+Zero downtime is an aspiration that must be translated into measurable tolerances. The ERP may tolerate a short write freeze while replication lag drains and the application restarts. Define acceptable lag, maximum cutover duration, rollback point, and business validation. Validate table counts, financial totals, open order counts, sequence values, permissions, stored procedure behavior, and representative application transactions. Keep the source database read-only until the rollback window closes.
+
+\begin{tipbox}
+Use business invariants for validation: trial balance totals, inventory quantities by warehouse, open invoice counts, and shipment status counts. Row counts are necessary but not sufficient.
+\end{tipbox}
+
+\section{Security, Operations, and Cost Notes}
+\index{Cloud SQL!security}\index{Secret Manager}\index{connection pooling}\index{cost governance}
+Relational databases concentrate high-value data. Use private IP, least-privilege IAM, strong database roles, Secret Manager, audit logging, and SSL where required. Avoid embedding passwords in scripts or application configuration. Use connection pooling because serverless and autoscaled clients can overwhelm PostgreSQL with thousands of short-lived connections. Monitor CPU, memory, storage growth, lock waits, slow queries, replication lag, connection count, backup status, and failover events.
+
+\begin{notebox}
+Database cost is driven by always-on compute, storage, backups, replicas, HA standby capacity, network traffic, and operational mistakes such as unbounded reporting queries. Label instances and export billing data so database spend is visible by workload.
+\end{notebox}
+
+\section{Interview Q\&A}
+\subsection{Concepts and Trade-offs}
+\begin{enumerate}
+    \item \textbf{Q: How does Cloud SQL regional HA differ from a read replica?}\\
+    A: Regional HA uses a standby in another zone for failover and is not a read endpoint. A read replica is asynchronously replicated and can serve reads, but it may lag and does not replace HA.
+
+    \item \textbf{Q: Why should migrations use private IP when possible?}\\
+    A: Private IP keeps database traffic off public addresses, reduces exposed attack surface, and fits compliance expectations, while still requiring IAM, firewall, credential, and database-role controls.
+
+    \item \textbf{Q: What is the main risk of reading from replicas?}\\
+    A: Replica lag. Reporting can usually tolerate slight staleness, but workflows that require read-after-write consistency should use the primary or design explicit consistency checks.
+
+    \item \textbf{Q: When would you choose AlloyDB over Cloud SQL for PostgreSQL?}\\
+    A: Choose AlloyDB when PostgreSQL compatibility is required and the workload needs higher performance, read pools, improved availability patterns, or columnar acceleration for operational analytics.
+\end{enumerate}
+
+\section{Further Reading}
+Read the Cloud SQL documentation for current PostgreSQL, MySQL, SQL Server, HA, backup, replica, and connectivity behavior \cite{googlecloudsqldocs}. Review the Cloud SQL private IP guidance before designing production networks \cite{googlecloudsqlprivateip}. Study Database Migration Service documentation for supported sources, continuous replication, connection profiles, and cutover practices \cite{googleclouddmsdocs}. Review AlloyDB documentation for clusters, instances, high availability, read pools, columnar engine behavior, and AI integrations \cite{googlecloudalloydbdocs,googlecloudalloydbcolumnar,googlecloudalloydbai}. Use the Google Cloud Architecture Framework to evaluate reliability, security, cost, performance, and operations \cite{googlecloudarchitectureframework}.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item Cloud SQL simplifies database administration, but engineers still own schema quality, connection behavior, migration correctness, and recovery testing.
+    \item Regional HA protects against zonal infrastructure failure; backups and point-in-time recovery protect against logical failure.
+    \item Read replicas scale reads and isolate reporting, but asynchronous lag must be visible and acceptable.
+    \item Database Migration Service migrations need assessment, private connectivity, continuous replication, validation, and a rehearsed cutover runbook.
+    \item AlloyDB extends PostgreSQL-compatible operations with performance features, columnar acceleration, and AI-oriented integrations.
+    \item ERP migrations should stabilize the transactional target first, then offload analytics to replicas, AlloyDB, or BigQuery.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Explain why high availability does not protect against an accidental \texttt{delete from orders} statement.
+    \item \textbf{(Conceptual)} Compare a Cloud SQL regional HA standby, same-region read replica, and cross-region read replica.
+    \item \textbf{(Hands-on)} Create a Cloud SQL PostgreSQL instance in a sandbox project with backups and point-in-time recovery enabled.
+    \item \textbf{(Hands-on)} Create a read replica and measure replication lag after inserting test rows into the primary.
+    \item \textbf{(Hands-on)} Run a failover drill and record application reconnect time using a small Python script.
+    \item \textbf{(Design)} Draft a DMS migration checklist for a 2~TB on-premises PostgreSQL database with a one-hour cutover window.
+    \item \textbf{(Design)} Choose private IP, public IP with authorized networks, or connector-based access for Cloud Run, GKE, and on-premises clients.
+    \item \textbf{(Architecture)} Extend the ERP migration design with monitoring, rollback criteria, business validation metrics, and an AlloyDB reporting workload.
+\end{enumerate}
+
+\section{Capstone Project: HA Cloud SQL and AlloyDB Analytics for ERP Migration}\label{sec:ch2-capstone}
+\index{capstone project}\index{ERP migration!capstone}\index{Cloud SQL!capstone}\index{AlloyDB!capstone}
+
+\begin{capstonebox}
+\textbf{Mission:} Design and prototype a zero-downtime ERP database migration from on-premises PostgreSQL to HA Cloud SQL, then offload operational analytics to AlloyDB. Your solution must preserve transactional correctness, use private connectivity, provide a tested failover plan, and give reporting users a path that does not overload the ERP primary.
+
+\textbf{Estimated time:} 5--7 hours.
+
+\textbf{What you'll practice:}
+\begin{itemize}
+    \item Creating a regional HA Cloud SQL for PostgreSQL target with backups and point-in-time recovery.
+    \item Designing DMS connection profiles, migration jobs, validation checks, and cutover steps.
+    \item Using private IP and least-privilege access for application and migration traffic.
+    \item Creating a read replica and defining promotion or failover runbooks.
+    \item Adding AlloyDB as an analytics-serving replica pattern for operational reporting.
+    \item Producing a reference architecture, implementation transcript, acceptance criteria, and rollback plan.
+\end{itemize}
+\end{capstonebox}
+
+\subsection*{Scenario}
+Northwind Precision Manufacturing runs a monolithic ERP backed by a 4~TB on-premises PostgreSQL database. The database receives order, procurement, inventory, finance, and shipping transactions around the clock. Month-end reporting joins large invoice, payment, and inventory tables and regularly slows application users. Leadership wants the database moved to Google Cloud with no data loss, only a brief planned write freeze, private connectivity, and a clear path for faster reporting.
+
+\subsection*{Requirements}
+\begin{itemize}
+    \item Deploy a Cloud SQL for PostgreSQL target with regional HA, automated backups, and point-in-time recovery.
+    \item Use private IP connectivity through a VPC design appropriate for application clients and DMS.
+    \item Define DMS source and destination connection profiles, full load, continuous replication, and cutover criteria.
+    \item Create at least one Cloud SQL read replica for reporting isolation or DR rehearsal.
+    \item Design an AlloyDB analytics replica pattern for month-end reporting tables and selected operational dashboards.
+    \item Document database roles, Secret Manager usage, audit logging, monitoring, and alert thresholds.
+    \item Provide validation evidence for row counts, checksums, sequence values, business totals, and application smoke tests.
+    \item Define rollback criteria and source database handling during the post-cutover stabilization window.
+\end{itemize}
+
+\subsection*{Reference Architecture}
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[
+        source/.style={rectangle, rounded corners, draw=codegray, thick, fill=white, text width=2.8cm, minimum height=1.0cm, align=center, font=\small\bfseries},
+        svc/.style={rectangle, rounded corners, draw=primary, thick, fill=primary!6, text width=2.9cm, minimum height=1.0cm, align=center, font=\small\bfseries},
+        db/.style={cylinder, shape border rotate=90, aspect=0.25, draw=primary, thick, fill=primary!10, text width=3.0cm, minimum height=1.4cm, align=center, font=\small\bfseries},
+        replica/.style={cylinder, shape border rotate=90, aspect=0.25, draw=codegreen!60!black, thick, fill=green!8, text width=3.0cm, minimum height=1.4cm, align=center, font=\small\bfseries},
+        ops/.style={rectangle, rounded corners, draw=magenta, thick, fill=magenta!8, text width=2.8cm, minimum height=1.0cm, align=center, font=\small\bfseries},
+        arrow/.style={-{Stealth[length=2.5mm]}, draw=primary, thick},
+        dasharrow/.style={-{Stealth[length=2.5mm]}, draw=codegray, thick, dashed}
+    ]
+        \node[source] (onpremapp) at (0,1.4) {ERP App\\On-Prem};
+        \node[source] (onpremdb) at (0,-1.4) {PostgreSQL\\Source};
+        \node[svc] (private) at (3.5,0) {Private\\Connectivity};
+        \node[svc] (dms) at (6.8,-1.4) {DMS\\Full Load\\+ CDC};
+        \node[db] (primary) at (10.2,0) {Cloud SQL\\Regional HA\\Primary};
+        \node[replica] (replica) at (13.8,1.5) {Cloud SQL\\Read Replica};
+        \node[replica] (alloy) at (13.8,-0.4) {AlloyDB\\Analytics\\Replica};
+        \node[ops] (ops) at (13.8,-2.3) {Monitoring\\Secrets\\Runbooks};
+
+        \draw[arrow] (onpremdb) -- (dms);
+        \draw[arrow] (dms) -- (primary);
+        \draw[arrow] (onpremapp) -- node[above, font=\footnotesize]{post-cutover} (private);
+        \draw[arrow] (private) -- (primary);
+        \draw[dasharrow] (primary) -- (replica);
+        \draw[dasharrow] (primary) -- (alloy);
+        \draw[dasharrow] (ops) -- (primary);
+        \draw[dasharrow] (ops) -- (alloy);
+    \end{tikzpicture}%
+    }
+    \caption{Capstone reference architecture for HA Cloud SQL with AlloyDB analytics offload during ERP migration.}
+    \label{fig:ch2-capstone-erp-cloudsql-alloydb}
+\end{figure}
+
+\subsection*{Implementation Steps}
+\begin{enumerate}
+    \item \textbf{Create the HA Cloud SQL target and read replica.} Replace all placeholders, use a sandbox project first, and do not store production passwords in shell history.
+
+\begin{lstlisting}[language=bash,caption={Capstone Cloud SQL target, database, user, and replica creation.}]
+$env:PROJECT_ID = "my-gcp-erp-capstone"
+$env:REGION = "us-central1"
+$env:NETWORK = "default"
+$env:INSTANCE = "erp-prod-pg-ha"
+$env:REPLICA = "erp-prod-pg-reporting"
+$env:DB_NAME = "erp"
+$env:DB_USER = "erp_app"
+$env:DB_PASSWORD = "Replace-With-Secret-Manager-Value"
+
+gcloud config set project $env:PROJECT_ID
+
+gcloud sql instances create $env:INSTANCE `
+  --database-version=POSTGRES_15 `
+  --region=$env:REGION `
+  --availability-type=REGIONAL `
+  --tier=db-custom-4-15360 `
+  --storage-type=SSD `
+  --storage-size=500GB `
+  --storage-auto-increase `
+  --network=$env:NETWORK `
+  --no-assign-ip `
+  --backup-start-time=02:00 `
+  --enable-point-in-time-recovery
+
+gcloud sql databases create $env:DB_NAME --instance=$env:INSTANCE
+
+gcloud sql users create $env:DB_USER `
+  --instance=$env:INSTANCE `
+  --password=$env:DB_PASSWORD
+
+gcloud sql instances create $env:REPLICA `
+  --master-instance-name=$env:INSTANCE `
+  --region=$env:REGION `
+  --tier=db-custom-4-15360
+\end{lstlisting}
+
+    \item \textbf{Create DMS placeholders and validation artifacts.} The exact flags vary by source engine and network path, so the listing emphasizes the repeatable evidence each migration must capture.
+
+\begin{lstlisting}[language=bash,caption={DMS planning commands and migration validation evidence placeholders.}]
+$env:MIGRATION_JOB = "erp-postgres-to-cloudsql"
+$env:SOURCE_PROFILE = "erp-onprem-postgres"
+$env:DEST_PROFILE = "erp-cloudsql-postgres"
+
+gcloud database-migration connection-profiles list --region=$env:REGION
+
+gcloud database-migration migration-jobs list --region=$env:REGION
+
+gcloud database-migration migration-jobs describe $env:MIGRATION_JOB `
+  --region=$env:REGION `
+  --format="yaml(state,phase,source,destination,dumpPath,duration)"
+
+@'
+validation_item,status,evidence
+row_counts,pending,Compare source and target counts for critical tables
+checksums,pending,Sample deterministic hashes by primary key range
+sequences,pending,Verify next values after cutover rehearsal
+business_totals,pending,Compare trial balance and inventory by warehouse
+smoke_tests,pending,Run login order invoice and shipment workflows
+'@ | Set-Content -Path .\erp-migration-validation.csv
+\end{lstlisting}
+
+    \item \textbf{Prototype application retry validation.} Run this check before and after a planned failover or cutover rehearsal.
+
+\begin{lstlisting}[language=Python,caption={Capstone retry loop for ERP database smoke testing.}]
+import os
+import time
+
+import psycopg
+
+
+SQL = """
+select
+    count(*) as open_orders
+from erp_orders
+where status in ('OPEN', 'ALLOCATED')
+"""
+
+
+def query_open_orders() -> int:
+    with psycopg.connect(
+        host=os.environ["PGHOST"],
+        port=os.environ.get("PGPORT", "5432"),
+        dbname=os.environ["PGDATABASE"],
+        user=os.environ["PGUSER"],
+        password=os.environ["PGPASSWORD"],
+        connect_timeout=10,
+    ) as conn:
+        with conn.cursor() as cur:
+            cur.execute(SQL)
+            return cur.fetchone()[0]
+
+
+for attempt in range(1, 8):
+    try:
+        print({"attempt": attempt, "open_orders": query_open_orders()})
+        break
+    except psycopg.OperationalError as exc:
+        print({"attempt": attempt, "retry": True, "error": str(exc)})
+        time.sleep(15)
+\end{lstlisting}
+\end{enumerate}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item A one-page architecture summary explaining HA Cloud SQL, private IP, DMS, read replica, AlloyDB analytics offload, and rollback boundaries.
+    \item The completed reference diagram or an equivalent diagram showing on-premises ERP, DMS, private connectivity, Cloud SQL HA, read replica, AlloyDB, monitoring, and secrets.
+    \item Command transcript or screenshots proving Cloud SQL creation, backup settings, PITR, private IP, read replica, and failover rehearsal.
+    \item A migration runbook with assessment findings, replication setup, validation queries, cutover timeline, rollback triggers, and owner assignments.
+    \item A reporting offload plan that identifies which ERP reports stay on Cloud SQL replicas, which move to AlloyDB, and which graduate to BigQuery.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item The target Cloud SQL instance uses regional HA, backups, point-in-time recovery, private IP, and least-privilege database roles.
+    \item DMS migration phases are documented from source assessment through continuous replication and cutover.
+    \item Validation includes row counts, sampled checksums, sequence values, business invariants, and application smoke tests.
+    \item The cutover plan defines write freeze, lag drain, DNS or configuration switch, rollback criteria, and source read-only handling.
+    \item A read replica or AlloyDB offload path protects the transactional primary from heavy reporting.
+    \item Monitoring covers CPU, memory, connections, storage growth, slow queries, locks, replica lag, backup status, and failover events.
+    \item Secrets are not hardcoded in application code, Terraform variables, notebooks, or command transcripts.
+    \item The design states residual risks, including replica lag, extension compatibility, stored procedure behavior, and application reconnect behavior.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Add a Cloud SQL Auth Proxy or language connector deployment pattern for Cloud Run, GKE, and on-premises migration workers.
+    \item Build a BigQuery dashboard from exported validation CSV files that tracks migration readiness by table and business process.
+    \item Add Datastream or another CDC path from Cloud SQL into BigQuery for long-term analytical history.
+    \item Prototype AlloyDB vector search for ERP support-ticket retrieval using sanitized, non-sensitive text.
+    \item Create a failover game day that measures application reconnect time, replica lag, alert delivery, and runbook accuracy.
+    \item Estimate monthly cost for Cloud SQL HA, replica, backups, AlloyDB, network transfer, and operational monitoring.
+\end{itemize}

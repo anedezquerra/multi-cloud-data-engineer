@@ -1,0 +1,721 @@
+\chapter{MongoDB Core Architecture and the WiredTiger Storage Engine}
+\index{MongoDB}\index{WiredTiger}\index{storage engine}\index{mongod}\index{journaling}\index{checkpointing}\index{write concern}\index{BSON}\index{cache eviction}%
+
+\begin{objectives}
+\begin{itemize}
+    \item Explain the role of the \texttt{mongod} daemon, client drivers, connection handling, BSON, and the storage-engine API in MongoDB's process architecture.
+    \item Describe WiredTiger's use of B+Tree files, cache pages, eviction thresholds, compression, and page allocation.
+    \item Trace a write from client acknowledgement through the in-memory cache, write-ahead journal, checkpoint, and crash recovery path.
+    \item Configure \texttt{storage.wiredTiger.engineConfig.cacheSizeGB} safely for a local deployment and reason about its interaction with the operating-system page cache.
+    \item Use \texttt{db.serverStatus().wiredTiger} metrics to diagnose eviction pressure, dirty-cache behavior, and checkpoint I/O.
+    \item Architect a high-throughput financial ledger deployment that balances durability, throughput, and predictable checkpoint latency.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+Although this book teaches \textbf{MongoDB}'s WiredTiger engine, the sibling cloud tracks share a common storage-foundation layer; the table shows how those object stores align and where MongoDB deliberately differs.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{2.8cm}p{3.0cm}p{3.0cm}p{3.0cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{AWS} & \textbf{Azure} & \textbf{GCP} \\
+\midrule
+Object storage & Amazon S3 & ADLS Gen2 / Blob & Cloud Storage \\
+Hot tier & S3 Standard & Hot & Standard \\
+Infrequent access & S3 Standard-IA & Cool / Cold & Nearline \\
+Archive (instant) & Glacier Instant Retrieval & Cold & Coldline \\
+Deep archive & Glacier Deep Archive & Archive & Archive \\
+Lifecycle rules & Lifecycle policies & Lifecycle management & Object Lifecycle Mgmt \\
+Versioning & S3 Versioning & Blob versioning & Object Versioning \\
+Immutability (WORM) & Object Lock & Immutable blob storage & Bucket Lock \\
+Cross-region copy & CRR / SRR & Object replication (GRS) & Dual/multi-region + Transfer \\
+Online transfer & DataSync & AzCopy & Storage Transfer Service \\
+Offline transfer & Snow Family & Data Box & Transfer Appliance \\
+\addlinespace
+Design durability & 11 nines & 11 nines (LRS) / 16 (GRS) & 11 nines \\
+Availability SLA & 99.9\% (Standard) & 99.9\% (RA-GRS read 99.99\%) & 99.95\% (multi-region) \\
+Encryption at rest & SSE-S3 / SSE-KMS / SSE-C & SSE + CMK via Key Vault & Google-managed / CMEK / CSEK \\
+Access control & IAM \& bucket policies, ACLs & Azure RBAC, SAS, POSIX ACLs & IAM, ACLs, signed URLs \\
+Pricing levers & Storage + requests + egress + retrieval & Storage + operations + egress + retrieval & Storage + operations + egress + retrieval \\
+Consistency & Strong read-after-write & Strong read-after-write & Strong (global) \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+The distinction that matters for this book: object stores and \textbf{Snowflake} micro-partitions and \textbf{Fabric OneLake} are \emph{remote, immutable} storage layers, whereas \textbf{MongoDB}'s WiredTiger is a \emph{node-local, mutable} engine with its own cache, journal, and checkpoints---which is exactly what the rest of this chapter dissects.
+\end{crosscloud}
+
+\section{Week 1 Roadmap: From Process to Persistent Bytes}
+MongoDB is often introduced as a document database, but a senior data engineer must also understand the path from a BSON document in a client driver to bytes persisted in storage files. The Week 1 objective is not to memorize every internal counter. It is to build an operational model: what \texttt{mongod} owns, what WiredTiger owns, what the operating system owns, and which metrics prove that the model is healthy. MongoDB's architecture documentation presents the database as a layered system of clients, server processes, storage, replication, and sharding \cite{mongodbArchitectureDocs}; this chapter opens the storage layer because later chapters on indexes, sharding, and DataOps depend on it.
+
+\begin{definitionbox}
+\textbf{WiredTiger} is MongoDB's default storage engine. It manages the on-disk data and index files, an internal cache, concurrency control, compression, checkpoints, and the journal used to recover committed writes after a crash \cite{mongodbWiredTigerDocs,wiredTigerArch}.
+\end{definitionbox}
+
+A useful mental model is to separate three caches. The \textbf{driver and application} may cache connections and objects. \textbf{WiredTiger} caches database pages inside the \texttt{mongod} process. The \textbf{operating system} caches filesystem blocks outside \texttt{mongod}. Performance work becomes confusing when these are collapsed into a single word, ``memory.''
+
+\begin{keyterms}
+\textbf{BSON}: MongoDB's binary document representation. \textbf{Dirty page}: a cached page that has changed in memory and must eventually be written to disk. \textbf{Checkpoint}: a durable, consistent view of data files at a point in time. \textbf{Journal}: write-ahead log used to replay committed changes during recovery. \textbf{Eviction}: the act of removing clean or reconciled pages from the WiredTiger cache to make room for active work.
+\end{keyterms}
+
+\section{Monday: MongoDB Process Architecture}
+\subsection{The \texttt{mongod} Daemon as the Database Boundary}
+The \texttt{mongod} daemon is the server process that accepts client connections, authenticates requests, parses commands, coordinates query execution, invokes the storage engine, and participates in replication or sharding roles. It is the operational boundary for configuration, logs, process memory, CPU scheduling, file descriptors, and network sockets. A standalone \texttt{mongod} may be enough for development, but production MongoDB systems usually run each \texttt{mongod} as a member of a replica set or as a shard inside a larger sharded cluster \cite{mongodbReplicationDocs,mongodbShardingDocs}.
+
+At the top of the stack, drivers maintain connection pools and send commands over MongoDB's wire protocol. Inside \texttt{mongod}, the command is authorized, parsed, planned, executed, and eventually translated into storage-engine operations. The storage engine is not responsible for user authentication, cluster routing, or the semantics of an aggregation pipeline. It is responsible for storing and retrieving records and indexes under a transactional contract.
+
+\begin{notebox}
+Architectural debugging starts by naming the layer. A slow dashboard could be caused by driver pool starvation, a query planner mistake, an index miss, WiredTiger eviction pressure, checkpoint I/O, disk latency, or cross-shard scatter-gather. Each layer has different evidence.
+\end{notebox}
+
+\subsection{Connection Handling, Threading, and Pools}
+MongoDB has historically been described as using a thread-per-connection model, but modern deployments include listener, worker, service-entry, and asynchronous execution details that vary by server version and platform. The practical point for data engineers is stable: client concurrency turns into server-side scheduling, memory consumption, locks or tickets, and storage-engine work. Each connection is not free. Drivers should use bounded pools, and server sizing should consider concurrent operations, operation mix, and storage tickets rather than only total connection count.
+
+Thread pools and internal executors help the server avoid unbounded resource growth, but they do not remove backpressure. If writes arrive faster than WiredTiger can reconcile dirty pages, if checkpoints cannot complete smoothly, or if disk latency spikes, the server must delay work somewhere. Senior incident review asks where the queue is visible: driver wait time, operation latency, ticket availability, eviction worker activity, journal commit latency, or checkpoint duration.
+
+\begin{pitfall}
+\textbf{Treating connection count as throughput.} More concurrent clients can reduce throughput if they force cache churn, lock contention, disk queueing, or replication lag. Start with a bounded driver pool and increase concurrency only when server metrics show unused capacity.
+\end{pitfall}
+
+\subsection{Memory Ownership: Process RSS, WiredTiger Cache, and OS Page Cache}
+MongoDB process memory includes more than the WiredTiger cache: executable code, thread stacks, connection buffers, aggregation memory, query execution state, indexes being built, replication buffers, and allocator overhead also contribute. WiredTiger's cache is the intentionally managed portion for pages. The operating system page cache is outside the configured WiredTiger cache and can still hold recently read filesystem blocks.
+
+By default, MongoDB chooses a WiredTiger cache size from available memory using rules documented by MongoDB, and administrators can override it with \texttt{storage.wiredTiger.engineConfig.cacheSizeGB} \cite{mongodbWiredTigerDocs}. The right value is workload-dependent. Analytical scans and hot indexes benefit from cache, but the OS still needs memory for filesystem cache, networking, compression buffers, and the rest of the host.
+
+\begin{tipbox}
+On a dedicated MongoDB host, do not allocate all RAM to WiredTiger. Leave room for the OS page cache and non-cache \texttt{mongod} memory. On a shared host, also reserve memory for co-located agents, monitoring, backup tools, and container overhead.
+\end{tipbox}
+
+\subsection{BSON Documents and the Storage-Engine API}
+MongoDB stores records as BSON documents. BSON preserves document structure, types, arrays, embedded subdocuments, and binary values in a format designed for efficient traversal by the server. The query layer reasons about collections, indexes, predicates, projections, updates, and aggregation stages. The storage-engine API sees lower-level operations: create or open tables, insert records, update records, delete records, scan cursors, maintain index structures, and participate in transactions.
+
+This separation explains why document modeling and storage behavior are connected but not identical. Embedding related data may reduce joins and improve locality, yet large growing arrays can force document moves or create write amplification. Indexes accelerate reads but add write work because every insert or update must maintain each affected index. The architectural skill is to translate a document-model decision into storage-engine consequences.
+
+\begin{definitionbox}
+The \textbf{storage-engine API} is the boundary through which MongoDB's higher-level server asks WiredTiger to persist records and indexes. It lets MongoDB swap storage implementations in principle, while WiredTiger remains responsible for page layout, cache management, compression, logging, and checkpoints.
+\end{definitionbox}
+
+\section{Tuesday: WiredTiger Internals}
+\subsection{B+Tree Data and Index Files}
+WiredTiger stores collection data and indexes in B-tree-like structures. B+Trees descend from classic ordered-index research \cite{bayer1972organization}: internal pages guide navigation, leaf pages hold keys and values or references to records, and sorted order enables range scans. In MongoDB, a collection and each secondary index are separate logical structures backed by WiredTiger files. A point lookup on an indexed field navigates the index tree, retrieves record identifiers, and then fetches the corresponding documents when the plan requires them.
+
+B+Tree organization is why index selectivity and working-set locality matter. A workload that repeatedly touches a small region of an index can stay cache-resident. A workload that jumps randomly across a very large index may turn every query into a page-fault and eviction exercise. Range queries exploit order; unbounded sorts without appropriate indexes force memory pressure elsewhere in the server.
+
+\begin{notebox}
+MongoDB indexes are not merely query-planner hints. They are persistent storage structures. Every additional secondary index increases insert, update, checkpoint, backup, and recovery work.
+\end{notebox}
+
+\subsection{Pages, Allocation, and Reconciliation}
+WiredTiger operates on pages rather than individual documents in isolation. Pages are read from disk into cache, modified in memory, reconciled into a disk-ready representation, compressed, and written during eviction or checkpoint activity. Page sizes, split behavior, and update chains affect how much work occurs when a hot document or hot key range changes repeatedly.
+
+When a page receives updates, WiredTiger may keep newer versions in memory until reconciliation creates a stable page image. This is a major reason storage engines need cache policy: not all memory is equally easy to evict. Clean pages can be discarded because they already exist on disk. Dirty pages require reconciliation and write I/O before their memory can be reused safely.
+
+\subsection{The WiredTiger Cache and Eviction Policy}
+The WiredTiger cache is the working memory for internal pages, leaf pages, update lists, and other storage-engine structures. Two important configuration ideas are \texttt{eviction\_target} and \texttt{eviction\_trigger}. The target is the level eviction tries to maintain; the trigger is the level at which application threads may be asked to help evict because pressure is too high. The exact defaults and tunables are version-specific, but the operational pattern is stable: healthy systems evict in the background before foreground operations stall.
+
+\begin{definitionbox}
+\textbf{Eviction pressure} occurs when WiredTiger cannot keep enough useful pages in cache while also making room for new reads and writes. It appears as high cache usage, many pages evicted by application threads, long reconciliation work, or operations waiting behind storage-engine pressure.
+\end{definitionbox}
+
+\begin{pitfall}
+\textbf{Increasing cache size without changing the workload.} A larger cache can hide poor indexes or unbounded scans until the data grows again. Tune queries and indexes first, then size cache for the measured working set.
+\end{pitfall}
+
+\subsection{Configurable Cache Size}
+The \texttt{cacheSizeGB} setting is a blunt but important capacity control. A cache that is too small increases reads from disk, evictions, and dirty-page churn. A cache that is too large can starve the OS and increase checkpoint burstiness because more dirty data can accumulate before being flushed. Containers add another complication: the database must be aware of actual cgroup limits and orchestration reservations, not only the physical host memory.
+
+A useful sizing conversation starts with four numbers: total RAM available to the process, non-WiredTiger \texttt{mongod} memory, OS and filesystem needs, and the hot data/index working set. For a ledger workload, the hot set may be recent accounts, recent ledger entries, and a small number of compound indexes. For an analytics workload, the hot set may be much wider and less predictable.
+
+\begin{tipbox}
+Measure \texttt{bytes currently in the cache}, \texttt{tracked dirty bytes in the cache}, pages read into cache, pages evicted from cache, and application-thread eviction counters before changing \texttt{cacheSizeGB}. A setting change without before-and-after metrics is a guess.
+\end{tipbox}
+
+\subsection{Compression: Snappy, Zstandard, and Prefix Compression}
+WiredTiger supports block compression for collection data. MongoDB commonly uses Snappy by default because it is fast and offers moderate compression. Zstandard can achieve better compression at additional CPU cost. Prefix compression can reduce index storage by storing common key prefixes more compactly, which is valuable for compound keys with repeated leading components.
+
+Compression changes the shape of bottlenecks. Better compression reduces disk footprint and I/O, but it spends CPU during compression and decompression. On a disk-bound workload, Zstandard may improve throughput. On a CPU-bound write-heavy workload, Snappy or less aggressive compression may be better. The senior answer is not ``compression on'' or ``compression off''; it is to compare CPU saturation, cache residency, disk throughput, and checkpoint duration.
+
+\section{Wednesday: The Write Path, Journaling, Checkpointing, and Recovery}
+\subsection{From Client Write to Dirty Page}
+A write begins at the client driver, which sends an insert, update, delete, or bulk operation to \texttt{mongod}. The server validates the command, checks authorization, enters the appropriate transactional context, updates collection data and affected indexes, and hands storage changes to WiredTiger. WiredTiger applies changes in memory first. The modified page becomes dirty because its in-memory state is newer than its durable data-file state.
+
+The acknowledgement returned to the client depends on write concern and journaling semantics. Acknowledging a write does not necessarily mean the checkpoint has already placed that write into the main data files. With journaling enabled, durability can be provided by the journal before the next checkpoint writes the complete page image \cite{mongodbWriteConcernDocs}.
+
+\subsection{Write-Ahead Logging and the Journal}
+Write-ahead logging is a classic recovery technique. The ARIES recovery paper formalized concepts such as logging changes before data-page persistence and replaying committed work after failure \cite{mohan1992aries}. WiredTiger's journal plays the same broad architectural role: it records enough information to recover committed changes if the server crashes after acknowledging them but before a checkpoint fully flushes affected data pages.
+
+\begin{definitionbox}
+\textbf{Write-ahead logging} means the durable log record for a change reaches stable storage before the corresponding data-file page is considered safely persisted. This ordering lets recovery replay committed changes after a crash.
+\end{definitionbox}
+
+Journaling is sequential compared with scattered data-page writes, which is why it is central to write performance. The data files can be checkpointed in organized batches, while the journal protects recent acknowledged work. On a storage device with volatile write cache or high latency, journal behavior is often the first place to look when acknowledged-write latency spikes.
+
+\subsection{Checkpointing and the 60-Second Rhythm}
+MongoDB checkpoints WiredTiger data at regular intervals; a commonly cited default checkpoint interval is approximately 60 seconds, though actual behavior is influenced by workload and version. A checkpoint establishes a consistent durable point in the data files. After a successful checkpoint, older journal records covered by that checkpoint can eventually be removed because the data files themselves contain the changes.
+
+Checkpointing is where many write-heavy systems feel periodic pain. If too much dirty data accumulates, the checkpoint may issue a burst of writes. If disk bandwidth is shared with backups, compaction, analytics, or other services, the checkpoint can compete with foreground traffic. If cache is oversized relative to disk throughput, large dirty working sets can produce longer flush periods.
+
+\begin{pitfall}
+\textbf{Ignoring checkpoint shape.} Average write latency can look acceptable while every 60 seconds a checkpoint creates a tail-latency spike. Watch p95 and p99 latency, not only mean throughput.
+\end{pitfall}
+
+\subsection{Crash Recovery and Durability Guarantees}
+Crash recovery combines the latest stable checkpoint with the journal records after that checkpoint. On restart, WiredTiger opens the files at a consistent checkpoint state and replays logged operations required to restore acknowledged durable writes. The recovery time depends on how much journal must be processed, storage speed, and the size of metadata and cache warm-up effects.
+
+Write concern and journaling interact with replica-set durability. A write concern of \texttt{w:1} can acknowledge after the primary accepts the write according to the configured journal behavior. A write concern of \texttt{majority} waits for replication to a majority of voting members under MongoDB's semantics. Journaling protects against local process or host crash; majority write concern protects against primary loss before secondaries receive the operation. They solve different parts of the durability problem \cite{mongodbWriteConcernDocs,mongodbReplicationDocs}.
+
+\begin{notebox}
+For financial ledgers, the usual default is to prefer explicit durable acknowledgements and idempotent application-level transaction identifiers. Throughput tuning must not silently weaken the business durability contract.
+\end{notebox}
+
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[
+        client/.style={rectangle, rounded corners, draw=primary, fill=primary!6, minimum width=2.5cm, minimum height=1cm, align=center, font=\small\bfseries},
+        engine/.style={rectangle, rounded corners, draw=green!45!black, fill=green!8, minimum width=2.8cm, minimum height=1cm, align=center, font=\small\bfseries},
+        disk/.style={cylinder, shape border rotate=90, aspect=0.25, draw=primary, fill=primary!10, minimum width=2.3cm, minimum height=1.35cm, align=center, font=\small\bfseries},
+        warn/.style={rectangle, rounded corners, draw=orange!85!black, fill=orange!10, minimum width=2.7cm, minimum height=1cm, align=center, font=\small\bfseries},
+        arrow/.style={-{Stealth[length=2.5mm]}, draw=primary, thick},
+        journal/.style={-{Stealth[length=2.5mm]}, draw=orange!85!black, thick},
+        recover/.style={{Stealth[length=2mm]}-{Stealth[length=2mm]}, draw=codegray, thick}
+    ]
+        \node[client] (app) at (0,0) {Client\\write};
+        \node[client] (server) at (3.3,0) {\texttt{mongod}\\command};
+        \node[engine] (cache) at (6.8,0) {WiredTiger\\dirty cache pages};
+        \node[warn] (journal) at (10.3,1.4) {Journal\\write-ahead log};
+        \node[warn] (ckpt) at (10.3,-1.4) {Checkpoint\\about 60s rhythm};
+        \node[disk] (data) at (13.9,0) {Data + Index\\files};
+        \node[client] (ack) at (6.8,2.5) {Acknowledgement\\per writeConcern};
+
+        \draw[arrow] (app) -- (server);
+        \draw[arrow] (server) -- (cache);
+        \draw[journal] (cache) -- (journal);
+        \draw[journal] (journal) -- (ack);
+        \draw[arrow] (cache) -- (ckpt);
+        \draw[arrow] (ckpt) -- (data);
+        \draw[recover] (journal) -- node[right,font=\scriptsize]{replay after crash} (data);
+        \draw[arrow] (ack) to[bend left=20] (app);
+    \end{tikzpicture}%
+    }
+    \caption{MongoDB write path through \texttt{mongod}, WiredTiger cache, journal, checkpoint, and durable data files.}
+    \label{fig:wiredtiger-write-path}
+\end{figure}
+
+\section{Thursday Hands-On Project: Configure and Observe WiredTiger}
+This lab configures a local \texttt{mongod}, sets a WiredTiger cache size, loads a large synthetic data set, and inspects eviction metrics. Run it on a development machine, not a production host. The 10-million-document target is intentionally large enough to create pressure; reduce it if your laptop cannot sustain the run.
+
+\subsection{Local Configuration}
+Create a dedicated data path and log path. On Windows, run PowerShell as a user with permission to write the selected directories. The following configuration uses a small cache to make eviction visible during the lab.
+
+\begin{lstlisting}[language=yaml, caption={Development-only \texttt{mongod.conf} with an explicit WiredTiger cache size.}]
+storage:
+  dbPath: C:\data\mongodb-wt-lab\db
+  journal:
+    enabled: true
+  wiredTiger:
+    engineConfig:
+      cacheSizeGB: 2
+    collectionConfig:
+      blockCompressor: snappy
+    indexConfig:
+      prefixCompression: true
+systemLog:
+  destination: file
+  path: C:\data\mongodb-wt-lab\log\mongod.log
+  logAppend: true
+net:
+  bindIp: 127.0.0.1
+  port: 27017
+replication:
+  replSetName: wtLabRs
+\end{lstlisting}
+
+\begin{tipbox}
+For the lab, small cache values reveal eviction behavior faster. For production, size the cache from workload evidence and host constraints, not from a copied lab value.
+\end{tipbox}
+
+\subsection{PowerShell and Shell Commands}
+The commands below assume MongoDB Database Tools, \texttt{mongod}, \texttt{mongosh}, Node.js, and \texttt{mgeneratejs} are installed and on \texttt{PATH}. They create folders, start the server, initiate a single-node replica set, and load generated records. If you already run a local MongoDB on port 27017, change the port.
+
+\begin{lstlisting}[language=bash, caption={PowerShell-friendly setup and data generation commands.}]
+New-Item -ItemType Directory -Force C:\data\mongodb-wt-lab\db
+New-Item -ItemType Directory -Force C:\data\mongodb-wt-lab\log
+mongod --config C:\data\mongodb-wt-lab\mongod.conf
+mongosh --eval "rs.initiate({_id: 'wtLabRs', members: [{_id: 0, host: '127.0.0.1:27017'}]})"
+npm install -g mgeneratejs
+mgeneratejs '{"_id":"$objectid","accountId":"$guid","postedAt":"$date","amount":{"$number":{"min":-5000,"max":5000}},"currency":{"$choose":{"from":["USD","EUR","MXN"]}},"memo":"$lorem"}' -n 10000000 | mongoimport --uri "mongodb://127.0.0.1:27017/ledger" --collection entries --type json
+\end{lstlisting}
+
+The command block is intentionally explicit rather than elegant. In a real benchmark, pin tool versions, isolate the disk, record CPU and storage metrics, and run multiple trials. A single load test is a learning exercise, not a capacity plan.
+
+\subsection{Indexes and Workload Driver}
+After loading, create an index that resembles a ledger access pattern: account plus posting time. Then run a mixed insert-and-read workload from \texttt{mongosh}. MongoDB shell syntax is JavaScript, so listings use \texttt{language=JavaScript}.
+
+\begin{lstlisting}[language=JavaScript, caption={\texttt{mongosh} workload and WiredTiger metrics probe.}]
+use ledger;
+db.entries.createIndex({ accountId: 1, postedAt: -1 });
+
+const sampleAccounts = db.entries.aggregate([
+  { $sample: { size: 1000 } },
+  { $project: { _id: 0, accountId: 1 } }
+]).toArray().map(d => d.accountId);
+
+for (let i = 0; i < 200000; i++) {
+  const accountId = sampleAccounts[i % sampleAccounts.length];
+  db.entries.insertOne({
+    accountId,
+    postedAt: new Date(),
+    amount: NumberDecimal((Math.random() * 1000 - 500).toFixed(2)),
+    currency: "USD",
+    source: "wt-lab",
+    sequence: i
+  }, { writeConcern: { w: "majority", j: true } });
+
+  if (i % 1000 === 0) {
+    db.entries.find({ accountId }).sort({ postedAt: -1 }).limit(20).toArray();
+  }
+}
+
+const wt = db.serverStatus().wiredTiger;
+printjson({
+  cache: wt.cache,
+  transaction: wt.transaction,
+  log: wt.log,
+  checkpoint: wt.checkpoint
+});
+\end{lstlisting}
+
+\subsection{Metrics to Read}
+The \texttt{serverStatus} command exposes WiredTiger sections for cache, log, transaction, and checkpoint behavior \cite{mongodbServerStatusDocs}. Field names can vary by version, so treat the categories as more important than a single exact key. Look for the following:
+
+\begin{itemize}
+    \item \textbf{Cache occupancy:} bytes currently in cache versus maximum bytes configured.
+    \item \textbf{Dirty bytes:} tracked dirty bytes and dirty percentage.
+    \item \textbf{Eviction work:} pages evicted by worker threads and by application threads.
+    \item \textbf{Read churn:} pages read into cache and pages requested from the cache.
+    \item \textbf{Checkpoint behavior:} checkpoint time, bytes written, and recent checkpoint progress.
+    \item \textbf{Journal behavior:} log bytes written, sync counts, and latency where exposed.
+\end{itemize}
+
+\begin{notebox}
+Application-thread eviction is a useful smoke alarm. It means foreground operations are helping create free cache space instead of simply doing user work. Occasional values are normal; sustained growth during peak traffic deserves investigation.
+\end{notebox}
+
+\subsection{Interpreting the Experiment}
+Run the workload three times: once with the 2 GB cache, once with a smaller cache if your host permits it, and once with a larger cache that still leaves OS memory. Compare p95 insert latency, p95 query latency, dirty bytes, pages evicted, and checkpoint duration. If a larger cache lowers read churn but increases checkpoint bursts, the best value may be in the middle.
+
+\begin{pitfall}
+\textbf{Benchmarking without warming and resetting.} The second run can be faster because the OS page cache is warm. Either design the test to include warm-cache behavior intentionally, or restart and document the cache state between runs.
+\end{pitfall}
+
+\section{Friday Use Case and Architecture: Financial Ledger Engine}
+\subsection{Scenario and Requirements}
+A financial ledger is a demanding MongoDB workload because it combines high write volume, strict auditability, predictable reads by account and time, and low tolerance for lost acknowledgements. Assume the platform must ingest payment events, maintain immutable ledger entries, support account-balance queries, and stream changes to risk, fraud, and reporting systems.
+
+The central storage-engine challenge is not only raw throughput. It is avoiding periodic stalls that violate latency objectives. A ledger may sustain 20,000 writes per second for most of a minute and then suffer checkpoint-induced p99 spikes if dirty data accumulates faster than disks can absorb it. The architecture must keep dirty-cache growth, journal latency, and checkpoint writes within predictable limits.
+
+\subsection{Document and Index Shape}
+A ledger entry should be immutable, idempotent, and shaped for the dominant access path. A common pattern is one document per posted ledger event with fields such as \texttt{tenantId}, \texttt{accountId}, \texttt{postedAt}, \texttt{transactionId}, \texttt{amount}, \texttt{currency}, \texttt{direction}, and \texttt{source}. Compound indexes often begin with tenant and account, then time, because account history is a dominant read. A unique transaction identifier prevents duplicate posting when upstream systems retry.
+
+Indexes should be few and deliberate. Every secondary index adds writes to the write path. Reporting teams may ask for many ad hoc indexes, but a ledger primary store should not become a general exploratory analytics engine. Use change streams, materialized views, or downstream analytical stores for broad reporting when needed.
+
+\subsection{Cache Allocation Versus OS Page Cache}
+The ledger's hot set is usually recent account histories, recent indexes, and uncheckpointed dirty pages. WiredTiger cache should be large enough for hot data and index pages but not so large that checkpoints become bursty or the OS page cache is starved. The OS page cache still helps with filesystem reads, journal files, and data files that WiredTiger has evicted but the operating system can serve without physical I/O.
+
+A reasonable design process is:
+\begin{enumerate}
+    \item Estimate hot account and index working set for the peak hour.
+    \item Reserve memory for non-cache \texttt{mongod} usage, connections, aggregation, monitoring, and the OS.
+    \item Configure WiredTiger cache below the remaining memory rather than at the full host capacity.
+    \item Set write concern explicitly, usually requiring journaled majority acknowledgement for committed ledger events.
+    \item Monitor dirty-cache percentage, application-thread eviction, checkpoint duration, journal latency, replication lag, and disk queue depth.
+\end{enumerate}
+
+\begin{tipbox}
+For high-throughput ledgers, reducing checkpoint spikes often requires both storage and data-model work: fast durable disks, bounded indexes, right-sized cache, batched ingestion, and downstream reporting offload.
+\end{tipbox}
+
+\subsection{Architecture Diagram}
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[
+        box/.style={rectangle, rounded corners, draw=primary, fill=primary!6, minimum width=2.5cm, minimum height=1cm, align=center, font=\small\bfseries},
+        greenbox/.style={rectangle, rounded corners, draw=green!45!black, fill=green!8, minimum width=2.7cm, minimum height=1cm, align=center, font=\small\bfseries},
+        orangebox/.style={rectangle, rounded corners, draw=orange!85!black, fill=orange!10, minimum width=2.7cm, minimum height=1cm, align=center, font=\small\bfseries},
+        disk/.style={cylinder, shape border rotate=90, aspect=0.25, draw=primary, fill=primary!10, minimum width=2.2cm, minimum height=1.3cm, align=center, font=\small\bfseries},
+        arrow/.style={-{Stealth[length=2.5mm]}, draw=primary, thick},
+        stream/.style={-{Stealth[length=2.5mm]}, draw=green!45!black, thick},
+        warn/.style={-{Stealth[length=2.5mm]}, draw=orange!85!black, thick}
+    ]
+        \node[box] (api) at (0,0) {Payment\\API};
+        \node[box] (driver) at (3,0) {Driver Pool\\bounded};
+        \node[greenbox] (primary) at (6.2,0) {Primary\\\texttt{mongod}};
+        \node[greenbox] (cache) at (9.6,0) {WiredTiger\\cache};
+        \node[orangebox] (journal) at (12.9,1.3) {Journal\\fast durable I/O};
+        \node[orangebox] (ckpt) at (12.9,-1.3) {Smoothed\\checkpoints};
+        \node[disk] (disk) at (16.1,0) {Data +\\Indexes};
+        \node[box] (sec1) at (6.2,-2.9) {Secondary\\analytics hidden};
+        \node[box] (sec2) at (9.6,-2.9) {Secondary\\HA};
+        \node[box] (cdc) at (13.0,-2.9) {Change Streams\\risk + reporting};
+
+        \draw[arrow] (api) -- (driver);
+        \draw[arrow] (driver) -- (primary);
+        \draw[arrow] (primary) -- (cache);
+        \draw[warn] (cache) -- (journal);
+        \draw[warn] (cache) -- (ckpt);
+        \draw[arrow] (journal) -- (disk);
+        \draw[arrow] (ckpt) -- (disk);
+        \draw[stream] (primary) -- node[left,font=\scriptsize]{oplog} (sec1);
+        \draw[stream] (primary) -- (sec2);
+        \draw[stream] (primary) to[bend left=15] (cdc);
+    \end{tikzpicture}%
+    }
+    \caption{Financial ledger architecture balancing journal durability, WiredTiger cache, checkpoints, replica-set replication, and downstream change streams.}
+    \label{fig:ledger-architecture}
+\end{figure}
+
+\subsection{Operational Guardrails}
+Ledger architecture should include guardrails that stop accidental overload from becoming data risk. Use bounded driver pools, idempotent transaction identifiers, explicit write concern, alerting on replication lag, and tested restore procedures. Use load shedding when queues grow beyond the recovery point objective. Keep the primary workload narrow; send broad reporting to secondaries or downstream systems only when consistency requirements permit it.
+
+\begin{pitfall}
+\textbf{Solving financial durability with storage tuning alone.} Cache and checkpoint tuning cannot compensate for missing idempotency, unclear write concern, weak backup validation, or untested failover procedures.
+\end{pitfall}
+
+\section{Interview Q\&A}
+\subsection{Concepts and Trade-offs}
+\begin{enumerate}
+    \item \textbf{Q: What does WiredTiger cache, and why is it different from the OS page cache?}\\
+    A: WiredTiger caches database pages and update state inside \texttt{mongod}; the OS caches filesystem blocks outside the process. WiredTiger understands dirty pages and eviction, while the OS page cache understands files and blocks.
+
+    \item \textbf{Q: Why can a checkpoint create latency spikes?}\\
+    A: If dirty pages accumulate faster than storage can flush them, checkpoint work competes with foreground operations and journal activity. The symptom is often p99 latency, not average latency.
+
+    \item \textbf{Q: How do write concern and journaling differ?}\\
+    A: Journaling protects local crash recovery. Write concern defines acknowledgement requirements, including whether replication to other replica-set members is required.
+
+    \item \textbf{Q: Why are too many indexes dangerous for write-heavy workloads?}\\
+    A: Each index must be updated on writes, consumes cache, increases checkpoint work, and lengthens recovery and backup activity.
+\end{enumerate}
+
+\section{Further Reading}
+Start with MongoDB's architecture, WiredTiger, write concern, replication, sharding, and \texttt{serverStatus} documentation \cite{mongodbArchitectureDocs,mongodbWiredTigerDocs,mongodbWriteConcernDocs,mongodbReplicationDocs,mongodbShardingDocs,mongodbServerStatusDocs}. For storage-engine foundations, read the WiredTiger architecture guide \cite{wiredTigerArch}, the original B-tree paper by Bayer and McCreight \cite{bayer1972organization}, and the ARIES write-ahead logging paper \cite{mohan1992aries}. For database-category context, compare document and NoSQL systems using Stonebraker's short critique and Han et al.'s survey \cite{stonebraker2010sql,han2011survey}. MongoDB Atlas Vector Search becomes relevant later when the storage and indexing foundations in this chapter are connected to AI search workloads \cite{mongodbAtlasVectorSearch}.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item \texttt{mongod} coordinates clients, commands, query execution, replication roles, and storage-engine calls; WiredTiger owns page storage, cache, compression, journaling, and checkpoints.
+    \item WiredTiger's cache is not the same as the OS page cache. Production sizing must leave memory for both plus non-cache server overhead.
+    \item B+Tree data and index files make locality, selectivity, and index count central to performance.
+    \item Writes first change in-memory pages, then rely on journal and checkpoint mechanisms for durable recovery.
+    \item Checkpoint I/O can create periodic tail-latency spikes when dirty pages, cache sizing, indexes, and disk bandwidth are misaligned.
+    \item \texttt{db.serverStatus().wiredTiger} exposes the evidence needed to move from speculation to diagnosis.
+    \item Financial ledger systems require explicit durability semantics, idempotency, bounded concurrency, right-sized cache, and downstream offload for reporting.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Draw the boundary between the MongoDB query layer and WiredTiger. Name three responsibilities on each side of the boundary.
+    \item \textbf{(Conceptual)} Explain why a larger WiredTiger cache can improve read locality while also making checkpoint spikes worse under some write-heavy workloads.
+    \item \textbf{(Conceptual)} Compare journaling with majority write concern. Which failure does each protect against, and where do they overlap?
+    \item \textbf{(Hands-on)} Run the lab with two different \texttt{cacheSizeGB} values. Record cache occupancy, dirty bytes, pages evicted, checkpoint time, and p95 insert latency.
+    \item \textbf{(Hands-on)} Modify the workload to add two extra secondary indexes. Measure how insert throughput and checkpoint metrics change.
+    \item \textbf{(Design)} Design a ledger document and index set for a tenant-aware payments platform. Defend every index using a query pattern and a write-path cost.
+    \item \textbf{(Design)} Create an alert policy for WiredTiger eviction pressure. Include at least one cache metric, one latency metric, and one disk metric.
+    \item \textbf{(Interview)} A team wants to set WiredTiger cache to 90\% of host RAM because ``MongoDB should use memory.'' Write a concise architecture-review response explaining why this is risky.
+\end{enumerate}
+
+\section{Capstone Project: A WiredTiger Cache-Tuning Lab for a Financial Ledger}\label{sec:ch1-capstone}
+
+\begin{capstonebox}
+\textbf{Mission:} build a repeatable Windows and PowerShell lab that proves how WiredTiger cache sizing changes write throughput, eviction pressure, checkpoint duration, journal activity, and p99 latency for a financial-ledger workload. You will run the same ledger workload under at least two cache configurations, collect comparable \texttt{db.serverStatus().wiredTiger} evidence, and recommend a cache setting that reduces checkpoint I/O spikes without starving the operating-system page cache.
+
+\textbf{Estimated time:} 4--6 hours, depending on storage speed and whether the full 10 million document data set fits comfortably on your lab machine.
+
+\textbf{What you will practice:}
+\begin{itemize}
+    \item Connecting \texttt{mongod} process architecture to WiredTiger cache, eviction, journaling, checkpointing, and crash recovery.
+    \item Configuring \texttt{storage.wiredTiger.engineConfig.cacheSizeGB} in a local Community Edition deployment.
+    \item Loading a large immutable ledger collection and driving sustained write-heavy traffic.
+    \item Capturing cache, eviction, journal, and checkpoint metrics before and after a cache change.
+    \item Explaining a tuning recommendation with evidence instead of intuition.
+\end{itemize}
+\end{capstonebox}
+
+\subsection*{Scenario}
+You are the data engineer on a payments platform that posts immutable financial-ledger entries for card authorizations, settlement events, reversals, and fee adjustments. During the Friday peak window, application logs show a regular pattern: insert latency is acceptable for most of each minute, then p99 latency jumps when checkpoint I/O competes with foreground writes. The business cannot weaken journaled durability, cannot drop the account-history index, and cannot move the primary ledger workload to an analytical replica during posting.
+
+Your goal is to eliminate or materially reduce checkpoint I/O spikes by balancing the WiredTiger cache against the operating-system page cache. A cache that is too small creates eviction pressure and foreground stalls. A cache that is too large can let more dirty data accumulate, reduce memory available for filesystem caching, and produce larger checkpoint flushes. The best answer is the measured middle ground for this workload, this host, and this durability contract.
+
+\subsection*{Requirements}
+\begin{itemize}
+    \item Use a local MongoDB Community \texttt{mongod} instance on Windows, started from PowerShell, with an explicit \texttt{storage.wiredTiger.engineConfig.cacheSizeGB} value in \texttt{mongod.conf}.
+    \item Prepare at least two configurations, such as a small-cache run near 20\% of available RAM and a larger-cache run near 50\% of available RAM. Leave enough memory for Windows, the OS page cache, the \texttt{mongod} process outside WiredTiger, terminal tools, and monitoring.
+    \item Generate 10 million ledger documents with immutable fields such as \texttt{accountId}, \texttt{transactionId}, \texttt{postedAt}, \texttt{amount}, \texttt{currency}, \texttt{direction}, and \texttt{sequence}. If the lab machine cannot safely hold 10 million documents, document the reduced count and keep the method identical.
+    \item Create a ledger-style index, at minimum \texttt{\{ accountId: 1, postedAt: -1 \}}, and optionally a unique transaction index to test write-path cost.
+    \item Run a write-heavy workload that inserts new ledger events while performing bounded account-history reads.
+    \item Capture \texttt{db.serverStatus().wiredTiger} cache, eviction, log, transaction, and checkpoint metrics under each cache configuration \cite{mongodbServerStatusDocs}.
+    \item Analyze checkpoint stalls by comparing p95 and p99 insert latency, dirty bytes, pages evicted by application threads, checkpoint duration, bytes written, and journal sync behavior.
+    \item Deliver a tuning recommendation that names the selected cache value, explains the trade-off with the OS page cache, and states what evidence would trigger a future retest.
+\end{itemize}
+
+\subsection*{Reference Architecture}
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[
+        actor/.style={rectangle, rounded corners, draw=primary, fill=primary!6, minimum width=2.45cm, minimum height=1cm, align=center, font=\small\bfseries},
+        engine/.style={rectangle, rounded corners, draw=green!45!black, fill=green!8, minimum width=2.65cm, minimum height=1cm, align=center, font=\small\bfseries},
+        wal/.style={rectangle, rounded corners, draw=orange!85!black, fill=orange!10, minimum width=2.55cm, minimum height=1cm, align=center, font=\small\bfseries},
+        disk/.style={cylinder, shape border rotate=90, aspect=0.25, draw=primary, fill=primary!10, minimum width=2.15cm, minimum height=1.25cm, align=center, font=\small\bfseries},
+        cache/.style={rectangle, rounded corners, draw=codegray, fill=backcolour, minimum width=2.85cm, minimum height=1cm, align=center, font=\small\bfseries},
+        arrow/.style={-{Stealth[length=2.5mm]}, draw=primary, thick},
+        io/.style={-{Stealth[length=2.5mm]}, draw=orange!85!black, thick},
+        mem/.style={{Stealth[length=2mm]}-{Stealth[length=2mm]}, draw=codegray, thick}
+    ]
+        \node[actor] (client) at (0,0) {Ledger\\workload};
+        \node[actor] (mongod) at (3.2,0) {\texttt{mongod}\\commands};
+        \node[engine] (wtcache) at (6.7,0) {WiredTiger\\cache};
+        \node[wal] (journal) at (10.0,1.45) {Journal\\WAL};
+        \node[wal] (checkpoint) at (10.0,-1.45) {Checkpoint\\flush};
+        \node[disk] (disk) at (13.35,0) {Data +\\Indexes};
+        \node[cache] (oscache) at (6.7,-3.0) {OS page cache\\filesystem blocks};
+        \node[actor] (metrics) at (3.2,2.45) {\texttt{serverStatus}\\metrics};
+
+        \draw[arrow] (client) -- (mongod);
+        \draw[arrow] (mongod) -- (wtcache);
+        \draw[io] (wtcache) -- (journal);
+        \draw[io] (wtcache) -- (checkpoint);
+        \draw[io] (journal) -- (disk);
+        \draw[io] (checkpoint) -- (disk);
+        \draw[mem] (wtcache) -- node[right,font=\scriptsize]{memory balance} (oscache);
+        \draw[mem] (oscache) -- node[below,font=\scriptsize]{file reuse after eviction} (disk);
+        \draw[arrow] (mongod) -- (metrics);
+    \end{tikzpicture}%
+    }
+    \caption{Capstone lab architecture for balancing WiredTiger cache, journal write-ahead logging, checkpoint flushing, durable files, and the operating-system page cache.}
+    \label{fig:ch1-capstone-cache-lab}
+\end{figure}
+
+\subsection*{Implementation Steps}
+\begin{enumerate}
+    \item \textbf{Choose cache values.} Record physical RAM, available RAM before starting \texttt{mongod}, disk type, MongoDB version, and the two cache targets. Example: on a 32 GB dedicated lab machine, compare \texttt{cacheSizeGB: 6} with \texttt{cacheSizeGB: 16}. On an 8 GB laptop, use smaller values and reduce the document count if needed.
+
+    \item \textbf{Create a reusable lab folder.} Keep each run isolated so that logs, data files, and metrics do not overwrite each other. The following configuration is a template; copy it once per cache size and change \texttt{dbPath}, \texttt{path}, and \texttt{cacheSizeGB}.
+
+\begin{lstlisting}[language=yaml, caption={PowerShell lab \texttt{mongod.conf} with explicit WiredTiger cache sizing.}]
+storage:
+  dbPath: C:\MongoData\wt-ledger-cache20\db
+  journal:
+    enabled: true
+  wiredTiger:
+    engineConfig:
+      cacheSizeGB: 6
+    collectionConfig:
+      blockCompressor: snappy
+    indexConfig:
+      prefixCompression: true
+systemLog:
+  destination: file
+  path: C:\MongoData\wt-ledger-cache20\log\mongod.log
+  logAppend: true
+net:
+  bindIp: 127.0.0.1
+  port: 27017
+processManagement:
+  timeZoneInfo: C:\Program Files\MongoDB\Server\8.0\share\zoneinfo
+\end{lstlisting}
+
+    \item \textbf{Start one run at a time from PowerShell.} Use a foreground \texttt{mongod} terminal for the active run, or register a Windows service only if that is already your local standard. The command block uses PowerShell syntax but the listing style is the book's shell style.
+
+\begin{lstlisting}[language=bash, caption={PowerShell commands to prepare one cache-size run.}]
+$RunName = "wt-ledger-cache20"
+$Root = "C:\MongoData\$RunName"
+New-Item -ItemType Directory -Force "$Root\db", "$Root\log", "$Root\metrics"
+mongod --config "$Root\mongod.conf"
+
+# In a second PowerShell terminal after mongod is listening:
+mongosh "mongodb://127.0.0.1:27017/ledger" --eval "db.runCommand({ ping: 1 })"
+\end{lstlisting}
+
+    \item \textbf{Load 10 million ledger documents.} The script below creates deterministic batches, inserts immutable ledger events, and adds the core account-history index. Run it once for each isolated data directory. If storage is limited, lower \texttt{targetDocuments} but keep the same batch size and field shape.
+
+\begin{lstlisting}[language=JavaScript, caption={\texttt{mongosh} data loader and baseline WiredTiger snapshot.}]
+use ledger;
+db.entries.drop();
+
+const targetDocuments = 10000000;
+const batchSize = 10000;
+const currencies = ["USD", "EUR", "MXN"];
+const directions = ["debit", "credit"];
+
+for (let base = 0; base < targetDocuments; base += batchSize) {
+  const batch = [];
+  for (let i = 0; i < batchSize; i++) {
+    const n = base + i;
+    batch.push({
+      accountId: "acct-" + (n % 250000).toString().padStart(6, "0"),
+      transactionId: "txn-" + n.toString().padStart(10, "0"),
+      postedAt: new Date(Date.now() - (n % 86400000)),
+      amount: NumberDecimal(((n % 200000) / 100 - 1000).toFixed(2)),
+      currency: currencies[n % currencies.length],
+      direction: directions[n % directions.length],
+      source: "capstone-load",
+      sequence: n
+    });
+  }
+  db.entries.insertMany(batch, { ordered: false, writeConcern: { w: 1, j: true } });
+  if (base % 100000 === 0) {
+    print("loaded " + base + " documents");
+  }
+}
+
+db.entries.createIndex({ accountId: 1, postedAt: -1 });
+db.entries.createIndex({ transactionId: 1 }, { unique: true });
+
+const wt = db.serverStatus().wiredTiger;
+printjson({
+  phase: "after-load",
+  cache: wt.cache,
+  log: wt.log,
+  checkpoint: wt.checkpoint
+});
+\end{lstlisting}
+
+    \item \textbf{Run a write-heavy workload and record metrics.} The Python script uses PyMongo so that latency can be measured client-side while WiredTiger counters are sampled from the server. Install PyMongo only if it is not already present in your lab environment. Save one metrics file per cache configuration.
+
+\begin{lstlisting}[language=bash, caption={PowerShell setup for the Python workload driver.}]
+python -m pip install pymongo
+python .\MongoDB\book\scripts\wt_ledger_workload.py --uri mongodb://127.0.0.1:27017 --database ledger --seconds 600 --metrics C:\MongoData\wt-ledger-cache20\metrics\metrics.jsonl
+\end{lstlisting}
+
+\begin{lstlisting}[language=Python, caption={PyMongo workload driver that records latency and WiredTiger metrics.}]
+import argparse
+import json
+import random
+import statistics
+import time
+from datetime import datetime, timezone
+
+from pymongo import MongoClient, WriteConcern
+
+
+def percentile(values, pct):
+    if not values:
+        return 0
+    ordered = sorted(values)
+    index = min(len(ordered) - 1, int(round((pct / 100) * (len(ordered) - 1))))
+    return ordered[index]
+
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--uri", default="mongodb://127.0.0.1:27017")
+parser.add_argument("--database", default="ledger")
+parser.add_argument("--seconds", type=int, default=600)
+parser.add_argument("--metrics", required=True)
+args = parser.parse_args()
+
+client = MongoClient(args.uri)
+db = client[args.database]
+entries = db.get_collection("entries", write_concern=WriteConcern(w=1, j=True))
+accounts = [f"acct-{n:06d}" for n in range(250000)]
+latencies_ms = []
+end_time = time.time() + args.seconds
+sequence = int(time.time())
+
+with open(args.metrics, "a", encoding="utf-8") as metrics_file:
+    while time.time() < end_time:
+        account_id = random.choice(accounts)
+        document = {
+            "accountId": account_id,
+            "transactionId": f"capstone-{sequence}",
+            "postedAt": datetime.now(timezone.utc),
+            "amount": round(random.uniform(-2500, 2500), 2),
+            "currency": "USD",
+            "direction": "credit" if sequence % 2 == 0 else "debit",
+            "source": "capstone-workload",
+            "sequence": sequence,
+        }
+        started = time.perf_counter()
+        entries.insert_one(document)
+        if sequence % 100 == 0:
+            list(entries.find({"accountId": account_id}).sort("postedAt", -1).limit(20))
+        latencies_ms.append((time.perf_counter() - started) * 1000)
+        sequence += 1
+
+        if len(latencies_ms) >= 1000:
+            status = db.command("serverStatus")["wiredTiger"]
+            row = {
+                "capturedAt": datetime.now(timezone.utc).isoformat(),
+                "insertP50Ms": percentile(latencies_ms, 50),
+                "insertP95Ms": percentile(latencies_ms, 95),
+                "insertP99Ms": percentile(latencies_ms, 99),
+                "insertMeanMs": statistics.mean(latencies_ms),
+                "cache": status.get("cache", {}),
+                "log": status.get("log", {}),
+                "transaction": status.get("transaction", {}),
+                "checkpoint": status.get("checkpoint", {}),
+            }
+            metrics_file.write(json.dumps(row, default=str) + "\n")
+            metrics_file.flush()
+            latencies_ms.clear()
+\end{lstlisting}
+
+    \item \textbf{Repeat with the larger cache.} Stop \texttt{mongod}, start the second configuration, reload or restore the same baseline data shape, run the same duration, and write metrics to a separate file. Do not compare a cold first run with a warm second run unless you explicitly label that difference.
+
+    \item \textbf{Analyze checkpoint stalls.} Plot or tabulate each sample interval. Pay special attention to intervals where p99 latency rises at the same time as dirty bytes, checkpoint duration, checkpoint bytes written, or application-thread eviction counters increase. Use the categories in the MongoDB WiredTiger and \texttt{serverStatus} documentation as your field guide \cite{mongodbWiredTigerDocs,mongodbServerStatusDocs}.
+
+    \item \textbf{Write the recommendation.} The recommendation must include the chosen cache size, rejected alternatives, expected impact on checkpoint spikes, and at least two follow-up metrics to monitor in production.
+\end{enumerate}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item Two or more \texttt{mongod.conf} files, named by cache configuration, with data and log paths that prove each run was isolated.
+    \item The data-loader script or \texttt{mongosh} transcript used to create the 10 million document ledger data set.
+    \item The workload script and raw metrics files for every run.
+    \item A short analysis document with the before-and-after metrics comparison table.
+\end{itemize}
+
+\begin{table}[H]
+\centering
+\caption{Example before-and-after comparison for the cache-tuning recommendation.}
+\label{tab:ch1-capstone-metrics}
+\begin{tabular}{@{}p{4.2cm}p{3.2cm}p{3.2cm}p{3.4cm}@{}}
+\toprule
+\textbf{Metric} & \textbf{Small cache, about 20\% RAM} & \textbf{Larger cache, about 50\% RAM} & \textbf{Interpretation} \\
+\midrule
+Configured \texttt{cacheSizeGB} &  &  & Confirm tested values. \\
+Insert p99 latency &  &  & Tail-latency impact during checkpoints. \\
+Bytes currently in cache &  &  & Working-set fit and cache headroom. \\
+Tracked dirty bytes &  &  & Dirty-cache pressure before flush. \\
+Pages evicted by application threads &  &  & Foreground eviction stall signal. \\
+Checkpoint duration or time writing &  &  & Checkpoint spike shape. \\
+Journal bytes and sync count &  &  & Durability path load. \\
+Disk queue or write latency &  &  & Whether storage is the limiting layer. \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item The lab runs from Windows PowerShell against a local MongoDB Community \texttt{mongod}.
+    \item At least two explicit \texttt{cacheSizeGB} configurations are tested with comparable data volume, indexes, workload duration, and write concern.
+    \item The ledger collection contains the required financial fields and either 10 million documents or a documented reduced count with a clear machine-capacity reason.
+    \item Metrics include WiredTiger cache, eviction, log, transaction, and checkpoint sections from \texttt{db.serverStatus().wiredTiger}.
+    \item The analysis identifies whether p99 latency spikes align with checkpoint activity, dirty-cache growth, or application-thread eviction.
+    \item The final recommendation is justified by measurements and explicitly discusses the trade-off between WiredTiger cache and the OS page cache.
+    \item The recommendation preserves the ledger durability contract; it does not disable journaling or weaken write concern merely to improve benchmark numbers.
+    \item The submitted table is complete enough for another engineer to reproduce the conclusion.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Vary WiredTiger eviction thresholds in a controlled development environment and observe whether foreground eviction decreases or merely moves the bottleneck.
+    \item Compare collection compression with Snappy and Zstandard to see whether lower I/O offsets extra CPU during checkpoints.
+    \item Test a different journal commit interval where supported by your MongoDB version and explain the durability and latency implications.
+    \item Measure p95 and p99 read latency separately from insert latency, especially for recent account-history queries.
+    \item Add two extra secondary indexes and quantify the write amplification they add to cache dirtiness and checkpoint work.
+    \item Run a crash-recovery drill after a workload burst: stop the process abruptly in a lab, restart \texttt{mongod}, and record recovery time and log messages. Do not run this drill on shared or production data.
+    \item Export Windows Performance Monitor counters for disk writes, disk queue length, CPU, and available memory, then correlate them with the WiredTiger samples.
+\end{itemize}

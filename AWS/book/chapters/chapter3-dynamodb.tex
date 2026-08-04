@@ -1,0 +1,548 @@
+\chapter{High-Scale NoSQL: Amazon DynamoDB}
+\index{Amazon DynamoDB}\index{NoSQL}\index{key-value database}\index{document database}\index{partition key}%
+\index{sort key}\index{global secondary index}\index{local secondary index}\index{DynamoDB Streams}\index{Global Tables}%
+\begin{objectives}
+\begin{itemize}
+    \item Explain DynamoDB core concepts: tables, items, attributes, partitions, request routing, read capacity units, write capacity units, and capacity modes.
+    \item Model high-scale access patterns with partition keys, sort keys, sparse indexes, local secondary indexes, and global secondary indexes.
+    \item Describe DynamoDB Streams, time to live, and Global Tables for event-driven integration, lifecycle management, and multi-region active-active designs.
+    \item Create a DynamoDB table, design a single-table schema for a forum workload, insert items with Boto3, and configure a GSI for query access.
+    \item Design an ingestion and serving layer for a global gaming leaderboard that handles one million reads and writes per second with predictable hot-key controls.
+    \item Build a capstone data layer using single-table design, GSIs, Streams, Global Tables, and on-demand scaling.
+\end{itemize}
+\end{objectives}
+\begin{crosscloud}
+NoSQL services differ in APIs and consistency models, but the recurring design vocabulary is familiar: key distribution, item or document shape, secondary access paths, change feeds, expiration, and multi-region replication.
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{2.4cm}p{2.7cm}p{2.7cm}p{2.8cm}p{2.8cm}@{}}
+\toprule
+\textbf{Concept} & \textbf{AWS DynamoDB} & \textbf{Azure Cosmos DB} & \textbf{GCP Firestore / Bigtable} & \textbf{MongoDB} \\
+\midrule
+Key-value / document store & Table of items with scalar, map, list, set, and document attributes & Container items with JSON documents & Firestore documents or Bigtable rows and column families & Collections of BSON documents \\
+Partition key & Hash key distributes items across physical partitions & Partition key routes items to logical partitions & Firestore document path or Bigtable row-key prefix design & Shard key when sharding is enabled \\
+Sort key & Optional range key orders related items within one partition key & Composite keys are modeled in item fields and indexed & Firestore indexed fields; Bigtable row-key suffix patterns & Compound index fields or embedded sortable attributes \\
+Secondary indexes & GSI for alternate partition or sort keys; LSI for alternate sort key on same partition key & Automatic or defined indexes with partition-aware query design & Firestore composite indexes; Bigtable secondary indexes are limited and often modeled manually & Secondary and compound indexes \\
+Streams / change feed & DynamoDB Streams with Lambda, Kinesis, or consumers & Change feed processor & Firestore triggers; Bigtable change streams & Change streams on replica sets or sharded clusters \\
+TTL & Per-item TTL attribute deletes expired items asynchronously & Time to live on containers or items & Firestore TTL policies; Bigtable garbage-collection rules & TTL indexes on date fields \\
+Global tables / multi-region & Global Tables replicate multi-active tables across Regions & Multi-region writes with tunable consistency & Firestore multi-region locations; Bigtable replication & Atlas global clusters and zone sharding \\
+\bottomrule
+\end{tabular}}
+\vspace{1mm}
+The transferable skill is not memorizing product names. It is learning to state access patterns first, choose keys that distribute traffic, and add only the secondary indexes needed to satisfy known queries.
+\end{crosscloud}
+\section{Week 3 Roadmap and Mental Model}
+DynamoDB is AWS\textquotesingle{}s managed, serverless NoSQL database for key-value and document workloads that need single-digit millisecond latency at very high scale \cite{awsDynamoDBDeveloperGuide}. Unlike relational systems, DynamoDB does not reward late query discovery. The data model is intentionally shaped around known access patterns, expected cardinality, item size, consistency needs, and write distribution. A data engineer uses DynamoDB when the workload needs operational serving speed, elastic scale, event-driven integration, or multi-region active-active availability more than ad hoc joins.
+\index{single-table design}\index{access pattern}\index{event-driven architecture}
+\begin{definitionbox}
+\textbf{Amazon DynamoDB} is a fully managed NoSQL key-value and document database. Applications read and write items in tables using primary keys, optional secondary indexes, capacity modes, and service-managed partitioning.
+\end{definitionbox}
+\begin{keyterms}
+\textbf{Item}: one record in a table. \textbf{Attribute}: one named value on an item. \textbf{Partition key}: hash key used to distribute and locate data. \textbf{Sort key}: optional range key used to order related items. \textbf{GSI}: global secondary index with its own key schema. \textbf{LSI}: local secondary index with the table partition key and alternate sort key.
+\end{keyterms}
+\section{Monday: DynamoDB Core Concepts, Partitions, and Capacity}
+\subsection{Tables, Items, and Physical Partitions}
+A DynamoDB table stores items. Each item is a set of attributes and can have a different shape from its neighbors. The required key attributes define how the service locates data. With a simple primary key, the partition key uniquely identifies an item. With a composite primary key, the partition key groups related items and the sort key uniquely orders items inside that group. Internally, DynamoDB hashes the partition key to route requests to physical partitions that hold data and serve capacity \cite{awsDynamoDBBestPractices}.
+\index{DynamoDB table}\index{item}\index{attribute}\index{physical partition}
+\begin{notebox}
+DynamoDB is schema-flexible, not schema-free. The table does not enforce every attribute, but the application contract must still define entity types, required attributes, key formats, index projections, and lifecycle rules.
+\end{notebox}
+\begin{figure}[H]
+    \centering
+    \resizebox{0.95\textwidth}{!}{%
+    \begin{tikzpicture}[
+        client/.style={rectangle, rounded corners, draw=codegreen!60!black, thick, fill=green!7, align=center, minimum width=2.5cm, minimum height=0.8cm, font=\small\bfseries},
+        key/.style={rectangle, rounded corners, draw=primary, thick, fill=primary!6, align=center, minimum width=2.4cm, minimum height=0.75cm, font=\small\bfseries},
+        part/.style={cylinder, shape border rotate=90, aspect=0.25, draw=orange!85!black, thick, fill=orange!8, align=center, text width=2.5cm, minimum height=1.25cm, font=\small\bfseries},
+        flow/.style={-{Latex[length=2.5mm]}, draw=primary, thick},
+        hash/.style={-{Latex[length=2.5mm]}, draw=orange!85!black, thick, dashed}
+    ]
+        \node[client] (app) at (0,1.5) {Application\\request};
+        \node[key] (pk) at (3.0,1.5) {PK = GAME\#42\\SK = SCORE\#...};
+        \node[key] (hash) at (6.0,1.5) {hash(PK)\\routing};
+        \node[part] (p1) at (9.2,2.7) {Partition A};
+        \node[part] (p2) at (9.2,1.0) {Partition B};
+        \node[part] (p3) at (9.2,-0.7) {Partition C};
+        \draw[flow] (app) -- (pk);
+        \draw[flow] (pk) -- (hash);
+        \draw[hash] (hash) -- (p1);
+        \draw[hash] (hash) -- (p2);
+        \draw[hash] (hash) -- (p3);
+        \node[font=\footnotesize\itshape,text=codegray,align=center] at (4.7,-1.5) {A good partition key spreads writes and reads across many hash values while preserving efficient item collections for known queries.};
+    \end{tikzpicture}%
+    }
+    \caption{DynamoDB hashes the partition key to route items and requests to physical partitions. Sort keys organize related items after the partition key has chosen the item collection.}
+    \label{fig:dynamodb-partition-hashing}
+\end{figure}
+\subsection{Read and Write Capacity}
+DynamoDB meters throughput in read capacity units and write capacity units for provisioned mode, or request units under on-demand billing. One write capacity unit supports one 1 KB write per second. Strongly consistent reads consume more capacity than eventually consistent reads, and larger items require more units. Capacity is consumed by the table and by indexes because index entries are separate write targets \cite{awsDynamoDBCapacity}.
+\index{read capacity unit}\index{write capacity unit}\index{strong consistency}\index{eventual consistency}
+\begin{definitionbox}
+\textbf{RCU} and \textbf{WCU} are capacity abstractions used by provisioned DynamoDB tables. They make item size, read consistency, and request rate visible so teams can plan cost and throttling risk.
+\end{definitionbox}
+\begin{tipbox}
+Estimate capacity from access patterns, not from table size alone. A small table with a celebrity user, global match, or viral post can throttle if the key design concentrates traffic on one partition key.
+\end{tipbox}
+
+\subsection{Provisioned Versus On-Demand Capacity}
+Provisioned capacity is appropriate when traffic is predictable, budgets require explicit limits, or autoscaling can follow a known pattern. On-demand capacity is appropriate for spiky, unknown, or early-stage workloads where operational simplicity and burst tolerance matter more than the lowest possible steady-state cost. Both modes still require key designs that avoid hot partitions.
+\index{provisioned capacity}\index{on-demand capacity}\index{throttling}\index{adaptive capacity}
+
+\begin{pitfall}
+\textbf{Assuming on-demand fixes bad keys.} On-demand mode removes capacity planning for the table, but it does not make one partition key able to absorb unlimited traffic. Hot keys still need write sharding, bucketing, caching, aggregation, or a different access pattern.
+\end{pitfall}
+
+\section{Tuesday: Data Modeling with Primary Keys, Sort Keys, LSI, and GSI}
+\subsection{Access-Pattern-First Modeling}
+Relational modeling starts from entities and normalization. DynamoDB modeling starts from questions the application must answer. For a forum, those questions might be: load a forum by slug, list threads in a forum by recent activity, load posts in a thread by creation time, list a user\textquotesingle{}s posts, show moderation queues by status, and retrieve leaderboard summaries. Each access pattern becomes a key choice, index choice, or denormalized item.
+\index{denormalization}\index{query-first design}\index{item collection}
+
+\begin{definitionbox}
+\textbf{Single-table design} stores multiple entity types in one DynamoDB table and uses overloaded key attributes to colocate items that are read together. It trades relational normalization for predictable, low-latency access patterns.
+\end{definitionbox}
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.3cm}p{3.3cm}p{3.2cm}p{3.2cm}@{}}
+\toprule
+\textbf{Access pattern} & \textbf{PK} & \textbf{SK} & \textbf{Index} \\
+\midrule
+Get forum metadata & FORUM\#slug & META & Table primary key \\
+List threads in forum & FORUM\#slug & THREAD\#lastActivity\#threadId & Table primary key \\
+Load posts in thread & THREAD\#threadId & POST\#createdAt\#postId & Table primary key \\
+List posts by user & USER\#userId & POST\#createdAt\#postId & GSI1 \\
+Moderation queue & STATUS\#pending & REPORTED\#createdAt\#postId & GSI2 sparse index \\
+\bottomrule
+\end{tabular}
+\caption{Example single-table access patterns for a forum workload.}
+\label{tab:forum-access-patterns}
+\end{table}
+
+\subsection{Primary Keys and Sort-Key Encoding}
+Partition keys should have enough cardinality to distribute load. Sort keys should encode hierarchy and ordering in a way that supports begins-with, between, forward order, and reverse order queries. Common patterns include prefixes such as \texttt{FORUM\#}, \texttt{THREAD\#}, and \texttt{POST\#}; ISO-8601 timestamps for lexical ordering; and inverted scores or padded numbers when descending order is needed.
+\index{composite key}\index{sort-key prefix}\index{ISO-8601 timestamp}
+
+\begin{notebox}
+DynamoDB query operations require an equality condition on the partition key. Sort-key conditions refine the item collection after the partition key is chosen. A query that starts with only a non-key attribute is not a DynamoDB query; it is usually an index-design problem.
+\end{notebox}
+
+\subsection{Local and Global Secondary Indexes}
+An LSI is created with the table, shares the table partition key, and provides an alternate sort key for items in the same item collection. A GSI can be created after table creation and has its own partition key and optional sort key. GSIs are the main tool for alternate access patterns, but they add write cost, storage cost, replication delay, and operational complexity \cite{awsDynamoDBSecondaryIndexes}.
+\index{local secondary index}\index{global secondary index}\index{sparse index}\index{index projection}
+
+\begin{tipbox}
+Use sparse GSIs deliberately. If only items with \texttt{GSI1PK} and \texttt{GSI1SK} attributes appear in the index, the GSI can become a compact queue, lookup table, or status-specific access path.
+\end{tipbox}
+
+\begin{pitfall}
+\textbf{Adding indexes after every new question.} Each GSI duplicates selected attributes and receives writes. Too many indexes turn one application write into many index writes and can make hot access patterns harder to diagnose.
+\end{pitfall}
+
+\section{Wednesday: Streams, TTL, and Global Tables}
+\subsection{DynamoDB Streams}
+DynamoDB Streams capture item-level changes in near real time. A stream record can contain keys only, new image, old image, or both images. Lambda functions, stream consumers, and Kinesis integrations use these records to update search indexes, maintain materialized views, publish events, enrich lake ingestion, or invalidate caches \cite{awsDynamoDBStreamsTTL}.
+\index{DynamoDB Streams}\index{change data capture}\index{Lambda trigger}\index{materialized view}
+
+\begin{definitionbox}
+\textbf{DynamoDB Streams} is a time-ordered change log for item modifications in a table. It enables event-driven processing without polling the table for recently changed items.
+\end{definitionbox}
+
+\begin{notebox}
+Stream consumers must be idempotent. Lambda retries, partial failures, and duplicate event processing are normal distributed-systems concerns, so downstream writes should use deterministic keys or conditional updates.
+\end{notebox}
+
+\subsection{Time to Live}
+TTL marks items for asynchronous expiration using an epoch-time attribute. It is useful for sessions, temporary leaderboards, deduplication records, invitations, cached computations, and retention controls. TTL deletion is not immediate and should not be used when exact deletion time is a hard compliance boundary \cite{awsDynamoDBStreamsTTL}.
+\index{time to live}\index{TTL}\index{data retention}
+
+\begin{pitfall}
+\textbf{Treating TTL as a scheduler.} TTL is a lifecycle hint, not a cron system. If business logic must execute exactly at expiration, use EventBridge, Step Functions, or a workflow service and treat TTL as cleanup.
+\end{pitfall}
+
+\subsection{Global Tables}
+Global Tables replicate DynamoDB tables across AWS Regions for multi-active applications. Applications can read and write locally in each participating Region, and DynamoDB replicates changes. This reduces latency for global users and improves regional resilience, but it also requires conflict-aware design, deterministic writes, and careful observability \cite{awsDynamoDBGlobalTables}.
+\index{Global Tables}\index{multi-region}\index{active-active}\index{conflict resolution}
+
+\begin{tipbox}
+Global tables work best when each write has a clear owner or monotonic version strategy. For leaderboards, make the score update conditional on a higher score or newer version so replicated writes do not accidentally move a player backward.
+\end{tipbox}
+
+\section{Thursday Hands-on Project: Forum Single-Table Schema and GSI}
+This lab creates a DynamoDB table for a forum, inserts representative single-table items, and configures a GSI for user-centric queries. The commands assume Windows PowerShell with AWS CLI v2 and a sandbox AWS account. Replace account-specific values and clean up resources after testing.
+\index{AWS CLI}\index{Boto3}\index{forum schema}\index{single-table schema}
+
+\begin{notebox}
+The lab uses on-demand capacity for simplicity. In production, choose on-demand or provisioned capacity from measured access patterns, expected peak traffic, budget controls, and throttling tolerance.
+\end{notebox}
+
+\begin{lstlisting}[language=bash,caption={PowerShell-oriented AWS CLI commands to create a DynamoDB table with a GSI.},label={lst:ch3-dynamodb-cli-create}]
+# Run from Windows PowerShell with AWS CLI v2 configured.
+$Region = "us-east-1"
+$TableName = "forum-single-table-demo"
+
+aws dynamodb create-table `
+  --table-name $TableName `
+  --attribute-definitions `
+      AttributeName=PK,AttributeType=S `
+      AttributeName=SK,AttributeType=S `
+      AttributeName=GSI1PK,AttributeType=S `
+      AttributeName=GSI1SK,AttributeType=S `
+  --key-schema `
+      AttributeName=PK,KeyType=HASH `
+      AttributeName=SK,KeyType=RANGE `
+  --global-secondary-indexes "[
+    {
+      \"IndexName\": \"GSI1\",
+      \"KeySchema\": [
+        {\"AttributeName\": \"GSI1PK\", \"KeyType\": \"HASH\"},
+        {\"AttributeName\": \"GSI1SK\", \"KeyType\": \"RANGE\"}
+      ],
+      \"Projection\": {\"ProjectionType\": \"ALL\"}
+    }
+  ]" `
+  --billing-mode PAY_PER_REQUEST `
+  --stream-specification StreamEnabled=true,StreamViewType=NEW_AND_OLD_IMAGES `
+  --region $Region
+
+aws dynamodb wait table-exists --table-name $TableName --region $Region
+
+aws dynamodb update-time-to-live `
+  --table-name $TableName `
+  --time-to-live-specification "Enabled=true,AttributeName=expiresAt" `
+  --region $Region
+\end{lstlisting}
+
+
+\begin{lstlisting}[language=Python,caption={Boto3 script to insert forum items and query a GSI by user.},label={lst:ch3-dynamodb-boto3-forum}]
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal
+import os
+import boto3
+
+region = os.environ.get("AWS_REGION", "us-east-1")
+table_name = os.environ.get("TABLE_NAME", "forum-single-table-demo")
+table = boto3.resource("dynamodb", region_name=region).Table(table_name)
+now = datetime.now(timezone.utc).isoformat()
+forum_slug, thread_id, user_id = "data-engineering", "thread-1001", "user-42"
+
+items = [
+    {"PK": f"FORUM#{forum_slug}", "SK": "META", "entityType": "Forum", "title": "Data Engineering", "createdAt": now},
+    {"PK": f"FORUM#{forum_slug}", "SK": f"THREAD#{now}#{thread_id}", "entityType": "Thread", "threadId": thread_id, "title": "DynamoDB modeling patterns", "GSI1PK": f"USER#{user_id}", "GSI1SK": f"THREAD#{now}#{thread_id}"},
+    {"PK": f"THREAD#{thread_id}", "SK": f"POST#{now}#post-1", "entityType": "Post", "postId": "post-1", "authorUserId": user_id, "body": "Start with access patterns.", "score": Decimal("1"), "GSI1PK": f"USER#{user_id}", "GSI1SK": f"POST#{now}#post-1", "expiresAt": int((datetime.now(timezone.utc) + timedelta(days=365)).timestamp())},
+]
+
+with table.batch_writer() as batch:
+    for item in items:
+        batch.put_item(Item=item)
+
+response = table.query(IndexName="GSI1", KeyConditionExpression="GSI1PK = :user", ExpressionAttributeValues={":user": f"USER#{user_id}"}, ScanIndexForward=False)
+for item in response["Items"]:
+    print(item["entityType"], item["SK"])
+\end{lstlisting}
+
+
+\section{Friday Use Case: Global Gaming Leaderboard at One Million Reads and Writes Per Second}
+A gaming company runs tournaments in North America, Europe, Asia, and South America. Every match emits score events, profile updates, anti-cheat flags, and session telemetry. Players expect local writes, fresh regional leaderboards, and fast reads from mobile clients. The platform target is one million reads and writes per second globally, using DynamoDB Global Tables for active-active serving, Streams for derived views, and cache layers for extreme fan-out.
+\index{gaming leaderboard}\index{leaderboard architecture}\index{DAX}\index{write sharding}
+
+\subsection{Architecture Narrative}
+The write path accepts score events through regional APIs. Each event uses an idempotency key so retries cannot double-count a match. The score item is written to a regional DynamoDB replica with a partition key that includes game, season, region, and bucket. A conditional expression updates the player\textquotesingle{}s best score only if the new score is higher or has a newer authoritative version. Global Tables replicate the update to peer Regions. Streams publish changes to Lambda or Kinesis consumers that maintain top-N materialized leaderboard items, feed S3 analytics, and invalidate caches.
+
+The read path separates personalized reads from hot global rankings. Player profile and rank lookups go directly to DynamoDB or DAX where appropriate \cite{awsDynamoDBDAX}. Extremely hot top-N pages are precomputed from streams and served from a cache or CDN-backed API. This keeps millions of clients from repeatedly querying the same partition key during a tournament final.
+
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[
+        api/.style={rectangle, rounded corners, draw=codegreen!60!black, thick, fill=green!7, align=center, minimum width=2.4cm, minimum height=0.85cm, font=\small\bfseries},
+        db/.style={cylinder, shape border rotate=90, aspect=0.25, draw=primary, thick, fill=blue!7, align=center, text width=2.5cm, minimum height=1.35cm, font=\small\bfseries},
+        stream/.style={rectangle, rounded corners, draw=orange!85!black, thick, fill=orange!8, align=center, minimum width=2.5cm, minimum height=0.85cm, font=\small\bfseries},
+        cache/.style={rectangle, rounded corners, draw=magenta, thick, fill=magenta!10, align=center, minimum width=2.4cm, minimum height=0.85cm, font=\small\bfseries},
+        flow/.style={-{Latex[length=2.4mm]}, draw=primary, thick},
+        repl/.style={-{Latex[length=2.4mm]}, draw=orange!85!black, thick, dashed}
+    ]
+        \node[api] (api1) at (0,1.6) {Regional API\\Americas};
+        \node[api] (api2) at (0,-1.6) {Regional API\\Europe};
+        \node[db] (ddb1) at (3.3,1.6) {DynamoDB\\Global Table\\us-east-1};
+        \node[db] (ddb2) at (3.3,-1.6) {DynamoDB\\Global Table\\eu-west-1};
+        \node[stream] (s1) at (6.5,1.6) {Streams\\top-N updater};
+        \node[stream] (s2) at (6.5,-1.6) {Streams\\analytics feed};
+        \node[cache] (cache) at (9.5,1.6) {DAX / cache\\hot reads};
+        \node[db] (s3) at (9.5,-1.6) {S3 data lake\\score history};
+        \node[api] (clients) at (12.0,1.6) {Players\\leaderboard reads};
+        \draw[flow] (api1) -- (ddb1);
+        \draw[flow] (api2) -- (ddb2);
+        \draw[repl] (ddb1) -- node[right,font=\scriptsize\bfseries,text=orange!85!black]{Global Tables} (ddb2);
+        \draw[flow] (ddb1) -- (s1);
+        \draw[flow] (ddb2) -- (s2);
+        \draw[flow] (s1) -- (cache);
+        \draw[flow] (s2) -- (s3);
+        \draw[flow] (clients) -- (cache);
+        \draw[flow] (clients) .. controls (10.0,0.2) and (6.0,0.0) .. (ddb1);
+    \end{tikzpicture}%
+    }
+    \caption{Global gaming leaderboard architecture with regional writes to DynamoDB Global Tables, streams for derived top-N views and lake ingestion, and cache or DAX layers for hot read serving.}
+    \label{fig:global-leaderboard-architecture}
+\end{figure}
+
+\subsection{Design Decisions}
+\textbf{Write distribution.} Avoid a single partition key such as \texttt{GAME\#123\#SEASON\#2026} for all score writes. Add buckets, region segments, or match identifiers so writes spread across many partition keys, then compute aggregate top-N views asynchronously.
+
+\textbf{Correctness.} Use conditional writes for best score, optimistic version attributes for profile changes, and idempotency items for score-event ingestion. Streams consumers must tolerate duplicate records and out-of-order cross-region observations.
+
+\textbf{Serving.} Use DynamoDB for player-specific and partitioned rank queries. Use stream-maintained materialized top-N items plus cache for the hottest pages. DAX can reduce read latency for read-heavy DynamoDB access patterns, but it does not replace good key design.
+
+\begin{pitfall}
+\textbf{Trying to query the whole leaderboard live.} A global top-N query over every player on demand is an analytical operation. Operational leaderboards should maintain precomputed slices for each game, season, region, league, and time window.
+\end{pitfall}
+
+\section{Interview Q\&A}
+\subsection{Concepts and Trade-offs}
+\begin{enumerate}
+    \item \textbf{Q: How is DynamoDB different from a relational database?}\\
+    A: DynamoDB is a managed key-value and document database optimized for predictable access patterns and high scale. It does not provide joins or ad hoc relational querying; the table and indexes are modeled around known queries.
+    \item \textbf{Q: What makes a DynamoDB partition key good?}\\
+    A: It has high cardinality, distributes reads and writes evenly, and still groups items that must be queried together. It avoids hot keys created by globally popular users, games, or status values.
+    \item \textbf{Q: When would you choose on-demand capacity?}\\
+    A: Choose it for unknown, bursty, or early-stage traffic where operational simplicity matters. For predictable steady traffic, provisioned capacity with autoscaling may be more cost controlled.
+    \item \textbf{Q: What is the difference between an LSI and a GSI?}\\
+    A: An LSI shares the table partition key and provides an alternate sort key created with the table. A GSI has its own key schema, can be created later, and supports alternate access patterns.
+    \item \textbf{Q: Why are sparse GSIs useful?}\\
+    A: Only items containing the index key attributes appear in the index, so a sparse GSI can efficiently represent queues, status views, or selected entity types without indexing every item.
+    \item \textbf{Q: What are DynamoDB Streams used for?}\\
+    A: They capture item changes for event-driven processing such as cache invalidation, materialized views, search indexing, audit trails, and lake ingestion.
+    \item \textbf{Q: What caveat applies to TTL?}\\
+    A: TTL expiration is asynchronous. It is useful for cleanup and lifecycle management, but not for exact-time scheduling or strict deletion deadlines.
+    \item \textbf{Q: What extra design work do Global Tables require?}\\
+    A: They require conflict-aware write rules, regional observability, deterministic updates, idempotent consumers, and application routing that understands multi-region behavior.
+\end{enumerate}
+
+\section{Further Reading}
+Start with the DynamoDB Developer Guide for table design, APIs, indexes, streams, TTL, backup, and security behavior \cite{awsDynamoDBDeveloperGuide}. Study capacity mode, adaptive capacity, and throttling guidance before estimating costs \cite{awsDynamoDBCapacity,awsDynamoDBBestPractices}. Review secondary index design and projection choices for every non-primary access pattern \cite{awsDynamoDBSecondaryIndexes}. For event-driven and multi-region workloads, read the Streams, TTL, Global Tables, and DAX documentation \cite{awsDynamoDBStreamsTTL,awsDynamoDBGlobalTables,awsDynamoDBDAX}.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item DynamoDB design starts with access patterns, traffic distribution, item size, consistency, and latency requirements.
+    \item Partition keys distribute data and capacity; sort keys organize related items for efficient range and prefix queries.
+    \item Provisioned capacity gives explicit throughput control, while on-demand capacity simplifies bursty workloads; neither mode fixes a hot key.
+    \item GSIs support alternate access patterns, but each index adds write cost, storage cost, and replication behavior to understand.
+    \item Streams, TTL, and Global Tables extend DynamoDB into event-driven, lifecycle-managed, and multi-region architectures.
+    \item Large-scale leaderboards need write sharding, idempotency, materialized views, and cache-aware read serving rather than live global scans.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Explain why a high-cardinality partition key matters for both cost and availability under heavy write traffic.
+    \item \textbf{(Conceptual)} Compare provisioned and on-demand capacity for a workload with predictable weekday peaks and unpredictable weekend tournaments.
+    \item \textbf{(Modeling)} Extend \cref{tab:forum-access-patterns} with an access pattern for unread notifications per user.
+    \item \textbf{(Hands-on)} Run \cref{lst:ch3-dynamodb-cli-create} in a sandbox account, then capture table status, stream ARN, TTL status, and GSI status.
+    \item \textbf{(Hands-on)} Modify \cref{lst:ch3-dynamodb-boto3-forum} to insert three posts by two users and query each user\textquotesingle{}s content through \texttt{GSI1}.
+    \item \textbf{(Design)} Design a sparse GSI for a moderation queue that only includes reported posts with status pending, escalated, or blocked.
+    \item \textbf{(Operations)} Write an alarm plan for throttled requests, system errors, replication latency, stream iterator age, and cache hit ratio.
+    \item \textbf{(Architecture)} Sketch a leaderboard write-sharding strategy for one million global writes per second and explain how top-N views are rebuilt.
+\end{enumerate}
+
+\section{Capstone Project: Building a Global Gaming-Leaderboard Data Layer}\label{sec:ch3-capstone}
+\index{capstone project}\index{DynamoDB!capstone}\index{Global Tables!capstone}\index{DynamoDB Streams!capstone}\index{gaming leaderboard!capstone}
+
+\begin{capstonebox}
+\textbf{Mission.} Build the data layer for a global gaming leaderboard using DynamoDB single-table design, GSIs, Streams, Global Tables, and on-demand scaling. The platform must support regional score writes, player rank lookups, hot top-N serving, analytics export, and operational evidence.
+
+\textbf{Estimated time.} 5--7 hours in a sandbox AWS account for table design, scripted inserts, stream integration stubs, global-table configuration, and acceptance evidence.
+
+\textbf{What you\textquotesingle{}ll practice.}
+\begin{itemize}
+    \item Translating leaderboard access patterns into partition keys, sort keys, item collections, and GSIs.
+    \item Designing write-sharded score ingestion with idempotency and conditional updates.
+    \item Using Streams to maintain materialized top-N views and send immutable score history to analytics storage.
+    \item Configuring Global Tables and on-demand scaling for multi-region active-active serving.
+\end{itemize}
+\end{capstonebox}
+
+\subsection*{Scenario}
+A competitive gaming company is launching a world championship across four Regions. Players submit scores after every match, mobile clients read personal rank after each game, and spectators refresh top leaderboards during finals. The business requires low-latency regional writes, globally replicated player best scores, and hot read paths that can absorb sudden fan traffic. Data science teams also need score history in S3 for fraud detection and tournament analytics.
+
+The data layer must use DynamoDB as the operational source of truth. It should avoid global scans, use GSIs only where access patterns require them, and produce evidence that streams, TTL, Global Tables, and capacity settings are configured correctly.
+
+\subsection*{Requirements}
+\textbf{Functional requirements.}
+\begin{itemize}
+    \item Design a single-table schema for games, seasons, players, score events, player best scores, regional leaderboard buckets, and top-N materialized views.
+    \item Use a composite primary key with write-sharded leaderboard partitions for high-ingestion score events.
+    \item Create at least one GSI for player-centric queries and one sparse GSI for tournament moderation or anti-cheat review.
+    \item Enable Streams with new and old images so consumers can update top-N views and export score history.
+    \item Enable TTL for temporary idempotency records, session records, and short-lived tournament cache items.
+    \item Configure Global Tables across at least two Regions or document the exact commands and acceptance evidence required when sandbox limits prevent creation.
+\end{itemize}
+
+\textbf{Non-functional requirements.}
+\begin{itemize}
+    \item The design must sustain hot tournaments without a single partition key receiving all writes.
+    \item All score updates must be idempotent and conditional so retries or replicated writes do not corrupt best-score state.
+    \item Read paths must separate personal rank lookups, regional top-N queries, and global spectator traffic.
+    \item Monitoring must include throttling, consumed capacity, user errors, system errors, stream iterator age, replication latency, and cache hit ratio where a cache is used.
+    \item Scripts must not contain secrets, account credentials, or hardcoded personal data.
+\end{itemize}
+
+\subsection*{Reference Architecture}
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[
+        box/.style={rectangle, rounded corners, draw=primary, thick, fill=primary!5, align=center, minimum width=2.4cm, minimum height=0.85cm, font=\small\bfseries},
+        db/.style={cylinder, shape border rotate=90, aspect=0.25, draw=primary, thick, fill=blue!7, align=center, text width=2.5cm, minimum height=1.35cm, font=\small\bfseries},
+        tool/.style={rectangle, rounded corners, draw=orange!85!black, thick, fill=orange!8, align=center, minimum width=2.5cm, minimum height=0.85cm, font=\small\bfseries},
+        ops/.style={rectangle, rounded corners, draw=red!60!black, thick, fill=red!5, align=center, minimum width=2.5cm, minimum height=0.85cm, font=\footnotesize\bfseries},
+        flow/.style={-{Latex[length=2.4mm]}, draw=primary, thick},
+        repl/.style={-{Latex[length=2.4mm]}, draw=orange!85!black, thick, dashed}
+    ]
+        \node[box] (api) at (0,1.7) {Score ingestion\\regional API};
+        \node[box] (readapi) at (0,-1.7) {Leaderboard\\read API};
+        \node[db] (ddbA) at (3.3,1.7) {DynamoDB\\Region A};
+        \node[db] (ddbB) at (3.3,-1.7) {DynamoDB\\Region B};
+        \node[tool] (streams) at (6.5,1.7) {Streams\\processors};
+        \node[db] (topn) at (6.5,-1.7) {Top-N items\\and GSIs};
+        \node[box] (cache) at (9.6,-1.7) {DAX / cache\\spectator reads};
+        \node[db] (lake) at (9.6,1.7) {S3\\score history};
+        \node[ops] (ops) at (12.2,0) {CloudWatch\\alarms\\runbooks};
+        \draw[flow] (api) -- (ddbA);
+        \draw[flow] (readapi) -- (ddbB);
+        \draw[repl] (ddbA) -- node[right,font=\scriptsize\bfseries,text=orange!85!black]{Global Tables} (ddbB);
+        \draw[flow] (ddbA) -- (streams);
+        \draw[flow] (streams) -- (lake);
+        \draw[flow] (streams) -- (topn);
+        \draw[flow] (readapi) -- (topn);
+        \draw[flow] (readapi) -- (cache);
+        \draw[flow] (ops) -- (ddbA);
+        \draw[flow] (ops) -- (ddbB);
+    \end{tikzpicture}%
+    }
+    \caption{Capstone reference architecture for a global gaming-leaderboard data layer with regional APIs, DynamoDB Global Tables, Streams processors, top-N materialized items, cache acceleration, S3 export, and observability.}
+    \label{fig:ch3-capstone-architecture}
+\end{figure}
+
+\subsection*{Implementation Steps}
+\begin{enumerate}
+    \item \textbf{Define access patterns.} List every read and write path: submit score, get player best score, get player rank, list top players by game and season, review flagged events, and export score history.
+    \item \textbf{Design keys.} Choose table PK and SK formats, write-sharded leaderboard bucket keys, GSI keys for player lookups, and sparse GSI keys for anti-cheat queues.
+    \item \textbf{Create the table.} Use on-demand capacity, streams with new and old images, TTL, server-side encryption, point-in-time recovery, and least-privilege IAM.
+    \item \textbf{Write ingestion code.} Insert score events idempotently and update best-score items with conditional expressions.
+    \item \textbf{Build stream consumers.} Maintain top-N materialized items and export immutable events to S3 or a delivery stream.
+    \item \textbf{Configure Global Tables.} Add replica Regions, test regional writes, and record replication status and latency evidence.
+    \item \textbf{Validate scale posture.} Demonstrate write distribution across bucketed keys, confirm hot read paths use materialized views or cache, and document alarms.
+\end{enumerate}
+
+\begin{lstlisting}[language=bash,caption={PowerShell-oriented AWS CLI skeleton for the leaderboard table and replicas.},label={lst:ch3-capstone-cli}]
+$PrimaryRegion = "us-east-1"
+$ReplicaRegion = "eu-west-1"
+$TableName = "global-leaderboard"
+
+aws dynamodb create-table `
+  --table-name $TableName `
+  --attribute-definitions `
+      AttributeName=PK,AttributeType=S `
+      AttributeName=SK,AttributeType=S `
+      AttributeName=GSI1PK,AttributeType=S `
+      AttributeName=GSI1SK,AttributeType=S `
+      AttributeName=GSI2PK,AttributeType=S `
+      AttributeName=GSI2SK,AttributeType=S `
+  --key-schema AttributeName=PK,KeyType=HASH AttributeName=SK,KeyType=RANGE `
+  --global-secondary-indexes "[
+    {
+      \"IndexName\":\"GSI1PlayerLookup\",
+      \"KeySchema\":[
+        {\"AttributeName\":\"GSI1PK\",\"KeyType\":\"HASH\"},
+        {\"AttributeName\":\"GSI1SK\",\"KeyType\":\"RANGE\"}
+      ],
+      \"Projection\":{\"ProjectionType\":\"ALL\"}
+    },
+    {
+      \"IndexName\":\"GSI2ReviewQueue\",
+      \"KeySchema\":[
+        {\"AttributeName\":\"GSI2PK\",\"KeyType\":\"HASH\"},
+        {\"AttributeName\":\"GSI2SK\",\"KeyType\":\"RANGE\"}
+      ],
+      \"Projection\":{\"ProjectionType\":\"ALL\"}
+    }
+  ]" `
+  --billing-mode PAY_PER_REQUEST `
+  --stream-specification StreamEnabled=true,StreamViewType=NEW_AND_OLD_IMAGES `
+  --sse-specification Enabled=true `
+  --region $PrimaryRegion
+
+aws dynamodb wait table-exists --table-name $TableName --region $PrimaryRegion
+
+aws dynamodb update-continuous-backups `
+  --table-name $TableName `
+  --point-in-time-recovery-specification PointInTimeRecoveryEnabled=true `
+  --region $PrimaryRegion
+
+aws dynamodb update-table `
+  --table-name $TableName `
+  --replica-updates "Create={RegionName=$ReplicaRegion}" `
+  --region $PrimaryRegion
+\end{lstlisting}
+
+
+\begin{lstlisting}[language=Python,caption={Boto3 score ingestion with idempotency and conditional best-score updates.},label={lst:ch3-capstone-boto3-ingest}]
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal
+import os, uuid, boto3
+from botocore.exceptions import ClientError
+
+table = boto3.resource("dynamodb", region_name=os.environ.get("AWS_REGION", "us-east-1")).Table(os.environ.get("TABLE_NAME", "global-leaderboard"))
+
+def submit_score(game_id, season_id, player_id, score, event_id=None):
+    now = datetime.now(timezone.utc)
+    event_id = event_id or str(uuid.uuid4())
+    bucket = int(player_id[-2:], 16) % 100
+    try:
+        table.put_item(Item={"PK": f"IDEMPOTENCY#{event_id}", "SK": "EVENT", "expiresAt": int((now + timedelta(days=2)).timestamp())}, ConditionExpression="attribute_not_exists(PK)")
+    except ClientError as exc:
+        if exc.response["Error"]["Code"] == "ConditionalCheckFailedException":
+            return {"status": "duplicate", "eventId": event_id}
+        raise
+
+    table.put_item(Item={"PK": f"GAME#{game_id}#SEASON#{season_id}#BUCKET#{bucket:02d}", "SK": f"SCORE#{now.isoformat()}#{event_id}", "entityType": "ScoreEvent", "playerId": player_id, "score": Decimal(str(score)), "GSI1PK": f"PLAYER#{player_id}", "GSI1SK": f"SCORE#{now.isoformat()}#{game_id}"})
+    table.update_item(
+        Key={"PK": f"PLAYER#{player_id}", "SK": f"BEST#{game_id}#{season_id}"},
+        UpdateExpression="SET entityType=:t, bestScore=:s, updatedAt=:n, GSI1PK=:p, GSI1SK=:g",
+        ConditionExpression="attribute_not_exists(bestScore) OR bestScore < :s",
+        ExpressionAttributeValues={":t": "PlayerBestScore", ":s": Decimal(str(score)), ":n": now.isoformat(), ":p": f"PLAYER#{player_id}", ":g": f"BEST#{game_id}#{season_id}"},
+    )
+    return {"status": "accepted", "eventId": event_id, "bucket": bucket}
+
+print(submit_score("space-race", "2026", "af42", 987650))
+\end{lstlisting}
+
+
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item Access-pattern matrix with table keys, sort-key formats, GSI keys, expected cardinality, and consistency choice for each query.
+    \item DynamoDB table creation evidence showing billing mode, stream setting, TTL status, point-in-time recovery, encryption, GSIs, and replica Regions.
+    \item Ingestion script with idempotency records, write-sharded score events, conditional best-score updates, and sample output.
+    \item Stream-processing design that explains how top-N views are updated, how duplicate events are handled, and how score history reaches S3.
+    \item Read-serving plan for player rank, regional leaderboard, global top-N, spectator traffic, and cache invalidation.
+    \item Operations packet with CloudWatch alarms, dashboard metrics, failure scenarios, and cleanup steps.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item The table uses a composite primary key and at least two GSIs: one for player lookups and one sparse index for review or moderation workflows.
+    \item Score writes include idempotency protection and conditional best-score updates.
+    \item Leaderboard writes are distributed across bucketed partition keys rather than concentrated on one game-season key.
+    \item Streams are enabled with new and old images, and the top-N update design is idempotent.
+    \item TTL is enabled for temporary records, and the design does not rely on exact deletion timing.
+    \item Global Tables are configured across at least two Regions or a sandbox exception documents the exact command, required IAM, and expected evidence.
+    \item The read path avoids live global scans and uses materialized views or cache for hot top-N pages.
+    \item Monitoring covers throttles, errors, consumed capacity, stream iterator age, global replication health, and cache behavior.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Add a load-test script that writes synthetic scores across 100 leaderboard buckets and reports key distribution.
+    \item Implement a Lambda stream consumer that maintains top 100 players per game, season, region, and league.
+    \item Add DAX or another cache for player rank reads, then measure hit ratio and stale-read tolerance.
+\end{itemize}

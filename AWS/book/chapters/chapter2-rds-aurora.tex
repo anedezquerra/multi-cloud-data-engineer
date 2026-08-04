@@ -1,0 +1,717 @@
+\chapter{Relational Databases: RDS and Aurora}
+\index{Amazon RDS}\index{Amazon Aurora}\index{relational databases}\index{Multi-AZ}\index{Read Replicas}%
+\index{Aurora Serverless v2}\index{Aurora Global Database}\index{AWS Database Migration Service}\index{AWS Schema Conversion Tool}\index{Oracle migration}%
+\begin{objectives}
+\begin{itemize}
+    \item Explain the managed relational database model behind Amazon RDS, including engines, instance classes, storage, backups, maintenance windows, and operational responsibility boundaries.
+    \item Design highly available RDS deployments with Multi-AZ DB instances or Multi-AZ DB clusters, and distinguish failover capacity from horizontal read scaling.
+    \item Compare RDS Read Replicas, Aurora Replicas, Aurora Global Database, and cross-region replica patterns for reporting, disaster recovery, and low-latency reads.
+    \item Describe Aurora's cloud-native distributed storage architecture, quorum writes, cache-aware failover, Global Database replication, and Aurora Serverless v2 scaling model.
+    \item Use AWS Database Migration Service and AWS Schema Conversion Tool to plan homogeneous and heterogeneous database migrations with full-load and change data capture phases.
+    \item Deploy an Aurora Serverless v2 PostgreSQL cluster, add cross-region read capacity, simulate regional failover, and design a zero-downtime Oracle ERP cutover to Aurora PostgreSQL.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+Managed relational platforms use different product names, but the architectural choices are familiar: engine compatibility, high availability, read scale, global reach, migration tooling, and operational automation.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{2.9cm}p{3.0cm}p{3.1cm}p{3.1cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{AWS} & \textbf{Azure} & \textbf{GCP} \\
+\midrule
+Managed relational & RDS / Aurora & Azure SQL / Azure Database for PostgreSQL & Cloud SQL / AlloyDB \\
+Cloud-native scale-out & Aurora & Hyperscale & AlloyDB \\
+High availability & Multi-AZ & Zone-redundant HA / auto-failover groups & Regional HA \\
+Read replicas & RDS Read Replicas / Aurora Replicas & Read replicas & Read replicas \\
+Global or geo-replication & Aurora Global Database & Active geo-replication & Cross-region replicas \\
+Migration & DMS + SCT & Azure DMS & Database Migration Service \\
+Operational automation & Backups, patching, monitoring, Performance Insights & Automated backups, maintenance, Query Performance Insight & Backups, maintenance, Query Insights \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+Adjacent services follow the same mental model. MongoDB Atlas and Amazon DocumentDB are managed document-database analogs; Microsoft Fabric and BigQuery are lakehouse or warehouse platforms rather than OLTP systems; Snowflake separates compute and storage for analytical workloads, while RDS and Aurora optimize transactional consistency and operational database availability.
+\end{crosscloud}
+
+\section{Week 2 Roadmap and Mental Model}
+Relational databases remain central to data engineering because most enterprise facts begin as transactions: orders, invoices, shipments, journal entries, patient encounters, payments, and inventory movements. A data engineer must understand not only how to extract those records, but also how the source database preserves consistency, scales reads, fails over, and migrates safely. Week~2 therefore focuses on managed relational infrastructure: Amazon RDS for familiar engines, Amazon Aurora for cloud-native relational scale, and AWS DMS plus AWS SCT for migration and replication workflows \cite{awsRDSUserGuide,awsAuroraUserGuide,awsDMSUserGuide}.
+
+Amazon RDS removes much of the undifferentiated database administration work: provisioning, backups, patching, monitoring hooks, storage management, and high-availability automation. It does not remove schema design, transaction design, index selection, query tuning, capacity planning, security boundaries, or migration accountability. Aurora goes further by redesigning the storage layer for distributed cloud infrastructure, but applications still experience it through MySQL-compatible or PostgreSQL-compatible SQL endpoints.
+\index{OLTP}\index{transaction processing}\index{managed database}
+
+\begin{definitionbox}
+\textbf{Amazon RDS} is a managed relational database service for engines such as PostgreSQL, MySQL, MariaDB, Oracle, SQL Server, and Db2. \textbf{Amazon Aurora} is an AWS-designed, MySQL-compatible and PostgreSQL-compatible relational database that separates compute from a distributed storage volume.
+\end{definitionbox}
+
+\begin{keyterms}
+\textbf{Primary instance}: the writer for a database. \textbf{Standby}: synchronous failover target in a Multi-AZ deployment. \textbf{Read replica}: asynchronous read-scaling copy. \textbf{Cluster endpoint}: Aurora endpoint that tracks the current writer. \textbf{CDC}: change data capture used to keep a migration target current.
+\end{keyterms}
+
+\section{Monday: Amazon RDS Architecture, Multi-AZ, and Read Replicas}
+\subsection{Managed RDS Architecture}
+An RDS database is a managed combination of engine software, compute, storage, networking, backup automation, monitoring, and control-plane operations. You choose an engine, version, instance class, allocated storage, subnet group, security groups, parameter groups, option groups, backup retention, maintenance window, encryption configuration, and high-availability topology. AWS operates the underlying infrastructure and service automation; the customer owns data model, credentials, network exposure, query behavior, and application compatibility.
+\index{DB instance}\index{parameter group}\index{option group}\index{backup retention}
+
+For a data engineering team, the most important RDS design boundary is the split between transactional workloads and analytical workloads. RDS can support operational reporting, but it is not a replacement for S3 data lakes, Redshift, Athena, or specialized analytical stores. Extracting from production RDS requires workload isolation, replica usage where appropriate, and a clear understanding of transaction logs, snapshots, and business cutover windows.
+
+\begin{notebox}
+RDS automation is not the same as database tuning. A poorly indexed query, chatty transaction pattern, or long-running report can still saturate CPU, memory, locks, connections, IOPS, or log volume on a fully managed database.
+\end{notebox}
+
+\subsection{Backups, Maintenance, and Observability}
+RDS automated backups combine daily snapshots with transaction logs so a database can be restored to a point within the retention period. Manual snapshots persist until deleted. Maintenance windows let AWS apply engine or OS updates; some changes are online, while others require a reboot or failover. CloudWatch metrics, Enhanced Monitoring, Performance Insights, database logs, and events are the operational evidence used to decide whether a system is healthy.
+\index{automated backups}\index{point-in-time recovery}\index{Performance Insights}\index{Enhanced Monitoring}
+
+\begin{tipbox}
+For production databases, set backup retention, deletion protection, encryption, monitoring, and maintenance windows intentionally at creation time. Retrofitting these controls during an incident is slower and riskier than declaring them in infrastructure as code.
+\end{tipbox}
+
+\subsection{Multi-AZ Deployments}
+Multi-AZ is the core RDS high-availability pattern. In a traditional Multi-AZ DB instance deployment, RDS synchronously replicates data to a standby in a different Availability Zone and automatically fails over when the primary becomes unavailable. The standby is not used for read traffic. Newer Multi-AZ DB clusters provide a writer and readable standby instances with lower commit latency and faster failover for supported engines \cite{awsRDSMultiAZ}.
+\index{Multi-AZ deployment}\index{synchronous replication}\index{failover}\index{Availability Zone}
+
+\begin{definitionbox}
+\textbf{RDS Multi-AZ} is a high-availability configuration that maintains a synchronous standby in another Availability Zone and uses automatic failover to preserve database availability during infrastructure, instance, or maintenance events.
+\end{definitionbox}
+
+\begin{figure}[H]
+    \centering
+    \resizebox{0.92\textwidth}{!}{%
+    \begin{tikzpicture}[
+        az/.style={rectangle, rounded corners, draw=primary, thick, fill=primary!3, minimum width=5.0cm, minimum height=4.2cm},
+        app/.style={rectangle, rounded corners, draw=codegreen!60!black, thick, fill=green!7, align=center, minimum width=2.4cm, minimum height=0.9cm, font=\small\bfseries},
+        db/.style={cylinder, shape border rotate=90, aspect=0.25, draw=primary, thick, fill=blue!7, align=center, text width=2.4cm, minimum height=1.35cm, font=\small\bfseries},
+        dns/.style={rectangle, rounded corners, draw=orange!80!black, thick, fill=orange!8, align=center, minimum width=2.7cm, minimum height=0.9cm, font=\small\bfseries},
+        flow/.style={-{Latex[length=2.5mm]}, draw=primary, thick},
+        sync/.style={-{Latex[length=2.5mm]}, draw=orange!85!black, thick, dashed}
+    ]
+        \node[az, label={[font=\small\bfseries\color{primary}]above:Availability Zone A}] (aza) at (0,0) {};
+        \node[az, label={[font=\small\bfseries\color{primary}]above:Availability Zone B}] (azb) at (6.4,0) {};
+        \node[app] (app) at (-2.0,1.2) {Application\\and ETL jobs};
+        \node[dns] (endpoint) at (3.2,1.2) {RDS endpoint\\DNS target};
+        \node[db] (primary) at (0,-0.8) {Primary DB\\writer};
+        \node[db] (standby) at (6.4,-0.8) {Standby DB\\no read traffic};
+        \draw[flow] (app) -- (endpoint);
+        \draw[flow] (endpoint) -- (primary);
+        \draw[sync] (primary) -- node[above,font=\scriptsize\bfseries,text=orange!85!black]{synchronous storage replication} (standby);
+        \draw[flow] (standby) -- ++(0,1.4) -- node[above,font=\scriptsize]{automatic failover updates endpoint} (endpoint);
+    \end{tikzpicture}%
+    }
+    \caption{RDS Multi-AZ protects availability by synchronously maintaining a standby in another Availability Zone and moving the endpoint during failover. It is not a read-scaling feature in the traditional DB instance model.}
+    \label{fig:rds-multi-az}
+\end{figure}
+
+\begin{pitfall}
+\textbf{Confusing Multi-AZ with read scaling.} Multi-AZ is primarily for availability and durability of service during failures or maintenance. Use Read Replicas, Aurora Replicas, caching, or analytical offload when the problem is read throughput.
+\end{pitfall}
+
+\subsection{Read Replicas}
+RDS Read Replicas use asynchronous replication to offload read-heavy workloads, support reporting, test upgrades, or create cross-region disaster-recovery candidates for supported engines \cite{awsRDSReadReplicas}. Because replication is asynchronous, replicas can lag. Applications must tolerate stale reads, and data engineers must not point critical reconciliation jobs at a lagging replica without checking freshness.
+\index{Read Replica}\index{replica lag}\index{asynchronous replication}\index{read scaling}
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.2cm}p{4.5cm}p{5.0cm}@{}}
+\toprule
+\textbf{Pattern} & \textbf{Best fit} & \textbf{Design caution} \\
+\midrule
+Single-AZ RDS & Development, tests, noncritical workloads & No AZ-level database failover target \\
+Multi-AZ DB instance & Production OLTP availability & Standby is not a reporting target \\
+Multi-AZ DB cluster & Production engines needing faster failover and readable standbys & Engine and feature support differ from classic deployments \\
+Read Replica & Read scaling, reporting, migration staging & Asynchronous lag and replica-specific capacity planning \\
+Cross-region replica & Regional DR candidate or local reads & Higher cost, lag, egress, and failover runbook complexity \\
+\bottomrule
+\end{tabular}
+\caption{RDS deployment patterns mapped to common data engineering decisions.}
+\label{tab:rds-patterns}
+\end{table}
+
+\section{Tuesday: Amazon Aurora Cloud-Native Relational Architecture}
+\subsection{Distributed Storage and Compute Separation}
+Aurora keeps the SQL engine familiar while changing the storage architecture. An Aurora cluster has one writer instance, zero or more reader instances, and a distributed cluster volume that automatically grows as data increases. The storage layer replicates data across multiple Availability Zones, and database instances attach to that shared volume rather than each owning a complete independent storage copy. This separation enables fast replica creation, faster failover, and storage durability that is not tied to one compute node \cite{awsAuroraStorage}.
+\index{Aurora cluster volume}\index{distributed storage}\index{quorum}\index{writer endpoint}\index{reader endpoint}
+
+\begin{definitionbox}
+\textbf{Aurora cluster volume} is a distributed, replicated storage volume shared by the DB instances in an Aurora cluster. Compute nodes can fail or be replaced while the storage service preserves the database volume independently.
+\end{definitionbox}
+
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[
+        inst/.style={rectangle, rounded corners, draw=primary, thick, fill=primary!6, align=center, minimum width=2.5cm, minimum height=0.9cm, font=\small\bfseries},
+        seg/.style={rectangle, rounded corners, draw=orange!80!black, thick, fill=orange!8, align=center, minimum width=1.9cm, minimum height=0.8cm, font=\scriptsize\bfseries},
+        endpoint/.style={rectangle, rounded corners, draw=codegreen!60!black, thick, fill=green!7, align=center, minimum width=2.5cm, minimum height=0.8cm, font=\footnotesize\bfseries},
+        flow/.style={-{Latex[length=2.5mm]}, draw=primary, thick},
+        storage/.style={-{Latex[length=2mm]}, draw=orange!85!black, thick}
+    ]
+        \node[endpoint] (writerEp) at (0,2.0) {cluster endpoint\\writer};
+        \node[endpoint] (readerEp) at (5.0,2.0) {reader endpoint\\load-balanced};
+        \node[inst] (writer) at (0,0.7) {Aurora writer};
+        \node[inst] (r1) at (3.6,0.7) {Aurora reader};
+        \node[inst] (r2) at (6.4,0.7) {Aurora reader};
+        \foreach \x/\az in {0/AZ A,2/AZ A,4/AZ B,6/AZ B,8/AZ C,10/AZ C} {
+            \node[seg] (s\x) at (\x,-1.2) {storage\\segment\\\az};
+        }
+        \draw[flow] (writerEp) -- (writer);
+        \draw[flow] (readerEp) -- (r1);
+        \draw[flow] (readerEp) -- (r2);
+        \draw[storage] (writer) -- (s2);
+        \draw[storage] (r1) -- (s4);
+        \draw[storage] (r2) -- (s6);
+        \draw[storage] (s0) -- (s2);
+        \draw[storage] (s2) -- (s4);
+        \draw[storage] (s4) -- (s6);
+        \draw[storage] (s6) -- (s8);
+        \draw[storage] (s8) -- (s10);
+        \node[font=\footnotesize\itshape,text=codegray,align=center] at (5,-2.3) {The storage volume is replicated across Availability Zones; readers share the same logical volume rather than receiving separate full database copies.};
+    \end{tikzpicture}%
+    }
+    \caption{Aurora separates compute instances from a distributed cluster volume. Writer and reader endpoints route application traffic while the storage service handles replication and durability.}
+    \label{fig:aurora-storage}
+\end{figure}
+
+\begin{notebox}
+Aurora replicas can serve reads and participate in failover promotion, but they still share the cluster's operational fate more closely than independent analytical systems. Heavy reporting can still affect cache, connections, locks, and engine resources.
+\end{notebox}
+
+\subsection{Aurora Global Database}
+Aurora Global Database replicates an Aurora cluster to secondary Regions using storage-level replication designed for low-latency cross-region propagation \cite{awsAuroraGlobalDatabase}. The primary Region accepts writes. Secondary Regions can serve low-latency reads and can be promoted during a regional disaster. A global database improves recovery posture, but it requires a failover plan for application endpoints, secrets, DNS, parameter differences, monitoring, and downstream integrations.
+\index{Aurora Global Database}\index{cross-region replication}\index{regional failover}\index{RPO}\index{RTO}
+
+\begin{tipbox}
+Write down the difference between \emph{planned switchover} and \emph{unplanned failover}. A planned switchover can coordinate writes and reduce data loss. An unplanned failover must prioritize recovery time while accepting that asynchronous replication may have an RPO window.
+\end{tipbox}
+
+\subsection{Aurora Serverless v2}
+Aurora Serverless v2 scales database capacity in Aurora Capacity Units without managing fixed DB instance sizes \cite{awsAuroraServerlessV2}. It is useful for variable workloads, development and testing, SaaS tenants with uneven activity, and operational systems that need finer-grained scaling than scheduled instance changes. Unlike a stateless compute service, database scaling still interacts with connections, transactions, locks, memory pressure, and query plans.
+\index{Aurora Serverless v2}\index{Aurora Capacity Unit}\index{serverless database}\index{connection pooling}
+
+\begin{pitfall}
+\textbf{Assuming serverless means unlimited.} Aurora Serverless v2 scales within configured minimum and maximum ACUs. Connection storms, unbounded queries, missing indexes, and long transactions can still produce throttling, poor latency, or cost surprises.
+\end{pitfall}
+
+\section{Wednesday: AWS DMS and Schema Conversion Tool}
+\subsection{Migration Phases}
+AWS Database Migration Service moves data from supported sources to supported targets with full-load, change data capture, or combined full-load-plus-CDC tasks \cite{awsDMSUserGuide}. Homogeneous migrations, such as PostgreSQL to PostgreSQL, can often use native schema tools plus DMS for replication. Heterogeneous migrations, such as Oracle to Aurora PostgreSQL, require schema assessment, code conversion, data-type mapping, and extensive application testing. AWS Schema Conversion Tool analyzes and converts schema objects where possible, then flags objects that require manual work \cite{awsSCTUserGuide}.
+\index{AWS DMS}\index{AWS SCT}\index{full load}\index{change data capture}\index{heterogeneous migration}
+
+\begin{definitionbox}
+\textbf{Full load} copies existing rows from the source to the target. \textbf{Change data capture} reads ongoing changes from database logs and applies them to the target so the migration can approach cutover with a small lag window.
+\end{definitionbox}
+
+\subsection{Replication Instances, Endpoints, and Tasks}
+A DMS migration uses a replication instance or serverless replication configuration, source and target endpoints, table mappings, task settings, and validation options. The replication resource must reach both databases over the network and must have credentials with enough rights to read source logs and apply target changes. For Oracle sources, supplemental logging, archive log retention, LOB handling, and privileges are frequent planning items.
+\index{replication instance}\index{DMS endpoint}\index{table mapping}\index{LOB migration}\index{supplemental logging}
+
+\begin{notebox}
+DMS is a migration and replication service, not a magic compatibility layer. Stored procedures, triggers, packages, optimizer hints, scheduler jobs, security models, and application SQL must be assessed separately.
+\end{notebox}
+
+\subsection{Validation and Cutover}
+A zero-downtime or near-zero-downtime migration depends on controlling writes. The usual pattern is: assess schema, provision target, convert schema, run full load, keep CDC running, validate row counts and checksums, rehearse cutover, freeze or dual-write source transactions, let lag reach an approved threshold, switch applications, and keep rollback evidence until the business accepts the new system. DMS validation helps, but business reconciliation remains essential \cite{awsDMSBestPractices}.
+
+\begin{tipbox}
+Always define who can approve cutover and rollback before the migration weekend. Technical success is insufficient if finance, supply chain, or operations teams cannot reconcile critical balances after the switch.
+\end{tipbox}
+
+\section{Thursday Hands-on Project: Aurora Serverless v2 and Regional Failover}
+This lab provisions an Aurora PostgreSQL Serverless v2 cluster, creates a secondary-region read path using Aurora Global Database, and rehearses a failover workflow. Replace every account-specific value before running. The commands are written for Windows PowerShell using AWS CLI v2; line continuations use backticks.
+\index{AWS CLI}\index{Boto3}\index{Aurora PostgreSQL}\index{failover drill}
+
+\begin{notebox}
+The lab creates billable database resources. Use a sandbox account, small ACU ranges, restrictive security groups, and short-lived clusters. Clean up global clusters, DB clusters, DB instances, subnet groups, and secrets after testing.
+\end{notebox}
+
+\begin{lstlisting}[language=bash,caption={AWS CLI commands to create an Aurora PostgreSQL Serverless v2 cluster and attach it to a global database.},label={lst:ch2-aurora-cli-create}]
+# Run from Windows PowerShell with AWS CLI v2 configured.
+$PrimaryRegion = "us-east-1"
+$SecondaryRegion = "us-west-2"
+$GlobalClusterId = "erp-aurora-global-demo"
+$PrimaryClusterId = "erp-aurora-primary-demo"
+$SecondaryClusterId = "erp-aurora-secondary-demo"
+$DbName = "erpdb"
+$MasterUser = "erp_admin"
+$PrimarySubnetGroup = "aurora-private-us-east-1"
+$SecondarySubnetGroup = "aurora-private-us-west-2"
+$PrimarySg = "sg-0123456789abcdef0"
+$SecondarySg = "sg-0fedcba9876543210"
+
+aws rds create-global-cluster `
+  --global-cluster-identifier $GlobalClusterId `
+  --engine aurora-postgresql `
+  --engine-version 16.4 `
+  --region $PrimaryRegion
+
+aws rds create-db-cluster `
+  --db-cluster-identifier $PrimaryClusterId `
+  --global-cluster-identifier $GlobalClusterId `
+  --engine aurora-postgresql `
+  --engine-version 16.4 `
+  --database-name $DbName `
+  --master-username $MasterUser `
+  --manage-master-user-password `
+  --serverless-v2-scaling-configuration MinCapacity=0.5,MaxCapacity=4 `
+  --db-subnet-group-name $PrimarySubnetGroup `
+  --vpc-security-group-ids $PrimarySg `
+  --backup-retention-period 7 `
+  --deletion-protection `
+  --region $PrimaryRegion
+
+aws rds create-db-instance `
+  --db-instance-identifier "$PrimaryClusterId-writer-1" `
+  --db-cluster-identifier $PrimaryClusterId `
+  --engine aurora-postgresql `
+  --db-instance-class db.serverless `
+  --region $PrimaryRegion
+\end{lstlisting}
+
+\begin{lstlisting}[language=bash,caption={AWS CLI commands to add a secondary Aurora Global Database cluster and rehearse failover.},label={lst:ch2-aurora-cli-failover}]
+aws rds wait db-cluster-available `
+  --db-cluster-identifier $PrimaryClusterId `
+  --region $PrimaryRegion
+
+aws rds create-db-cluster `
+  --db-cluster-identifier $SecondaryClusterId `
+  --global-cluster-identifier $GlobalClusterId `
+  --engine aurora-postgresql `
+  --engine-version 16.4 `
+  --serverless-v2-scaling-configuration MinCapacity=0.5,MaxCapacity=4 `
+  --db-subnet-group-name $SecondarySubnetGroup `
+  --vpc-security-group-ids $SecondarySg `
+  --region $SecondaryRegion
+
+aws rds create-db-instance `
+  --db-instance-identifier "$SecondaryClusterId-reader-1" `
+  --db-cluster-identifier $SecondaryClusterId `
+  --engine aurora-postgresql `
+  --db-instance-class db.serverless `
+  --region $SecondaryRegion
+
+aws rds describe-global-clusters `
+  --global-cluster-identifier $GlobalClusterId `
+  --query "GlobalClusters[0].GlobalClusterMembers[*].[DBClusterArn,IsWriter]" `
+  --output table `
+  --region $PrimaryRegion
+
+# Planned switchover is preferred for drills because it coordinates roles.
+aws rds switchover-global-cluster `
+  --global-cluster-identifier $GlobalClusterId `
+  --target-db-cluster-identifier "arn:aws:rds:us-west-2:123456789012:cluster:erp-aurora-secondary-demo" `
+  --region $PrimaryRegion
+\end{lstlisting}
+
+\subsection{Boto3 Verification}
+The Boto3 snippet verifies that the global cluster has one writer, collects endpoints, and records failover evidence. In a real test, pair this with SQL-level checks using a PostgreSQL client from a host inside the VPC.
+
+\begin{lstlisting}[language=Python,caption={Boto3 verification for Aurora Global Database membership and endpoints.},label={lst:ch2-aurora-boto3-verify}]
+import json
+import os
+from pathlib import Path
+
+import boto3
+
+primary_region = os.environ.get("PRIMARY_REGION", "us-east-1")
+secondary_region = os.environ.get("SECONDARY_REGION", "us-west-2")
+global_cluster_id = os.environ["GLOBAL_CLUSTER_ID"]
+primary_cluster_id = os.environ["PRIMARY_CLUSTER_ID"]
+secondary_cluster_id = os.environ["SECONDARY_CLUSTER_ID"]
+
+rds_primary = boto3.client("rds", region_name=primary_region)
+rds_secondary = boto3.client("rds", region_name=secondary_region)
+
+global_cluster = rds_primary.describe_global_clusters(
+    GlobalClusterIdentifier=global_cluster_id
+)["GlobalClusters"][0]
+members = global_cluster["GlobalClusterMembers"]
+writers = [member for member in members if member["IsWriter"]]
+assert len(writers) == 1, writers
+
+primary = rds_primary.describe_db_clusters(
+    DBClusterIdentifier=primary_cluster_id
+)["DBClusters"][0]
+secondary = rds_secondary.describe_db_clusters(
+    DBClusterIdentifier=secondary_cluster_id
+)["DBClusters"][0]
+
+evidence = {
+    "global_cluster": global_cluster_id,
+    "writer_cluster_arn": writers[0]["DBClusterArn"],
+    "primary_endpoint": primary.get("Endpoint"),
+    "primary_reader_endpoint": primary.get("ReaderEndpoint"),
+    "secondary_endpoint": secondary.get("Endpoint"),
+    "secondary_reader_endpoint": secondary.get("ReaderEndpoint"),
+    "members": [
+        {"arn": member["DBClusterArn"], "is_writer": member["IsWriter"]}
+        for member in members
+    ],
+}
+
+Path("chapter2-aurora-global-evidence.json").write_text(
+    json.dumps(evidence, indent=2), encoding="utf-8"
+)
+print(json.dumps(evidence, indent=2))
+\end{lstlisting}
+
+\begin{pitfall}
+\textbf{Failing over only the database.} A regional failover also needs secrets, DNS, application configuration, security groups, IAM, monitoring alarms, DMS tasks, job schedulers, and downstream consumers to point at the promoted Region.
+\end{pitfall}
+
+\section{Friday Use Case: Zero-Downtime Oracle ERP Migration to Aurora PostgreSQL}
+A manufacturing company runs a monolithic on-premises Oracle ERP that supports purchasing, inventory, order management, finance, and shop-floor execution. The database is expensive to operate, hard to scale for reporting, and tightly coupled to legacy stored procedures. The target state is Aurora PostgreSQL for transactional workloads, S3 and Redshift for analytics, and DMS-based replication during the migration window.
+\index{Oracle ERP}\index{Aurora PostgreSQL}\index{zero-downtime migration}\index{cutover}
+
+\subsection{Architecture Narrative}
+The migration begins with discovery. SCT assesses schemas, packages, triggers, sequences, materialized views, synonyms, partitioning, data types, and SQL constructs. Objects that convert cleanly become Aurora PostgreSQL DDL. Objects that do not convert become remediation backlog for database developers and application teams. Meanwhile, the platform team provisions Aurora PostgreSQL with Multi-AZ storage, at least one reader, encryption, backups, parameter groups, monitoring, and a cross-region recovery pattern.
+
+DMS then performs a full load from Oracle to Aurora PostgreSQL and continues CDC from Oracle redo or archive logs. During rehearsals, teams compare table counts, financial balances, open orders, inventory quantities, and application smoke tests. The final cutover freezes writes or routes them through a controlled dual-write layer, waits for DMS latency to reach the approved threshold, validates business-critical queries, switches application endpoints, and keeps Oracle read-only until rollback risk has passed.
+
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[
+        sys/.style={rectangle, rounded corners, draw=primary, thick, fill=primary!6, align=center, minimum width=2.6cm, minimum height=0.9cm, font=\small\bfseries},
+        db/.style={cylinder, shape border rotate=90, aspect=0.25, draw=primary, thick, fill=blue!7, align=center, text width=2.5cm, minimum height=1.45cm, font=\small\bfseries},
+        tool/.style={rectangle, rounded corners, draw=orange!85!black, thick, fill=orange!8, align=center, minimum width=2.5cm, minimum height=0.9cm, font=\small\bfseries},
+        check/.style={rectangle, rounded corners, draw=codegreen!60!black, thick, fill=green!7, align=center, minimum width=2.6cm, minimum height=0.9cm, font=\small\bfseries},
+        flow/.style={-{Latex[length=2.5mm]}, draw=primary, thick},
+        cdc/.style={-{Latex[length=2.5mm]}, draw=orange!85!black, thick, dashed}
+    ]
+        \node[sys] (erp) at (0,1.4) {ERP application\\users};
+        \node[db] (oracle) at (0,-0.5) {On-prem\\Oracle};
+        \node[tool] (sct) at (3.4,1.4) {SCT assessment\\schema conversion};
+        \node[tool] (dms) at (3.4,-0.5) {DMS full load\\+ CDC};
+        \node[db] (aurora) at (6.8,-0.5) {Aurora\\PostgreSQL};
+        \node[check] (valid) at (6.8,1.4) {Validation\\reconciliation};
+        \node[db] (dr) at (10.1,-0.5) {Cross-region\\read replica};
+        \node[sys] (newerp) at (10.1,1.4) {ERP endpoint\\after cutover};
+        \draw[flow] (erp) -- (oracle);
+        \draw[flow] (oracle) -- (sct);
+        \draw[cdc] (oracle) -- (dms);
+        \draw[flow] (sct) -- (aurora);
+        \draw[cdc] (dms) -- (aurora);
+        \draw[flow] (aurora) -- (valid);
+        \draw[cdc] (aurora) -- node[below,font=\scriptsize\bfseries,text=orange!85!black]{DR replication} (dr);
+        \draw[flow] (valid) -- (newerp);
+        \draw[flow] (newerp) -- (aurora);
+    \end{tikzpicture}%
+    }
+    \caption{Zero-downtime Oracle ERP migration pattern using SCT for schema conversion, DMS for full load and CDC, validation for business reconciliation, and Aurora PostgreSQL with cross-region recovery for the target.}
+    \label{fig:oracle-erp-migration}
+\end{figure}
+
+\subsection{Operational Decisions}
+\textbf{Source readiness.} Oracle supplemental logging, archive log retention, network connectivity, and read privileges must be in place before DMS starts. The source must keep enough logs to survive DMS pauses without losing CDC continuity.
+
+\textbf{Target readiness.} Aurora PostgreSQL parameter groups, extensions, schemas, roles, vacuum behavior, indexes, and connection pooling must be tested under realistic ERP concurrency. Load indexes strategically; sometimes a full load is faster before building selected secondary indexes, but constraints required for correctness cannot be skipped casually.
+
+\textbf{Cutover control.} The business needs a cutover commander, rollback owner, reconciliation owners, and a communication plan. Technical DMS latency is only one metric; financial totals, order status, inventory balances, and integration queues decide whether the ERP is ready.
+
+\begin{pitfall}
+\textbf{Underestimating stored procedures and batch jobs.} Oracle ERP systems often contain business logic in packages, triggers, scheduler jobs, and ad hoc reports. Schema conversion without application and batch remediation is not a complete migration.
+\end{pitfall}
+
+\section{Interview Q\&A}
+\subsection{Concepts and Trade-offs}
+\begin{enumerate}
+    \item \textbf{Q: What is the difference between RDS Multi-AZ and a Read Replica?}\\
+    A: Multi-AZ provides synchronous standby capacity for high availability and failover. A Read Replica uses asynchronous replication for read scaling, reporting, or migration staging and can lag behind the writer.
+    \item \textbf{Q: Why can Aurora fail over faster than many traditional databases?}\\
+    A: Aurora separates compute from a distributed cluster volume. A replica can be promoted without copying an entire database volume because the storage layer is already shared and replicated.
+    \item \textbf{Q: When would you use Aurora Global Database?}\\
+    A: Use it when a workload needs low-latency cross-region reads or a stronger regional disaster-recovery posture than backups alone. It still requires application and operations failover planning.
+    \item \textbf{Q: What does Aurora Serverless v2 solve, and what does it not solve?}\\
+    A: It provides fine-grained capacity scaling for variable workloads. It does not eliminate schema tuning, connection management, transaction design, or maximum-capacity planning.
+    \item \textbf{Q: What is the role of SCT in an Oracle to Aurora PostgreSQL migration?}\\
+    A: SCT assesses and converts schema objects where possible and identifies manual remediation for incompatible SQL, procedural code, data types, and database features.
+    \item \textbf{Q: Why is CDC important for near-zero-downtime migration?}\\
+    A: CDC keeps the target current while the source remains online after the initial full load. Cutover can then happen after replication lag and business validation reach approved thresholds.
+\end{enumerate}
+
+\section{Further Reading}
+Start with the Amazon RDS User Guide for instance, backup, monitoring, security, Multi-AZ, and replica behavior \cite{awsRDSUserGuide}. Review RDS Multi-AZ and Read Replica documentation before promising RTO or read-scaling outcomes \cite{awsRDSMultiAZ,awsRDSReadReplicas}. Study the Aurora User Guide, especially storage reliability, endpoints, Global Database, and Serverless v2 capacity scaling \cite{awsAuroraUserGuide,awsAuroraStorage,awsAuroraGlobalDatabase,awsAuroraServerlessV2}. For migrations, read the AWS DMS User Guide, AWS SCT User Guide, and DMS best-practices guidance before designing an Oracle ERP cutover \cite{awsDMSUserGuide,awsSCTUserGuide,awsDMSBestPractices}.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item RDS is managed infrastructure for familiar relational engines, but customers still own schema design, query behavior, access control, and workload isolation.
+    \item Multi-AZ protects database availability; Read Replicas and Aurora Replicas address read scaling and can introduce asynchronous lag.
+    \item Aurora separates compute from a distributed storage layer, enabling fast replica operations, failover, and cloud-native durability patterns.
+    \item Aurora Global Database supports cross-region reads and disaster recovery, but application failover, secrets, networking, and monitoring must be rehearsed.
+    \item Aurora Serverless v2 scales database capacity within configured ACU limits; it is not a substitute for indexing, pooling, and transaction discipline.
+    \item DMS and SCT can reduce migration downtime and conversion effort, but heterogeneous ERP migrations still require business reconciliation and application remediation.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Explain why a traditional RDS Multi-AZ standby is not used for reporting traffic. What problem does it solve instead?
+    \item \textbf{(Conceptual)} Compare RDS Read Replicas and Aurora Replicas. Include replication behavior, failover use, and reporting risk.
+    \item \textbf{(Hands-on)} Use AWS CLI in a sandbox to describe an existing RDS or Aurora cluster and identify engine version, backup retention, deletion protection, endpoints, and Multi-AZ or replica status.
+    \item \textbf{(Hands-on)} Modify \cref{lst:ch2-aurora-boto3-verify} to write CloudWatch-style metrics for global-cluster writer Region and replica count.
+    \item \textbf{(Design)} Design an RDS PostgreSQL deployment for a billing system with strict RTO requirements and moderate reporting load. Choose Multi-AZ, replicas, backups, and monitoring.
+    \item \textbf{(Migration)} List the prerequisites for DMS CDC from Oracle to Aurora PostgreSQL. Include source logging, privileges, network, LOB handling, and validation.
+    \item \textbf{(Governance)} Create a cutover checklist for an ERP migration that includes technical, financial, security, and business sign-offs.
+    \item \textbf{(Architecture)} Extend \cref{fig:oracle-erp-migration} with S3, Glue, and Redshift for analytics offload. Explain how you avoid reporting queries against the OLTP writer.
+\end{enumerate}
+
+\section{Capstone Project: Migrating and Operating a Cross-Region Aurora PostgreSQL Fleet for Oracle ERP Cutover}\label{sec:ch2-capstone}
+\index{capstone project}\index{Aurora PostgreSQL!capstone}\index{Oracle ERP migration!capstone}\index{DMS!capstone}\index{Aurora Global Database!capstone}
+
+\begin{capstonebox}
+\textbf{Mission.} Migrate and operate a highly available, cross-region Aurora PostgreSQL fleet for an Oracle ERP cutover. Your platform must support schema conversion, full-load migration, CDC replication, validation, planned cutover, regional failover, and post-cutover operations.
+
+\textbf{Estimated time.} 6--8 hours in a sandbox AWS account for infrastructure and rehearsal artifacts, plus optional time for application SQL remediation and performance testing.
+
+\textbf{What you\textquotesingle{}ll practice.}
+\begin{itemize}
+    \item Translating Oracle ERP migration requirements into Aurora PostgreSQL capacity, HA, backup, monitoring, security, and cross-region recovery decisions.
+    \item Using SCT assessment outputs and DMS full-load-plus-CDC tasks to reduce downtime during heterogeneous migration.
+    \item Verifying Aurora Global Database or cross-region read-replica readiness, failover evidence, replication lag, and application endpoint cutover.
+    \item Producing business-facing acceptance criteria for reconciliation, rollback, and operational handoff.
+\end{itemize}
+\end{capstonebox}
+
+\subsection*{Scenario}
+A manufacturing enterprise is replacing an on-premises Oracle ERP database with Aurora PostgreSQL. The ERP supports procurement, inventory, manufacturing execution, sales orders, shipping, accounts payable, and general ledger. Downtime must be minimized because warehouses and production lines operate across time zones. The source database contains decades of transactional history, Oracle packages, triggers, sequences, materialized views, and nightly batch jobs.
+
+The target platform must run in a primary AWS Region with high availability across Availability Zones and a secondary Region for disaster recovery. The migration team must prove that DMS can keep the target current, that SCT conversion gaps are remediated or accepted, that critical business totals reconcile, and that operators can promote the secondary Region if the primary Region is unavailable.
+
+\subsection*{Requirements}
+\textbf{Functional requirements.}
+\begin{itemize}
+    \item Produce an SCT assessment summary that classifies schema objects as automatically converted, manually remediated, retired, or deferred.
+    \item Provision Aurora PostgreSQL with encryption, backup retention, deletion protection, at least one reader, Performance Insights, database logs, and restricted network access.
+    \item Configure cross-region recovery using Aurora Global Database or a documented cross-region replica pattern with explicit RPO and RTO targets.
+    \item Create DMS source and target endpoints, table mappings, and a full-load-plus-CDC task for ERP schemas selected for the cutover rehearsal.
+    \item Validate row counts, sample checksums, sequence alignment, referential integrity, and business totals for orders, inventory, invoices, and ledger balances.
+    \item Define cutover steps that freeze or control writes, drain replication lag, switch application endpoints, verify smoke tests, and preserve rollback evidence.
+\end{itemize}
+
+\textbf{Non-functional requirements.}
+\begin{itemize}
+    \item The target database must be highly available within the primary Region and recoverable in the secondary Region.
+    \item Secrets must be stored outside scripts, preferably in AWS Secrets Manager, and database access must follow least privilege.
+    \item DMS replication lag, task errors, table errors, database CPU, memory, storage, connections, deadlocks, and slow queries must be observable.
+    \item The migration must have a named cutover owner, rollback owner, validation owners, and business sign-off process.
+    \item The final design must avoid analytical reporting against the Aurora writer by using replicas, S3 exports, or downstream analytical stores.
+\end{itemize}
+
+\subsection*{Reference Architecture}
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[
+        box/.style={rectangle, rounded corners, draw=primary, thick, fill=primary!5, align=center, minimum width=2.4cm, minimum height=0.85cm, font=\small\bfseries},
+        db/.style={cylinder, shape border rotate=90, aspect=0.25, draw=primary, thick, fill=blue!7, align=center, text width=2.5cm, minimum height=1.35cm, font=\small\bfseries},
+        tool/.style={rectangle, rounded corners, draw=orange!85!black, thick, fill=orange!8, align=center, minimum width=2.5cm, minimum height=0.85cm, font=\small\bfseries},
+        ops/.style={rectangle, rounded corners, draw=red!60!black, thick, fill=red!5, align=center, minimum width=2.5cm, minimum height=0.85cm, font=\footnotesize\bfseries},
+        flow/.style={-{Latex[length=2.4mm]}, draw=primary, thick},
+        repl/.style={-{Latex[length=2.4mm]}, draw=orange!85!black, thick, dashed}
+    ]
+        \node[db] (oracle) at (0,0) {On-prem\\Oracle ERP};
+        \node[tool] (sct) at (0,2.0) {SCT\\assessment};
+        \node[tool] (dms) at (3.2,0) {DMS\\full load + CDC};
+        \node[db] (aurora) at (6.4,0) {Aurora PostgreSQL\\primary Region};
+        \node[db] (reader) at (6.4,-2.0) {Aurora reader\\reporting guardrail};
+        \node[db] (global) at (9.8,0) {Aurora DR\\secondary Region};
+        \node[box] (app) at (6.4,2.0) {ERP application\\endpoint switch};
+        \node[ops] (obs) at (9.8,2.0) {CloudWatch\\PI\\runbooks};
+        \node[box] (lake) at (9.8,-2.0) {S3 / Redshift\\analytics offload};
+        \draw[flow] (oracle) -- (sct);
+        \draw[repl] (oracle) -- (dms);
+        \draw[repl] (dms) -- (aurora);
+        \draw[flow] (sct) -- (aurora);
+        \draw[flow] (app) -- (aurora);
+        \draw[flow] (aurora) -- (reader);
+        \draw[repl] (aurora) -- node[above,font=\scriptsize\bfseries,text=orange!85!black]{global replication} (global);
+        \draw[flow] (obs) -- (aurora);
+        \draw[flow] (reader) -- (lake);
+    \end{tikzpicture}%
+    }
+    \caption{Capstone reference architecture for an Oracle ERP migration to Aurora PostgreSQL with DMS CDC, SCT conversion, high availability, cross-region recovery, observability, and analytics offload.}
+    \label{fig:ch2-capstone-architecture}
+\end{figure}
+
+\subsection*{Implementation Steps}
+\begin{enumerate}
+    \item \textbf{Assess and classify.} Run SCT against the Oracle source, export the assessment, and classify incompatible objects by business criticality and remediation owner.
+    \item \textbf{Provision Aurora.} Create the Aurora PostgreSQL cluster, readers, subnet groups, security groups, parameter groups, Secrets Manager entries, backups, logs, Performance Insights, and deletion protection.
+    \item \textbf{Configure regional recovery.} Create a global database or cross-region replica, document RPO and RTO, and run a planned switchover or failover rehearsal.
+    \item \textbf{Create DMS migration tasks.} Configure source and target endpoints, table mappings, full-load-plus-CDC settings, validation, logging, and CloudWatch alarms.
+    \item \textbf{Reconcile data.} Compare row counts, checksums, sequence values, totals, and application smoke-test outputs. Record exceptions and owners.
+    \item \textbf{Execute cutover rehearsal.} Freeze writes or enable controlled dual-write, wait for CDC lag to drain, switch a test application endpoint, validate transactions, and document rollback steps.
+\end{enumerate}
+
+\begin{lstlisting}[language=bash,caption={PowerShell-oriented AWS CLI skeleton for Aurora PostgreSQL fleet creation.},label={lst:ch2-capstone-aurora-cli}]
+$Region = "us-east-1"
+$DrRegion = "us-west-2"
+$ClusterId = "erp-prod-aurora-pg"
+$GlobalClusterId = "erp-prod-global"
+$DbName = "erp"
+$SubnetGroup = "erp-private-db-subnets"
+$SecurityGroup = "sg-0123456789abcdef0"
+$KmsKeyId = "arn:aws:kms:us-east-1:123456789012:key/aurora-key"
+
+aws rds create-global-cluster `
+  --global-cluster-identifier $GlobalClusterId `
+  --engine aurora-postgresql `
+  --engine-version 16.4 `
+  --region $Region
+
+aws rds create-db-cluster `
+  --db-cluster-identifier $ClusterId `
+  --global-cluster-identifier $GlobalClusterId `
+  --engine aurora-postgresql `
+  --engine-version 16.4 `
+  --database-name $DbName `
+  --manage-master-user-password `
+  --storage-encrypted `
+  --kms-key-id $KmsKeyId `
+  --backup-retention-period 14 `
+  --deletion-protection `
+  --enable-cloudwatch-logs-exports postgresql `
+  --serverless-v2-scaling-configuration MinCapacity=2,MaxCapacity=32 `
+  --db-subnet-group-name $SubnetGroup `
+  --vpc-security-group-ids $SecurityGroup `
+  --region $Region
+
+aws rds create-db-instance `
+  --db-instance-identifier "$ClusterId-writer-1" `
+  --db-cluster-identifier $ClusterId `
+  --engine aurora-postgresql `
+  --db-instance-class db.serverless `
+  --enable-performance-insights `
+  --region $Region
+\end{lstlisting}
+
+\begin{lstlisting}[language=bash,caption={PowerShell-oriented AWS CLI skeleton for DMS endpoints and a full-load-plus-CDC task.},label={lst:ch2-capstone-dms-cli}]
+$DmsReplicationInstanceArn = "arn:aws:dms:us-east-1:123456789012:rep:ABCDEF123456"
+$OracleSecretArn = "arn:aws:secretsmanager:us-east-1:123456789012:secret:oracle-erp"
+$AuroraSecretArn = "arn:aws:secretsmanager:us-east-1:123456789012:secret:aurora-erp"
+$OracleEndpointId = "oracle-erp-source"
+$AuroraEndpointId = "aurora-pg-target"
+$TaskId = "oracle-erp-to-aurora-cdc"
+
+aws dms create-endpoint `
+  --endpoint-identifier $OracleEndpointId `
+  --endpoint-type source `
+  --engine-name oracle `
+  --database-name ERPDB `
+  --secrets-manager-secret-id $OracleSecretArn `
+  --region us-east-1
+
+aws dms create-endpoint `
+  --endpoint-identifier $AuroraEndpointId `
+  --endpoint-type target `
+  --engine-name aurora-postgresql `
+  --database-name erp `
+  --secrets-manager-secret-id $AuroraSecretArn `
+  --region us-east-1
+
+$TableMappings = @"
+{
+  "rules": [
+    {
+      "rule-type": "selection",
+      "rule-id": "include-erp-schema",
+      "rule-name": "include-erp-schema",
+      "object-locator": { "schema-name": "ERP", "table-name": "%" },
+      "rule-action": "include"
+    }
+  ]
+}
+"@
+$TableMappings | Set-Content -Path ch2-dms-table-mappings.json -Encoding ascii
+
+aws dms create-replication-task `
+  --replication-task-identifier $TaskId `
+  --source-endpoint-arn "arn:aws:dms:us-east-1:123456789012:endpoint:SOURCE" `
+  --target-endpoint-arn "arn:aws:dms:us-east-1:123456789012:endpoint:TARGET" `
+  --replication-instance-arn $DmsReplicationInstanceArn `
+  --migration-type full-load-and-cdc `
+  --table-mappings file://ch2-dms-table-mappings.json `
+  --replication-task-settings file://ch2-dms-task-settings.json `
+  --region us-east-1
+\end{lstlisting}
+
+\begin{lstlisting}[language=Python,caption={Boto3 evidence collector for DMS task status and Aurora cluster posture.},label={lst:ch2-capstone-boto3-evidence}]
+import json
+import os
+from pathlib import Path
+
+import boto3
+
+region = os.environ.get("AWS_REGION", "us-east-1")
+cluster_id = os.environ["AURORA_CLUSTER_ID"]
+task_id = os.environ["DMS_TASK_ID"]
+
+rds = boto3.client("rds", region_name=region)
+dms = boto3.client("dms", region_name=region)
+
+cluster = rds.describe_db_clusters(DBClusterIdentifier=cluster_id)["DBClusters"][0]
+instances = rds.describe_db_instances()["DBInstances"]
+cluster_instances = [
+    instance for instance in instances
+    if instance.get("DBClusterIdentifier") == cluster_id
+]
+
+tasks = dms.describe_replication_tasks(
+    Filters=[{"Name": "replication-task-id", "Values": [task_id]}]
+)["ReplicationTasks"]
+assert tasks, f"DMS task {task_id} not found"
+task = tasks[0]
+
+summary = {
+    "cluster_id": cluster_id,
+    "engine": cluster["Engine"],
+    "engine_version": cluster["EngineVersion"],
+    "multi_az_members": cluster.get("AvailabilityZones", []),
+    "backup_retention_days": cluster["BackupRetentionPeriod"],
+    "deletion_protection": cluster.get("DeletionProtection"),
+    "cluster_endpoint": cluster.get("Endpoint"),
+    "reader_endpoint": cluster.get("ReaderEndpoint"),
+    "instance_count": len(cluster_instances),
+    "dms_task_status": task["Status"],
+    "dms_migration_type": task["MigrationType"],
+    "dms_stop_reason": task.get("StopReason"),
+}
+
+Path("ch2-capstone-evidence.json").write_text(
+    json.dumps(summary, indent=2), encoding="utf-8"
+)
+print(json.dumps(summary, indent=2))
+\end{lstlisting}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item Architecture summary with primary Region, secondary Region, RPO, RTO, Aurora sizing, backup policy, security posture, and failover plan.
+    \item SCT assessment summary showing automatic conversions, manual remediations, retired objects, and owners for unresolved issues.
+    \item Aurora configuration evidence: engine version, endpoints, readers, backup retention, encryption, deletion protection, Performance Insights, logs, and parameter groups.
+    \item DMS artifacts: endpoint definitions, table mappings, task settings, validation settings, CloudWatch alarms, and replication-lag evidence.
+    \item Reconciliation packet with row counts, checksums or sample comparisons, sequence validation, and business totals for critical ERP domains.
+    \item Cutover and rollback runbook with command sequence, approval gates, communications, smoke tests, and rollback criteria.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item Aurora PostgreSQL is deployed with encryption, backups, deletion protection, monitoring, and at least one reader in the primary Region.
+    \item Cross-region recovery is configured and the team has documented whether failover is planned switchover, unplanned failover, or restore from backup.
+    \item DMS full-load-plus-CDC task reaches running or load-complete status in rehearsal, and replication lag is measured before cutover.
+    \item SCT findings are triaged; no critical Oracle package, trigger, or scheduler dependency is left without an owner or disposition.
+    \item Validation covers both technical counts and business reconciliation for orders, inventory, invoices, and ledger balances.
+    \item Application endpoint switching is rehearsed without hardcoded database hostnames in application code or batch jobs.
+    \item Rollback criteria are explicit, time-bound, and approved by business and technical owners before the cutover window.
+    \item Analytical workloads are routed away from the Aurora writer through readers, S3 exports, Redshift, or another downstream store.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Add AWS DMS premigration assessment and validation reports to the acceptance packet, including table-level error thresholds.
+    \item Use AWS Secrets Manager rotation for Aurora credentials and document how applications refresh connections safely.
+    \item Add RDS Proxy or PgBouncer-style pooling for application connection storms, then test failover behavior with pooled connections.
+    \item Export selected Aurora tables to S3 and build a Redshift or Athena reporting path that eliminates ad hoc reporting against the writer.
+    \item Build CloudWatch dashboards for ACU usage, CPU, database connections, deadlocks, commit latency, replica lag, DMS CDCLatencySource, and CDCLatencyTarget.
+    \item Run a game day that simulates primary-region unavailability, promotes the secondary database, switches a read-only application, and documents failback reconciliation.
+\end{itemize}

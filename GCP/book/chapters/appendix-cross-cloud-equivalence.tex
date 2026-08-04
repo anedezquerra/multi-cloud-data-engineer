@@ -1,0 +1,295 @@
+\chapter{Cross-Cloud Service Equivalence}
+\index{cross-cloud equivalence}\index{service mapping}\index{multi-cloud}%
+This appendix is a living reference that maps conceptually equivalent services and
+ideas across the six platforms studied in this book series: Amazon Web Services
+(AWS), Microsoft Azure, Microsoft Fabric, Google Cloud Platform (GCP), MongoDB, and
+Snowflake. The names differ, but the underlying data-engineering concepts---durable
+object storage, tiered lifecycle economics, immutability, managed relational engines,
+elastic compute, and disciplined data organization---recur everywhere.
+
+\begin{notebox}
+This appendix grows with each chapter. Every new chapter contributes the equivalence
+tables introduced in its cross-cloud callout, so by the end of the book you will hold
+a single consolidated Rosetta Stone for moving fluently between clouds. Where a clean
+one-to-one mapping does not exist, the prose notes the closest analog and the caveat.
+\end{notebox}
+
+\section{Object and Data-Lake Storage}
+\index{object storage!equivalence}\index{storage classes!equivalence}%
+The foundational layer covered in Chapter~1. Every platform offers durable, HTTP-addressable
+object storage with tiered pricing, lifecycle transitions, versioning, and write-once-read-many
+(WORM) controls.
+
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{2.8cm}p{3.2cm}p{3.2cm}p{3.2cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{AWS} & \textbf{Azure} & \textbf{GCP} \\
+\midrule
+Object storage & Amazon S3 & ADLS Gen2 / Blob & Cloud Storage \\
+Hot tier & S3 Standard & Hot & Standard \\
+Infrequent access & S3 Standard-IA & Cool & Nearline \\
+Archive (instant) & Glacier Instant Retrieval & Cold & Coldline \\
+Deep archive & Glacier Deep Archive & Archive & Archive \\
+Lifecycle rules & Lifecycle policies & Lifecycle management & Object Lifecycle Mgmt \\
+Versioning & S3 Versioning & Blob versioning & Object Versioning \\
+Immutability (WORM) & Object Lock & Immutable blob storage & Bucket Lock \\
+Cross-region copy & CRR / SRR & Object replication & Dual/multi-region + Transfer \\
+Encryption at rest & SSE-S3 / SSE-KMS & SSE + CMK (Key Vault) & Google-managed / CMEK \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent The three remaining platforms approach storage differently.
+\textbf{Microsoft Fabric} exposes a single logical lake, \emph{OneLake}, and uses
+\emph{shortcuts} to virtualize S3, ADLS Gen2, and Google Cloud Storage in place without copying.
+\textbf{Snowflake} abstracts storage entirely: table data lives in cloud object storage as
+immutable, columnar \emph{micro-partitions} that the service manages on your behalf.
+\textbf{MongoDB} persists documents through the \emph{WiredTiger} storage engine, balancing an
+internal cache against the operating-system page cache rather than exposing storage tiers.
+
+\section{Managed Relational Databases}
+\index{relational databases!equivalence}%
+The focus of Chapter~2 for the three hyperscalers. Each provides a fully managed relational
+engine, a cloud-native high-performance variant, high availability, read replicas, and a
+migration service.
+
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{2.8cm}p{3.2cm}p{3.2cm}p{3.2cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{AWS} & \textbf{Azure} & \textbf{GCP} \\
+\midrule
+Managed relational & Amazon RDS & Azure SQL Database & Cloud SQL \\
+Cloud-native engine & Amazon Aurora & SQL Hyperscale & AlloyDB \\
+Managed PostgreSQL & RDS / Aurora PostgreSQL & Azure DB for PostgreSQL & Cloud SQL / AlloyDB \\
+High availability & Multi-AZ & Zone-redundant HA & Regional HA \\
+Read scaling & Read Replicas & Read replicas / geo-replicas & Read Replicas \\
+Global / geo & Aurora Global Database & Active geo-replication & Cross-region replicas \\
+Serverless compute & Aurora Serverless v2 & Azure SQL Serverless & AlloyDB (elastic) \\
+Migration service & DMS + SCT & Azure Database Migration Svc & Database Migration Svc \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent \textbf{Snowflake}, \textbf{Fabric}, and \textbf{MongoDB} are not managed relational
+engines, but they solve overlapping problems: Snowflake and Fabric provide SQL analytics over
+warehouse/lakehouse storage, while MongoDB provides a distributed document store whose schema
+design (Chapter~2) replaces rigid relational normalization with intentional, access-driven modeling.
+
+\section{Elastic Compute and Analytical Warehouses}
+\index{elastic compute!equivalence}\index{virtual warehouse!equivalence}%
+Snowflake's Chapter~2 topic---separating compute from storage and scaling it elastically---has a
+counterpart in every analytics platform.
+
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{2.8cm}p{3.2cm}p{3.2cm}p{3.2cm}@{}}
+\toprule
+\textbf{Concept} & \textbf{Snowflake} & \textbf{AWS} & \textbf{Azure / GCP} \\
+\midrule
+Compute unit & Virtual Warehouse & Redshift RA3 / Serverless & Synapse pool / BigQuery slots \\
+Elastic concurrency & Multi-cluster warehouse & Concurrency scaling & Autoscale / on-demand \\
+Pause when idle & Auto-suspend / resume & Pause / resume & Auto-pause / serverless \\
+Billing unit & Credits & RPU / node-hours & DWU / slot-hours \\
+Result reuse & Result cache & Result cache & Result / BI cache \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent \textbf{Microsoft Fabric} meters all workloads against a shared pool of Capacity Units
+(CU) on an F-SKU, an approach closer to a single elastic budget than to per-engine warehouses.
+\textbf{MongoDB Atlas} scales through cluster tiers with optional auto-scaling of compute and storage.
+
+\section{Data Organization and the Medallion Pattern}
+\index{medallion architecture!equivalence}%
+Fabric's Chapter~2 topic---the Bronze/Silver/Gold medallion---is a portable design pattern rather
+than a product. Every platform implements the same progressive-refinement idea with its own primitives.
+
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{2.6cm}p{3.4cm}p{3.4cm}p{3.0cm}@{}}
+\toprule
+\textbf{Layer} & \textbf{Fabric} & \textbf{Data lake (AWS/Azure/GCP)} & \textbf{Snowflake} \\
+\midrule
+Bronze (raw) & Bronze Lakehouse & \texttt{raw/} prefix (S3/ADLS/GCS) & RAW schema / stage \\
+Silver (validated) & Silver Lakehouse & \texttt{validated/} prefix & STAGING schema \\
+Gold (curated) & Gold Lakehouse & \texttt{curated/} prefix & ANALYTICS schema \\
+Storage format & Delta-Parquet & Parquet / Delta / Iceberg & Micro-partitions \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent \textbf{MongoDB} realizes the same separation with distinct collections or databases
+(for example \texttt{raw\_events}, \texttt{validated}, \texttt{curated}) governed by schema-design
+patterns rather than a lake layout.
+
+\section{Document Data Modeling}
+\index{document modeling!equivalence}%
+MongoDB's Chapter~2 schema-design patterns generalize to every document and wide-column store.
+
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{3.0cm}p{3.2cm}p{3.2cm}p{3.0cm}@{}}
+\toprule
+\textbf{Concept} & \textbf{MongoDB} & \textbf{Amazon DynamoDB} & \textbf{Azure Cosmos DB} \\
+\midrule
+Primary access unit & Document / collection & Item / table & Item / container \\
+Partitioning & Shard key & Partition key & Partition key \\
+One-table modeling & Embedding + patterns & Single-table design & Embedding + partitioning \\
+Time-series grouping & Bucket Pattern & Composite sort keys & Bucketing by key \\
+Optional attributes & Attribute Pattern & Sparse attributes & Sparse properties \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent Google Cloud's closest analogs are \textbf{Firestore} and \textbf{Bigtable}. In
+\textbf{Snowflake} and \textbf{Fabric}, semi-structured documents are stored in \texttt{VARIANT}
+(Snowflake) or JSON columns and queried with path expressions rather than modeled as collections.
+
+\section{Globally Distributed and NoSQL Databases}
+\index{NoSQL!equivalence}\index{distributed databases!equivalence}%
+Chapter~3 branches by platform into high-scale NoSQL (AWS DynamoDB, Azure Cosmos DB), globally
+consistent NewSQL (GCP Cloud Spanner), and advanced document modeling (MongoDB). They all answer
+the same question: how to scale a database horizontally across partitions and regions.
+
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{2.8cm}p{2.9cm}p{2.9cm}p{2.9cm}p{2.4cm}@{}}
+\toprule
+\textbf{Concept} & \textbf{DynamoDB} & \textbf{Cosmos DB} & \textbf{Cloud Spanner} & \textbf{MongoDB} \\
+\midrule
+Model & Key-value / doc & Multi-model & Distributed SQL & Document \\
+Partitioning & Partition key & Partition key & Split by key range & Shard key \\
+Throughput unit & RCU / WCU & Request Units (RU) & Nodes / processing units & Cluster tier \\
+Secondary indexes & GSI / LSI & Automatic indexing & Secondary indexes & Indexes \\
+Change stream & DynamoDB Streams & Change Feed & Change streams & Change streams \\
+Expiry & TTL & TTL & (manual) & TTL index \\
+Multi-region & Global Tables & Multi-region writes & Multi-region (synchronous) & Zones / global clusters \\
+Consistency & Eventual / strong & 5 tunable levels & External (TrueTime) & Tunable read/write concern \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent \textbf{Snowflake} and \textbf{Fabric} are analytical platforms rather than OLTP key-value
+stores; they ingest from these operational databases and store semi-structured payloads in
+\texttt{VARIANT}/JSON columns. Google's dedicated NoSQL analogs are \textbf{Firestore} (document)
+and \textbf{Bigtable} (wide-column).
+
+\section{Managed Apache Spark}
+\index{Apache Spark!equivalence}%
+Microsoft Fabric's Chapter~3 topic---managed Spark pools and notebooks---has a first-class
+equivalent on every cloud.
+
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{2.8cm}p{3.2cm}p{3.2cm}p{3.2cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{Fabric} & \textbf{AWS} & \textbf{Azure / GCP} \\
+\midrule
+Managed Spark & Starter / Custom pools & Glue / EMR / EMR Serverless & Synapse Spark / Databricks; Dataproc \\
+Notebook UX & Fabric Notebooks & Glue Studio / EMR Studio & Synapse / Databricks; Vertex AI \\
+Serverless option & Autoscaling pools & Glue / EMR Serverless & Synapse serverless; Dataproc Serverless \\
+Lake format & Delta on OneLake & Delta / Iceberg / Hudi & Delta; Delta / Iceberg \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent \textbf{Snowflake} offers \textbf{Snowpark} for DataFrame-style processing, and
+\textbf{MongoDB} integrates through the Spark Connector.
+
+\section{Query Acceleration and Materialized Views}
+\index{materialized views!equivalence}\index{query acceleration!equivalence}%
+Snowflake's Chapter~3 acceleration tools---materialized views, the Search Optimization Service, and
+transient/temporary tables---map to comparable features in every warehouse.
+
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{2.8cm}p{3.0cm}p{3.0cm}p{3.4cm}@{}}
+\toprule
+\textbf{Feature} & \textbf{Snowflake} & \textbf{AWS Redshift} & \textbf{Azure Synapse / GCP BigQuery} \\
+\midrule
+Materialized views & Materialized Views & Materialized views & Materialized views \\
+Point-lookup accel. & Search Optimization Svc & Sort keys / zone maps & (indexing) / search indexes \\
+Result reuse & Result cache & Result cache & Result-set cache / BI Engine \\
+Ephemeral tables & Transient / temporary & Temp tables & Temp tables \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent \textbf{Fabric} accelerates reads through Direct Lake and its Warehouse engine, while
+\textbf{MongoDB} relies on secondary and compound indexes plus the in-memory working set.
+
+\section{In-Memory Caching and Hybrid Ingestion}
+\index{caching!equivalence}\index{in-memory cache!equivalence}%
+The AWS and Azure Chapter~4 topic---low-latency caching in front of a durable store, fed by hybrid
+(edge-to-cloud) ingestion---has a managed Redis-compatible equivalent on every cloud.
+
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{2.8cm}p{3.0cm}p{3.0cm}p{3.4cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{AWS} & \textbf{Azure} & \textbf{GCP / others} \\
+\midrule
+Managed cache & ElastiCache (Redis/Memcached) & Cache for Redis & Memorystore (Redis/Memcached) \\
+Real-time API layer & AppSync / API Gateway & API Management / SignalR & API Gateway / Apigee \\
+Hybrid ingestion & DataSync / Snow family / IoT Core & Data Box / IoT Hub / Arc & Transfer Appliance / IoT Core \\
+Streaming intake & Kinesis / MSK & Event Hubs & Pub/Sub \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent \textbf{Snowflake} and \textbf{Fabric} rely on result and Direct~Lake caches rather than a
+standalone Redis tier, while \textbf{MongoDB} serves hot data from its in-memory working set and
+Atlas can pair with an external cache.
+
+\section{Wide-Column and Key-Value NoSQL}
+\index{wide-column!equivalence}\index{Bigtable!equivalence}%
+GCP's Chapter~4 topic---Cloud Bigtable---is a wide-column, high-throughput, low-latency NoSQL store.
+Its peers span the managed and open-source ecosystems.
+
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{2.8cm}p{3.0cm}p{3.0cm}p{3.4cm}@{}}
+\toprule
+\textbf{Characteristic} & \textbf{GCP Bigtable} & \textbf{AWS} & \textbf{Azure / open source} \\
+\midrule
+Data model & Wide-column & DynamoDB (key-value/doc) & Cosmos DB (multi-model) \\
+HBase-compatible & HBase API & Keyspaces (Cassandra) & Managed Instance for Cassandra \\
+Scaling unit & Nodes / clusters & On-demand / provisioned & RU/s (Cosmos) \\
+Best fit & Time-series, IoT, ad-tech & Serverless key-value & Global multi-model \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent \textbf{Snowflake} and \textbf{Fabric} address these workloads analytically rather than as
+operational key-value stores; \textbf{MongoDB} covers the document end of the same NoSQL spectrum.
+
+\section{Data Protection: Cloning, Time Travel, and Migration}
+\index{cloning!equivalence}\index{time travel!equivalence}\index{point-in-time recovery!equivalence}%
+Snowflake's Chapter~4 topic---zero-copy cloning, Time Travel, and Fail-safe---plus MongoDB's
+relational-to-document migration map to data-protection and migration tooling across the clouds.
+
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{2.8cm}p{3.0cm}p{3.0cm}p{3.4cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{Snowflake} & \textbf{AWS / Azure} & \textbf{GCP / Fabric} \\
+\midrule
+Instant clone & Zero-copy clone & Aurora clone / SQL DB copy & BigQuery table clone; OneLake shortcut \\
+Point-in-time recovery & Time Travel & PITR (RDS/SQL DB backups) & PITR; Delta time travel \\
+Retention safety net & Fail-safe (7 days) & Automated backups & Backups; Delta VACUUM window \\
+Schema migration & --- & DMS / SCT & Database Migration Service \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent \textbf{MongoDB} migrations use \textbf{Relational Migrator} plus the embed-vs-reference
+patterns from Chapter~4, and \textbf{Delta Lake} exposes historical versions through
+\texttt{VERSION AS OF} time-travel queries.
+
+\begin{tipbox}
+Use this appendix as a study aid for the book's lockstep, cross-cloud approach: when you learn a
+concept on one platform, immediately locate its equivalent here and predict how the other five
+would express the same idea. That habit turns six separate vocabularies into one mental model.
+\end{tipbox}
