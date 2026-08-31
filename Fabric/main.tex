@@ -18,6 +18,20 @@
 \usepackage{enumitem}   % For customized lists
 \usepackage{xcolor}     % For colored highlights
 \usepackage[colorlinks=true, linkcolor=blue]{hyperref} % For internal links
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta, positioning, shapes.geometric, shapes.multipart, backgrounds, fit}
+\usepackage{listings}
+\lstdefinestyle{code}{
+    basicstyle=\ttfamily\footnotesize,
+    breaklines=true,
+    frame=single,
+    backgroundcolor=\color{gray!8},
+    rulecolor=\color{gray!40},
+    columns=fullflexible,
+    keepspaces=true,
+    showstringspaces=false
+}
+\lstset{style=code}
 
 % --- CUSTOM COMMANDS ---
 \newcommand{\project}[1]{\vspace{1mm}\noindent\textbf{\textcolor{blue}{Hands-on Project:}} #1}
@@ -32,6 +46,30 @@
     \vspace{3mm}
 }
 \newcommand{\dayitem}[2]{\item \textbf{#1:} #2}
+% Rubric box: capstone acceptance criteria
+\newcommand{\rubric}[1]{
+    \vspace{1mm}
+    \noindent\fbox{
+        \parbox{0.97\textwidth}{
+            \textbf{\textcolor{orange}{Acceptance Criteria:}} #1
+        }
+    }
+    \vspace{2mm}
+}
+% Weekly curated resources
+\newcommand{\resources}[1]{\vspace{1mm}\noindent\textbf{\textcolor{violet}{Resources:}} #1}
+% Production hardening note
+\newcommand{\prodnote}[1]{
+    \vspace{1mm}
+    \noindent\fbox{
+        \parbox{0.97\textwidth}{
+            \textbf{\textcolor{brown}{Production Note:}} \textit{#1}
+        }
+    }
+    \vspace{1mm}
+}
+% Weekly self-check questions
+\newcommand{\selfcheck}[1]{\vspace{1mm}\noindent\textbf{\textcolor{purple}{Self-check:}} #1}
 
 \title{\Huge \textbf{Microsoft Fabric Master Data Engineer}\\ \Large 6-Month Exhaustive Training \& Certification Program}
 \author{Advanced Architecture, Hands-on Labs, and MLOps}
@@ -48,13 +86,32 @@
 \tableofcontents
 \newpage
 
+\section*{Prerequisites \& How to Use This Syllabus}
+\begin{itemize}[label=-]
+    \item \textbf{Prerequisite skills:} Working knowledge of Python (PySpark preferred), T-SQL fundamentals, Git basics, command-line comfort, and general cloud concepts. No prior Microsoft Fabric experience is required; Azure portal familiarity helps.
+    \item \textbf{Weekly cadence:} Plan for 10--12 hours per week. Monday--Wednesday cover theory and concepts, Thursday is a mandatory hands-on project, and Friday is an architecture use case review.
+    \item \textbf{Deliverables:} Every monthly capstone must produce a Git repository, an architecture diagram, a capacity cost estimate, and a security review checklist, as defined in the Acceptance Criteria boxes.
+    \item \textbf{Assessment:} The 24-week tracking timetable at the end of this document doubles as the assessment checklist --- a week is only ``done'' when its project is committed and reproducible.
+\end{itemize}
+
+\noindent\textbf{Environment setup checklist:}
+\begin{itemize}[label=$\square$, leftmargin=8mm]
+    \item Install Python 3.x, Git, Docker Desktop, and VS Code (with Python and Power BI/Fabric extensions).
+    \item Install the Azure CLI (\texttt{az}) and sign in; install SQL Server Management Studio (SSMS) for the SQL analytics endpoint.
+    \item Create a free Microsoft Fabric trial account (60-day trial capacity) and enable Fabric in your tenant.
+    \item Clone your course repository structure: \texttt{data/}, \texttt{src/}, \texttt{tests/}, \texttt{infra/}, \texttt{docs/}.
+    \item Configure credentials via environment variables (e.g., \texttt{AZURE\_CLIENT\_ID}, connection strings in Azure Key Vault) --- never hardcode secrets in notebooks or pipelines.
+\end{itemize}
+
 % ==========================================
 % MILESTONE 1
 % ==========================================
 \section{Milestone 1: Core Data Infrastructure \& OneLake (Month 1)}
 \textit{Objective: Master OneLake, Workspaces, Lakehouses, and the Medallion Architecture.}
+\par\noindent\textbf{Learning outcomes:} provision workspaces and Lakehouses, virtualize external data with OneLake shortcuts, transform data with Spark notebooks, optimize Delta tables with V-Order and time travel
 
 \subsection*{Week 1: OneLake \& Fabric Foundations}
+\par\noindent\textbf{Outcomes:} provision a Fabric workspace and Lakehouse, virtualize external data with OneLake shortcuts, explain capacities and domains
 \begin{itemize}[label=-]
     \dayitem{Monday}{Introduction to Microsoft Fabric: SaaS architecture, Capacities, and Domains.}
     \dayitem{Tuesday}{OneLake concepts: The "OneDrive for Data", Workspaces, and Folders.}
@@ -62,8 +119,19 @@
     \dayitem{Thursday}{\project{Create a Fabric Workspace. Provision a Lakehouse and create a OneLake shortcut to a public Azure Blob Storage container without moving any data.}}
     \dayitem{Friday}{\usecase{Architect a multi-cloud data virtualization strategy for a global retailer that has historical sales in AWS S3 and current CRM data in Dataverse.}}
 \end{itemize}
+\resources{Microsoft OneLake documentation (\url{https://learn.microsoft.com/fabric/onelake/}); Data Engineering Zoomcamp (\url{https://github.com/DataTalksClub/data-engineering-zoomcamp}).}
+\selfcheck{
+\begin{itemize}[label=$\bullet$, leftmargin=6mm, itemsep=0pt]
+    \item What does a OneLake shortcut do instead of copying data?
+    \item What is the difference between a capacity and a workspace?
+    \item Name two external sources supported by OneLake shortcuts.
+    \item Why is Fabric described as SaaS rather than PaaS?
+    \item What problem do domains solve in a large Fabric tenant?
+\end{itemize}
+}
 
 \subsection*{Week 2: The Medallion Architecture}
+\par\noindent\textbf{Outcomes:} apply Bronze/Silver/Gold layering, choose Lakehouse vs.\ Warehouse per workload, isolate medallion layers across workspaces
 \begin{itemize}[label=-]
     \dayitem{Monday}{Medallion principles: Bronze (Raw), Silver (Validated), and Gold (Enriched).}
     \dayitem{Tuesday}{Lakehouse vs. Data Warehouse in Fabric: When to choose which.}
@@ -71,34 +139,179 @@
     \dayitem{Thursday}{\project{Deploy three Lakehouses (Bronze, Silver, Gold). Manually upload raw CSV files to Bronze, and set up the folder structure for future transformations.}}
     \dayitem{Friday}{\usecase{Design a multi-workspace architecture for a financial institution ensuring strict isolation between raw ingested logs and curated financial reports.}}
 \end{itemize}
+\resources{Implement medallion lakehouse architecture in Fabric (\url{https://learn.microsoft.com/fabric/onelake/onelake-medallion-lakehouse-architecture}); Data Engineer Handbook (\url{https://github.com/DataExpert-io/data-engineer-handbook}).}
+\selfcheck{
+\begin{itemize}[label=$\bullet$, leftmargin=6mm, itemsep=0pt]
+    \item Which data quality level belongs in Bronze vs.\ Silver?
+    \item When would you choose a Warehouse over a Lakehouse?
+    \item Why separate workspaces per medallion layer?
+    \item Which Delta component underlies every Lakehouse table?
+    \item Who should hold write access to Gold, and why?
+\end{itemize}
+}
 
 \subsection*{Week 3: Apache Spark in Fabric}
+\par\noindent\textbf{Outcomes:} configure Spark starter and custom pools, cleanse CSV data into Delta with PySpark, combine Spark SQL and PySpark in one notebook
 \begin{itemize}[label=-]
     \dayitem{Monday}{Spark compute in Fabric: Starter pools vs. Custom pools, Spark environments.}
     \dayitem{Tuesday}{Fabric Notebooks: PySpark basics, reading/writing files in OneLake.}
     \dayitem{Wednesday}{Spark SQL and combining PySpark with SQL in the same notebook.}
     \dayitem{Thursday}{\project{Write a PySpark notebook that reads raw CSV data from the Bronze Lakehouse, drops duplicates, drops nulls, and writes to the Silver Lakehouse as Delta tables.}}
+\begin{lstlisting}[language=Python]
+# Medallion cell: Bronze (CSV) -> Silver (Delta) with dedup
+from pyspark.sql import functions as F
+
+bronze_df = (spark.read.format("csv")
+    .option("header", "true")
+    .option("inferSchema", "true")
+    .load("Files/bronze/raw_sales"))
+
+silver_df = (bronze_df
+    .dropDuplicates(["order_id"])            # dedup on business key
+    .dropna(subset=["order_id", "order_date"])
+    .withColumn("ingest_ts", F.current_timestamp()))
+
+(silver_df.write
+    .format("delta")
+    .mode("overwrite")
+    .saveAsTable("silver.sales_clean"))
+\end{lstlisting}
     \dayitem{Friday}{\usecase{Design a scalable ingestion layer for a telemetry system processing 100 GB of JSON logs daily using Spark Notebooks.}}
 \end{itemize}
+\resources{Apache Spark in Fabric docs (\url{https://learn.microsoft.com/fabric/data-engineering/spark-compute}); Apache Spark repository (\url{https://github.com/apache/spark}).}
+\selfcheck{
+\begin{itemize}[label=$\bullet$, leftmargin=6mm, itemsep=0pt]
+    \item What is the difference between a starter pool and a custom pool?
+    \item What does \texttt{dropDuplicates(["order\_id"])} guarantee?
+    \item Why write Silver as Delta instead of plain Parquet files?
+    \item When would you mix Spark SQL and PySpark in one notebook?
+    \item What is the risk of \texttt{inferSchema} on a 100 GB CSV load?
+\end{itemize}
+}
 
 \subsection*{Week 4: Delta Lake Optimization}
+\par\noindent\textbf{Outcomes:} optimize Delta tables with V-Order, OPTIMIZE, and Z-Ordering, recover deleted data via time travel, set a safe VACUUM retention
 \begin{itemize}[label=-]
     \dayitem{Monday}{Delta Lake internals: Parquet files + Transaction logs (JSON).}
     \dayitem{Tuesday}{Optimizing Delta Tables: V-Order, OPTIMIZE, and Z-Ordering.}
     \dayitem{Wednesday}{Managing Delta Tables: VACUUM, Time Travel, and Schema Evolution.}
-    \dayitem{Thursday}{\project{Run an OPTIMIZE command with V-Order on a large Silver table. Use Delta Time Travel to query a previous version of the table after an accidental deletion.}}
+    \dayitem{Thursday}{\project{Run an OPTIMIZE command with V-Order on a large Silver table. Then run a DR restore drill: deliberately delete or overwrite a Gold table, restore it via Delta time travel (\texttt{RESTORE} or a timestamp query), and verify row counts match the pre-delete baseline --- this exercises the recovery path described in the Production Note below.}}
+\begin{lstlisting}[language=Python]
+# DR drill: restore an overwritten/deleted Gold table via Delta time travel
+before = spark.read.table("gold.sales_summary").count()   # baseline
+
+spark.sql("DELETE FROM gold.sales_summary WHERE sale_date < '2024-01-01'")
+print("after delete:", spark.read.table("gold.sales_summary").count())
+
+# Option 1: restore the table to a previous version
+spark.sql("RESTORE TABLE gold.sales_summary TO VERSION AS OF 3")
+
+# Option 2: inspect a point-in-time snapshot without restoring
+# spark.sql("SELECT COUNT(*) FROM gold.sales_summary "
+#           "TIMESTAMP AS OF '2024-06-01T00:00:00Z'").show()
+
+restored = spark.read.table("gold.sales_summary").count()
+assert restored == before, f"DRILL FAIL: {restored} != baseline {before}"
+print("restore verified:", restored)
+\end{lstlisting}
     \dayitem{Friday}{\usecase{Troubleshoot and re-architect a severely degraded Delta table that has accumulated millions of small files (small file problem) over 6 months of streaming.}}
 \end{itemize}
+\prodnote{Delta time travel is your first line of accidental-delete recovery in Fabric: OneLake has no traditional backup/restore, so a bad overwrite or dropped partition is recovered with RESTORE or VERSION AS OF against Delta history. Pair it with soft-delete patterns (tombstone flags) for row-level mistakes, and watch your VACUUM retention --- vacuuming below the retention horizon destroys the very history you rely on.}
+\resources{Use Delta tables in Apache Spark in Fabric (\url{https://learn.microsoft.com/fabric/data-engineering/lakehouse-and-delta-tables}); Delta Lake repository (\url{https://github.com/delta-io/delta}).}
+\selfcheck{
+\begin{itemize}[label=$\bullet$, leftmargin=6mm, itemsep=0pt]
+    \item Which two components make up a Delta table?
+    \item What does V-Order do to the underlying Parquet files?
+    \item How does OPTIMIZE address the small-file problem?
+    \item Why can an aggressive VACUUM break your time-travel recovery plan?
+    \item Which command restores a table to a specific version?
+\end{itemize}
+}
 
 \capstone{Milestone 1}{Build a Spark-driven Medallion Lakehouse. Create Workspaces for Bronze, Silver, and Gold. Use OneLake shortcuts to ingest sample data. Write parameterized Spark notebooks to clean the data (Silver) and aggregate it into a Star Schema (Gold) using Delta format with V-Order enabled.}
+\rubric{
+\begin{itemize}[label=$\bullet$, leftmargin=6mm]
+    \item End-to-end pipeline runs from a clean environment following the repo README.
+    \item Architecture diagram committed (TikZ/draw.io/PNG) showing OneLake, shortcuts, and the three Lakehouses.
+    \item At least 3 automated data-quality tests (null, duplicate-key, schema) with a failing-case demonstration.
+    \item Monitoring evidence: Monitoring Hub screenshot of notebook runs plus Delta history showing a time-travel recovery.
+    \item Monthly capacity cost estimate (CU consumption) with 2 optimization decisions documented (e.g., V-Order, custom pool sizing).
+    \item Security review: least-privilege workspace roles, no hardcoded secrets, PII handling noted.
+\end{itemize}
+}
+
+\subsection*{Milestone 1 Capstone: Reference Solution Sketch}
+\begin{itemize}[label=-, itemsep=0pt]
+    \item \textbf{Architecture:} OneLake shortcuts $\rightarrow$ Bronze Lakehouse (raw files) $\rightarrow$ parameterized Spark notebooks $\rightarrow$ Silver (validated Delta) $\rightarrow$ Gold star schema; chosen for zero-copy multi-cloud ingestion and engine-agnostic Delta storage.
+    \item Create three Lakehouses (Bronze/Silver/Gold) and shortcut external data into Bronze --- no copy jobs.
+    \item Parameterize notebooks by source path and batch date; run Bronze $\rightarrow$ Silver $\rightarrow$ Gold in order from a pipeline.
+    \item Write Silver with dedup on the business key, explicit schemas, and Delta schema enforcement.
+    \item Build Gold as fact + conformed dimensions; enable V-Order and OPTIMIZE with Z-ORDER on join keys.
+    \item Capture Monitoring Hub runs and Delta history for the time-travel recovery demo.
+\end{itemize}
+\begin{lstlisting}[language=Python]
+# Gold optimization: compact files and co-locate join keys
+spark.sql("OPTIMIZE gold.fact_sales ZORDER BY (customer_key)")
+spark.sql("OPTIMIZE gold.dim_customer ZORDER BY (customer_key)")
+# Verify compaction took effect
+(spark.sql("DESCRIBE DETAIL gold.fact_sales")
+      .select("numFiles", "sizeInBytes").show())
+\end{lstlisting}
+\begin{itemize}[label=-, itemsep=0pt]
+    \item \textbf{Pitfall:} \texttt{inferSchema} on large CSVs scans everything and mis-infers --- declare explicit schemas.
+    \item \textbf{Pitfall:} small-file buildup from frequent appends; schedule OPTIMIZE, do not run it ad hoc.
+    \item \textbf{Pitfall:} \texttt{spark.read.table} only sees the attached Lakehouse by default --- use the SQL endpoint or shortcuts for cross-Lakehouse reads.
+\end{itemize}
+
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}[node distance=8mm and 10mm,
+    box/.style={draw, rounded corners, fill=blue!10, align=center, minimum width=2.6cm, minimum height=9mm},
+    ext/.style={draw, rounded corners, fill=gray!10, align=center, minimum width=2.4cm, minimum height=9mm},
+    arrow/.style={-{Stealth}, thick}]
+    \node[ext] (s3) {Amazon S3 /\\ ADLS Gen2};
+    \node[ext, below=of s3] (dv) {Dataverse};
+    \node[box, right=of s3] (onelake) {OneLake\\ (Shortcuts)};
+    \node[box, right=of onelake] (bronze) {Bronze\\ Lakehouse};
+    \node[box, below=of bronze] (silver) {Silver\\ Lakehouse};
+    \node[box, below=of silver] (gold) {Gold\\ Lakehouse};
+    \node[box, fill=orange!10, right=of silver] (spark) {Spark\\ Notebooks};
+    \draw[arrow] (s3) -- (onelake);
+    \draw[arrow] (dv.east) -- ++(4mm,0) |- (onelake.south);
+    \draw[arrow] (onelake) -- (bronze);
+    \draw[arrow] (bronze) -- (silver);
+    \draw[arrow] (silver) -- (gold);
+    \draw[arrow] (spark) -- (silver);
+\end{tikzpicture}
+\caption{Milestone 1 reference architecture: OneLake medallion lakehouse}
+\end{figure}
+
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}[node distance=9mm and 12mm,
+    erd/.style={rectangle split, rectangle split parts=2, draw, rounded corners, fill=blue!8, align=left, font=\footnotesize, inner sep=4pt},
+    rel/.style={-{Stealth}, thick},
+    lbl/.style={font=\scriptsize, midway, above}]
+    \node[erd] (customer) {\textbf{CUSTOMER} \nodepart{second} customer\_id (PK)\\name\\region\\segment};
+    \node[erd, right=of customer] (orders) {\textbf{ORDERS} \nodepart{second} order\_id (PK)\\order\_date\\customer\_id (FK)\\amount};
+    \node[erd, right=of orders] (item) {\textbf{ORDER\_ITEM} \nodepart{second} item\_id (PK)\\order\_id (FK)\\product\_id (FK)\\qty, price};
+    \node[erd, below=of item] (product) {\textbf{PRODUCT} \nodepart{second} product\_id (PK)\\name\\category\\list\_price};
+    \draw[rel] (customer) -- node[lbl]{1:N} (orders);
+    \draw[rel] (orders) -- node[lbl]{1:N} (item);
+    \draw[rel] (product) -- node[lbl, right]{1:N} (item);
+\end{tikzpicture}
+\caption{Capstone data model: medallion sales star (N:M orders--products via ORDER\_ITEM)}
+\end{figure}
 
 % ==========================================
 % MILESTONE 2
 % ==========================================
 \section{Milestone 2: Data Warehousing \& BI Integration (Month 2)}
 \textit{Objective: Deep dive into Synapse Data Warehouse, T-SQL, and DirectLake mode.}
+\par\noindent\textbf{Learning outcomes:} load warehouses with COPY INTO, model star schemas with semantic models and DAX, secure data with RLS, build DirectLake Power BI reports
 
 \subsection*{Week 5: Synapse Data Warehouse in Fabric}
+\par\noindent\textbf{Outcomes:} load millions of rows with COPY INTO, compare pipeline/T-SQL/Dataflow ingestion patterns, estimate capacity cost for a warehouse workload
 \begin{itemize}[label=-]
     \dayitem{Monday}{Fabric Data Warehouse architecture: Compute and Storage separation.}
     \dayitem{Tuesday}{T-SQL in Fabric: Supported surface area, COPY INTO, and cross-database querying.}
@@ -107,7 +320,35 @@
     \dayitem{Friday}{\usecase{Estimate capacity usage and recommend an ingestion pattern (Lakehouse vs. Warehouse) for a legacy SQL Server migration requiring heavy stored procedure usage.}}
 \end{itemize}
 
+\noindent\textbf{Capacity \& cost trade-offs (supports Friday's use case):}
+\begin{center}
+\small
+\begin{tabular}{@{} p{3.6cm} p{3.2cm} p{3.8cm} p{4.4cm} @{}}
+\toprule
+\textbf{Option} & \textbf{Billing model} & \textbf{Best for} & \textbf{Watch-outs} \\
+\midrule
+Fabric capacity reservation (F2--F64, CU-based) & Reserved CUs, monthly/annual commit & Steady production workloads with predictable load & Paying for idle CUs off-hours; throttling if undersized \\
+Fabric pay-as-you-go (F2--F64) & Per-second CU billing; pause/resume any time & Dev/test, bursty or business-hours-only workloads & Easy to forget to pause; unoptimized Spark jobs spike cost \\
+Power BI Premium (P SKU / Premium Per User) & Per-capacity or per-user monthly & BI-heavy estates already on Premium licensing & P SKUs being superseded by F SKUs; PPU limits sharing to PPU users \\
+Fabric free trial & 60-day trial capacity, no cost & Learning, proofs of concept, this syllabus & Expires; unsuitable for production SLAs \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\prodnote{Make COPY INTO loads idempotent: stage files under date-partitioned OneLake paths, drive loads from a manifest or watermark table, and design retries so re-running the same batch never produces duplicate rows. On failure, rerun the batch --- do not hand-patch partial tables.}
+\resources{Fabric Data Warehouse documentation (\url{https://learn.microsoft.com/fabric/data-warehouse/}); Data Engineering Zoomcamp (\url{https://github.com/DataTalksClub/data-engineering-zoomcamp}).}
+\selfcheck{
+\begin{itemize}[label=$\bullet$, leftmargin=6mm, itemsep=0pt]
+    \item When is \texttt{COPY INTO} preferable to a pipeline Copy activity?
+    \item Why does separating compute from storage matter for warehouse scaling?
+    \item Which ingestion pattern best fits a stored-procedure-heavy migration?
+    \item What is the unit of Fabric capacity billing?
+    \item Why pause a pay-as-you-go capacity outside business hours?
+\end{itemize}
+}
+
 \subsection*{Week 6: SQL Analytics Endpoint}
+\par\noindent\textbf{Outcomes:} query Lakehouse tables via the SQL analytics endpoint, build reusable views and TVFs, enforce object-level and row-level security
 \begin{itemize}[label=-]
     \dayitem{Monday}{The automatic SQL Analytics Endpoint for Lakehouses (Read-only).}
     \dayitem{Tuesday}{Creating Views, TVFs, and Stored Procedures over Lakehouse Delta tables.}
@@ -115,17 +356,64 @@
     \dayitem{Thursday}{\project{Connect to a Lakehouse's SQL Analytics Endpoint via SQL Server Management Studio (SSMS). Create a View joining a Silver Delta table with a Gold Delta table.}}
     \dayitem{Friday}{\usecase{Design a logical data warehouse architecture allowing data analysts to query raw data lake files using purely T-SQL without duplicating the data.}}
 \end{itemize}
+\resources{SQL analytics endpoint documentation (\url{https://learn.microsoft.com/fabric/data-engineering/lakehouse-sql-analytics-endpoint}); DuckDB repository (\url{https://github.com/duckdb/duckdb}).}
+\selfcheck{
+\begin{itemize}[label=$\bullet$, leftmargin=6mm, itemsep=0pt]
+    \item Why is the SQL analytics endpoint read-only?
+    \item Which object would you create to reuse a join across reports?
+    \item How does RLS differ from object-level security?
+    \item What happens when you query a shortcut through the endpoint?
+    \item Why connect via SSMS instead of only the web editor?
+\end{itemize}
+}
 
 \subsection*{Week 7: Data Modeling for Power BI}
+\par\noindent\textbf{Outcomes:} model a Kimball star schema with declared grain, implement SCD Type 2 merges, define relationships and DAX measures in a semantic model
 \begin{itemize}[label=-]
-    \dayitem{Monday}{Dimensional modeling: Star schemas, Facts, and Dimensions.}
+    \dayitem{Monday}{Kimball dimensional modeling: declare the grain first (what one fact row means), fact table types (transaction, periodic snapshot, accumulating snapshot), conformed dimensions shared across fact tables, and Slowly Changing Dimensions --- Type 1 (overwrite) vs.\ Type 2 (versioned history with effective dates).}
     \dayitem{Tuesday}{The default Power BI semantic model in Fabric Workspaces.}
     \dayitem{Wednesday}{Creating custom Semantic Models and defining relationships.}
-    \dayitem{Thursday}{\project{Open the Semantic Model view in a Fabric Workspace. Define a 1-to-many relationship between a Date dimension and a Sales fact table. Create a DAX measure.}}
+    \dayitem{Thursday}{\project{Open the Semantic Model view in a Fabric Workspace. Define a 1-to-many relationship between a Date dimension and a Sales fact table. Create a DAX measure. Then implement the SCD Type 2 MERGE below against your Gold Lakehouse and verify that a changed customer attribute closes the old row and opens a new one.}}
+\begin{lstlisting}[language=Python]
+# SCD Type 2 upsert into gold.dim_customer via Delta MERGE (PySpark)
+from delta.tables import DeltaTable
+
+tgt = DeltaTable.forName(spark, "gold.dim_customer")
+src = spark.read.table("silver.customer_daily")  # today's snapshot
+
+# Step 1: expire current rows whose tracked attributes changed
+(tgt.alias("t").merge(src.alias("s"),
+    "t.customer_id = s.customer_id AND t.is_current = true")
+ .whenMatchedUpdate(
+    condition="t.segment <> s.segment OR t.region <> s.region",
+    set={"is_current": "false", "valid_to": "s.change_date"})
+ .execute())
+
+# Step 2: insert new versions (changed attributes + brand-new customers)
+(tgt.alias("t").merge(src.alias("s"),
+    "t.customer_id = s.customer_id AND t.is_current = true"
+    " AND t.segment = s.segment AND t.region = s.region")
+ .whenNotMatchedInsert(values={
+    "customer_id": "s.customer_id", "segment": "s.segment",
+    "region": "s.region", "is_current": "true",
+    "valid_from": "s.change_date", "valid_to": "null"})
+ .execute())
+\end{lstlisting}
     \dayitem{Friday}{\usecase{Resolve a circular dependency issue in a complex enterprise data model by implementing a proper bridge table architecture.}}
 \end{itemize}
+\resources{Power BI semantic models documentation (\url{https://learn.microsoft.com/power-bi/connect-data/service-datasets-understand}); dbt Core repository (\url{https://github.com/dbt-labs/dbt-core}).}
+\selfcheck{
+\begin{itemize}[label=$\bullet$, leftmargin=6mm, itemsep=0pt]
+    \item Why must you declare the grain before adding fact columns?
+    \item Name the three Kimball fact table types.
+    \item What makes a dimension ``conformed''?
+    \item When is SCD Type 2 required instead of Type 1?
+    \item In the MERGE snippet, what closes the current SCD2 row?
+\end{itemize}
+}
 
 \subsection*{Week 8: Power BI DirectLake Mode}
+\par\noindent\textbf{Outcomes:} build a DirectLake report, detect and diagnose DirectQuery fallback, benchmark DirectLake against DirectQuery
 \begin{itemize}[label=-]
     \dayitem{Monday}{DirectLake concept: Reading Delta/Parquet directly into memory (No Import, No DirectQuery).}
     \dayitem{Tuesday}{DirectLake fallback behavior (falling back to DirectQuery).}
@@ -133,34 +421,190 @@
     \dayitem{Thursday}{\project{Create a Power BI report using DirectLake mode against your Gold Lakehouse. Benchmark the performance vs a traditional DirectQuery model.}}
     \dayitem{Friday}{\usecase{Architect a real-time BI dashboard for an executive team that requires sub-second response times on 100-million-row datasets without nightly refresh delays.}}
 \end{itemize}
+\prodnote{DirectLake silently falls back to DirectQuery when a query exceeds framing guardrails or hits unsupported shapes. Monitor fallback events with the Capacity Metrics app and semantic model telemetry --- a slow ``DirectLake'' report is often a fallback problem or missing V-Order, not a capacity problem.}
+\resources{DirectLake overview (\url{https://learn.microsoft.com/fabric/get-started/direct-lake-overview}); Data Engineer Handbook (\url{https://github.com/DataExpert-io/data-engineer-handbook}).}
+\selfcheck{
+\begin{itemize}[label=$\bullet$, leftmargin=6mm, itemsep=0pt]
+    \item What triggers a DirectLake fallback to DirectQuery?
+    \item Why does V-Order matter specifically for DirectLake?
+    \item What does framing do in a DirectLake model?
+    \item Which telemetry reveals fallback events in production?
+    \item When is Import mode still preferable to DirectLake?
+\end{itemize}
+}
 
 \capstone{Milestone 2}{End-to-End Analytics Workflow. Establish a Synapse Data Warehouse. Create complex T-SQL stored procedures to build a Star Schema from raw OneLake data. Build a custom Semantic Model with relationships and DAX measures, and publish a DirectLake Power BI report.}
+\rubric{
+\begin{itemize}[label=$\bullet$, leftmargin=6mm]
+    \item End-to-end workflow runs from a clean environment following the repo README (load $\rightarrow$ model $\rightarrow$ report).
+    \item Architecture diagram committed (TikZ/draw.io/PNG) showing Warehouse, SQL Endpoint, Semantic Model, and Power BI.
+    \item At least 3 automated data-quality tests (referential integrity, measure totals, row counts) with a failing-case demonstration.
+    \item Monitoring evidence: DirectLake vs.\ DirectQuery benchmark results and any fallback events captured.
+    \item Monthly capacity cost estimate with 2 optimization decisions documented (e.g., V-Order, column pruning).
+    \item Security review: RLS rules demonstrated, least-privilege roles, no hardcoded secrets.
+\end{itemize}
+}
+
+\subsection*{Milestone 2 Capstone: Reference Solution Sketch}
+\begin{itemize}[label=-, itemsep=0pt]
+    \item \textbf{Architecture:} OneLake Delta staging $\rightarrow$ Warehouse via COPY INTO $\rightarrow$ T-SQL star schema $\rightarrow$ custom semantic model (DAX, RLS) $\rightarrow$ DirectLake Power BI; chosen for T-SQL-heavy transformation with sub-second BI.
+    \item Stage Parquet under date-partitioned OneLake paths driven by a manifest/watermark table.
+    \item COPY INTO warehouse staging tables; stored procedures build dimensions and facts (SCD2 where history matters).
+    \item Create a custom semantic model: relationships, measures, and RLS roles tested as multiple test users.
+    \item Benchmark DirectLake vs.\ DirectQuery and capture fallback events in the Capacity Metrics app.
+\end{itemize}
+\begin{lstlisting}[language=SQL]
+-- Idempotent load: only files not yet in the manifest
+COPY INTO dbo.stg_sales
+FROM 'https://onelake.dfs.fabric.microsoft.com/<ws>/<lh>/Files/stage/sales/2024-06/'
+WITH ( FILE_TYPE = 'PARQUET' );
+
+INSERT cfg.load_manifest (batch_path, rows_loaded, loaded_ts)
+VALUES ('2024-06', @@ROWCOUNT, CURRENT_TIMESTAMP);
+\end{lstlisting}
+\begin{itemize}[label=-, itemsep=0pt]
+    \item \textbf{Pitfall:} re-running COPY INTO without a manifest duplicates rows --- make loads idempotent.
+    \item \textbf{Pitfall:} DirectLake silently falls back to DirectQuery without V-Order; verify with telemetry, not assumption.
+    \item \textbf{Pitfall:} RLS ``works'' only for the developer role unless you test View-As for every role.
+\end{itemize}
+
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}[node distance=8mm and 10mm,
+    box/.style={draw, rounded corners, fill=blue!10, align=center, minimum width=2.7cm, minimum height=9mm},
+    side/.style={draw, rounded corners, fill=gray!10, align=center, minimum width=2.4cm, minimum height=9mm},
+    arrow/.style={-{Stealth}, thick}]
+    \node[box] (onelake) {OneLake\\ Delta Tables};
+    \node[box, right=of onelake] (wh) {Synapse Data\\ Warehouse};
+    \node[box, below=of wh] (sql) {SQL Analytics\\ Endpoint};
+    \node[box, right=of sql] (model) {Semantic Model\\ (Star Schema, DAX)};
+    \node[box, fill=orange!10, right=of model] (pbi) {Power BI\\ (DirectLake)};
+    \node[side, below=of model] (sec) {RLS \& Object-Level\\ Security};
+    \draw[arrow] (onelake) -- node[above, font=\footnotesize]{COPY INTO} (wh);
+    \draw[arrow] (onelake.south) |- (sql.west);
+    \draw[arrow] (wh) -- (sql);
+    \draw[arrow] (sql) -- (model);
+    \draw[arrow] (model) -- (pbi);
+    \draw[arrow, dashed] (sec) -- (model);
+\end{tikzpicture}
+\caption{Milestone 2 reference architecture: warehouse-to-DirectLake serving layer}
+\end{figure}
+
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}[node distance=9mm and 12mm,
+    erd/.style={rectangle split, rectangle split parts=2, draw, rounded corners, fill=blue!8, align=left, font=\footnotesize, inner sep=4pt},
+    rel/.style={-{Stealth}, thick},
+    lbl/.style={font=\scriptsize, midway, above}]
+    \node[erd] (fact) {\textbf{FACT\_SALES} \nodepart{second} date\_key (FK)\\customer\_key (FK)\\product\_key (FK)\\qty, revenue};
+    \node[erd, above left=of fact] (date) {\textbf{DIM\_DATE} \nodepart{second} date\_key (PK)\\full\_date\\month\\quarter};
+    \node[erd, below left=of fact] (cust) {\textbf{DIM\_CUSTOMER} \nodepart{second} customer\_key (PK)\\customer\_id\\segment, region\\is\_current (SCD2)};
+    \node[erd, right=of fact] (prod) {\textbf{DIM\_PRODUCT} \nodepart{second} product\_key (PK)\\product\_id\\category\\brand};
+    \draw[rel] (date) -- node[lbl, sloped]{1:N} (fact);
+    \draw[rel] (cust) -- node[lbl, sloped]{1:N} (fact);
+    \draw[rel] (prod) -- node[lbl]{1:N} (fact);
+\end{tikzpicture}
+\caption{Capstone data model: warehouse star schema with conformed dimensions}
+\end{figure}
 
 % ==========================================
 % MILESTONE 3
 % ==========================================
 \section{Milestone 3: Batch Processing \& ETL Orchestration (Month 3)}
 \textit{Objective: Master Data Factory in Fabric, Dataflows Gen2, and Pipelines.}
+\par\noindent\textbf{Learning outcomes:} build metadata-driven pipelines, design Dataflows Gen2 with output destinations, configure hybrid gateways, orchestrate and monitor dependent workloads
 
 \subsection*{Week 9: Data Factory Pipelines}
+\par\noindent\textbf{Outcomes:} build a metadata-driven pipeline with Lookup and ForEach, parameterize copies with dynamic expressions, enforce data-contract schema validation
 \begin{itemize}[label=-]
     \dayitem{Monday}{Fabric Pipelines: Copy Activity, Lookups, and Get Metadata.}
     \dayitem{Tuesday}{Control Flow: ForEach, If Condition, Until, and Switch.}
-    \dayitem{Wednesday}{Parameters, Variables, and dynamic expressions in Pipelines.}
-    \dayitem{Thursday}{\project{Build a dynamic pipeline that looks up a list of table names from a configuration file and uses a ForEach loop to copy them from an Azure SQL DB to OneLake.}}
+    \dayitem{Wednesday}{Parameters, Variables, and dynamic expressions in Pipelines. Data contracts: validate the expected schema in a notebook (or pipeline expression) before writing to Silver; Delta schema enforcement (default) vs.\ schema evolution (\texttt{mergeSchema}, \texttt{overwriteSchema}); breaking vs.\ non-breaking contract changes and contract versioning; who owns the contract --- the producer workspace publishes and versions it, consumer workspaces validate against it.}
+    \dayitem{Thursday}{\project{Build a dynamic pipeline that looks up a list of table names from a configuration file and uses a ForEach loop to copy them from an Azure SQL DB to OneLake. Add an expected-schema validation step that rejects the batch when a source column is renamed or dropped (breaking change) but allows new additive columns (non-breaking).}}
+\begin{lstlisting}
+// Pipeline JSON (abridged): @activity() feeds a ForEach,
+// variables and dynamic expressions parameterize the Copy
+{
+  "name": "PL_Metadata_Ingest",
+  "variables": { "vBatchTag": { "type": "String", "defaultValue": "daily" } },
+  "activities": [
+    { "name": "LookupTables", "type": "Lookup",
+      "typeProperties": { "sqlReaderQuery":
+        "SELECT schema_name, table_name FROM cfg.ingest_config WHERE is_active = 1" } },
+    { "name": "CopyEachTable", "type": "ForEach",
+      "dependsOn": [ { "activity": "LookupTables", "dependencyConditions": ["Succeeded"] } ],
+      "typeProperties": {
+        "items": "@activity('LookupTables').output.value",
+        "activities": [ { "name": "CopyToOneLake", "type": "Copy",
+          "typeProperties": {
+            "source": { "sqlReaderQuery":
+              "@concat('SELECT * FROM ', item().schema_name, '.', item().table_name)" },
+            "sink": { "type": "LakehouseTable",
+              "tableOption": "autoCreate",
+              "partitionOption": "@concat(variables('vBatchTag'), '/',
+                                          item().table_name)" } } } ] } } ]
+}
+\end{lstlisting}
     \dayitem{Friday}{\usecase{Design a metadata-driven ingestion framework capable of onboarding hundreds of new tables automatically without manual pipeline creation.}}
 \end{itemize}
+\resources{Data Factory in Fabric documentation (\url{https://learn.microsoft.com/fabric/data-factory/}); Apache Airflow repository (\url{https://github.com/apache/airflow}).}
+\selfcheck{
+\begin{itemize}[label=$\bullet$, leftmargin=6mm, itemsep=0pt]
+    \item What makes an ingestion framework ``metadata-driven''?
+    \item Which activity iterates over a Lookup result set?
+    \item What distinguishes a breaking from a non-breaking schema change?
+    \item Who owns the data contract: the producer or the consumer workspace?
+    \item What does \texttt{mergeSchema} allow that default Delta writes reject?
+\end{itemize}
+}
 
 \subsection*{Week 10: Dataflows Gen2}
+\par\noindent\textbf{Outcomes:} transform API data with Dataflows Gen2 output destinations, configure incremental refresh, gate Gold writes with data-quality assertions and quarantine
 \begin{itemize}[label=-]
     \dayitem{Monday}{Power Query Online integration: Visual data transformations.}
     \dayitem{Tuesday}{Dataflows Gen2 output destinations (Lakehouse, Warehouse, Azure SQL).}
-    \dayitem{Wednesday}{Staging vs. Data destinations, incremental refresh in Dataflows.}
-    \dayitem{Thursday}{\project{Build a Dataflow Gen2 to connect to a web API, pivot and clean the JSON response using Power Query, and set the destination to a Gold Lakehouse table.}}
+    \dayitem{Wednesday}{Staging vs. Data destinations, incremental refresh in Dataflows. Data-quality validation patterns: Great Expectations suites and notebook-based PySpark assertions gating writes to Gold.}
+    \dayitem{Thursday}{\project{Build a Dataflow Gen2 to connect to a web API, pivot and clean the JSON response using Power Query, and set the destination to a Gold Lakehouse table. Add a notebook data-quality assertion cell that gates the Gold write.}}
+\begin{lstlisting}[language=Python]
+# Data-quality assertions before writing to Gold
+from pyspark.sql import functions as F
+
+df = spark.read.table("silver.orders")
+
+null_pk  = df.filter(F.col("order_id").isNull()).count()
+dup_keys = (df.groupBy("order_id").count()
+              .filter("count > 1").count())
+
+assert null_pk == 0,  f"DQ FAIL: {null_pk} null order_id values"
+assert dup_keys == 0, f"DQ FAIL: {dup_keys} duplicate order_id keys"
+
+# Quarantine bad rows instead of failing silently
+rejected = df.filter(F.col("amount") < 0)
+if rejected.count() > 0:
+    (rejected.withColumn("reject_reason", F.lit("negative_amount"))
+             .write.format("delta").mode("append")
+             .saveAsTable("gold.rejected_orders"))
+
+(df.filter(F.col("amount") >= 0)
+   .write.format("delta").mode("overwrite")
+   .saveAsTable("gold.orders"))
+\end{lstlisting}
     \dayitem{Friday}{\usecase{Evaluate Mapping Dataflows (ADF), Dataflows Gen2, and Spark Notebooks for a team of business analysts migrating from Excel-based ETL.}}
 \end{itemize}
+\prodnote{Never fail silently on bad rows: quarantine records that violate expectations to a Rejected Delta table with an error-context column, alert via pipeline notification, and keep the Gold write clean. Failing the entire batch on a handful of bad rows breaks the SLA; ignoring them corrupts every downstream aggregate.}
+\resources{Dataflows Gen2 overview (\url{https://learn.microsoft.com/fabric/data-factory/dataflows-gen2-overview}); Great Expectations repository (\url{https://github.com/great-expectations/great_expectations}).}
+\selfcheck{
+\begin{itemize}[label=$\bullet$, leftmargin=6mm, itemsep=0pt]
+    \item What is an output destination in Dataflows Gen2?
+    \item Why stage data before writing to a destination?
+    \item What does incremental refresh avoid recomputing?
+    \item Why quarantine bad rows instead of failing the whole batch?
+    \item When are Spark notebooks preferable to Dataflows Gen2?
+\end{itemize}
+}
 
 \subsection*{Week 11: Data Integration \& Connectivity}
+\par\noindent\textbf{Outcomes:} connect on-premises and VNet sources via gateways, ingest REST APIs and webhooks, design a highly available gateway cluster
 \begin{itemize}[label=-]
     \dayitem{Monday}{On-premises Data Gateway vs. VNet Data Gateway.}
     \dayitem{Tuesday}{Connecting to hybrid sources (SQL Server, Oracle, SAP).}
@@ -168,8 +612,20 @@
     \dayitem{Thursday}{\project{Configure a mock on-premises SQL Server. Install the On-premises Data Gateway and build a Fabric pipeline to extract data daily to OneLake.}}
     \dayitem{Friday}{\usecase{Architect a secure hybrid connectivity pattern for a bank that strictly forbids public IP endpoints for their on-premise transactional databases.}}
 \end{itemize}
+\prodnote{A single-node on-premises data gateway is a single point of failure for every hybrid pipeline. Install gateway clusters with two or more nodes for high availability and load balancing, keep gateway software patched within one release of current, and monitor node health centrally.}
+\resources{On-premises data gateway documentation (\url{https://learn.microsoft.com/data-integration/gateway/}); Data Engineer Handbook (\url{https://github.com/DataExpert-io/data-engineer-handbook}).}
+\selfcheck{
+\begin{itemize}[label=$\bullet$, leftmargin=6mm, itemsep=0pt]
+    \item When do you need a VNet data gateway instead of an on-premises gateway?
+    \item Why cluster gateway nodes for production workloads?
+    \item Which credential pattern should webhook/API ingestion use?
+    \item How does a gateway keep data inside the bank's network perimeter?
+    \item What breaks if the gateway machine goes offline mid-pipeline?
+\end{itemize}
+}
 
 \subsection*{Week 12: Orchestration \& Monitoring}
+\par\noindent\textbf{Outcomes:} orchestrate notebooks and Dataflows from pipelines, wire On Failure alerts with runbook links, monitor runs in the Monitoring Hub
 \begin{itemize}[label=-]
     \dayitem{Monday}{Invoking Notebooks and Dataflows from Pipelines.}
     \dayitem{Tuesday}{Dependency management (On Success, On Failure, On Completion).}
@@ -177,8 +633,91 @@
     \dayitem{Thursday}{\project{Create a master orchestration pipeline that triggers a Dataflow Gen2, waits for completion, triggers a Spark Notebook, and sends a Teams/Outlook alert on failure.}}
     \dayitem{Friday}{\usecase{Design a resilient, self-healing orchestration layer for a daily banking reconciliation process spanning 15 dependent systems using Fabric Pipelines.}}
 \end{itemize}
+\prodnote{Route pipeline failures to Teams/Outlook and attach a runbook link to every alert: expected rerun steps, backfill procedure, and escalation owner. An alert without a runbook creates a 3 a.m.\ archaeology session. Use On Failure paths for compensating actions, not just notifications.}
+\resources{Monitoring hub documentation (\url{https://learn.microsoft.com/fabric/admin/monitoring-hub}); OpenLineage repository (\url{https://github.com/OpenLineage/OpenLineage}).}
+\selfcheck{
+\begin{itemize}[label=$\bullet$, leftmargin=6mm, itemsep=0pt]
+    \item What is the difference between On Failure and On Completion paths?
+    \item What does the Monitoring Hub show per pipeline run?
+    \item Why attach a runbook link to every alert?
+    \item How do you make a rerun of a failed batch idempotent?
+    \item What is a compensating action in an On Failure path?
+\end{itemize}
+}
 
 \capstone{Milestone 3}{Automated Batch ELT Pipeline. Use Fabric Data Factory to build a complete pipeline. Ingest data via REST APIs using the Copy Activity, use Dataflows Gen2 for visual data cleansing, and orchestrate Spark notebooks for complex ML feature engineering. Schedule the pipeline and configure failure alerts.}
+\rubric{
+\begin{itemize}[label=$\bullet$, leftmargin=6mm]
+    \item End-to-end pipeline runs on a schedule from a clean environment following the repo README.
+    \item Architecture diagram committed (TikZ/draw.io/PNG) showing pipeline, Dataflow, notebook, and Lakehouse flow.
+    \item At least 3 automated data-quality tests (including a quarantined-row case) with a failing-case demonstration.
+    \item Monitoring/alerting evidence: Teams/Outlook failure alert fired on a deliberately broken run, plus runbook link.
+    \item Monthly capacity cost estimate with 2 optimization decisions documented (e.g., staging vs.\ direct destination).
+    \item Security review: gateway credentials vaulted, least-privilege connection identities, no hardcoded secrets.
+\end{itemize}
+}
+
+\subsection*{Milestone 3 Capstone: Reference Solution Sketch}
+\begin{itemize}[label=-, itemsep=0pt]
+    \item \textbf{Architecture:} config-table-driven pipeline (Lookup $\rightarrow$ ForEach Copy) + Dataflow Gen2 cleansing + Spark notebook feature engineering, orchestrated by a master pipeline with failure alerts; chosen so new tables onboard by inserting a config row, not by building pipelines.
+    \item Create \texttt{cfg.ingest\_config} with watermark and is\_active columns.
+    \item Build the dynamic pipeline with a schema-validation gate that rejects breaking contract changes.
+    \item Land raw data in Bronze, cleanse via Dataflow Gen2 to Silver, run notebook DQ assertions with quarantine before Gold.
+    \item Wire the master pipeline: On Failure $\rightarrow$ Teams/Outlook alert with runbook link; advance watermarks only on success.
+\end{itemize}
+\begin{lstlisting}[language=SQL]
+-- Advance the watermark only after a successful batch
+UPDATE cfg.ingest_config
+SET watermark = @max_ts
+WHERE schema_name = @sch AND table_name = @tbl
+  AND @batch_status = 'Succeeded';
+-- On rerun, the source query reads WHERE ts > @watermark,
+-- so a retried batch never re-copies committed rows.
+\end{lstlisting}
+\begin{itemize}[label=-, itemsep=0pt]
+    \item \textbf{Pitfall:} non-idempotent reruns duplicate rows --- watermark/manifest discipline is the fix.
+    \item \textbf{Pitfall:} ForEach runs sequentially by default; enable parallelism with a bounded batch size.
+    \item \textbf{Pitfall:} an alert without a runbook produces 3 a.m.\ archaeology --- attach rerun and backfill steps.
+\end{itemize}
+
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}[node distance=8mm and 10mm,
+    box/.style={draw, rounded corners, fill=blue!10, align=center, minimum width=2.7cm, minimum height=9mm},
+    side/.style={draw, rounded corners, fill=gray!10, align=center, minimum width=2.4cm, minimum height=9mm},
+    arrow/.style={-{Stealth}, thick}]
+    \node[box] (api) {REST API /\\ Azure SQL DB};
+    \node[box, right=of api] (pl) {Fabric Pipeline\\ (Orchestrator)};
+    \node[box, right=of pl] (df) {Dataflow Gen2\\ (Power Query)};
+    \node[box, below=of df] (nb) {Spark Notebook\\ (Feature Eng.)};
+    \node[box, right=of nb] (lh) {Lakehouse\\ Bronze/Silver/Gold};
+    \node[side, below=of pl] (mon) {Monitoring Hub\\ + Teams Alerts};
+    \draw[arrow] (api) -- (pl);
+    \draw[arrow] (pl) -- (df);
+    \draw[arrow] (pl) |- (nb);
+    \draw[arrow] (df) -- (lh);
+    \draw[arrow] (nb) -- (lh);
+    \draw[arrow, dashed] (pl) -- (mon);
+\end{tikzpicture}
+\caption{Milestone 3 reference architecture: orchestrated batch ELT}
+\end{figure}
+
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}[node distance=9mm and 12mm,
+    erd/.style={rectangle split, rectangle split parts=2, draw, rounded corners, fill=blue!8, align=left, font=\footnotesize, inner sep=4pt},
+    rel/.style={-{Stealth}, thick},
+    lbl/.style={font=\scriptsize, midway, above}]
+    \node[erd] (cfg) {\textbf{INGEST\_CONFIG} \nodepart{second} config\_id (PK)\\schema\_name\\table\_name\\is\_active, watermark};
+    \node[erd, right=of cfg] (run) {\textbf{INGEST\_RUN} \nodepart{second} run\_id (PK)\\config\_id (FK)\\status\\rows\_copied, run\_ts};
+    \node[erd, right=of run] (orders) {\textbf{ORDERS} \nodepart{second} order\_id (PK)\\run\_id (FK)\\customer\\amount};
+    \node[erd, below=of run] (rej) {\textbf{REJECTED\_ROW} \nodepart{second} reject\_id (PK)\\run\_id (FK)\\raw\_payload\\reject\_reason};
+    \draw[rel] (cfg) -- node[lbl]{1:N} (run);
+    \draw[rel] (run) -- node[lbl]{1:N} (orders);
+    \draw[rel] (run) -- node[lbl, right]{1:N} (rej);
+\end{tikzpicture}
+\caption{Capstone data model: metadata-driven batch ELT with quarantine}
+\end{figure}
 
 \newpage
 % ==========================================
@@ -186,8 +725,10 @@
 % ==========================================
 \section{Milestone 4: Real-Time Intelligence (Month 4)}
 \textit{Objective: Conquer unbounded data, Eventstreams, and KQL Databases.}
+\par\noindent\textbf{Learning outcomes:} ingest streaming events with Eventstreams, query time series with KQL, detect anomalies, automate alerts with Data Activator, build real-time dashboards
 
 \subsection*{Week 13: Eventstreams \& Real-Time Ingestion}
+\par\noindent\textbf{Outcomes:} ingest mock IoT events with Eventstreams, route to KQL and Lakehouse destinations, design idempotent replay-safe consumers
 \begin{itemize}[label=-]
     \dayitem{Monday}{Real-Time Intelligence architecture in Fabric.}
     \dayitem{Tuesday}{Eventstreams: Sources (Azure Event Hubs, Custom Apps, IoT).}
@@ -195,17 +736,74 @@
     \dayitem{Thursday}{\project{Create a Fabric Eventstream. Write a Python script to send mock IoT temperature data to the custom app endpoint, and route the data to a KQL Database.}}
     \dayitem{Friday}{\usecase{Architect a global telemetry ingestion point for 5 million mobile games, ensuring high throughput and low-latency processing into Fabric.}}
 \end{itemize}
+\prodnote{Design Eventstream consumers for idempotency and replay: events can be delivered more than once, so stamp every event with a unique ID and dedupe downstream (e.g., Delta MERGE on event\_id). Know the source's replay window (Event Hubs retention) so you can reprocess after a downstream failure without data loss or duplicates.}
+\resources{Fabric Eventstreams documentation (\url{https://learn.microsoft.com/fabric/real-time-intelligence/event-streams/overview}); Apache Kafka repository (\url{https://github.com/apache/kafka}).}
+\selfcheck{
+\begin{itemize}[label=$\bullet$, leftmargin=6mm, itemsep=0pt]
+    \item Name two Eventstream sources and one destination.
+    \item Why stamp every event with a unique ID?
+    \item What does the Event Hubs retention (replay) window control?
+    \item When would you route events to a KQL database vs.\ a Lakehouse?
+    \item What does at-least-once delivery imply for downstream consumers?
+\end{itemize}
+}
 
 \subsection*{Week 14: KQL Databases (Eventhouses)}
+\par\noindent\textbf{Outcomes:} write KQL time-series queries with make-series, compute rolling averages, detect anomalies with series functions, maintain incremental state with materialized views, deduplicate replayed events with arg\_max, and join streams to streams and dimensions with time-windowed keys
 \begin{itemize}[label=-]
     \dayitem{Monday}{Eventhouses and Kusto Query Language (KQL) databases.}
-    \dayitem{Tuesday}{KQL syntax basics: search, where, project, summarize.}
-    \dayitem{Wednesday}{Advanced KQL: Time series analysis, joins, and windowing.}
+    \dayitem{Tuesday}{KQL syntax basics: search, where, project, summarize. Materialized views as incremental state over append-only streams; event deduplication with \texttt{arg\_max} on event id and \texttt{ingestion\_time()}.}
+    \dayitem{Wednesday}{Advanced KQL: time series analysis, stream-to-stream and stream-to-dimension joins, time-windowed join keys, late-arrival implications for windowed aggregates, and why unbounded lookback windows degrade query and materialization performance.}
     \dayitem{Thursday}{\project{Query the IoT data in your KQL database. Write a KQL query to calculate the 5-minute rolling average temperature and detect anomalies using built-in functions.}}
-    \dayitem{Friday}{\usecase{Troubleshoot a scenario where a streaming dashboard is showing inaccurate daily aggregations due to mobile devices going offline and uploading data late.}}
+\begin{lstlisting}[language=SQL]
+// 5-minute rolling average + anomaly detection per device
+IoTTelemetry
+| where Timestamp > ago(6h)
+| make-series AvgTemp = avg(Temperature) default=0
+              on Timestamp step 5m by DeviceId
+| extend RollingAvg = series_fir(AvgTemp, repeat(1, 5))
+| extend Anomalies = series_decompose_anomalies(RollingAvg, 1.5)
+| mv-expand Timestamp, RollingAvg, Anomalies
+| project DeviceId,
+          Timestamp = todatetime(Timestamp),
+          RollingAvg = todouble(RollingAvg),
+          IsAnomaly = toint(Anomalies) == 1
+| order by DeviceId, Timestamp
+\end{lstlisting}
+    \dayitem{Friday}{End-to-end exactly-once: Eventstream at-least-once delivery, idempotent ingestion into KQL/Lakehouse, dedup-key placement, and downstream consumer checkpointing. \usecase{Troubleshoot a scenario where a streaming dashboard is showing inaccurate daily aggregations due to mobile devices going offline and uploading data late.}}
+\begin{lstlisting}[language=SQL]
+// Dedup (keep latest arrival per id), windowed stream join, dimension lookup
+let Telemetry =
+    IoTTelemetry
+    | where Timestamp > ago(1h)              // bounded lookback window
+    | summarize arg_max(ingestion_time(), *) by EventId;
+let Alerts =
+    DeviceAlerts
+    | where AlertTime > ago(1h)
+    | summarize arg_max(ingestion_time(), *) by AlertId;
+Telemetry
+| join kind=inner Alerts on DeviceId
+| where abs(datetime_diff('second', Timestamp, AlertTime)) <= 300
+| join kind=inner (                          // stream-to-dimension
+    Devices | project DeviceId, Site, Model
+) on DeviceId
+| summarize Readings = count() by Site, Model, bin(Timestamp, 1m)
+\end{lstlisting}
 \end{itemize}
+\prodnote{Eventstream replay is the top source of silent duplicates downstream: after a consumer failure or reconfiguration, Eventstream redelivers events from the source's retention window, and every at-least-once hop (Eventstream $\rightarrow$ KQL, Eventstream $\rightarrow$ Lakehouse) can double-land rows. Stamp the dedup key at the producer (a unique \texttt{event\_id} generated before the first send, not at any hop), propagate it untouched through Eventstream, and enforce dedup at the first queryable boundary --- a KQL materialized view with \texttt{arg\_max}, or a Delta MERGE on \texttt{event\_id} for the Lakehouse --- so every downstream consumer (dashboards, Activator rules, reverse ETL) reads already-clean data. Pair this with consumer checkpointing: record the last processed event time/offset so restarts resume instead of replaying.}
+\resources{Kusto Query Language (KQL) documentation (\url{https://learn.microsoft.com/azure/data-explorer/kusto/query/}); Data Engineering Zoomcamp (\url{https://github.com/DataTalksClub/data-engineering-zoomcamp}).}
+\selfcheck{
+\begin{itemize}[label=$\bullet$, leftmargin=6mm, itemsep=0pt]
+    \item How does a KQL materialized view maintain incremental state over an append-only stream, and what does \texttt{arg\_max} by \texttt{EventId} with \texttt{ingestion\_time()} deduplicate?
+    \item Why do unbounded lookback windows degrade query and materialization performance?
+    \item How do you express a time-windowed stream-to-stream join in KQL, and how do late arrivals affect it?
+    \item Where must the dedup key be generated and enforced for end-to-end exactly-once semantics under Eventstream replay?
+    \item What does downstream consumer checkpointing protect against, and what breaks without it?
+\end{itemize}
+}
 
 \subsection*{Week 15: Data Activator (Reflex)}
+\par\noindent\textbf{Outcomes:} build Data Activator triggers with sustained-threshold conditions, automate Teams and email actions, suppress alert noise
 \begin{itemize}[label=-]
     \dayitem{Monday}{Data Activator concepts: Triggers, Conditions, and Actions.}
     \dayitem{Tuesday}{Creating Reflex items from Power BI visuals or Eventstreams.}
@@ -213,17 +811,109 @@
     \dayitem{Thursday}{\project{Set up a Data Activator trigger on your streaming IoT data. Configure an alert to send an email if the temperature exceeds a threshold for 3 consecutive minutes.}}
     \dayitem{Friday}{\usecase{Design a proactive alerting system for a logistics company to instantly notify drivers via custom app webhooks when a delivery truck goes off route.}}
 \end{itemize}
+\resources{Data Activator (Reflex) documentation (\url{https://learn.microsoft.com/fabric/real-time-intelligence/data-activator/activator-introduction}); Data Engineer Handbook (\url{https://github.com/DataExpert-io/data-engineer-handbook}).}
+\selfcheck{
+\begin{itemize}[label=$\bullet$, leftmargin=6mm, itemsep=0pt]
+    \item Which three parts define a Data Activator trigger?
+    \item Why require ``3 consecutive minutes'' instead of a single spike?
+    \item Which actions can Reflex fire natively?
+    \item How do you create an alert from a Power BI visual?
+    \item What alert latency should you expect from a Reflex item?
+\end{itemize}
+}
 
 \subsection*{Week 16: Real-Time Dashboards}
+\par\noindent\textbf{Outcomes:} build auto-refreshing real-time dashboards on KQL, implement reverse-ETL upserts to Dataverse on stable business keys, weigh sync frequency against CU cost
 \begin{itemize}[label=-]
     \dayitem{Monday}{KQL Querysets vs. Real-Time Dashboards.}
     \dayitem{Tuesday}{Building visual dashboards directly on KQL databases.}
-    \dayitem{Wednesday}{Power BI automatic page refresh (DirectQuery vs KQL).}
-    \dayitem{Thursday}{\project{Create a Real-Time Dashboard natively in Fabric using KQL queries. Add auto-refreshing charts for active IoT devices and current temperature trends.}}
+    \dayitem{Wednesday}{Power BI automatic page refresh (DirectQuery vs KQL). Reverse ETL: pushing curated Gold Lakehouse/warehouse data back to Dataverse or an operational CRM via pipelines --- identity resolution (matching on stable business keys such as Dataverse IDs), and sync-frequency trade-offs (near-real-time micro-batches vs.\ nightly full syncs, and their CU/API-throttling cost).}
+    \dayitem{Thursday}{\project{Create a Real-Time Dashboard natively in Fabric using KQL queries. Add auto-refreshing charts for active IoT devices and current temperature trends. Then build a reverse-ETL pipeline that upserts a Gold customer-segment table back into Dataverse, keyed on a stable business key.}}
     \dayitem{Friday}{\usecase{Design the BI access layer for a manufacturing floor where operators need sub-second latency dashboards monitoring machine health (vibration and heat).}}
 \end{itemize}
+\resources{Real-Time Dashboards documentation (\url{https://learn.microsoft.com/fabric/real-time-intelligence/dashboard-real-time-create}); Data Engineering Zoomcamp (\url{https://github.com/DataTalksClub/data-engineering-zoomcamp}).}
+\selfcheck{
+\begin{itemize}[label=$\bullet$, leftmargin=6mm, itemsep=0pt]
+    \item When would you choose a Real-Time Dashboard over a KQL queryset?
+    \item What does automatic page refresh cost in DirectQuery mode?
+    \item What is reverse ETL, and why push Gold data back to a CRM?
+    \item Which identity-resolution key would you sync Dataverse records on?
+    \item Trade-off between 15-minute and nightly reverse-ETL syncs?
+\end{itemize}
+}
 
 \capstone{Milestone 4}{Real-Time Fraud Detection. Build a Python script simulating credit card swipes sent to a Fabric Eventstream. Route data to a KQL Database. Write KQL queries to detect if a card is used in two different cities within 10 minutes. Use Data Activator to instantly alert the security team on Microsoft Teams.}
+\rubric{
+\begin{itemize}[label=$\bullet$, leftmargin=6mm]
+    \item End-to-end stream runs from a clean environment: producer script $\rightarrow$ Eventstream $\rightarrow$ KQL $\rightarrow$ alert.
+    \item Architecture diagram committed (TikZ/draw.io/PNG) showing Eventstream, Eventhouse, Reflex, and dashboard.
+    \item At least 3 automated data-quality/logic tests (dedup, late events, anomaly thresholds) with a failing-case demonstration.
+    \item Monitoring/alerting evidence: Teams alert captured from a simulated fraud event, with replay demonstrated.
+    \item Monthly capacity cost estimate (Eventhouse vs.\ capacity CU burn) with 2 optimization decisions documented.
+    \item Security review: producer credentials via connection strings in Key Vault, least-privilege KQL access, PII noted.
+\end{itemize}
+}
+
+\subsection*{Milestone 4 Capstone: Reference Solution Sketch}
+\begin{itemize}[label=-, itemsep=0pt]
+    \item \textbf{Architecture:} Python producer (faker) $\rightarrow$ Eventstream $\rightarrow$ Eventhouse/KQL $\rightarrow$ impossible-travel fraud query $\rightarrow$ Data Activator $\rightarrow$ Teams alert; chosen for sub-minute detection on unbounded event streams.
+    \item Generate card swipes with \texttt{faker}, including deliberate two-cities-in-10-minutes cases, and stamp every event with a unique \texttt{txn\_id}.
+    \item Route the Eventstream to a KQL database; deduplicate on \texttt{txn\_id} downstream (at-least-once delivery).
+    \item Implement the fraud rule in KQL and create a Reflex trigger with a sustained condition to avoid alert storms.
+    \item Prove replay: reprocess from the Event Hubs retention window after a simulated downstream outage.
+\end{itemize}
+\begin{lstlisting}[language=SQL]
+// Impossible travel: same card, different cities, <= 10 min apart
+Txn
+| order by card_id asc, ts asc
+| serialize
+| extend p_card = prev(card_id), p_city = prev(city), p_ts = prev(ts)
+| where card_id == p_card and city != p_city and ts - p_ts <= 10m
+| project card_id, ts, city, p_city
+\end{lstlisting}
+\begin{itemize}[label=-, itemsep=0pt]
+    \item \textbf{Pitfall:} late-arriving events shift window aggregates --- define and document a lateness policy.
+    \item \textbf{Pitfall:} duplicates from at-least-once delivery double-fire alerts; dedupe before the rule query.
+    \item \textbf{Pitfall:} single-spike triggers alert-storm the team; require sustained conditions (e.g., 3 consecutive minutes).
+\end{itemize}
+
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}[node distance=8mm and 10mm,
+    box/.style={draw, rounded corners, fill=blue!10, align=center, minimum width=2.6cm, minimum height=9mm},
+    side/.style={draw, rounded corners, fill=gray!10, align=center, minimum width=2.4cm, minimum height=9mm},
+    arrow/.style={-{Stealth}, thick}]
+    \node[box] (iot) {IoT Devices /\\ Event Hubs};
+    \node[box, right=of iot] (es) {Eventstream};
+    \node[box, right=of es] (kql) {Eventhouse\\ (KQL Database)};
+    \node[box, below=of kql] (dash) {Real-Time\\ Dashboard};
+    \node[box, fill=orange!10, right=of kql] (reflex) {Data Activator\\ (Reflex)};
+    \node[side, right=of reflex] (teams) {Teams / Email\\ Alerts};
+    \draw[arrow] (iot) -- (es);
+    \draw[arrow] (es) -- (kql);
+    \draw[arrow] (kql) -- (dash);
+    \draw[arrow] (kql) -- (reflex);
+    \draw[arrow] (reflex) -- (teams);
+\end{tikzpicture}
+\caption{Milestone 4 reference architecture: real-time intelligence pipeline}
+\end{figure}
+
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}[node distance=9mm and 12mm,
+    erd/.style={rectangle split, rectangle split parts=2, draw, rounded corners, fill=blue!8, align=left, font=\footnotesize, inner sep=4pt},
+    rel/.style={-{Stealth}, thick},
+    lbl/.style={font=\scriptsize, midway, above}]
+    \node[erd] (card) {\textbf{CARD} \nodepart{second} card\_id (PK)\\holder\_name\\home\_city\\credit\_limit};
+    \node[erd, right=of card] (txn) {\textbf{TXN} \nodepart{second} txn\_id (PK)\\card\_id (FK)\\merchant\_id (FK)\\ts, amount, city};
+    \node[erd, right=of txn] (mch) {\textbf{MERCHANT} \nodepart{second} merchant\_id (PK)\\name\\city\\category};
+    \node[erd, below=of txn] (alert) {\textbf{FRAUD\_ALERT} \nodepart{second} alert\_id (PK)\\txn\_id (FK)\\rule\_fired\\sent\_ts};
+    \draw[rel] (card) -- node[lbl]{1:N} (txn);
+    \draw[rel] (mch) -- node[lbl]{1:N} (txn);
+    \draw[rel] (txn) -- node[lbl, right]{1:N} (alert);
+\end{tikzpicture}
+\caption{Capstone data model: real-time fraud detection}
+\end{figure}
 
 
 % ==========================================
@@ -231,8 +921,10 @@
 % ==========================================
 \section{Milestone 5: Data Science \& AI Operationalization (Month 5)}
 \textit{Objective: Embed AI into data pipelines using MLflow and SynapseML.}
+\par\noindent\textbf{Learning outcomes:} prepare features with Data Wrangler, track experiments with MLflow, enrich data with SynapseML and Azure OpenAI, operationalize batch scoring
 
 \subsection*{Week 17: Data Science Foundations in Fabric}
+\par\noindent\textbf{Outcomes:} clean data visually with Data Wrangler and export PySpark, perform EDA on samples before full passes, engineer leakage-safe features
 \begin{itemize}[label=-]
     \dayitem{Monday}{The Data Science experience: Notebooks, Data Wrangler.}
     \dayitem{Tuesday}{Exploratory Data Analysis (EDA) with Pandas and PySpark.}
@@ -240,8 +932,19 @@
     \dayitem{Thursday}{\project{Use Fabric Data Wrangler in a Notebook to visually clean a dataset, handle missing values, and generate the corresponding PySpark code automatically.}}
     \dayitem{Friday}{\usecase{Architect a system to automatically forecast daily inventory needs for 1,000 retail stores using purely Spark-based pipelines.}}
 \end{itemize}
+\resources{Fabric Data Science documentation (\url{https://learn.microsoft.com/fabric/data-science/}); Apache Spark repository (\url{https://github.com/apache/spark}).}
+\selfcheck{
+\begin{itemize}[label=$\bullet$, leftmargin=6mm, itemsep=0pt]
+    \item What does Data Wrangler generate from your visual cleaning steps?
+    \item Why run EDA on a sample before a full PySpark pass?
+    \item Name two leakage risks in feature engineering.
+    \item Why keep feature sets in the Lakehouse instead of CSV exports?
+    \item What makes a forecasting pipeline ``Spark-native''?
+\end{itemize}
+}
 
 \subsection*{Week 18: Model Training \& MLflow}
+\par\noindent\textbf{Outcomes:} track experiments with mlflow.autolog, register and version models, compare hyperparameter runs by metric
 \begin{itemize}[label=-]
     \dayitem{Monday}{Machine Learning Experiments and Models in Fabric.}
     \dayitem{Tuesday}{Using MLflow for tracking parameters, metrics, and artifacts.}
@@ -249,8 +952,19 @@
     \dayitem{Thursday}{\project{Train a Scikit-Learn Random Forest model. Use `mlflow.autolog()` to automatically track the experiment in Fabric, and register the best model.}}
     \dayitem{Friday}{\usecase{Design a workflow for data scientists to track hundreds of hyperparameter tuning runs collaboratively within a shared Fabric Workspace.}}
 \end{itemize}
+\resources{MLflow in Fabric documentation (\url{https://learn.microsoft.com/fabric/data-science/mlflow-overview}); Data Engineer Handbook (\url{https://github.com/DataExpert-io/data-engineer-handbook}).}
+\selfcheck{
+\begin{itemize}[label=$\bullet$, leftmargin=6mm, itemsep=0pt]
+    \item What does \texttt{mlflow.autolog()} capture per run?
+    \item Why register a model instead of referencing run artifacts directly?
+    \item Which metadata should accompany every experiment run?
+    \item How do you compare hundreds of hyperparameter runs efficiently?
+    \item What does model versioning enable for rollback?
+\end{itemize}
+}
 
 \subsection*{Week 19: SynapseML \& AI Integration}
+\par\noindent\textbf{Outcomes:} enrich columns with SynapseML and Azure OpenAI in batch, keep API keys out of notebooks, publish sentiment to Gold for BI
 \begin{itemize}[label=-]
     \dayitem{Monday}{Introduction to SynapseML (Distributed ML library).}
     \dayitem{Tuesday}{Pre-built AI Models: Integrating Azure OpenAI and Cognitive Services.}
@@ -258,8 +972,19 @@
     \dayitem{Thursday}{\project{Use SynapseML in a Spark notebook to call the Azure OpenAI API. Pass a column of customer reviews and append a new column with the sentiment analysis result.}}
     \dayitem{Friday}{\usecase{Design a scalable pipeline to process terabytes of uploaded user reviews, extract sentiment, and make the metadata available in a Gold Lakehouse.}}
 \end{itemize}
+\resources{SynapseML repository (\url{https://github.com/microsoft/SynapseML}); Azure OpenAI in Fabric docs (\url{https://learn.microsoft.com/fabric/data-science/ai-services/overview}).}
+\selfcheck{
+\begin{itemize}[label=$\bullet$, leftmargin=6mm, itemsep=0pt]
+    \item What does SynapseML add on top of Spark MLlib?
+    \item How do you avoid hardcoding Azure OpenAI keys in a notebook?
+    \item Why batch sentiment calls instead of calling the API row-by-row?
+    \item What can Copilot in Fabric generate from natural language?
+    \item Where should sentiment results land to be usable by BI?
+\end{itemize}
+}
 
 \subsection*{Week 20: MLOps \& Batch Scoring}
+\par\noindent\textbf{Outcomes:} batch-score Delta tables with the PREDICT function, automate inference in pipelines, detect data drift and trigger retraining
 \begin{itemize}[label=-]
     \dayitem{Monday}{Batch scoring with Spark `PREDICT` function.}
     \dayitem{Tuesday}{Applying registered MLflow models to Delta tables.}
@@ -267,8 +992,95 @@
     \dayitem{Thursday}{\project{Load a registered MLflow model and use the `PREDICT` function in Spark to score a new batch of 100,000 rows. Write the predictions back to OneLake.}}
     \dayitem{Friday}{\usecase{Architect an MLOps lifecycle that detects data drift in a production recommendation engine and automatically triggers a retraining Pipeline.}}
 \end{itemize}
+\resources{Machine learning model training in Fabric (\url{https://learn.microsoft.com/fabric/data-science/model-training-overview}); MLflow repository (\url{https://github.com/mlflow/mlflow}).}
+\selfcheck{
+\begin{itemize}[label=$\bullet$, leftmargin=6mm, itemsep=0pt]
+    \item What does the Spark \texttt{PREDICT} function do?
+    \item Why score in scheduled batch instead of per-request here?
+    \item Which signal indicates data drift in production?
+    \item Why automate inference via pipelines instead of manual notebook runs?
+    \item Which schema contract must scoring output honor downstream?
+\end{itemize}
+}
 
 \capstone{Milestone 5}{End-to-End MLOps Pipeline. Use Data Factory Pipelines to orchestrate a workflow that extracts features from a Lakehouse, triggers a Notebook to train a churn prediction model, tracks it with MLflow, registers the model, and runs a daily batch scoring Notebook that populates a Power BI DirectLake report.}
+\rubric{
+\begin{itemize}[label=$\bullet$, leftmargin=6mm]
+    \item End-to-end pipeline runs from a clean environment: features $\rightarrow$ train $\rightarrow$ register $\rightarrow$ score $\rightarrow$ report.
+    \item Architecture diagram committed (TikZ/draw.io/PNG) showing Lakehouse, MLflow, registry, and scoring flow.
+    \item At least 3 automated tests (feature null checks, model metric threshold, scoring output schema) with a failing-case demonstration.
+    \item Monitoring evidence: MLflow experiment metrics, drift signal, and pipeline run history screenshots.
+    \item Monthly capacity cost estimate with 2 optimization decisions documented (e.g., batch window, pool sizing).
+    \item Security review: model artifacts access-controlled, no API keys in notebooks, PII handling noted.
+\end{itemize}
+}
+
+\subsection*{Milestone 5 Capstone: Reference Solution Sketch}
+\begin{itemize}[label=-, itemsep=0pt]
+    \item \textbf{Architecture:} Gold feature table $\rightarrow$ MLflow-tracked training notebook $\rightarrow$ model registry $\rightarrow$ scheduled batch-scoring notebook $\rightarrow$ Power BI DirectLake report; chosen to keep the full MLOps loop inside one Fabric workspace.
+    \item Build leakage-safe features in Gold (no post-outcome columns; fixed training windows).
+    \item Train with \texttt{mlflow.autolog()}; register the best run with dataset version and code commit as metadata.
+    \item Orchestrate scoring via a pipeline; write predictions with a \texttt{model\_version} column for auditability.
+    \item Add a drift check comparing feature distributions against training baselines; trigger retraining on breach.
+\end{itemize}
+\begin{lstlisting}[language=Python]
+# Batch scoring with the registered model (Spark UDF at scale)
+import mlflow
+from pyspark.sql import functions as F
+
+predict = mlflow.pyfunc.spark_udf(spark, "models:/churn_model/Production",
+                                  result_type="double")
+df = spark.read.table("gold.churn_features")
+(df.withColumn("churn_score", predict(*df.columns))
+   .withColumn("model_version", F.lit("Production"))
+   .write.format("delta").mode("append")
+   .saveAsTable("gold.churn_predictions"))
+\end{lstlisting}
+\begin{itemize}[label=-, itemsep=0pt]
+    \item \textbf{Pitfall:} training/serving skew --- compute scoring features with the same logic used in training.
+    \item \textbf{Pitfall:} predictions without \texttt{model\_version} cannot be audited or rolled back.
+    \item \textbf{Pitfall:} drift unmonitored means the model quietly rots; alert on distribution shift, not just errors.
+\end{itemize}
+
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}[node distance=8mm and 10mm,
+    box/.style={draw, rounded corners, fill=blue!10, align=center, minimum width=2.6cm, minimum height=9mm},
+    side/.style={draw, rounded corners, fill=gray!10, align=center, minimum width=2.4cm, minimum height=9mm},
+    arrow/.style={-{Stealth}, thick}]
+    \node[box] (gold) {Gold Lakehouse\\ (Features)};
+    \node[box, right=of gold] (nb) {Notebook\\ (Training)};
+    \node[box, right=of nb] (mlflow) {MLflow\\ Experiment};
+    \node[box, below=of mlflow] (reg) {Model\\ Registry};
+    \node[box, left=of reg] (score) {Batch Scoring\\ (PREDICT)};
+    \node[box, fill=orange!10, left=of score] (pbi) {Power BI\\ Report};
+    \node[side, right=of mlflow] (synml) {SynapseML /\\ Azure OpenAI};
+    \draw[arrow] (gold) -- (nb);
+    \draw[arrow] (nb) -- (mlflow);
+    \draw[arrow] (mlflow) -- (reg);
+    \draw[arrow] (reg) -- (score);
+    \draw[arrow] (score) -- (pbi);
+    \draw[arrow, dashed] (synml) -- (mlflow);
+\end{tikzpicture}
+\caption{Milestone 5 reference architecture: MLflow-driven MLOps lifecycle}
+\end{figure}
+
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}[node distance=9mm and 12mm,
+    erd/.style={rectangle split, rectangle split parts=2, draw, rounded corners, fill=blue!8, align=left, font=\footnotesize, inner sep=4pt},
+    rel/.style={-{Stealth}, thick},
+    lbl/.style={font=\scriptsize, midway, above}]
+    \node[erd] (cust) {\textbf{CUSTOMER} \nodepart{second} customer\_id (PK)\\segment\\signup\_date\\region};
+    \node[erd, right=of cust] (evt) {\textbf{USAGE\_EVENT} \nodepart{second} event\_id (PK)\\customer\_id (FK)\\event\_ts\\event\_type};
+    \node[erd, below=of evt] (pred) {\textbf{PREDICTION} \nodepart{second} prediction\_id (PK)\\customer\_id (FK)\\model\_version (FK)\\churn\_score, scored\_ts};
+    \node[erd, right=of pred] (model) {\textbf{MODEL\_VERSION} \nodepart{second} model\_version (PK)\\mlflow\_run\_id\\metric\_auc\\trained\_ts};
+    \draw[rel] (cust) -- node[lbl]{1:N} (evt);
+    \draw[rel] (cust) -- node[lbl, left]{1:N} (pred);
+    \draw[rel] (model) -- node[lbl]{1:N} (pred);
+\end{tikzpicture}
+\caption{Capstone data model: churn MLOps (features, models, predictions)}
+\end{figure}
 
 \newpage
 % ==========================================
@@ -276,8 +1088,10 @@
 % ==========================================
 \section{Milestone 6: Security, Administration \& Exam Prep (Month 6)}
 \textit{Objective: Secure OneLake, implement Purview, and prepare for DP-600.}
+\par\noindent\textbf{Learning outcomes:} apply least-privilege access controls, govern data with Purview labels and lineage, implement Git-based CI/CD with deployment pipelines, pass the DP-600 exam
 
 \subsection*{Week 21: Security \& Access Control}
+\par\noindent\textbf{Outcomes:} assign least-privilege workspace and item roles, configure OneLake data access roles and SQL RLS, audit for privilege creep
 \begin{itemize}[label=-]
     \dayitem{Monday}{Workspace Roles: Admin, Member, Contributor, Viewer.}
     \dayitem{Tuesday}{Item-level permissions vs. Workspace-level permissions.}
@@ -285,26 +1099,64 @@
     \dayitem{Thursday}{\project{Create a Workspace and assign a Contributor role. Configure Row-Level Security on a SQL Analytics Endpoint to restrict a user to seeing only 'US' region data.}}
     \dayitem{Friday}{\usecase{Design a highly secure data perimeter for a healthcare provider ensuring strict separation of duties between Data Engineers and Data Analysts within Fabric.}}
 \end{itemize}
+\prodnote{Grant access at the narrowest scope: prefer item-level permissions and OneLake data access roles over workspace-wide Member/Admin assignments. Audit quarterly --- Viewer on a workspace combined with broad item sharing is the most common form of privilege creep in Fabric tenants.}
+\resources{Fabric security documentation (\url{https://learn.microsoft.com/fabric/security/}); DataHub repository (\url{https://github.com/datahub-project/datahub}).}
+\selfcheck{
+\begin{itemize}[label=$\bullet$, leftmargin=6mm, itemsep=0pt]
+    \item What distinguishes Contributor from Viewer workspace roles?
+    \item Why prefer item-level permissions over workspace-level grants?
+    \item What do OneLake data access roles control?
+    \item How does SQL RLS restrict a user to `US' region rows only?
+    \item What is privilege creep, and how do you audit for it?
+\end{itemize}
+}
 
-\subsection*{Week 22: Governance \& Microsoft Purview in Fabric}
+\subsection*{Week 22: Governance, Purview \& GDPR Erasure}
+\par\noindent\textbf{Outcomes:} apply and inherit sensitivity labels, trace end-to-end lineage for impact analysis, execute a GDPR erasure request via crypto-shredding across Delta, KQL, and caches
 \begin{itemize}[label=-]
     \dayitem{Monday}{Purview Hub in Fabric and tenant-level administration.}
-    \dayitem{Tuesday}{Information Protection: Sensitivity labels applied to Fabric items.}
-    \dayitem{Wednesday}{Data Lineage, Endorsement (Promoted/Certified), and Impact Analysis.}
-    \dayitem{Thursday}{\project{Apply a 'Highly Confidential' sensitivity label to a Lakehouse. View the automated data lineage graph from the Lakehouse through a Pipeline to a Power BI report.}}
-    \dayitem{Friday}{\usecase{Architect a Data Mesh for a global conglomerate with 5 independent domains, ensuring centralized governance via Purview while using separate Fabric Workspaces.}}
+    \dayitem{Tuesday}{Information Protection: Sensitivity labels applied to Fabric items; label inheritance downstream and the interaction with legal-hold/retention policies --- a legal hold overrides an erasure request and must be recorded as a documented exception in the audit register.}
+    \dayitem{Wednesday}{Data Lineage, Endorsement (Promoted/Certified), and Impact Analysis. GDPR right-to-erasure propagation path: a deletion request must reach OneLake raw zones, Bronze/Silver/Gold Delta tables (including Delta time-travel history files and the VACUUM implications for purging them), Eventstream/KQL retention windows, downstream derived tables, semantic model caches, and clones/backups. Compare crypto-shredding (per-subject encryption keys in Azure Key Vault --- deleting the key erases every copy including backups) against row-level DELETE with downstream replay.}
+    \dayitem{Thursday}{\project{Apply a 'Highly Confidential' sensitivity label to a Lakehouse. View the automated data lineage graph from the Lakehouse through a Pipeline to a Power BI report. Then implement crypto-shredding: generate per-subject encryption keys in Azure Key Vault, encrypt PII columns in a notebook, and process a sample erasure request by deleting one subject's key --- verifying the subject's data becomes unrecoverable in current tables and Delta history alike, while a row-level DELETE leaves rows readable via time travel until VACUUM runs.}}
+    \dayitem{Friday}{\usecase{Architect a Data Mesh for a global conglomerate with 5 independent domains, ensuring centralized governance via Purview while using separate Fabric Workspaces. Add the erasure-propagation runbook each domain must implement for its own Bronze/Silver/Gold Lakehouses and KQL databases.}}
 \end{itemize}
+\prodnote{Naive DELETE is insufficient for GDPR erasure in Fabric: Delta time travel keeps deleted rows readable in history files until VACUUM expires them, Eventstream/KQL data persists per its retention policy, semantic model caches hold copies in memory, and clones/backups re-create erased rows on restore. Crypto-shredding sidesteps all of these --- deleting the per-subject key in Azure Key Vault renders every encrypted copy unreadable, including history and backups. Coordinate VACUUM retention, KQL retention policies, and the legal-hold register so erasure windows and litigation exceptions do not conflict.}
+\resources{Microsoft Purview and Fabric documentation (\url{https://learn.microsoft.com/fabric/governance/microsoft-purview-fabric}); DataHub repository (\url{https://github.com/datahub-project/datahub}).}
+\selfcheck{
+\begin{itemize}[label=$\bullet$, leftmargin=6mm, itemsep=0pt]
+    \item What does a sensitivity label pass on to downstream items?
+    \item What is the difference between Promoted and Certified endorsement?
+    \item How does lineage help with impact analysis before a change?
+    \item What does the Purview Hub surface to tenant administrators?
+    \item Why separate workspaces per domain in a data-mesh design?
+\end{itemize}
+}
 
 \subsection*{Week 23: Administration \& CI/CD}
+\par\noindent\textbf{Outcomes:} analyze capacity metrics and throttling, run Git-integrated CI/CD with deployment pipelines, deploy zero-downtime expand-contract schema changes
 \begin{itemize}[label=-]
-    \dayitem{Monday}{Fabric Capacity management, metrics app, and pausing/resuming.}
-    \dayitem{Tuesday}{Git Integration: Syncing Workspaces with Azure DevOps/GitHub.}
-    \dayitem{Wednesday}{Deployment Pipelines: Dev $\rightarrow$ Test $\rightarrow$ Prod promotion.}
+    \dayitem{Monday}{Fabric Capacity management, metrics app, and pausing/resuming. Hands-on: open the Fabric Capacity Metrics app against a loaded capacity, identify throttling events (interactive vs.\ background rejection, smoothing windows), and record the CU consumption trend to decide when to scale up.}
+    \dayitem{Tuesday}{Git Integration: Syncing Workspaces with Azure DevOps/GitHub. Disaster-recovery role: Git Integration plus Deployment Pipelines serve as the recovery mechanism for workspace items --- Fabric has no traditional backup/restore for workspace metadata.}
+    \dayitem{Wednesday}{Deployment Pipelines: Dev $\rightarrow$ Test $\rightarrow$ Prod promotion. Designing multi-region BCDR: since OneLake data is not automatically replicated across regions, plan deliberate dual-workspace / dual-capacity designs with data re-ingestion or Delta clone strategies. Zero-downtime schema evolution (expand $\rightarrow$ migrate $\rightarrow$ contract): add the new nullable column, dual-write and backfill it, switch consumers to the new column behind backward-compatible view shims on the SQL analytics endpoint, then drop the old column in a later release --- sequenced through Git Integration and Deployment Pipelines so schema-change notebooks deploy before the pipelines, notebooks, and semantic models that depend on them (the Fabric equivalent of coordinating dbt/schemachange migration order).}
     \dayitem{Thursday}{\project{Connect your Workspace to an Azure DevOps repository. Commit your Notebooks and Pipelines. Create a Deployment Pipeline to promote items to a 'Prod' workspace.}}
     \dayitem{Friday}{\usecase{Design an enterprise CI/CD pipeline allowing multiple data engineering teams to collaborate on the same Lakehouse without overwriting each other's code.}}
 \end{itemize}
+\prodnote{Fabric DR reality check: OneLake has no traditional backup/restore. Workspace items (notebooks, pipelines, models) are recoverable because Git Integration + Deployment Pipelines rehydrate them; OneLake \emph{data} recovery relies on Delta time travel and soft-delete patterns, and multi-region BCDR requires a deliberate dual-workspace design --- there is no automatic cross-region failover today.}
+\prodnote{Capacity guardrails: enable surge protection for background jobs, set up alerting on CU consumption (via the Capacity Metrics app and Activator rules on capacity events), and pause non-production capacities on a schedule. Throttling is smoothed and delayed --- by the time users complain, you have already burned hours of interactive capacity.}
+\prodnote{Failure story (deploy order): a deployment pipeline promoted a notebook that renamed \texttt{customer\_segment} before the Gold view shim was deployed; the DirectLake semantic model still referenced the old column and every executive dashboard errored at 8 a.m. The fix was to treat view shims as a separate, always-first deployment stage in the pipeline, and to drop old columns only after one full release cycle of dual-running old and new columns.}
+\resources{Fabric Git integration documentation (\url{https://learn.microsoft.com/fabric/cicd/git-integration/intro-to-git-integration}); Fabric Capacity Metrics app (\url{https://learn.microsoft.com/fabric/enterprise/metrics-app}).}
+\selfcheck{
+\begin{itemize}[label=$\bullet$, leftmargin=6mm, itemsep=0pt]
+    \item Which CU consumption behavior triggers background throttling?
+    \item Why is Git Integration the recovery mechanism for workspace items?
+    \item Why is there no automatic cross-region failover for OneLake?
+    \item What does surge protection guard against?
+    \item Why pause non-production capacities on a schedule?
+\end{itemize}
+}
 
 \subsection*{Week 24: DP-600 Certification Preparation}
+\par\noindent\textbf{Outcomes:} assess readiness against DP-600 skill domains, remediate weak domains with targeted review, pass two full-length mock exams
 \begin{itemize}[label=-]
     \dayitem{Monday}{Review DP-600 (Implementing Analytics Solutions Using Microsoft Fabric) Objectives.}
     \dayitem{Tuesday}{Deep dive: DirectLake vs Import vs DirectQuery optimization.}
@@ -312,8 +1164,415 @@
     \dayitem{Thursday}{Targeted review of weak domains (e.g., Spark optimization, Pipeline parameters).}
     \dayitem{Friday}{Full-length Mock Exam 2.}
 \end{itemize}
+\resources{DP-600 certification and study guide (\url{https://learn.microsoft.com/credentials/certifications/fabric-analytics-engineer-associate/}); Data Engineering Zoomcamp (\url{https://github.com/DataTalksClub/data-engineering-zoomcamp}).}
+\selfcheck{
+\begin{itemize}[label=$\bullet$, leftmargin=6mm, itemsep=0pt]
+    \item Which skill domains does the DP-600 exam weight most heavily?
+    \item When does DirectLake beat Import in exam scenarios?
+    \item How do you triage weak domains after Mock Exam 1?
+    \item Which capacity metric signals DirectLake fallback?
+    \item What score thresholds mark you certification-ready in this program?
+\end{itemize}
+}
 
 \capstone{Milestone 6}{Secure, Governed Data Platform. Build a multi-workspace architecture. Ingest streaming PII data. Use Dataflows Gen2 to mask the PII. Apply Sensitivity Labels and Endorsements. Connect to Azure DevOps and use Deployment Pipelines to seamlessly promote the architecture from a Development Workspace to Production.}
+\rubric{
+\begin{itemize}[label=$\bullet$, leftmargin=6mm]
+    \item Full platform redeploys from a clean environment: Git repo $\rightarrow$ Dev workspace $\rightarrow$ Deployment Pipeline $\rightarrow$ Prod.
+    \item Architecture diagram committed (TikZ/draw.io/PNG) showing workspaces, CI/CD, and Purview governance.
+    \item At least 3 automated data-quality tests with a failing-case demonstration, carried through all environments.
+    \item Monitoring/alerting evidence: Capacity Metrics app report plus a pipeline failure alert with runbook.
+    \item Monthly capacity cost estimate with 2 optimization decisions documented (e.g., surge protection, pause schedule).
+    \item Security review: PII masked before Gold, sensitivity labels applied, least-privilege roles, no secrets in the repo; DR plan documented (Git recovery + Delta time travel + dual-workspace BCDR).
+\end{itemize}
+}
+
+\subsection*{Milestone 6 Capstone: Reference Solution Sketch}
+\begin{itemize}[label=-, itemsep=0pt]
+    \item \textbf{Architecture:} Dev/Test/Prod workspaces with Git Integration + Deployment Pipelines, Purview sensitivity labels and lineage, PII masked before Gold; chosen so the whole platform redeploys from Git and governs itself by label inheritance.
+    \item Ingest synthetic PII streams in Dev; mask PII in a Dataflow Gen2 (or notebook) before any Gold write.
+    \item Apply sensitivity labels and endorsements; verify downstream inheritance in the Purview Hub.
+    \item Connect the workspace to Azure DevOps; promote via a Deployment Pipeline with deployment rules per stage.
+    \item Enforce least-privilege roles plus SQL RLS; document the DR plan (Git recovery + Delta time travel + dual-workspace BCDR).
+\end{itemize}
+\begin{lstlisting}[language=Python]
+# Mask PII before Gold: hash emails, redact phone numbers
+from pyspark.sql import functions as F
+
+masked = (df
+    .withColumn("email", F.sha2(F.col("email"), 256))
+    .withColumn("phone", F.regexp_replace("phone", r"\d", "*")))
+
+(masked.write.format("delta").mode("overwrite")
+       .saveAsTable("gold.patients_masked"))
+\end{lstlisting}
+\begin{itemize}[label=-, itemsep=0pt]
+    \item \textbf{Pitfall:} workspace items sync to Git verbatim --- secrets in a notebook are secrets in the repo.
+    \item \textbf{Pitfall:} labels are not automatically applied to every downstream item; audit inheritance in Purview.
+    \item \textbf{Pitfall:} deploy-order breaks consumers; ship view shims first and drop old columns a release later (Week 23).
+\end{itemize}
+
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}[node distance=8mm and 9mm,
+    box/.style={draw, rounded corners, fill=blue!10, align=center, minimum width=2.4cm, minimum height=9mm},
+    side/.style={draw, rounded corners, fill=gray!10, align=center, minimum width=2.6cm, minimum height=9mm},
+    arrow/.style={-{Stealth}, thick}]
+    \node[box] (git) {Git Repo\\ (Azure DevOps)};
+    \node[box, right=of git] (dev) {Dev\\ Workspace};
+    \node[box, right=of dev] (dp) {Deployment\\ Pipeline};
+    \node[box, right=of dp] (test) {Test\\ Workspace};
+    \node[box, right=of test] (prod) {Prod\\ Workspace};
+    \node[side, below=of dp] (purview) {Microsoft Purview\\ (Labels \& Lineage)};
+    \draw[{Stealth}-{Stealth}, thick] (git) -- (dev);
+    \draw[arrow] (dev) -- (dp);
+    \draw[arrow] (dp) -- (test);
+    \draw[arrow] (test) -- (prod);
+    \draw[arrow, dashed] (purview) -- (dev);
+    \draw[arrow, dashed] (purview) -- (prod);
+\end{tikzpicture}
+\caption{Milestone 6 reference architecture: governed CI/CD platform}
+\end{figure}
+
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}[node distance=9mm and 12mm,
+    erd/.style={rectangle split, rectangle split parts=2, draw, rounded corners, fill=blue!8, align=left, font=\footnotesize, inner sep=4pt},
+    rel/.style={-{Stealth}, thick},
+    lbl/.style={font=\scriptsize, midway, above}]
+    \node[erd] (patient) {\textbf{PATIENT} \nodepart{second} patient\_id (PK)\\name\_masked\\region\\sensitivity\_label};
+    \node[erd, right=of patient] (evt) {\textbf{TELEMETRY\_EVENT} \nodepart{second} event\_id (PK)\\patient\_id (FK)\\event\_ts\\reading\_value};
+    \node[erd, below left=of patient] (consent) {\textbf{CONSENT} \nodepart{second} consent\_id (PK)\\patient\_id (FK)\\consent\_flag\\updated\_ts};
+    \node[erd, below right=of patient] (audit) {\textbf{AUDIT\_LOG} \nodepart{second} entry\_id (PK)\\patient\_id (FK)\\actor, action\\action\_ts};
+    \draw[rel] (patient) -- node[lbl]{1:N} (evt);
+    \draw[rel] (patient) -- node[lbl, sloped]{1:N} (consent);
+    \draw[rel] (patient) -- node[lbl, sloped]{1:N} (audit);
+\end{tikzpicture}
+\caption{Capstone data model: governed PII streaming platform}
+\end{figure}
+
+\newpage
+% ==========================================
+% APPENDICES
+% ==========================================
+\section{Appendix A: Glossary}
+\begin{description}[leftmargin=3.2cm, style=nextline]
+    \item[OneLake] The single, tenant-wide data lake underlying all of Fabric (``OneDrive for data'').
+    \item[Lakehouse] A Fabric item combining files and managed Delta tables with a SQL analytics endpoint.
+    \item[Data Warehouse] Fabric's T-SQL-native analytical store with full transactional DDL/DML support.
+    \item[Delta Lake] Open table format (Parquet + transaction log) used by all Fabric engines.
+    \item[Medallion Architecture] Bronze (raw) $\rightarrow$ Silver (validated) $\rightarrow$ Gold (enriched) layering pattern.
+    \item[Shortcut] A OneLake pointer that virtualizes external data (ADLS, S3, Dataverse) without copying it.
+    \item[Semantic Model] The Power BI dataset layer defining tables, relationships, and DAX measures.
+    \item[DirectLake] Power BI storage mode reading Delta/Parquet directly into memory without import or DirectQuery.
+    \item[SQL Analytics Endpoint] The automatic read-only T-SQL endpoint generated for every Lakehouse.
+    \item[Dataflow Gen2] Power Query Online-based visual ETL with output destinations.
+    \item[Pipeline] Fabric Data Factory orchestration item (Copy, ForEach, Notebook activities, etc.).
+    \item[Eventstream] Real-time ingestion and routing item for streaming events.
+    \item[Eventhouse] Fabric's real-time analytics store hosting one or more KQL databases.
+    \item[KQL] Kusto Query Language for time-series and log analytics over Eventhouses.
+    \item[Data Activator (Reflex)] No-code item that triggers actions when data meets conditions.
+    \item[MLflow] Open-source experiment tracking and model registry framework integrated into Fabric.
+    \item[SynapseML] Microsoft's distributed ML library for Spark, including Azure AI service connectors.
+    \item[Capacity Unit (CU)] Fabric's compute billing unit; capacities are sized in SKUs (F2--F2048).
+    \item[Throttling] Capacity protection that delays or rejects operations when CU consumption exceeds limits.
+    \item[Workspace Role] Admin, Member, Contributor, or Viewer --- the coarse access boundary in Fabric.
+    \item[Git Integration] Native sync of workspace items to Azure DevOps/GitHub repositories.
+    \item[Deployment Pipeline] Fabric item promoting content across Dev $\rightarrow$ Test $\rightarrow$ Prod workspaces.
+    \item[Sensitivity Label] Microsoft Purview classification applied to Fabric items, inherited downstream.
+    \item[Monitoring Hub] Central Fabric surface for run history, status, and alert routing.
+    \item[Purview Hub] In-Fabric governance portal for lineage, endorsement, and tenant insights.
+\end{description}
+
+\section{Appendix B: Assessment \& Grading Model}
+Each monthly capstone is graded against its Acceptance Criteria box using the following weights:
+
+\begin{center}
+\begin{tabular}{@{} l c @{}}
+\toprule
+\textbf{Category} & \textbf{Weight} \\
+\midrule
+Correctness (solution runs end-to-end with accurate results) & 30\% \\
+Reliability \& tests (data-quality tests, idempotency, retries) & 20\% \\
+Security (least-privilege, no secrets in code, PII handling) & 15\% \\
+Cost awareness (CU/capacity estimate and optimizations) & 15\% \\
+Documentation (README, architecture diagram, runbook) & 10\% \\
+Demo (live walkthrough of the working solution) & 10\% \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent The two DP-600 mock exams in Week 24 feed the final readiness score: ``certification ready'' requires an average capstone grade of at least 80\% \emph{and} a mock-exam average of at least 75\%, with no single weak domain left unremediated.
+
+\section{Appendix C: Interview Preparation}
+\begin{enumerate}
+    \item When would you use a OneLake shortcut instead of copying data, and what are the trade-offs? (Week 1)
+    \item How do you decide between a Lakehouse and a Data Warehouse for a given workload? (Weeks 2, 5)
+    \item A Delta table has degraded badly over months of streaming --- how do you diagnose and fix it? (Week 4)
+    \item Explain DirectLake vs.\ Import vs.\ DirectQuery, and how you detect fallback in production. (Weeks 8, 24)
+    \item Design a metadata-driven ingestion framework that onboards new tables without new pipelines. (Week 9)
+    \item How do you enforce data quality before Gold writes without failing entire batches on a few bad rows? (Week 10)
+    \item A pipeline failed at 3 a.m.\ --- walk through your alerting, runbook, and rerun strategy. (Week 12)
+    \item How do you handle late-arriving and duplicate events in a KQL/Eventstream pipeline? (Weeks 13--14)
+    \item How would you track, register, and batch-score an ML model entirely inside Fabric? (Weeks 18, 20)
+    \item Fabric has no traditional backup/restore --- design the DR and multi-region BCDR strategy. (Week 23)
+\end{enumerate}
+
+\section{Appendix D: Self-Check Answer Key}
+
+\noindent\textbf{Week 1:}
+\begin{enumerate}[leftmargin=8mm, itemsep=0pt]
+    \item A shortcut virtualizes external data in place; no copy or duplication.
+    \item Capacity provides compute CUs; a workspace organizes items and access.
+    \item ADLS Gen2 and Amazon S3 (also Dataverse, Google Cloud Storage).
+    \item Microsoft manages infrastructure and updates; you consume capacities, not servers.
+    \item Domains group workspaces by business area for delegated governance.
+\end{enumerate}
+
+\noindent\textbf{Week 2:}
+\begin{enumerate}[leftmargin=8mm, itemsep=0pt]
+    \item Bronze holds raw unvalidated data; Silver holds cleaned, conformed data.
+    \item When T-SQL DDL/DML, transactions, or stored procedures are required.
+    \item Isolation of access, lifecycle, and capacity billing per layer.
+    \item The Delta transaction log alongside Parquet data files.
+    \item Only curated-output owners; Gold feeds reports, so writes stay controlled.
+\end{enumerate}
+
+\noindent\textbf{Week 3:}
+\begin{enumerate}[leftmargin=8mm, itemsep=0pt]
+    \item Starter pools pre-warm shared nodes; custom pools are sized and dedicated.
+    \item One row per order\_id survives, keeping an arbitrary occurrence.
+    \item Delta adds ACID transactions, time travel, and schema enforcement.
+    \item When set logic is clearer in SQL but complex transforms need Python.
+    \item Full scan plus skewed inference; prefer explicit schemas at scale.
+\end{enumerate}
+
+\noindent\textbf{Week 4:}
+\begin{enumerate}[leftmargin=8mm, itemsep=0pt]
+    \item Parquet data files plus the JSON transaction log.
+    \item Rewrites Parquet with sorting/compression optimized for Fabric engines.
+    \item It compacts many small files into fewer, larger ones.
+    \item Vacuuming below retention deletes old versions, destroying recovery history.
+    \item \texttt{RESTORE TABLE ... TO VERSION AS OF n}.
+\end{enumerate}
+
+\noindent\textbf{Week 5:}
+\begin{enumerate}[leftmargin=8mm, itemsep=0pt]
+    \item When you need direct T-SQL bulk loads from OneLake/ADLS with transactional control.
+    \item Scale or pause compute independently while data persists in OneLake.
+    \item A Fabric Warehouse with T-SQL pipelines; stored procedures port most directly.
+    \item The Capacity Unit (CU), sized by F SKU.
+    \item Pay-as-you-go billing stops while paused, cutting idle spend.
+\end{enumerate}
+
+\noindent\textbf{Week 6:}
+\begin{enumerate}[leftmargin=8mm, itemsep=0pt]
+    \item It is generated from the Lakehouse; writes go through Spark or pipelines.
+    \item A view (or table-valued function) encapsulating the join logic.
+    \item RLS filters rows per user; object-level security grants or denies whole objects.
+    \item It reads the external data in place through the shortcut.
+    \item Full T-SQL tooling, source control, and existing DBA workflows.
+\end{enumerate}
+
+\noindent\textbf{Week 7:}
+\begin{enumerate}[leftmargin=8mm, itemsep=0pt]
+    \item The grain defines what one row means; mismatched columns corrupt aggregates.
+    \item Transaction, periodic snapshot, accumulating snapshot.
+    \item Standardized dimensions joinable consistently across multiple fact tables.
+    \item When history of attribute changes must be preserved for analysis.
+    \item Setting \texttt{is\_current = false} and \texttt{valid\_to} on the matched row.
+\end{enumerate}
+
+\noindent\textbf{Week 8:}
+\begin{enumerate}[leftmargin=8mm, itemsep=0pt]
+    \item Guardrail limits exceeded, or unsupported query shapes and RLS paths.
+    \item DirectLake reads Parquet directly; V-Order maximizes compression and pruning.
+    \item Framing loads recent Delta data into memory for fast queries.
+    \item Fallback events in the Capacity Metrics app and model telemetry.
+    \item Small models needing guaranteed cached performance or full feature parity.
+\end{enumerate}
+
+\noindent\textbf{Week 9:}
+\begin{enumerate}[leftmargin=8mm, itemsep=0pt]
+    \item Table lists and rules live in configuration, not hardcoded per pipeline.
+    \item The ForEach activity.
+    \item Breaking changes remove/rename columns; non-breaking changes only add columns.
+    \item The producer workspace owns and versions it; consumers validate against it.
+    \item Appending new columns automatically; default writes reject schema mismatches.
+\end{enumerate}
+
+\noindent\textbf{Week 10:}
+\begin{enumerate}[leftmargin=8mm, itemsep=0pt]
+    \item Where cleansed rows land: Lakehouse, Warehouse, Azure SQL, and similar.
+    \item Staging isolates transformation errors before destination writes.
+    \item Reloading full history; only new or changed slices are refreshed.
+    \item A few bad rows should not break the SLA or corrupt Gold aggregates.
+    \item Complex logic, large scale, or reuse beyond Power Query's strengths.
+\end{enumerate}
+
+\noindent\textbf{Week 11:}
+\begin{enumerate}[leftmargin=8mm, itemsep=0pt]
+    \item When sources live inside an Azure VNet without public endpoints.
+    \item A single gateway node is a single point of failure.
+    \item Managed/service identities or vaulted secrets; never hardcoded keys.
+    \item It makes outbound-only connections; no inbound public IP is exposed.
+    \item In-flight activities fail; reruns must be idempotent by design.
+\end{enumerate}
+
+\noindent\textbf{Week 12:}
+\begin{enumerate}[leftmargin=8mm, itemsep=0pt]
+    \item On Failure runs only on error; On Completion runs either way.
+    \item Status, duration, and per-activity run history across items.
+    \item It makes alerts actionable: rerun steps, backfill, escalation owner.
+    \item Watermark/manifest-driven loads so reprocessing never duplicates rows.
+    \item Compensating actions (rollback, quarantine), not just notifications.
+\end{enumerate}
+
+\noindent\textbf{Week 13:}
+\begin{enumerate}[leftmargin=8mm, itemsep=0pt]
+    \item Event Hubs and custom apps; destinations include KQL databases.
+    \item It enables downstream deduplication under at-least-once delivery.
+    \item How far back events can be replayed after a downstream failure.
+    \item KQL for real-time analytics; Lakehouse for durable batch history.
+    \item Duplicates must be expected and merged on event\_id.
+\end{enumerate}
+
+\noindent\textbf{Week 14:}
+\begin{enumerate}[leftmargin=8mm, itemsep=0pt]
+    \item It stores only the aggregated delta per new ingested batch instead of rescanning raw rows; \texttt{arg\_max} collapses replayed copies of the same \texttt{EventId}, keeping the latest arrival by \texttt{ingestion\_time()}.
+    \item State and scan cost grow without bound: every query/materialization cycle re-reads more history, raising memory, CPU, and latency until the Eventhouse falls behind the ingest rate.
+    \item Join on the shared key, then filter on \texttt{datetime\_diff} between the two event times within the window; late arrivals fall outside the window and are dropped or mis-matched, skewing the joined aggregates.
+    \item Generated at the producer before the first send and enforced at the first queryable boundary (KQL materialized view or Delta MERGE on \texttt{event\_id}), so replay never duplicates rows downstream.
+    \item It records the last processed event time/offset so a restarted consumer resumes where it stopped; without it, restarts replay events and re-emit duplicates.
+\end{enumerate}
+
+\noindent\textbf{Week 15:}
+\begin{enumerate}[leftmargin=8mm, itemsep=0pt]
+    \item Data source (trigger), condition, and action.
+    \item It suppresses noise from single transient spikes.
+    \item Teams messages, emails, and Power Automate/custom workflows.
+    \item Via ``Set alert'' on the visual, creating a Reflex item.
+    \item Near-real-time: seconds to minutes after the condition is met.
+\end{enumerate}
+
+\noindent\textbf{Week 16:}
+\begin{enumerate}[leftmargin=8mm, itemsep=0pt]
+    \item Dashboards for shareable tiled visuals; querysets for ad-hoc exploration.
+    \item Repeated queries hit the source; load grows with refresh frequency.
+    \item Syncing curated warehouse data back into operational CRM/support tools.
+    \item A stable business key, e.g., the Dataverse record ID.
+    \item Freshness vs.\ CU cost and API throttling; nightly is cheaper but staler.
+\end{enumerate}
+
+\noindent\textbf{Week 17:}
+\begin{enumerate}[leftmargin=8mm, itemsep=0pt]
+    \item Executable PySpark code.
+    \item Speed and cost; validate assumptions before full-cluster scans.
+    \item Future-information leakage and training/serving skew.
+    \item Delta tables are governed, time-travelable, and shareable.
+    \item Distributed training/scoring on Spark with no data export.
+\end{enumerate}
+
+\noindent\textbf{Week 18:}
+\begin{enumerate}[leftmargin=8mm, itemsep=0pt]
+    \item Parameters, metrics, artifacts, and the model itself.
+    \item Versioning, aliasing, and governed promotion.
+    \item Dataset version, code commit, and environment.
+    \item Compare runs by metric and parameters in the experiment UI/MLflow.
+    \item Instant rollback to a previous registered version.
+\end{enumerate}
+
+\noindent\textbf{Week 19:}
+\begin{enumerate}[leftmargin=8mm, itemsep=0pt]
+    \item Distributed deep learning and prebuilt Azure AI service connectors.
+    \item Keep secrets in Key Vault or environment variables, retrieved at runtime.
+    \item Batching amortizes latency and cost across many rows.
+    \item Code, queries, and narrative insights.
+    \item A Gold Lakehouse table feeding Power BI.
+\end{enumerate}
+
+\noindent\textbf{Week 20:}
+\begin{enumerate}[leftmargin=8mm, itemsep=0pt]
+    \item Applies a registered MLflow model as a transformation over a DataFrame.
+    \item Scheduled bulk scoring beats per-request latency and cost here.
+    \item Feature distributions diverging from training baselines.
+    \item Pipelines give reproducible, monitored, retryable runs with alerts.
+    \item The downstream contract: stable output columns for Power BI and consumers.
+\end{enumerate}
+
+\noindent\textbf{Week 21:}
+\begin{enumerate}[leftmargin=8mm, itemsep=0pt]
+    \item Contributors write items; Viewers only read shared content.
+    \item It limits blast radius; workspace roles grant everything inside.
+    \item Folder/table-level data access within OneLake.
+    \item A filter predicate (region = `US') applied per role at query time.
+    \item Accumulated over-broad grants; review workspace/item permissions quarterly.
+\end{enumerate}
+
+\noindent\textbf{Week 22:}
+\begin{enumerate}[leftmargin=8mm, itemsep=0pt]
+    \item Downstream items inherit the label and its protection.
+    \item Promoted is self-endorsed; Certified is centrally approved.
+    \item It shows upstream/downstream impact before changing or deleting items.
+    \item Tenant-wide adoption, sensitivity coverage, and audit insights.
+    \item Domain autonomy with centralized Purview governance.
+\end{enumerate}
+
+\noindent\textbf{Week 23:}
+\begin{enumerate}[leftmargin=8mm, itemsep=0pt]
+    \item Sustained CU overage beyond the smoothing windows.
+    \item Items redeploy from the repository into any workspace.
+    \item OneLake data is not automatically replicated across regions.
+    \item Background jobs starving interactive capacity.
+    \item It cuts idle CU spend in pay-as-you-go dev/test capacities.
+\end{enumerate}
+
+\noindent\textbf{Week 24:}
+\begin{enumerate}[leftmargin=8mm, itemsep=0pt]
+    \item Data engineering and analytics-solution implementation domains.
+    \item Large Delta tables where import refresh is too slow.
+    \item Re-study the lowest-scoring domains first, then re-mock.
+    \item DirectQuery fallback events in the Capacity Metrics app.
+    \item Capstone average at least 80\% and mock-exam average at least 75\%.
+\end{enumerate}
+
+\section{Appendix E: Datasets \& Project Data}
+\begin{itemize}[label=-]
+    \item \textbf{NYC Taxi (TLC trip records)} --- available as a built-in Fabric sample dataset and published as public Parquet (\url{https://www.nyc.gov/site/tlc/about/tlc-trip-record-data.page}, mirrored on Azure Open Datasets). Use for Milestones 1--2: medallion Lakehouse, warehouse star schema, DirectLake reports. Multiple years exceed 100M rows; 1--5M rows suffice for the capstones.
+    \item \textbf{Olist Brazilian e-commerce} (\url{https://www.kaggle.com/datasets/olistbr/brazilian-ecommerce}) --- roughly 100k orders across 9 related CSVs (orders, items, customers, products, payments, reviews). Use for Milestones 3 and 5: metadata-driven ingestion and churn/feature-engineering capstones.
+    \item \textbf{Streaming events} --- generate credit-card swipes and IoT telemetry synthetically for Milestone 4 (and PII data for Milestone 6) with the Python \texttt{faker} library; target 5--20k events per minute during demos.
+    \item \textbf{Synthetic data note:} use \texttt{faker} for CRM/PII-style tables, seeded for reproducibility. Volume guidance: Milestone 1 $\approx$ 1--10M CSV rows; Milestone 2 $\approx$ 5M fact rows; Milestone 3 $\approx$ 9 Olist tables re-ingested daily; Milestone 5 $\approx$ 100k scoring rows. Commit generator scripts, not generated data, to your repositories.
+\end{itemize}
+
+\section{Appendix F: Portfolio \& Presentation Guide}
+
+\noindent\textbf{GitHub README structure (every capstone):}
+\begin{enumerate}[leftmargin=8mm, itemsep=0pt]
+    \item Problem statement (2--3 sentences, business framing).
+    \item Architecture diagram first --- reuse the TikZ figure from this syllabus or draw your own.
+    \item Setup instructions that run from a clean environment.
+    \item Screenshots: pipeline run, dashboard, alert, Monitoring Hub.
+    \item Capacity cost estimate (CU consumption) and the optimizations applied.
+    \item Lessons learned: what broke and what you would do differently.
+\end{enumerate}
+
+\noindent\textbf{Resume bullet templates (two per milestone):}
+\begin{itemize}[label=-, itemsep=0pt]
+    \item \textbf{M1:} Built a Spark medallion lakehouse on Microsoft Fabric (Bronze/Silver/Gold) with Delta time-travel recovery, processing N rows/day.
+    \item \textbf{M1:} Virtualized multi-cloud data with OneLake shortcuts, eliminating duplicate storage across ADLS and S3.
+    \item \textbf{M2:} Delivered a DirectLake Power BI star schema over N rows with sub-second response and row-level security.
+    \item \textbf{M2:} Implemented Kimball dimensional models (conformed dimensions, SCD Type 2 MERGE) in PySpark on a Fabric Lakehouse.
+    \item \textbf{M3:} Built a metadata-driven ingestion framework onboarding N tables with zero new pipelines.
+    \item \textbf{M3:} Added data-contract validation and quarantine patterns, eliminating batch failures from bad rows.
+    \item \textbf{M4:} Engineered a real-time fraud pipeline (Eventstream $\rightarrow$ KQL $\rightarrow$ Data Activator) alerting within N seconds.
+    \item \textbf{M4:} Implemented reverse-ETL syncs from Gold tables to Dataverse/CRM with idempotent, key-based upserts.
+    \item \textbf{M5:} Operationalized an MLflow-tracked churn model with daily batch scoring over N rows via Fabric pipelines.
+    \item \textbf{M5:} Integrated Azure OpenAI sentiment enrichment into a Spark pipeline processing N reviews.
+    \item \textbf{M6:} Designed Git-integrated CI/CD (Dev $\rightarrow$ Test $\rightarrow$ Prod) with Purview labels and least-privilege access.
+    \item \textbf{M6:} Authored the DR plan (Git recovery + Delta time travel + dual-workspace BCDR) and passed DP-600.
+\end{itemize}
+
+\noindent\textbf{Talking about your project in interviews:} lead with the business problem and one number (rows, latency, or cost saved), walk the architecture diagram top to bottom, then describe one failure you hit and how you fixed it. Interviewers probe for trade-offs --- be ready to explain why you chose Lakehouse vs.\ Warehouse, Import vs.\ DirectLake, or batch vs.\ streaming, and what you would change at 10$\times$ scale.
 
 \newpage
 % ==========================================
@@ -366,7 +1625,7 @@
 20 & MLOps \& Batch Scoring & \textbf{Cap 5: End-to-End MLOps Pipeline} & $\square$ \\
 \midrule
 21 & Security \& Access Control & SQL RLS and Workspace Roles & $\square$ \\
-22 & Governance \& Purview & Sensitivity Labels \& Lineage Hub & $\square$ \\
+22 & Governance, Purview \& GDPR Erasure & Sensitivity Labels, Lineage \& Crypto-Shredding & $\square$ \\
 23 & Administration \& CI/CD & Git Integration \& Deployment Pipelines & $\square$ \\
 24 & Exam Prep (DP-600) & \textbf{Cap 6: Secure Governed Platform} & $\square$ \\
 

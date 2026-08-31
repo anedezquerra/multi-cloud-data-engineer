@@ -19,6 +19,22 @@
 \usepackage{enumitem}   % For customized lists
 \usepackage{xcolor}     % For colored highlights
 \usepackage[colorlinks=true, linkcolor=blue]{hyperref} % For internal links
+\usepackage{xurl}       % Allow URLs in Resources lines to break anywhere
+\emergencystretch=1.5em % Reduce overfull lines in justified text
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta, positioning, shapes.geometric, backgrounds, fit}
+\usepackage{listings}
+\lstdefinestyle{code}{
+    basicstyle=\ttfamily\footnotesize,
+    breaklines=true,
+    frame=single,
+    backgroundcolor=\color{gray!8},
+    rulecolor=\color{gray!40},
+    columns=fullflexible,
+    keepspaces=true,
+    showstringspaces=false
+}
+\lstset{style=code}
 
 % --- CUSTOM COMMANDS ---
 \newcommand{\project}[1]{\vspace{1mm}\noindent\textbf{\textcolor{blue}{Hands-on Project:}} #1}
@@ -33,6 +49,30 @@
     \vspace{3mm}
 }
 \newcommand{\dayitem}[2]{\item \textbf{#1:} #2}
+% Rubric box: capstone acceptance criteria
+\newcommand{\rubric}[1]{
+    \vspace{1mm}
+    \noindent\fbox{
+        \parbox{0.97\textwidth}{
+            \textbf{\textcolor{orange}{Acceptance Criteria:}} #1
+        }
+    }
+    \vspace{2mm}
+}
+% Weekly curated resources
+\newcommand{\resources}[1]{\vspace{1mm}\noindent\textbf{\textcolor{violet}{Resources:}} #1}
+% Production hardening note
+\newcommand{\prodnote}[1]{
+    \vspace{1mm}
+    \noindent\fbox{
+        \parbox{0.97\textwidth}{
+            \textbf{\textcolor{brown}{Production Note:}} \textit{#1}
+        }
+    }
+    \vspace{1mm}
+}
+% Weekly self-check questions
+\newcommand{\selfcheck}[1]{\vspace{1mm}\noindent\textbf{\textcolor{purple}{Self-check:}} #1}
 
 \title{\Huge \textbf{GCP Master Data Engineer}\\ \Large 6-Month Exhaustive Training \& Certification Program}
 \author{Advanced Architecture, Hands-on Labs, and MLOps}
@@ -50,12 +90,36 @@
 \newpage
 
 % ==========================================
+% PREREQUISITES
+% ==========================================
+\section*{Prerequisites \& How to Use This Syllabus}
+\begin{itemize}[label=-]
+    \item \textbf{Prerequisite skills:} intermediate Python, solid SQL, Git fundamentals, Linux/CLI basics, and Docker fundamentals. You also need a Google Cloud project with billing enabled (free trial credits are sufficient for most labs).
+    \item \textbf{Weekly cadence:} plan for roughly 10--12 hours per week --- Monday to Wednesday for theory and service deep dives, Thursday for the hands-on project, and Friday for the architecture use case.
+    \item \textbf{Deliverable expectation:} every capstone must produce a git repository, an architecture diagram, a monthly cost estimate, and a security review checklist, per the Acceptance Criteria boxes in each milestone.
+    \item \textbf{Assessment:} the 24-week tracking timetable at the end of this document doubles as your assessment checklist --- mark a week complete only when its deliverables are committed.
+    \item \textbf{Self-checks:} every week ends with 5 self-check questions; answer them from memory before consulting the answer key in Appendix D.
+\end{itemize}
+
+\noindent\textbf{Environment setup checklist} (complete before Week 1):
+\begin{itemize}[label=$\square$]
+    \item Install Python 3.x, Git, Docker Desktop, and VS Code (with the Python and Cloud Code extensions).
+    \item Install the \texttt{gcloud} CLI and \texttt{bq} (bundled), plus Terraform for Week 24.
+    \item Create a Google Cloud free-tier project with billing enabled and \$300 trial credits.
+    \item Clone a course repository structured as \texttt{data/}, \texttt{src/}, \texttt{tests/}, \texttt{infra/}, \texttt{docs/}.
+    \item Configure credentials via environment variables and Application Default Credentials (\texttt{gcloud auth application-default login}) --- never hardcode keys in source.
+\end{itemize}
+\newpage
+
+% ==========================================
 % MILESTONE 1
 % ==========================================
 \section{Milestone 1: Core Data Infrastructure \& Storage (Month 1)}
 \textit{Objective: Master the foundational storage options and transactional databases.}
+\par\noindent\textbf{Learning outcomes:} provision and lifecycle-manage GCS buckets, deploy HA Cloud SQL instances, design globally consistent Spanner schemas, model hotspot-free Bigtable row keys
 
 \subsection*{Week 1: Cloud Storage \& Transfer Services}
+\par\noindent\textbf{Outcomes:} select storage classes from access patterns, configure lifecycle and versioning rules, execute a cross-cloud transfer job, quantify Archive-tier savings
 \begin{itemize}[label=-]
     \dayitem{Monday}{Object storage fundamentals, Storage Classes (Standard, Nearline, Coldline, Archive).}
     \dayitem{Tuesday}{Lifecycle Management, Versioning, and Retention Policies.}
@@ -63,17 +127,36 @@
     \dayitem{Thursday}{\project{Deploy a GCS bucket via CLI, configure a 30-day transition to Archive, and set up a Storage Transfer job from a public AWS S3 bucket.}}
     \dayitem{Friday}{\usecase{Design a multi-region disaster recovery storage architecture for a media streaming company serving 10PB of video assets.}}
 \end{itemize}
+\prodnote{Enable Object Versioning on buckets holding pipeline state or raw data: accidental deletes and overwrites become recoverable by restoring a noncurrent version (\texttt{gcloud storage cp gs://bucket/object\#generation}). Pair with a lifecycle rule that expires old noncurrent versions so recovery ability does not silently inflate storage costs.}
+\resources{Cloud Storage docs (\url{https://cloud.google.com/storage/docs}); Data Engineering Zoomcamp (\url{https://github.com/DataTalksClub/data-engineering-zoomcamp}).}
+\selfcheck{\begin{itemize}[label=-, nosep, leftmargin=1.5em]
+    \item Which storage class minimizes cost for data accessed less than once a year?
+    \item What does a lifecycle rule transitioning to Archive after 30 days actually change?
+    \item When is Transfer Appliance preferred over Storage Transfer Service?
+    \item How does Object Versioning let you recover an accidentally deleted object?
+    \item Why is multi-region storage not sufficient by itself for a DR plan?
+\end{itemize}}
 
 \subsection*{Week 2: Relational Databases (Cloud SQL \& AlloyDB)}
+\par\noindent\textbf{Outcomes:} deploy HA Cloud SQL with read replicas, execute a PITR restore drill, plan a DMS minimal-downtime cutover, identify AlloyDB columnar-engine workloads
 \begin{itemize}[label=-]
     \dayitem{Monday}{Cloud SQL Architecture, High Availability (HA), and Read Replicas.}
     \dayitem{Tuesday}{Database Migration Service (DMS) and Private IP connections.}
     \dayitem{Wednesday}{AlloyDB for PostgreSQL: Columnar engine and ML integration.}
-    \dayitem{Thursday}{\project{Deploy an HA Cloud SQL Postgres instance, create a read replica, and simulate a regional failover.}}
+    \dayitem{Thursday}{\project{Deploy an HA Cloud SQL Postgres instance, create a read replica, and simulate a regional failover. DR drill: enable point-in-time recovery (PITR), restore to a NEW instance (or clone) at a timestamp before a deliberate \texttt{DELETE}, verify row counts against the primary, then delete the restored instance.}}
     \dayitem{Friday}{\usecase{Architect a zero-downtime migration strategy for a monolithic on-premise ERP system to Cloud SQL.}}
 \end{itemize}
+\resources{Cloud SQL docs (\url{https://cloud.google.com/sql/docs}); Data Engineer Handbook (\url{https://github.com/DataExpert-io/data-engineer-handbook}).}
+\selfcheck{\begin{itemize}[label=-, nosep, leftmargin=1.5em]
+    \item What is the failover mechanism behind Cloud SQL high availability?
+    \item Why must PITR be restored to a new instance rather than in place?
+    \item When is a private IP connection required for Cloud SQL?
+    \item What does AlloyDB's columnar engine accelerate compared to stock PostgreSQL?
+    \item How does DMS achieve minimal downtime during migration?
+\end{itemize}}
 
 \subsection*{Week 3: Global Relational Scaling (Cloud Spanner)}
+\par\noindent\textbf{Outcomes:} design hotspot-free Spanner primary keys, model interleaved parent-child schemas, interpret query execution plans, explain TrueTime consistency guarantees
 \begin{itemize}[label=-]
     \dayitem{Monday}{Spanner concepts: Nodes, Replicas, TrueTime, and Strong Global Consistency.}
     \dayitem{Tuesday}{Schema Design: Primary keys, Interleaved Tables, and Indexing.}
@@ -81,8 +164,17 @@
     \dayitem{Thursday}{\project{Create a multi-region Spanner instance, design an interleaved schema for an e-commerce cart, and load 10,000 synthetic records.}}
     \dayitem{Friday}{\usecase{Design a globally distributed payment processing ledger that requires 99.999\% availability and zero data loss across continents.}}
 \end{itemize}
+\resources{Cloud Spanner docs (\url{https://cloud.google.com/spanner/docs}); Data Engineer Handbook (\url{https://github.com/DataExpert-io/data-engineer-handbook}).}
+\selfcheck{\begin{itemize}[label=-, nosep, leftmargin=1.5em]
+    \item What does TrueTime guarantee that wall-clock timestamps cannot?
+    \item Why should primary keys avoid monotonically increasing values in Spanner?
+    \item What problem do interleaved tables solve?
+    \item How does Spanner deliver strong consistency across regions?
+    \item When is Spanner the wrong choice versus Cloud SQL?
+\end{itemize}}
 
 \subsection*{Week 4: Wide-Column NoSQL (Cloud Bigtable)}
+\par\noindent\textbf{Outcomes:} design salted row keys that avoid hotspotting, route traffic with App Profiles, diagnose hotspots in Key Visualizer, tune garbage-collection policies
 \begin{itemize}[label=-]
     \dayitem{Monday}{Bigtable architecture: Tablets, Nodes, and App Profiles.}
     \dayitem{Tuesday}{Row Key Design: Salting, hashing, and avoiding hotspotting.}
@@ -90,25 +182,138 @@
     \dayitem{Thursday}{\project{Deploy a Bigtable cluster, write a Python script to ingest IoT temperature sensor data using a reversed-timestamp row key.}}
     \dayitem{Friday}{\usecase{Design an ingestion and serving layer for a financial trading platform processing 100,000 stock ticks per second.}}
 \end{itemize}
+\resources{Cloud Bigtable docs (\url{https://cloud.google.com/bigtable/docs}); Data Engineering Zoomcamp (\url{https://github.com/DataTalksClub/data-engineering-zoomcamp}).}
+\selfcheck{\begin{itemize}[label=-, nosep, leftmargin=1.5em]
+    \item Why do sequential row keys cause hotspotting in Bigtable?
+    \item What does salting a row key accomplish, and what does it cost?
+    \item What is an App Profile used for?
+    \item How does Key Visualizer help diagnose performance problems?
+    \item What do garbage-collection policies control in a column family?
+\end{itemize}}
 
 \capstone{Milestone 1}{Build an E-Commerce Multi-Tier Data Backend. Deploy Cloud SQL for user accounts, Spanner for global inventory/checkout transactions, Bigtable for clickstream tracking, and Cloud Storage for product images. Map the VPC peering required to connect them securely.}
+
+\rubric{
+\begin{itemize}[label=-, nosep, leftmargin=1.5em]
+    \item All four stores deployable from a clean environment via scripts/README in the git repo.
+    \item Architecture diagram committed showing the VPC topology and private connectivity.
+    \item At least 3 automated validation tests (e.g., failover check, Spanner consistency read, Bigtable hotspot probe) with a failing-case demonstration.
+    \item Monitoring/alerting evidence: exported Cloud Monitoring dashboards or alert policies for each store.
+    \item Monthly cost estimate with 2 optimization decisions documented (e.g., storage classes, Spanner node sizing).
+    \item Security review: least-privilege service accounts, no hardcoded secrets, private IPs only, PII handling noted.
+\end{itemize}
+}
+
+\subsection*{Milestone 1 Capstone: Reference Solution Sketch}
+\begin{itemize}[label=-, leftmargin=1.5em]
+    \item \textbf{Architecture:} Cloud SQL (users) + Spanner (inventory/checkout, multi-region) + Bigtable (clickstream) + GCS (product images), all on private IPs inside one VPC --- each store matched to its workload profile, nothing over-provisioned.
+    \item \textbf{Steps:} (1) provision all four stores via Terraform/gcloud scripts; (2) load the Olist dataset with seeded generators; (3) configure private IP and authorized networks; (4) run the failover, Spanner consistency, and Bigtable hotspot tests; (5) export Cloud Monitoring dashboards; (6) write the cost estimate.
+    \item \textbf{Hardest part --- a hotspot-free Bigtable row key:}
+\begin{lstlisting}[language=Python]
+import hashlib
+def click_row_key(user_id: str, event_ts: int) -> str:
+    # salt spreads writes across tablets; reversed ts sorts newest first
+    salt = hashlib.md5(user_id.encode()).hexdigest()[:4]
+    return f"{salt}#{user_id}#{9999999999 - event_ts}"
+\end{lstlisting}
+    \item \textbf{Pitfall:} monotonically increasing order IDs as Spanner primary keys funnel writes onto one split --- use UUIDs or bit-reversed sequences.
+    \item \textbf{Pitfall:} leaving Cloud SQL on its default public IP fails the private-connectivity security review.
+    \item \textbf{Pitfall:} reading Bigtable without an App Profile makes single-cluster failover tests meaningless.
+\end{itemize}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[node distance=5mm and 9mm, every node/.style={draw, rounded corners, fill=blue!10, align=center, font=\footnotesize}]
+    \node[fill=teal!10] (app) {Client / App\\Tier};
+    \node[right=of app] (sql) {Cloud SQL\\(Users)};
+    \node[above=of sql] (gcs) {Cloud Storage\\(Product Images)};
+    \node[below=of sql] (spanner) {Spanner\\(Inventory / Checkout)};
+    \node[below=of spanner] (bigtable) {Bigtable\\(Clickstream)};
+    \begin{scope}[on background layer]
+        \node[draw, dashed, fill=gray!5, fit=(gcs)(sql)(spanner)(bigtable), inner sep=3mm, label={[font=\footnotesize]above:VPC Peering / Private IP}] (vpc) {};
+    \end{scope}
+    \node[right=of spanner, fill=brown!10] (iam) {IAM + KMS\\(CMEK)};
+    \draw[-{Stealth}] (app) -- (sql);
+    \draw[-{Stealth}] (app) |- (gcs);
+    \draw[-{Stealth}] (app) |- (spanner);
+    \draw[-{Stealth}] (app.east) |- (bigtable);
+    \draw[-{Stealth}, dashed] (iam) -- (vpc);
+\end{tikzpicture}
+\caption{Milestone 1 reference architecture: multi-tier transactional and storage backend inside a VPC.}
+\end{figure}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[node distance=5mm and 10mm,
+    entity/.style={draw, rounded corners, fill=blue!5, align=left, font=\scriptsize, inner sep=1.5mm},
+    title/.style={font=\scriptsize\bfseries}]
+    \node[entity] (users) {\title USERS\\[0.5mm]user\_id (PK)\\email\\region};
+    \node[entity, right=of users] (orders) {\title ORDERS\\[0.5mm]order\_id (PK)\\user\_id (FK)\\order\_ts\\status};
+    \node[entity, right=of orders] (items) {\title ORDER\_ITEMS\\[0.5mm]order\_id (FK)\\product\_id (FK)\\qty\\price};
+    \node[entity, right=of items] (products) {\title PRODUCTS\\[0.5mm]product\_id (PK)\\sku\\image\_uri (GCS)};
+    \node[entity, below=6mm of orders] (clicks) {\title CLICKSTREAM\\[0.5mm]row\_key (user+ts)\\event\_type\\product\_id};
+    \draw[-{Stealth}] (users) -- node[above, font=\scriptsize]{1:N} (orders);
+    \draw[-{Stealth}] (orders) -- node[above, font=\scriptsize]{1:N} (items);
+    \draw[-{Stealth}] (products) -- node[above, font=\scriptsize]{1:N} (items);
+    \draw[-{Stealth}] (users) |- node[near start, right, font=\scriptsize]{1:N} (clicks);
+\end{tikzpicture}
+\caption{Capstone data model: e-commerce multi-tier backend (Cloud SQL users, Spanner orders, Bigtable clickstream).}
+\end{figure}
 
 % ==========================================
 % MILESTONE 2
 % ==========================================
 \section{Milestone 2: Data Warehousing \& Analytics (Month 2)}
 \textit{Objective: Deep dive into BigQuery optimization, Lakehouses, and Data Sharing.}
+\par\noindent\textbf{Learning outcomes:} optimize BigQuery with partitioning and clustering, estimate and control query costs, build BigLake lakehouse tables with fine-grained security, publish governed datasets via Analytics Hub
 
 \subsection*{Week 5: BigQuery Architecture \& Core SQL}
+\par\noindent\textbf{Outcomes:} apply window functions, arrays, and structs in BigQuery SQL, model a star schema with an SCD2 dimension, choose between on-demand and Editions pricing
 \begin{itemize}[label=-]
     \dayitem{Monday}{BigQuery decoupled architecture: Colossus, Jupiter, Dremel.}
     \dayitem{Tuesday}{Pricing models (On-demand vs. Capacity/Editions) and Slots.}
-    \dayitem{Wednesday}{Advanced SQL: Window functions, Arrays, and Structs.}
+    \dayitem{Wednesday}{Advanced SQL (window functions, arrays, structs) and Kimball dimensional modeling: declaring the grain, fact types (transaction, periodic snapshot, accumulating), conformed dimensions, and SCD Type 1 vs.\ Type 2.}
+\begin{lstlisting}[language=SQL]
+-- SCD Type 2 upsert into a customer dimension on BigQuery
+MERGE analytics.dim_customer T
+USING staging.customers_daily S
+ON T.customer_id = S.customer_id AND T.is_current = TRUE
+WHEN MATCHED AND (T.email <> S.email OR T.segment <> S.segment) THEN
+  UPDATE SET valid_to = CURRENT_DATE(), is_current = FALSE
+WHEN NOT MATCHED THEN
+  INSERT (customer_id, email, segment, valid_from, valid_to, is_current)
+  VALUES (S.customer_id, S.email, S.segment, CURRENT_DATE(), DATE '9999-12-31', TRUE);
+-- Follow with a second INSERT for the new versions of the matched rows.
+\end{lstlisting}
     \dayitem{Thursday}{\project{Query the GitHub public dataset, unnest arrays, and calculate a 7-day rolling average of commits per repository using window functions.}}
     \dayitem{Friday}{\usecase{Estimate the monthly cost of a marketing analytics workload scanning 50TB daily and recommend an Edition tier.}}
 \end{itemize}
 
+\begin{center}
+\renewcommand{\arraystretch}{1.4}
+\begin{tabular}{@{} l l p{4.5cm} p{4.5cm} @{}}
+\toprule
+\textbf{Option} & \textbf{Billing model} & \textbf{Best for} & \textbf{Watch-outs} \\
+\midrule
+On-demand & Per-TiB scanned & Spiky, unpredictable, or low-volume workloads & One bad query can scan petabytes; set custom query cost quotas. \\
+Editions (slots) & Slot-hours, per edition tier (Standard / Enterprise / Enterprise Plus) & Steady production workloads needing predictable spend and autoscaling & Commitments are per region; idle baseline slots still bill. \\
+Flat-rate (legacy) & Fixed monthly slots & Legacy contracts migrating to Editions & Being phased out --- no new features; plan migration to Editions. \\
+BigQuery Omni & Per-TiB (or slots) on cross-cloud data in AWS/Azure & Analytics over data that must stay in another cloud & Egress from the source cloud plus cross-region latency. \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\resources{BigQuery docs (\url{https://cloud.google.com/bigquery/docs}); Data Engineering Zoomcamp (\url{https://github.com/DataTalksClub/data-engineering-zoomcamp}).}
+\selfcheck{\begin{itemize}[label=-, nosep, leftmargin=1.5em]
+    \item Which BigQuery components make storage and compute independently scalable?
+    \item When do Editions beat on-demand pricing for a steady workload?
+    \item What does ``declaring the grain'' of a fact table commit you to?
+    \item When is SCD Type 2 required over Type 1, and what columns implement it?
+    \item Why must a MERGE for SCD2 match on both key and is\_current?
+\end{itemize}}
+
 \subsection*{Week 6: BigQuery Optimization}
+\par\noindent\textbf{Outcomes:} partition and cluster large tables, measure bytes-billed deltas across scan strategies, read execution plans for skew, decide when materialized views or BI Engine pay off
 \begin{itemize}[label=-]
     \dayitem{Monday}{Partitioning: Ingestion-time vs. Column-based (Time/Integer).}
     \dayitem{Tuesday}{Clustering: Sorting data for optimal filter performance.}
@@ -116,8 +321,19 @@
     \dayitem{Thursday}{\project{Create a massive synthetic table. Compare the execution time and bytes billed between a full scan, a partitioned scan, and a clustered scan.}}
     \dayitem{Friday}{\usecase{Re-architect a poorly performing multi-petabyte log analysis table that is currently causing high query costs for the security team.}}
 \end{itemize}
+\prodnote{Monitor BigQuery slot contention with Cloud Monitoring metrics (e.g., slots/allocated vs.\ slots/total\_available per reservation) and alert on sustained saturation; move steady-state workloads to capacity editions with baseline plus autoscaling slots to avoid on-demand bill shock.}
+
+\resources{BigQuery performance best practices (\url{https://cloud.google.com/bigquery/docs/best-practices-performance-overview}); DuckDB repo (\url{https://github.com/duckdb/duckdb}).}
+\selfcheck{\begin{itemize}[label=-, nosep, leftmargin=1.5em]
+    \item How do partitioning and clustering reduce bytes billed differently?
+    \item When does clustering beat partitioning for selective filters?
+    \item What does a materialized view precompute, and what does it cost?
+    \item Where in the execution plan do you spot a skewed stage?
+    \item What does BI Engine accelerate, and when is it wasted?
+\end{itemize}}
 
 \subsection*{Week 7: Advanced Data Types \& Federated Queries}
+\par\noindent\textbf{Outcomes:} create external tables over GCS, run GEOGRAPHY spatial joins, evaluate BigQuery Omni egress and latency trade-offs, decide when federation beats ingestion
 \begin{itemize}[label=-]
     \dayitem{Monday}{BigQuery GIS (Geospatial) and BigQuery Search.}
     \dayitem{Tuesday}{External Tables and querying data directly in Cloud Storage.}
@@ -125,8 +341,17 @@
     \dayitem{Thursday}{\project{Create an external table pointing to CSVs in GCS. Write a query joining this external data with native BigQuery GIS taxi-dropoff data.}}
     \dayitem{Friday}{\usecase{Design a multi-cloud data architecture for a retail company that has historical sales in AWS S3 but wants to analyze them in GCP.}}
 \end{itemize}
+\resources{BigQuery GIS docs (\url{https://cloud.google.com/bigquery/docs/geospatial-intro}); Data Engineer Handbook (\url{https://github.com/DataExpert-io/data-engineer-handbook}).}
+\selfcheck{\begin{itemize}[label=-, nosep, leftmargin=1.5em]
+    \item What is the difference between an external table and a native BigQuery table?
+    \item Which GEOGRAPHY function tests whether a point falls inside a polygon?
+    \item What extra cost dimension does BigQuery Omni introduce?
+    \item Why can external tables not benefit from clustering?
+    \item When is federated querying preferable to ingestion?
+\end{itemize}}
 
 \subsection*{Week 8: Data Lakehouse \& Analytics Hub}
+\par\noindent\textbf{Outcomes:} build BigLake tables with row- and column-level security, index unstructured files with Object Tables, publish governed datasets through Analytics Hub, design a data clean room
 \begin{itemize}[label=-]
     \dayitem{Monday}{BigLake: Unifying data lakes and data warehouses with fine-grained security.}
     \dayitem{Tuesday}{Object Tables: Analyzing unstructured data (PDFs/Images).}
@@ -134,16 +359,91 @@
     \dayitem{Thursday}{\project{Set up a BigLake table with column-level access control. Publish a dataset to the Analytics Hub for a "partner" organization.}}
     \dayitem{Friday}{\usecase{Architect a Data Clean Room for an ad agency to merge their CRM data with Google Ads data without exposing raw PII.}}
 \end{itemize}
+\resources{BigLake docs (\url{https://cloud.google.com/bigquery/docs/biglake-intro}); Apache Iceberg repo (\url{https://github.com/apache/iceberg}).}
+\selfcheck{\begin{itemize}[label=-, nosep, leftmargin=1.5em]
+    \item How does BigLake give GCS files warehouse-grade security?
+    \item What can an Object Table index that a regular external table cannot?
+    \item How does Analytics Hub share data without copying it?
+    \item What does a data clean room prevent each party from seeing?
+    \item Why use policy tags instead of separate views per role?
+\end{itemize}}
 
 \capstone{Milestone 2}{Enterprise Data Lakehouse Build. Ingest 5 years of retail data into GCS. Create BigLake tables over the data, apply row/column level security policies based on region, create Materialized Views for executive dashboards, and set up a BI Engine reservation.}
+
+\rubric{
+\begin{itemize}[label=-, nosep, leftmargin=1.5em]
+    \item End-to-end lakehouse rebuilds from a clean environment following the repo README (ingest to GCS, BigLake, MVs).
+    \item Architecture diagram committed (draw.io/TikZ/PNG) showing zones, security policies, and serving layers.
+    \item At least 3 automated data-quality tests on the curated tables (row counts, null checks, freshness) with a failing-case demonstration.
+    \item Monitoring/alerting evidence: query-cost and slot-utilization dashboards or exported alert policies.
+    \item Monthly cost estimate (on-demand vs.\ editions) with 2 optimization decisions documented (partitioning, clustering, MV, or BI Engine).
+    \item Security review: row/column-level policies verified with a negative test, least-privilege roles, no hardcoded secrets.
+\end{itemize}
+}
+
+\subsection*{Milestone 2 Capstone: Reference Solution Sketch}
+\begin{itemize}[label=-, leftmargin=1.5em]
+    \item \textbf{Architecture:} GCS Parquet zones $\rightarrow$ BigLake tables with policy tags and row access policies $\rightarrow$ BigQuery materialized views + BI Engine $\rightarrow$ Analytics Hub listing --- one governed copy serving both internal dashboards and external partners.
+    \item \textbf{Steps:} (1) land 5 years of retail Parquet in GCS partitioned by date; (2) create BigLake tables over the files; (3) apply a row access policy on \texttt{region} and a policy tag on customer PII columns; (4) build MVs for executive KPIs and add a BI Engine reservation; (5) publish the curated dataset via Analytics Hub; (6) run the negative security test.
+    \item \textbf{Hardest part --- row-level security that survives audits:}
+\begin{lstlisting}[language=SQL]
+CREATE ROW ACCESS POLICY region_filter
+ON lakehouse.fact_sales
+GRANT TO ("group:analysts-eu@example.com")
+FILTER USING (region = "EU");
+-- negative test: query as an analyst-us member must return zero EU rows
+\end{lstlisting}
+    \item \textbf{Pitfall:} clustering on a low-cardinality column yields no pruning --- cluster on the columns selective filters actually use.
+    \item \textbf{Pitfall:} materialized views support a restricted SQL subset (no arbitrary joins or UDFs) --- keep them simple pre-aggregations.
+    \item \textbf{Pitfall:} policy tags deny by default; a forgotten group grant blocks dashboards silently --- always pair with a negative test.
+\end{itemize}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[node distance=6mm and 10mm, every node/.style={draw, rounded corners, fill=blue!10, align=center, font=\footnotesize}]
+    \node[fill=teal!10] (gcs) {GCS Data Lake\\(5 yrs retail)};
+    \node[right=of gcs] (biglake) {BigLake Tables\\(row/col security)};
+    \node[right=of biglake] (bq) {BigQuery\\(MVs + BI Engine)};
+    \node[right=of bq] (hub) {Analytics Hub\\(data sharing)};
+    \node[above=of bq, fill=violet!10] (dash) {Executive\\Dashboards};
+    \node[below=of bq, fill=brown!10] (iam) {Policy Tags +\\IAM};
+    \draw[-{Stealth}] (gcs) -- (biglake);
+    \draw[-{Stealth}] (biglake) -- (bq);
+    \draw[-{Stealth}] (bq) -- (hub);
+    \draw[-{Stealth}] (bq) -- (dash);
+    \draw[-{Stealth}, dashed] (iam) -- (biglake);
+    \draw[-{Stealth}, dashed] (iam) -- (bq);
+\end{tikzpicture}
+\caption{Milestone 2 reference architecture: governed lakehouse from GCS to shared analytics.}
+\end{figure}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[node distance=5mm and 10mm,
+    entity/.style={draw, rounded corners, fill=blue!5, align=left, font=\scriptsize, inner sep=1.5mm},
+    title/.style={font=\scriptsize\bfseries}]
+    \node[entity] (fact) {\title FACT\_SALES\\[0.5mm]sale\_id (PK)\\date\_key (FK)\\store\_key (FK)\\product\_key (FK)\\customer\_key (FK)\\amount};
+    \node[entity, above=5mm of fact] (date) {\title DIM\_DATE\\[0.5mm]date\_key (PK)\\month\\quarter\\year};
+    \node[entity, left=of fact] (store) {\title DIM\_STORE\\[0.5mm]store\_key (PK)\\store\_name\\region (RLS)};
+    \node[entity, right=of fact] (prod) {\title DIM\_PRODUCT\\[0.5mm]product\_key (PK)\\category\\brand};
+    \node[entity, below=5mm of fact] (cust) {\title DIM\_CUSTOMER (SCD2)\\[0.5mm]customer\_key (PK)\\customer\_id\\segment\\valid\_from / is\_current};
+    \draw[-{Stealth}] (date) -- node[right, font=\scriptsize]{1:N} (fact);
+    \draw[-{Stealth}] (store) -- node[above, font=\scriptsize]{1:N} (fact);
+    \draw[-{Stealth}] (prod) -- node[above, font=\scriptsize]{1:N} (fact);
+    \draw[-{Stealth}] (cust) -- node[right, font=\scriptsize]{1:N} (fact);
+\end{tikzpicture}
+\caption{Capstone data model: retail lakehouse star schema with conformed dimensions and SCD2 customers.}
+\end{figure}
 
 % ==========================================
 % MILESTONE 3
 % ==========================================
 \section{Milestone 3: Batch Processing \& ETL Orchestration (Month 3)}
 \textit{Objective: Master Hadoop migration, No-code ETL, CDC, and Airflow.}
+\par\noindent\textbf{Learning outcomes:} migrate Hadoop workloads to Dataproc, build no-code Data Fusion pipelines, configure Datastream CDC replication, orchestrate multi-service DAGs in Cloud Composer
 
 \subsection*{Week 9: Managed Hadoop/Spark (Cloud Dataproc)}
+\par\noindent\textbf{Outcomes:} submit PySpark jobs to ephemeral clusters, migrate HDFS data to GCS, tune Spark memory and autoscaling, make Spark writes idempotent under preemption
 \begin{itemize}[label=-]
     \dayitem{Monday}{Dataproc Architecture, Ephemeral clusters, and Preemptible VMs.}
     \dayitem{Tuesday}{Migrating from on-prem HDFS to Cloud Storage.}
@@ -151,8 +451,19 @@
     \dayitem{Thursday}{\project{Deploy an ephemeral Dataproc cluster, submit a PySpark job that reads from GCS, aggregates sales data, writes back to GCS, and self-deletes.}}
     \dayitem{Friday}{\usecase{Design a migration strategy for a 100-node on-premise Cloudera cluster, prioritizing cost reduction and decoupling compute from storage.}}
 \end{itemize}
+\prodnote{Make Spark jobs idempotent (deterministic output paths, write-then-swap into BigQuery) so preemptible VM reclamation or retries never double-load data; use ephemeral clusters and autoscaling policies as a cost guardrail.}
+
+\resources{Cloud Dataproc docs (\url{https://cloud.google.com/dataproc/docs}); Apache Spark repo (\url{https://github.com/apache/spark}).}
+\selfcheck{\begin{itemize}[label=-, nosep, leftmargin=1.5em]
+    \item Why should Dataproc clusters be ephemeral for scheduled jobs?
+    \item What is the cost trade-off of preemptible VMs in a Spark cluster?
+    \item Why migrate HDFS data to GCS instead of keeping HDFS?
+    \item What Spark property most often explains executor out-of-memory errors?
+    \item How do autoscaling policies decide when to add workers?
+\end{itemize}}
 
 \subsection*{Week 10: Visual ETL (Cloud Data Fusion)}
+\par\noindent\textbf{Outcomes:} build Wrangler-based no-code pipelines, parameterize deployed pipelines with macros, schedule recurring runs, justify Data Fusion versus Dataflow for analyst teams
 \begin{itemize}[label=-]
     \dayitem{Monday}{CDAP concepts, Data Fusion architecture, and Private IPs.}
     \dayitem{Tuesday}{Wrangler: Interactive data cleaning and transformation.}
@@ -160,26 +471,150 @@
     \dayitem{Thursday}{\project{Build a no-code Data Fusion pipeline that reads messy customer data from GCS, uses Wrangler to extract domains from emails, and writes to BigQuery.}}
     \dayitem{Friday}{\usecase{Evaluate Data Fusion vs. Dataflow for a team of business analysts who need to build daily reporting pipelines without writing Java/Python.}}
 \end{itemize}
+\resources{Cloud Data Fusion docs (\url{https://cloud.google.com/data-fusion/docs}); Data Engineering Zoomcamp (\url{https://github.com/DataTalksClub/data-engineering-zoomcamp}).}
+\selfcheck{\begin{itemize}[label=-, nosep, leftmargin=1.5em]
+    \item What underlying framework executes Data Fusion pipelines?
+    \item What is Wrangler's role before a pipeline runs at scale?
+    \item When should you choose Data Fusion over Dataflow?
+    \item Why use a private IP Data Fusion instance?
+    \item What do macros parameterize in a deployed pipeline?
+\end{itemize}}
 
 \subsection*{Week 11: Change Data Capture (Datastream)}
+\par\noindent\textbf{Outcomes:} configure Datastream CDC from PostgreSQL to BigQuery, classify schema changes as breaking or non-breaking, monitor freshness and failed events, handle source schema drift
 \begin{itemize}[label=-]
     \dayitem{Monday}{CDC concepts and the Datastream architecture.}
     \dayitem{Tuesday}{Source configurations (MySQL/PostgreSQL/Oracle).}
-    \dayitem{Wednesday}{Destination configurations (Cloud Storage vs. BigQuery native).}
-    \dayitem{Thursday}{\project{Set up a Cloud SQL PostgreSQL database, configure logical replication, and build a Datastream pipeline to sync changes to BigQuery in near real-time.}}
+    \dayitem{Wednesday}{Destination configurations (Cloud Storage vs.\ BigQuery native) and data contracts: BigQuery schema enforcement on load (reject rows with unknown or mismatched fields), contract versioning, breaking vs.\ non-breaking changes (adding a nullable column vs.\ renaming one), and producer vs.\ consumer ownership of the contract.}
+    \dayitem{Thursday}{\project{Set up a Cloud SQL PostgreSQL database, configure logical replication, and build a Datastream pipeline to sync changes to BigQuery in near real-time. Test the contract: add a nullable column (non-breaking) and rename one (breaking), observing Datastream's schema-drift handling.}}
     \dayitem{Friday}{\usecase{Architect a zero-downtime database replication pipeline from an on-premise Oracle database to BigQuery for real-time BI reporting.}}
 \end{itemize}
+\prodnote{Alert on Datastream CDC latency (data freshness metric) and failed events in Cloud Monitoring; write a runbook for stale log positions and backfill via GCS staging when BigQuery apply falls behind. Schema drift at the source must be handled explicitly --- test adding and renaming a column.}
+
+\resources{Datastream docs (\url{https://cloud.google.com/datastream/docs}); Data Engineer Handbook (\url{https://github.com/DataExpert-io/data-engineer-handbook}).}
+\selfcheck{\begin{itemize}[label=-, nosep, leftmargin=1.5em]
+    \item How does Datastream capture changes without querying the source tables?
+    \item Which is a breaking contract change: adding a nullable column or renaming one?
+    \item What does BigQuery schema enforcement on load reject by default?
+    \item Who should own a data contract --- producer, consumer, or both?
+    \item What does the data freshness metric tell you about CDC lag?
+\end{itemize}}
 
 \subsection*{Week 12: Pipeline Orchestration (Cloud Composer)}
+\par\noindent\textbf{Outcomes:} author Airflow DAGs with sensors and Google operators, orchestrate cross-service Dataproc and BigQuery tasks, implement idempotent retry-safe tasks, wire failure notifications
 \begin{itemize}[label=-]
     \dayitem{Monday}{Apache Airflow concepts: DAGs, Operators, Tasks, and XComs.}
     \dayitem{Tuesday}{Cloud Composer 2 architecture (Autoscaling, GKE underlying).}
     \dayitem{Wednesday}{Cross-service orchestration (Triggering Dataproc, Dataflow, BQ).}
     \dayitem{Thursday}{\project{Write a Python DAG that: 1. Checks if a file exists in GCS. 2. Triggers a Dataproc job. 3. Loads the output to BigQuery. 4. Sends an email on failure.}}
+\begin{lstlisting}[language=Python]
+from datetime import datetime, timedelta
+from airflow import DAG
+from airflow.providers.google.cloud.sensors.gcs import GCSObjectExistenceSensor
+from airflow.providers.google.cloud.operators.dataproc import DataprocSubmitJobOperator
+from airflow.providers.google.cloud.operators.bigquery import BigQueryInsertJobOperator
+from airflow.operators.email import EmailOperator
+
+default_args = {"retries": 2, "retry_delay": timedelta(minutes=5)}
+
+with DAG("daily_sales_elt", schedule="@daily", start_date=datetime(2026, 1, 1),
+         default_args=default_args, catchup=False) as dag:
+    wait_for_file = GCSObjectExistenceSensor(
+        task_id="wait_for_file", bucket="raw-sales", object="daily/{{ ds }}/sales.csv")
+    spark_job = DataprocSubmitJobOperator(
+        task_id="spark_transform", project_id="my-project", region="us-central1",
+        job={"placement": {"cluster_name": "ephemeral-etl"},
+             "pyspark_job": {"main_python_file_uri": "gs://code/transform.py"}})
+    load_bq = BigQueryInsertJobOperator(
+        task_id="load_bq",
+        configuration={"query": {"query": "CALL analytics.refresh_daily_sales()",
+                                 "useLegacySql": False}})
+    notify = EmailOperator(task_id="notify", to=["data-oncall@example.com"],
+                           subject="daily_sales_elt finished", html_content="Done.",
+                           trigger_rule="all_done")
+    wait_for_file >> spark_job >> load_bq >> notify
+\end{lstlisting}
     \dayitem{Friday}{\usecase{Design a resilient, self-healing orchestration layer for a daily banking reconciliation process spanning 15 dependent systems.}}
 \end{itemize}
+\prodnote{Enable Composer DAG failure notifications: set email/Slack on\_failure\_callbacks and Cloud Monitoring alert policies on failed task instances and SLA misses; use retries with exponential backoff and keep tasks idempotent so re-runs are safe.}
+
+\resources{Apache Airflow repo (\url{https://github.com/apache/airflow}); Cloud Composer docs (\url{https://cloud.google.com/composer/docs}).}
+\selfcheck{\begin{itemize}[label=-, nosep, leftmargin=1.5em]
+    \item Why must Airflow tasks be idempotent for safe retries?
+    \item What does the \texttt{all\_done} trigger rule guarantee here?
+    \item What runs underneath Cloud Composer 2?
+    \item When should you use a GCS sensor instead of a schedule?
+    \item What information should flow through XComs --- and what should not?
+\end{itemize}}
 
 \capstone{Milestone 3}{Automated Batch ELT Pipeline. Use Cloud Scheduler to trigger a Composer DAG. The DAG runs a Datastream CDC sync verification, triggers a Serverless Dataproc Spark job to calculate complex ML features, loads them into BigQuery, and creates a Materialized View.}
+
+\rubric{
+\begin{itemize}[label=-, nosep, leftmargin=1.5em]
+    \item End-to-end pipeline runs from a clean environment following the repo README (Scheduler triggers Composer; DAG completes without manual steps).
+    \item Architecture diagram committed showing Scheduler, Composer, Datastream, Dataproc, and BigQuery flows.
+    \item At least 3 automated data-quality tests after load (CDC row-count reconciliation, freshness check, feature null-rate) with a failing-case demonstration.
+    \item Monitoring/alerting evidence: DAG failure notification and a Cloud Monitoring alert on pipeline latency.
+    \item Monthly cost estimate with 2 optimization decisions documented (ephemeral clusters, preemptible VMs, Composer sizing).
+    \item Security review: service accounts scoped per service, no hardcoded secrets, PII handling noted.
+\end{itemize}
+}
+
+\subsection*{Milestone 3 Capstone: Reference Solution Sketch}
+\begin{itemize}[label=-, leftmargin=1.5em]
+    \item \textbf{Architecture:} Cloud Scheduler $\rightarrow$ Composer DAG $\rightarrow$ (Datastream freshness check $\rightarrow$ serverless Dataproc Spark feature job $\rightarrow$ BigQuery load $\rightarrow$ MV refresh) --- one orchestrator, each stage idempotent.
+    \item \textbf{Steps:} (1) verify CDC row counts between source and BigQuery; (2) run the Spark aggregation on an ephemeral cluster; (3) load with \texttt{WRITE\_TRUNCATE} on a date partition; (4) refresh the materialized view; (5) wire failure email and latency alerts; (6) document the backfill runbook.
+    \item \textbf{Hardest part --- an idempotent Spark write safe under retries:}
+\begin{lstlisting}[language=Python]
+ds = kwargs["ds"]  # logical date from Airflow context
+out = f"gs://ml-features/dt={ds}"  # deterministic path per run
+(spark.read.parquet(f"gs://cdc-staging/dt={ds}")
+      .groupBy("customer_id")
+      .agg(F.count("*").alias("orders_30d"),
+           F.sum("amount").alias("spend_30d"))
+      .write.mode("overwrite").parquet(out))
+# BQ load uses WRITE_TRUNCATE on partition dt=ds: re-runs replace, never duplicate
+\end{lstlisting}
+    \item \textbf{Pitfall:} \texttt{catchup=True} on a new DAG floods weeks of backfill runs at once --- disable it or cap \texttt{max\_active\_runs}.
+    \item \textbf{Pitfall:} append-mode loads double-count rows when a task retries --- always overwrite by partition.
+    \item \textbf{Pitfall:} passing DataFrames or file contents through XComs stalls the scheduler --- pass paths and row counts only.
+\end{itemize}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[node distance=6mm and 10mm, every node/.style={draw, rounded corners, fill=blue!10, align=center, font=\footnotesize}]
+    \node[fill=teal!10] (sched) {Cloud\\Scheduler};
+    \node[right=of sched] (composer) {Cloud Composer\\(Airflow DAG)};
+    \node[right=of composer] (dataproc) {Serverless Dataproc\\(Spark features)};
+    \node[below=of dataproc] (datastream) {Datastream CDC\\(Cloud SQL source)};
+    \node[right=of dataproc] (bq) {BigQuery\\(+ Materialized View)};
+    \node[below=of composer, fill=brown!10] (mon) {Cloud Monitoring\\(alerts + runbooks)};
+    \draw[-{Stealth}] (sched) -- (composer);
+    \draw[-{Stealth}] (composer) -- (dataproc);
+    \draw[-{Stealth}, dashed] (composer) |- (datastream);
+    \draw[-{Stealth}] (dataproc) -- (bq);
+    \draw[-{Stealth}] (datastream) -- (bq);
+    \draw[-{Stealth}, dashed] (composer) -- (mon);
+    \draw[-{Stealth}, dashed] (dataproc) -- (mon);
+\end{tikzpicture}
+\caption{Milestone 3 reference architecture: scheduled batch ELT with CDC verification.}
+\end{figure}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[node distance=5mm and 10mm,
+    entity/.style={draw, rounded corners, fill=blue!5, align=left, font=\scriptsize, inner sep=1.5mm},
+    title/.style={font=\scriptsize\bfseries}]
+    \node[entity] (src) {\title ORDERS\_CDC (source)\\[0.5mm]order\_id\\customer\_id\\order\_ts\\cdc\_op};
+    \node[entity, right=of src] (stg) {\title STG\_ORDERS\\[0.5mm]order\_id (PK)\\cdc\_op\\loaded\_ts};
+    \node[entity, right=of stg] (feat) {\title ML\_FEATURES\\[0.5mm]customer\_id (PK)\\orders\_30d\\spend\_30d\\feature\_ts};
+    \node[entity, below=6mm of feat] (mv) {\title MV\_DAILY\_SALES\\[0.5mm]sale\_date\\store\_key\\total\_amount};
+    \draw[-{Stealth}] (src) -- node[above, font=\scriptsize]{1:N} (stg);
+    \draw[-{Stealth}] (stg) -- node[above, font=\scriptsize]{1:N} (feat);
+    \draw[-{Stealth}] (stg) |- node[near start, right, font=\scriptsize]{1:N} (mv);
+\end{tikzpicture}
+\caption{Capstone data model: batch ELT flow from CDC staging to ML features and materialized aggregates.}
+\end{figure}
 
 \newpage
 % ==========================================
@@ -187,17 +622,53 @@
 % ==========================================
 \section{Milestone 4: Streaming \& Real-Time Analytics (Month 4)}
 \textit{Objective: Conquer unbounded data, message queues, and real-time visualization.}
+\par\noindent\textbf{Learning outcomes:} design Pub/Sub topics with dead-letter handling, implement Beam streaming pipelines with windowing and late-data handling, unit-test and monitor Dataflow jobs in production, serve real-time dashboards in Looker
 
 \subsection*{Week 13: Asynchronous Messaging (Pub/Sub)}
+\par\noindent\textbf{Outcomes:} publish with retry and exponential backoff, configure dead-letter topics and snapshot/seek replay, enforce topic schemas at the edge, deduplicate at-least-once delivery downstream
 \begin{itemize}[label=-]
-    \dayitem{Monday}{Pub/Sub concepts: Topics, Subscriptions (Push/Pull), Acknowledgements.}
+    \dayitem{Monday}{Pub/Sub concepts: Topics, Subscriptions (Push/Pull), Acknowledgements; schema validation with Avro or Protocol Buffer schemas attached to topics (rejecting non-conforming publishes as contract enforcement at the edge).}
     \dayitem{Tuesday}{Dead-Letter Topics, Retry Policies, and Snapshot/Seek.}
     \dayitem{Wednesday}{Pub/Sub Lite vs. Pub/Sub Standard (Cost vs. Operational overhead).}
     \dayitem{Thursday}{\project{Create a Pub/Sub topic and pull subscription. Write a Python publisher to stream mock financial transactions. Configure a Dead-Letter Topic for failed messages.}}
+\begin{lstlisting}[language=Python]
+import json, random, time
+from google.cloud import pubsub_v1
+
+publisher = pubsub_v1.PublisherClient(
+    publisher_options=pubsub_v1.types.PublisherOptions(
+        retry=pubsub_v1.types.Retry(initial=0.1, maximum=10.0, multiplier=2.0)))
+topic_path = publisher.topic_path("my-project", "card-transactions")
+
+def publish(txn):
+    future = publisher.publish(topic_path, json.dumps(txn).encode("utf-8"),
+                               origin="pos-simulator")
+    future.add_done_callback(lambda f: print("acked:", f.result()))
+
+for i in range(1000):
+    publish({"card_id": f"card-{random.randint(1, 500)}",
+             "amount": round(random.uniform(1, 500), 2),
+             "city": random.choice(["NYC", "LON", "TYO"]), "ts": time.time()})
+
+# DLQ is configured on the subscription, not the publisher:
+# gcloud pubsub subscriptions create card-sub --topic=card-transactions \
+#   --dead-letter-topic=card-dlq --max-delivery-attempts=5
+\end{lstlisting}
     \dayitem{Friday}{\usecase{Architect a global telemetry ingestion point for 5 million mobile games, ensuring exactly-once processing semantics.}}
 \end{itemize}
+\prodnote{Publishing is at-least-once: deduplicate downstream with message IDs or Dataflow exactly-once mode, publish with retry and exponential backoff, and alert on oldest unacked message age and DLQ message counts.}
+
+\resources{Pub/Sub docs (\url{https://cloud.google.com/pubsub/docs}); Apache Kafka repo (\url{https://github.com/apache/kafka}).}
+\selfcheck{\begin{itemize}[label=-, nosep, leftmargin=1.5em]
+    \item What happens to a message that exceeds max delivery attempts?
+    \item How does a topic schema enforce a data contract at publish time?
+    \item Why is Pub/Sub publishing at-least-once, and how do you deduplicate?
+    \item When does Pub/Sub Lite beat Standard on cost?
+    \item What does the oldest-unacked-message-age metric warn you about?
+\end{itemize}}
 
 \subsection*{Week 14: Dataflow \& Apache Beam (Basics)}
+\par\noindent\textbf{Outcomes:} implement PTransforms and ParDos, unit-test pipelines with TestPipeline and PAssert, package Flex Templates, run and autoscale a job on the Dataflow runner
 \begin{itemize}[label=-]
     \dayitem{Monday}{Apache Beam model: PCollections, PTransforms, ParDo, and Runners.}
     \dayitem{Tuesday}{Dataflow architecture: Streaming Engine, Shuffle, Autoscaling.}
@@ -205,26 +676,174 @@
     \dayitem{Thursday}{\project{Write an Apache Beam pipeline in Python that reads texts, tokenizes words, counts frequencies (WordCount), and runs it on the Dataflow runner.}}
     \dayitem{Friday}{\usecase{Design a pipeline to anonymize incoming healthcare HL7 messages in real-time before storing them in BigQuery.}}
 \end{itemize}
+\prodnote{Unit-test Beam pipelines before deploying to Dataflow: run transforms locally with TestPipeline and assert outputs with PAssert (beam.testing); test DoFns in isolation and use TestStream to verify windowed and late-data behavior in CI.}
 
-\subsection*{Week 15: Dataflow Advanced (Windowing \& Time)}
+\resources{Apache Beam docs (\url{https://beam.apache.org/documentation/}); Data Engineering Zoomcamp (\url{https://github.com/DataTalksClub/data-engineering-zoomcamp}).}
+\selfcheck{\begin{itemize}[label=-, nosep, leftmargin=1.5em]
+    \item What is the difference between a PTransform and a ParDo?
+    \item Why unit-test Beam with TestPipeline before deploying to Dataflow?
+    \item What does Streaming Engine move off the worker VMs?
+    \item When should you package a pipeline as a Flex Template?
+    \item How does Dataflow autoscaling react to a growing backlog?
+\end{itemize}}
+
+\subsection*{Week 15: Dataflow Advanced (Windowing, State \& Exactly-Once)}
+\par\noindent\textbf{Outcomes:} choose fixed, sliding, or session windows per workload, configure triggers and allowed lateness, manage per-key state with the Beam State \& Timers API, join streams over windows with CoGroupByKey, reason about end-to-end exactly-once versus at-least-once plus dedup, alert on watermark lag
 \begin{itemize}[label=-]
     \dayitem{Monday}{Event Time vs. Processing Time and Watermarks.}
     \dayitem{Tuesday}{Windowing strategies: Fixed, Sliding, and Session windows.}
-    \dayitem{Wednesday}{Handling Late Data: Allowed Lateness and Triggers.}
+    \dayitem{Wednesday}{Handling Late Data: Allowed Lateness and Triggers. Stateful streaming: Beam State \& Timers API, per-key state bags, and state TTL via watermark garbage collection --- why unbounded state kills streaming jobs.}
+\begin{lstlisting}[language=Python]
+import apache_beam as beam
+from apache_beam.coders import coders
+from apache_beam.transforms.userstate import BagStateSpec, TimerSpec, on_timer
+
+class DedupWithTimer(beam.DoFn):
+    SEEN = BagStateSpec("seen", coders.StrUtf8Coder())
+    EXPIRY = TimerSpec("expiry")
+
+    def process(self, element, seen=beam.DoFn.StateParam(SEEN),
+                expiry=beam.DoFn.TimerParam(EXPIRY)):
+        key, event = element
+        expiry.set(event["event_ts"] + 600)  # state TTL: 10 min
+        if event["event_id"] in set(seen.read()):
+            return  # duplicate: discard
+        seen.add(event["event_id"])
+        yield event
+
+    @on_timer(EXPIRY)
+    def on_expiry(self, seen=beam.DoFn.StateParam(SEEN)):
+        seen.clear()  # free per-key state at timer fire
+\end{lstlisting}
     \dayitem{Thursday}{\project{Build a streaming Dataflow pipeline reading from Pub/Sub. Group user clicks into 5-minute Session Windows, allowing for 2 minutes of late data.}}
-    \dayitem{Friday}{\usecase{Troubleshoot a scenario where a streaming dashboard is showing inaccurate daily aggregations due to mobile devices going offline and uploading data late.}}
+\begin{lstlisting}[language=Python]
+import json
+import apache_beam as beam
+from apache_beam.options.pipeline_options import PipelineOptions, StandardOptions
+from apache_beam.transforms.window import TimestampedValue, FixedWindows
+import apache_beam.transforms.trigger as trigger
+
+options = PipelineOptions(project="my-project", region="us-central1",
+                          temp_location="gs://my-bucket/tmp")
+options.view_as(StandardOptions).streaming = True
+
+with beam.Pipeline(options=options) as p:
+    (p | "Read" >> beam.io.ReadFromPubSub(
+             subscription="projects/my-project/subscriptions/clicks-sub")
+       | "Parse" >> beam.Map(lambda b: json.loads(b.decode("utf-8")))
+       | "Stamp" >> beam.Map(lambda e: TimestampedValue(e, e["event_ts"]))
+       | "Window" >> beam.WindowInto(
+             FixedWindows(300),  # 5-minute windows
+             trigger=trigger.AfterWatermark(late=trigger.AfterCount(1)),
+             allowed_lateness=120,  # 2 minutes of late data
+             accumulation_mode=trigger.AccumulationMode.DISCARDING)
+       | "KeyByUser" >> beam.Map(lambda e: (e["user_id"], 1))
+       | "Count" >> beam.CombinePerKey(sum)
+       | "Write" >> beam.io.WriteToBigQuery(
+             "my-project:analytics.clicks_5min",
+             create_disposition=beam.io.BigQueryDisposition.CREATE_IF_NEEDED))
+\end{lstlisting}
+    \dayitem{Friday}{Stream-stream joins: CoGroupByKey and joins over windows, join + watermark alignment, and state retention implications. End-to-end exactly-once: Dataflow exactly-once shuffle with Streaming Engine and idempotent sinks (BigQuery Storage Write API exactly-once semantics) versus at-least-once plus downstream dedup. \usecase{Troubleshoot a scenario where a streaming dashboard is showing inaccurate daily aggregations due to mobile devices going offline and uploading data late.}}
 \end{itemize}
+\prodnote{Create Cloud Monitoring alert policies on Dataflow system lag and per-stage data watermark lag; growing watermark lag signals late data or a stuck stage --- page on-call and check the upstream Pub/Sub backlog (oldest unacked message age).}
+\prodnote{Changing stateful logic (state specs, timers, or windowing) usually breaks in-place job updates because existing state cannot map to the new schema: prefer an in-place update only for stateless-compatible changes, and use drain-and-replace (drain the old job, start the new one from a snapshot or fresh subscription) when stateful transforms change --- plan the cutover to avoid reprocessing or gaps.}
+
+\resources{Beam programming guide (\url{https://beam.apache.org/documentation/programming-guide/}); OpenLineage repo (\url{https://github.com/OpenLineage/OpenLineage}).}
+\selfcheck{\begin{itemize}[label=-, nosep, leftmargin=1.5em]
+    \item What does a watermark estimate, and what lies behind it?
+    \item Why does unbounded per-key state kill a streaming job, and how do timers plus watermark garbage collection bound it?
+    \item In the dedup DoFn, what do the \texttt{SEEN} bag state and \texttt{EXPIRY} timer each do?
+    \item What must align across both inputs for a CoGroupByKey stream-stream join to emit, and what state does it retain?
+    \item How do Streaming Engine shuffle and the BigQuery Storage Write API deliver end-to-end exactly-once, and when is at-least-once plus downstream dedup the cheaper choice?
+\end{itemize}}
 
 \subsection*{Week 16: Business Intelligence \& Looker}
+\par\noindent\textbf{Outcomes:} model governed metrics in LookML explores, build drill-down dashboards on streaming data, push reverse-ETL segments to operational APIs, compare Looker Studio with Looker Core
 \begin{itemize}[label=-]
     \dayitem{Monday}{Looker Architecture: The Semantic Layer and LookML.}
     \dayitem{Tuesday}{Dimensions, Measures, Explores, and Views.}
-    \dayitem{Wednesday}{Looker Studio vs. Looker Core (Self-serve vs. Governed BI).}
-    \dayitem{Thursday}{\project{Connect Looker Studio (or a Looker trial) to your BigQuery retail dataset. Create a real-time dashboard monitoring streaming sales with drill-down filters.}}
+    \dayitem{Wednesday}{Looker Studio vs.\ Looker Core (Self-serve vs.\ Governed BI); Reverse ETL: pushing curated BigQuery segments back into operational CRM/marketing APIs via a scheduled query plus Cloud Function (or a Dataform operation), with identity resolution across systems and sync-frequency trade-offs (freshness vs.\ API rate limits and cost).}
+    \dayitem{Thursday}{\project{Connect Looker Studio (or a Looker trial) to your BigQuery retail dataset. Create a real-time dashboard monitoring streaming sales with drill-down filters. Reverse-ETL lab: schedule a BigQuery query that materializes a high-value customer segment and have a Cloud Function POST it to a mock marketing API webhook.}}
     \dayitem{Friday}{\usecase{Design the BI access layer for an enterprise where 500 analysts need to query centralized data without creating conflicting metrics (e.g., "Gross Revenue" definitions).}}
 \end{itemize}
+\resources{Looker docs (\url{https://cloud.google.com/looker/docs}); DataHub repo (\url{https://github.com/datahub-project/datahub}).}
+\selfcheck{\begin{itemize}[label=-, nosep, leftmargin=1.5em]
+    \item Why does a LookML semantic layer prevent conflicting metric definitions?
+    \item What problem does reverse ETL solve that dashboards cannot?
+    \item What breaks in a sync without identity resolution across systems?
+    \item What trade-off governs reverse-ETL sync frequency?
+    \item When is Looker Core justified over Looker Studio?
+\end{itemize}}
 
 \capstone{Milestone 4}{Real-Time Fraud Detection. Build a Python script simulating credit card swipes sent to Pub/Sub. Create a Dataflow pipeline that uses a Sliding Window to detect if a card is used in two different cities within 10 minutes, flags it, and streams the alert to BigQuery for live Looker visualization.}
+
+\rubric{
+\begin{itemize}[label=-, nosep, leftmargin=1.5em]
+    \item End-to-end streaming pipeline runs from a clean environment following the repo README (simulator to Pub/Sub to Dataflow to BigQuery/Looker).
+    \item Architecture diagram committed, including DLQ, windowing semantics, and serving layer.
+    \item At least 3 automated tests (PAssert unit tests for the fraud-detection logic plus a late-data case) with a failing-case demonstration.
+    \item Monitoring/alerting evidence: alert policies on Dataflow watermark lag and Pub/Sub backlog (screenshot or exported config).
+    \item Monthly cost estimate with 2 optimization decisions documented (Streaming Engine, autoscaling bounds, Pub/Sub vs.\ Lite).
+    \item Security review: least-privilege runner service account, no hardcoded secrets, PII handling noted (card data pseudonymized).
+\end{itemize}
+}
+
+\subsection*{Milestone 4 Capstone: Reference Solution Sketch}
+\begin{itemize}[label=-, leftmargin=1.5em]
+    \item \textbf{Architecture:} Python card-swipe simulator $\rightarrow$ Pub/Sub (with DLQ) $\rightarrow$ Dataflow sliding-window fraud rule $\rightarrow$ BigQuery alerts table $\rightarrow$ Looker live dashboard --- serverless end to end, no clusters to manage.
+    \item \textbf{Steps:} (1) generate seeded transactions with occasional cross-city anomalies; (2) publish with retry/backoff; (3) window events per card with a 10-minute sliding window; (4) flag windows containing two distinct cities; (5) write alerts to BigQuery; (6) build the Looker dashboard and watermark-lag alert.
+    \item \textbf{Hardest part --- the two-cities-in-ten-minutes rule:}
+\begin{lstlisting}[language=Python]
+alerts = (
+    events
+    | "KeyByCard" >> beam.Map(lambda e: (e["card_id"], e))
+    | "Window" >> beam.WindowInto(SlidingWindows(600, 60),
+          allowed_lateness=120,
+          accumulation_mode=trigger.AccumulationMode.DISCARDING)
+    | "Group" >> beam.GroupByKey()
+    | "Flag" >> beam.FlatMap(lambda kv: [(kv[0], w)]
+        for w in [1] if len({e["city"] for e in kv[1]}) > 1))
+\end{lstlisting}
+    \item \textbf{Pitfall:} keying on processing time instead of event time misses offline-mobile swipes --- always use the event timestamp.
+    \item \textbf{Pitfall:} default watermarks silently drop late events; set \texttt{allowed\_lateness} and monitor watermark lag.
+    \item \textbf{Pitfall:} unbounded per-key state in session windows grows worker memory --- emit and clear state per window firing.
+\end{itemize}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[node distance=6mm and 10mm, every node/.style={draw, rounded corners, fill=blue!10, align=center, font=\footnotesize}]
+    \node[fill=teal!10] (prod) {Producers\\(card swipes)};
+    \node[right=of prod] (ps) {Pub/Sub\\(transactions)};
+    \node[right=of ps] (df) {Dataflow\\(sliding window)};
+    \node[right=of df] (bq) {BigQuery\\(fraud alerts)};
+    \node[right=of bq] (looker) {Looker\\(live dashboard)};
+    \node[below=of ps, fill=brown!10] (dlq) {Dead-Letter\\Topic};
+    \node[below=of df, fill=brown!10] (mon) {Cloud Monitoring\\(watermark lag alerts)};
+    \draw[-{Stealth}] (prod) -- (ps);
+    \draw[-{Stealth}] (ps) -- (df);
+    \draw[-{Stealth}] (df) -- (bq);
+    \draw[-{Stealth}] (bq) -- (looker);
+    \draw[-{Stealth}, dashed] (ps) -- (dlq);
+    \draw[-{Stealth}, dashed] (df) -- (mon);
+\end{tikzpicture}
+\caption{Milestone 4 reference architecture: real-time fraud detection streaming pipeline.}
+\end{figure}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[node distance=5mm and 10mm,
+    entity/.style={draw, rounded corners, fill=blue!5, align=left, font=\scriptsize, inner sep=1.5mm},
+    title/.style={font=\scriptsize\bfseries}]
+    \node[entity] (cards) {\title CARDS\\[0.5mm]card\_id (PK)\\holder\_id\\issuer\\status};
+    \node[entity, right=of cards] (txns) {\title TRANSACTIONS\\[0.5mm]txn\_id (PK)\\card\_id (FK)\\amount\\city\\event\_ts};
+    \node[entity, right=of txns] (alerts) {\title FRAUD\_ALERTS\\[0.5mm]alert\_id (PK)\\card\_id (FK)\\rule\\window\_start/end\\flagged\_ts};
+    \node[entity, below=6mm of txns] (dlq) {\title DLQ\_MESSAGES\\[0.5mm]message\_id (PK)\\payload\\error\\delivery\_attempts};
+    \draw[-{Stealth}] (cards) -- node[above, font=\scriptsize]{1:N} (txns);
+    \draw[-{Stealth}] (txns) -- node[above, font=\scriptsize]{1:N} (alerts);
+    \draw[-{Stealth}, dashed] (txns) -- node[right, font=\scriptsize]{1:N} (dlq);
+\end{tikzpicture}
+\caption{Capstone data model: real-time fraud detection (cards, transactions, alerts, dead-lettered messages).}
+\end{figure}
 
 
 % ==========================================
@@ -232,8 +851,10 @@
 % ==========================================
 \section{Milestone 5: Machine Learning Operationalization (Month 5)}
 \textit{Objective: Embed AI into data pipelines and manage the MLOps lifecycle.}
+\par\noindent\textbf{Learning outcomes:} train and evaluate models in BigQuery ML, deploy AutoML models to Vertex AI endpoints, orchestrate Kubeflow pipelines with continuous training triggers, integrate AI APIs into streaming pipelines
 
 \subsection*{Week 17: BigQuery ML (BQML)}
+\par\noindent\textbf{Outcomes:} train classification and clustering models in pure SQL, forecast with ARIMA\_PLUS, evaluate with ML.EVALUATE ROC and precision/recall, detect overfitting from eval output
 \begin{itemize}[label=-]
     \dayitem{Monday}{BQML capabilities: Regression, Classification, K-Means Clustering.}
     \dayitem{Tuesday}{Time-series forecasting (ARIMA\_PLUS) and Anomaly Detection.}
@@ -241,8 +862,17 @@
     \dayitem{Thursday}{\project{Use BQML to train a logistic regression model on Google Analytics sample data to predict user churn. Evaluate the model's ROC curve using SQL.}}
     \dayitem{Friday}{\usecase{Architect a system to automatically forecast daily inventory needs for 1,000 retail stores using purely SQL-based pipelines.}}
 \end{itemize}
+\resources{BigQuery ML docs (\url{https://cloud.google.com/bigquery/docs/bqml-introduction}); dbt Core repo (\url{https://github.com/dbt-labs/dbt-core}).}
+\selfcheck{\begin{itemize}[label=-, nosep, leftmargin=1.5em]
+    \item Which BQML model type fits customer churn prediction?
+    \item What does ARIMA\_PLUS automate compared to classic ARIMA?
+    \item Which ML.EVALUATE metrics matter most for imbalanced churn?
+    \item What is the advantage of training where the data already lives?
+    \item How do you detect overfitting with BQML evaluation output?
+\end{itemize}}
 
 \subsection*{Week 18: Vertex AI Foundations}
+\par\noindent\textbf{Outcomes:} train an AutoML Tabular model, version it in the Model Registry, deploy to a managed endpoint, request online predictions with feature attributions
 \begin{itemize}[label=-]
     \dayitem{Monday}{Vertex AI Ecosystem, AutoML vs. Custom Training.}
     \dayitem{Tuesday}{Vertex AI Model Registry and Endpoint deployment (Online vs. Batch).}
@@ -250,8 +880,17 @@
     \dayitem{Thursday}{\project{Train an AutoML Tabular model on a cleaned BigQuery dataset. Deploy the model to a Vertex AI Endpoint and send a cURL request for an online prediction.}}
     \dayitem{Friday}{\usecase{Design a workflow for data scientists to train custom TensorFlow models on GPUs while accessing data securely stored in BigQuery.}}
 \end{itemize}
+\resources{Vertex AI docs (\url{https://cloud.google.com/vertex-ai/docs}); Data Engineer Handbook (\url{https://github.com/DataExpert-io/data-engineer-handbook}).}
+\selfcheck{\begin{itemize}[label=-, nosep, leftmargin=1.5em]
+    \item When is AutoML Tabular sufficient versus custom training?
+    \item What does the Model Registry version control?
+    \item Online versus batch prediction: which serves a checkout flow?
+    \item What do feature attributions tell a model consumer?
+    \item Why deploy through an endpoint rather than calling the model directly?
+\end{itemize}}
 
 \subsection*{Week 19: MLOps \& Vertex AI Pipelines}
+\par\noindent\textbf{Outcomes:} serve features online and offline via Feature Store, compose a Kubeflow Extract-Train-Deploy pipeline, gate retraining on drift alerts, distinguish skew from drift
 \begin{itemize}[label=-]
     \dayitem{Monday}{Vertex AI Feature Store: Online vs. Offline serving.}
     \dayitem{Tuesday}{Kubeflow pipelines and Vertex AI Pipelines orchestration.}
@@ -259,8 +898,19 @@
     \dayitem{Thursday}{\project{Build a simple Kubeflow pipeline (Extract $\rightarrow$ Train $\rightarrow$ Deploy). Compile it and run it using Vertex AI Pipelines.}}
     \dayitem{Friday}{\usecase{Architect an MLOps lifecycle that detects data drift in a production recommendation engine and automatically triggers a retraining pipeline via Cloud Functions.}}
 \end{itemize}
+\prodnote{Wire Vertex Model Monitoring alerts (feature drift and prediction skew) to a notification channel and a runbook: triage the drifting feature, validate upstream schema drift, then trigger retraining only after data-quality checks pass --- never auto-deploy without evaluation gates.}
+
+\resources{Vertex AI Pipelines docs (\url{https://cloud.google.com/vertex-ai/docs/pipelines}); OpenLineage repo (\url{https://github.com/OpenLineage/OpenLineage}).}
+\selfcheck{\begin{itemize}[label=-, nosep, leftmargin=1.5em]
+    \item What problem does a Feature Store solve between training and serving?
+    \item Online vs.\ offline serving: which backs a real-time recommender?
+    \item What does a Kubeflow pipeline component encapsulate?
+    \item Which signal should gate an automated retraining trigger?
+    \item How does prediction skew differ from training-data drift?
+\end{itemize}}
 
 \subsection*{Week 20: Unstructured Data \& AI APIs}
+\par\noindent\textbf{Outcomes:} call Vision and Natural Language APIs from a streaming Dataflow job, handle API rate limits with backoff and batching, make OCR output searchable, forecast per-call API cost
 \begin{itemize}[label=-]
     \dayitem{Monday}{Cloud Vision API and Video Intelligence API.}
     \dayitem{Tuesday}{Natural Language API and Translation API.}
@@ -268,8 +918,82 @@
     \dayitem{Thursday}{\project{Write a Dataflow pipeline that reads customer support text reviews from Pub/Sub, calls the Natural Language API to get sentiment scores, and saves to BigQuery.}}
     \dayitem{Friday}{\usecase{Design a scalable pipeline to process terabytes of uploaded user images, extract text (OCR), tag objects, and make the metadata searchable.}}
 \end{itemize}
+\resources{Cloud AI APIs docs (\url{https://cloud.google.com/products/ai}); Data Engineering Zoomcamp (\url{https://github.com/DataTalksClub/data-engineering-zoomcamp}).}
+\selfcheck{\begin{itemize}[label=-, nosep, leftmargin=1.5em]
+    \item When should a Dataflow pipeline call an AI API versus BQML?
+    \item What rate-limit handling belongs around external API calls?
+    \item Which API extracts entities and sentiment from support text?
+    \item How do you make OCR output searchable in BigQuery?
+    \item What cost risk do per-call AI APIs add to streaming jobs?
+\end{itemize}}
 
 \capstone{Milestone 5}{End-to-End MLOps Pipeline. Use Composer to orchestrate a pipeline that extracts features from BigQuery, pushes them to Vertex Feature Store, trains a custom model using Vertex Training, registers the model, and sets up Vertex Model Monitoring for serving skew.}
+
+\rubric{
+\begin{itemize}[label=-, nosep, leftmargin=1.5em]
+    \item End-to-end MLOps pipeline runs from a clean environment following the repo README (feature extraction to registered, monitored model).
+    \item Architecture diagram committed covering Feature Store, training, registry, endpoint, and monitoring loop.
+    \item At least 3 automated tests (feature-quality checks, model evaluation threshold gate, pipeline unit test) with a failing-case demonstration.
+    \item Monitoring/alerting evidence: Vertex Model Monitoring drift/skew alert configuration exported or screenshotted.
+    \item Monthly cost estimate with 2 optimization decisions documented (machine types, endpoint min/max nodes, batch vs.\ online).
+    \item Security review: pipeline service account with least privilege, no hardcoded secrets, training-data PII handling noted.
+\end{itemize}
+}
+
+\subsection*{Milestone 5 Capstone: Reference Solution Sketch}
+\begin{itemize}[label=-, leftmargin=1.5em]
+    \item \textbf{Architecture:} BigQuery features $\rightarrow$ Vertex Feature Store $\rightarrow$ Vertex Training $\rightarrow$ Model Registry $\rightarrow$ Endpoint, orchestrated by Composer, with Model Monitoring closing the retraining loop --- one managed platform instead of bespoke infrastructure.
+    \item \textbf{Steps:} (1) build the feature table in BigQuery; (2) sync to Feature Store; (3) train with an evaluation-metrics artifact; (4) gate registration on a quality threshold; (5) deploy to an endpoint with traffic splitting; (6) configure drift/skew alerts that trigger the retraining pipeline.
+    \item \textbf{Hardest part --- the evaluation gate that blocks bad models:}
+\begin{lstlisting}[language=Python]
+@component(base_image="python:3.10")
+def register_gate(evaluation: Input[Metrics]) -> bool:
+    auc = evaluation.metadata["roc_auc"]
+    if auc < 0.80:
+        raise ValueError(f"ROC AUC {auc:.3f} below 0.80 gate")
+    return True  # downstream register/deploy tasks only run if this passes
+\end{lstlisting}
+    \item \textbf{Pitfall:} auto-deploying without an evaluation gate ships regressions silently --- gate on a metric, page on failure.
+    \item \textbf{Pitfall:} features computed ad hoc in training and serving cause skew --- serve both paths from Feature Store.
+    \item \textbf{Pitfall:} \texttt{min\_replica\_count=0} saves money but adds cold-start latency to the first request after idle.
+\end{itemize}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[node distance=6mm and 9mm, every node/.style={draw, rounded corners, fill=blue!10, align=center, font=\footnotesize}]
+    \node[fill=teal!10] (bq) {BigQuery\\(features)};
+    \node[right=of bq] (fs) {Vertex AI\\Feature Store};
+    \node[right=of fs] (train) {Vertex AI\\Training};
+    \node[right=of train] (reg) {Model\\Registry};
+    \node[right=of reg] (ep) {Endpoint\\(serving)};
+    \node[above=8mm of train, fill=violet!10] (orch) {Cloud Composer\\(orchestration)};
+    \node[below=8mm of train, fill=brown!10] (mon) {Model Monitoring\\(drift / skew)};
+    \draw[-{Stealth}] (bq) -- (fs);
+    \draw[-{Stealth}] (fs) -- (train);
+    \draw[-{Stealth}] (train) -- (reg);
+    \draw[-{Stealth}] (reg) -- (ep);
+    \draw[-{Stealth}, dashed] (orch) -- (train);
+    \draw[-{Stealth}, dashed] (ep.south) -- (mon.east);
+    \draw[-{Stealth}, dashed] (mon) -- (orch);
+\end{tikzpicture}
+\caption{Milestone 5 reference architecture: MLOps lifecycle on Vertex AI with Composer orchestration.}
+\end{figure}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[node distance=5mm and 10mm,
+    entity/.style={draw, rounded corners, fill=blue!5, align=left, font=\scriptsize, inner sep=1.5mm},
+    title/.style={font=\scriptsize\bfseries}]
+    \node[entity] (feat) {\title FEATURES\\[0.5mm]entity\_id (PK)\\feature\_values\\feature\_ts};
+    \node[entity, right=of feat] (ds) {\title TRAINING\_DATASETS\\[0.5mm]dataset\_id (PK)\\bq\_source\_uri\\label\_col};
+    \node[entity, right=of ds] (model) {\title MODELS\\[0.5mm]model\_id (PK)\\version\\framework\\eval\_metrics};
+    \node[entity, right=of model] (pred) {\title PREDICTIONS\\[0.5mm]pred\_id (PK)\\model\_id (FK)\\entity\_id\\score\\served\_ts};
+    \draw[-{Stealth}] (feat) -- node[above, font=\scriptsize]{N:M} (ds);
+    \draw[-{Stealth}] (ds) -- node[above, font=\scriptsize]{1:N} (model);
+    \draw[-{Stealth}] (model) -- node[above, font=\scriptsize]{1:N} (pred);
+\end{tikzpicture}
+\caption{Capstone data model: MLOps lineage from features through registered models to served predictions.}
+\end{figure}
 
 \newpage
 % ==========================================
@@ -277,8 +1001,10 @@
 % ==========================================
 \section{Milestone 6: Security, Governance \& Exam Prep (Month 6)}
 \textit{Objective: Secure the perimeter, implement Data Mesh, and certify.}
+\par\noindent\textbf{Learning outcomes:} enforce VPC Service Controls perimeters, govern a Dataplex data mesh, automate DLP de-identification, provision data infrastructure with Terraform and ship Dataform pipelines through CI/CD
 
 \subsection*{Week 21: Security, IAM \& Networking}
+\par\noindent\textbf{Outcomes:} configure VPC Service Controls perimeters and access levels, apply least-privilege custom roles and Workload Identity, choose CMEK versus CSEK, validate the perimeter with a negative test
 \begin{itemize}[label=-]
     \dayitem{Monday}{VPC Service Controls (Perimeters) and Private Service Connect.}
     \dayitem{Tuesday}{IAM Deep Dive: Custom Roles, Service Accounts, and Workload Identity.}
@@ -286,8 +1012,19 @@
     \dayitem{Thursday}{\project{Create a VPC Service Perimeter around a BigQuery dataset. Attempt to query it from an external IP to verify the block. Configure an access level to allow your IP.}}
     \dayitem{Friday}{\usecase{Design a highly secure data perimeter for a healthcare provider ensuring no data exfiltration can occur even if IAM credentials are compromised.}}
 \end{itemize}
+\prodnote{Apply least-privilege custom roles and prefer Workload Identity over service-account keys; enable Cloud Audit Logs on all data services and validate the VPC SC perimeter with a negative test (query attempt from outside the perimeter) in every change window.}
+
+\resources{VPC Service Controls docs (\url{https://cloud.google.com/vpc-service-controls/docs}); Data Engineering Zoomcamp (\url{https://github.com/DataTalksClub/data-engineering-zoomcamp}).}
+\selfcheck{\begin{itemize}[label=-, nosep, leftmargin=1.5em]
+    \item What does a VPC SC perimeter block that IAM cannot?
+    \item Why prefer Workload Identity over service-account keys?
+    \item CMEK versus CSEK: who holds the key material in each?
+    \item How do access levels modify perimeter behavior?
+    \item Why test a perimeter with a negative (denied) query?
+\end{itemize}}
 
 \subsection*{Week 22: Data Governance \& Data Mesh (Dataplex)}
+\par\noindent\textbf{Outcomes:} organize Dataplex lakes, zones, and assets, tag sensitive columns with policy tags, run AutoDQ and profiling scans, trace lineage from a broken dashboard to its source
 \begin{itemize}[label=-]
     \dayitem{Monday}{Dataplex architecture: Lakes, Zones (Raw/Curated), and Assets.}
     \dayitem{Tuesday}{Data Catalog: Tag templates, Search, and Data Lineage.}
@@ -295,26 +1032,474 @@
     \dayitem{Thursday}{\project{Set up a Dataplex Lake. Map a GCS bucket and BigQuery dataset as assets. Create a tag template and apply policy tags to restrict access to a 'Salary' column.}}
     \dayitem{Friday}{\usecase{Architect a Data Mesh for a global conglomerate with 5 independent domains, ensuring centralized governance but decentralized data ownership.}}
 \end{itemize}
+\resources{Dataplex docs (\url{https://cloud.google.com/dataplex/docs}); DataHub repo (\url{https://github.com/datahub-project/datahub}).}
+\selfcheck{\begin{itemize}[label=-, nosep, leftmargin=1.5em]
+    \item What distinguishes a raw zone from a curated zone in Dataplex?
+    \item What does a tag template attach to catalog entries?
+    \item What does AutoDQ check without you writing rules?
+    \item In a data mesh, who owns the data product --- central team or domain?
+    \item How does lineage help when a downstream dashboard breaks?
+\end{itemize}}
 
 \subsection*{Week 23: Compliance \& Data Loss Prevention (DLP)}
+\par\noindent\textbf{Outcomes:} detect PII with InfoTypes and scheduled scans, apply masking and KMS-backed tokenization, propagate GDPR erasure via crypto-shredding, reconcile retention policies with legal holds
 \begin{itemize}[label=-]
     \dayitem{Monday}{Cloud DLP concepts: InfoTypes, Inspection, and De-identification.}
     \dayitem{Tuesday}{Masking, Tokenization, and Crypto-based hashing.}
-    \dayitem{Wednesday}{Automated DLP scanning in BigQuery and GCS.}
-    \dayitem{Thursday}{\project{Write a Python script using the DLP API to scan a block of text, identify emails and credit card numbers, and replace them with asterisks (masking).}}
-    \dayitem{Friday}{\usecase{Design a pipeline that ingests third-party customer data, automatically identifies PII, tokenizes it using a KMS key, and stores the safe version in the data warehouse.}}
+    \dayitem{Wednesday}{Automated DLP scanning in BigQuery and GCS. GDPR right-to-erasure propagation: a single deletion request must reach raw GCS lake zones (through object versioning and retention policies), curated BigQuery tables (plus the time-travel window and Fail-safe), Pub/Sub topics (message retention and snapshots), downstream derived tables, caches, and BigQuery backups. Practical patterns: crypto-shredding with per-subject encryption keys in Cloud KMS --- destroying the key renders every copy, including backups, unrecoverable --- versus row-level deletes that require downstream replay across each layer. Legal-hold and audit-trail exceptions suspend erasure and must be documented.}
+    \dayitem{Thursday}{\project{Write a Python script using the DLP API to scan a block of text, identify emails and credit card numbers, and replace them with asterisks (masking). Erasure drill: encrypt a test subject's PII column with a per-subject Cloud KMS key, then schedule key destruction and verify that both the BigQuery table and a restored backup become unreadable, while rows for other subjects decrypt normally.}}
+    \dayitem{Friday}{\usecase{Design a pipeline that ingests third-party customer data, automatically identifies PII, tokenizes it using a KMS key, and stores the safe version in the data warehouse. Extend it with an end-to-end erasure-propagation map: for each storage layer (GCS buckets with versioning/retention, BigQuery tables with time travel, Pub/Sub subscriptions with snapshots, BigQuery backups) document how a crypto-shredding key deletion propagates, and how a legal hold pauses it.}}
 \end{itemize}
+\prodnote{BigQuery time travel, Fail-safe, Pub/Sub snapshots, and backups make a naive \texttt{DELETE} insufficient for GDPR erasure: deleted rows remain queryable via \texttt{FOR SYSTEM\_TIME AS OF} during the time-travel window, survive seven more days in Fail-safe, and persist in backups and snapshots beyond that. Crypto-shredding erases every copy at once --- schedule key destruction in Cloud KMS (keeping the 24-hour destruction delay as a safety net) instead of chasing deletes across zones, and record which legal holds exempt retained copies.}
+\resources{Cloud DLP docs (\url{https://cloud.google.com/sensitive-data-protection/docs}); Great Expectations repo (\url{https://github.com/great-expectations/great_expectations}).}
+\selfcheck{\begin{itemize}[label=-, nosep, leftmargin=1.5em]
+    \item What is an InfoType, and name two built-in examples.
+    \item Masking versus tokenization: which is reversible, and by whom?
+    \item Why use a KMS-wrapped key for tokenization?
+    \item What does scheduled DLP scanning of BigQuery tables detect?
+    \item How do you verify de-identified data is actually unreadable?
+\end{itemize}}
 
-\subsection*{Week 24: Final Certification Preparation}
+\subsection*{Week 24: Production DataOps (IaC, Dataform \& CI/CD) \& Certification Prep}
+\par\noindent\textbf{Outcomes:} provision data infrastructure with Terraform, ship Dataform SQLX models and assertions through CI/CD, execute a zero-downtime expand-contract migration, map weak domains from the exam guide
 \begin{itemize}[label=-]
-    \dayitem{Monday}{Case Study Review 1: EHR Healthcare (focus on compliance and migration).}
-    \dayitem{Tuesday}{Case Study Review 2: Helium Sports (focus on real-time analytics).}
-    \dayitem{Wednesday}{Full-length Mock Exam 1 (Identify weak domains).}
-    \dayitem{Thursday}{Targeted review of weak domains based on mock exam results.}
-    \dayitem{Friday}{Full-length Mock Exam 2.}
+    \dayitem{Monday}{Infrastructure as Code with the Terraform google provider: GCS buckets, BigQuery datasets, and Composer environments (state files, workspaces, remote backends).}
+    \dayitem{Tuesday}{Dataform --- BigQuery's native SQL pipeline tool: SQLX models, assertions as data-quality tests, dependency trees, and scheduled runs; note dbt as the cross-platform alternative.}
+    \dayitem{Wednesday}{CI/CD for data pipelines with Cloud Build or GitHub Actions: terraform plan/apply on merge, Dataform compilation and assertion runs on every pull request. Zero-downtime schema evolution (expand $\rightarrow$ migrate $\rightarrow$ contract): add a nullable column, dual-write and backfill it, switch consumers to a backward-compatible view shim, then drop the old column --- each stage is a separate ordered deployment through the same Cloud Build pipeline, coordinated with the Dataform (or dbt) release cycle.}
+    \dayitem{Thursday}{\project{Create a GitHub repository containing Terraform code that provisions a BigQuery dataset and GCS bucket, plus a Dataform project with 3 SQLX models and 5 assertions. Add a Cloud Build trigger that compiles Dataform and runs assertions on every pull request. Expand-contract drill: rename a column in one SQLX model using the four-stage pattern (expand, dual-write/backfill, view shim, contract) across four separate pull requests, verifying the dashboard stays green at every stage.}}
+\begin{lstlisting}
+terraform {
+  required_providers {
+    google = { source = "hashicorp/google", version = "~> 5.0" }
+  }
+}
+
+provider "google" {
+  project = var.project_id
+  region  = "us-central1"
+}
+
+resource "google_bigquery_dataset" "analytics" {
+  dataset_id    = "analytics_curated"
+  location      = "US"
+  description   = "Curated data products, managed by Terraform"
+  default_table_expiration_ms = 7776000000  # 90 days
+  labels        = { env = "prod", team = "data-engineering" }
+}
+\end{lstlisting}
+    \dayitem{Friday}{Compressed Professional Data Engineer prep: review the exam guide domains against the EHR Healthcare (compliance \& migration) and Helium Sports (real-time analytics) case studies, identify weak areas, and schedule both full-length mock exams for the weekend following the program.}
 \end{itemize}
+\prodnote{Never commit service-account keys to the repository --- use Workload Identity Federation for Cloud Build/GitHub Actions; gate terraform apply behind PR approval, and set budget alerts on the CI project as a cost guardrail.}
+\prodnote{Failure story: a team dropped the legacy \texttt{email} column and renamed it \texttt{email\_address} in the same release as the Dataform model change; the Looker dashboard deploy followed an hour later and every tile errored on the missing column, paging the on-call. Expand-contract would have kept both columns alive until consumers switched. Deploy-order rule: schema expands first, consumers migrate to the view shim, contraction ships last --- never bundle all three in one release.}
+
+\resources{Terraform google provider docs (\url{https://registry.terraform.io/providers/hashicorp/google/latest/docs}); Dataform docs (\url{https://cloud.google.com/dataform/docs}).}
+\selfcheck{\begin{itemize}[label=-, nosep, leftmargin=1.5em]
+    \item Why must Terraform state live in a remote backend for team work?
+    \item What does a Dataform assertion guarantee about a model's output?
+    \item What should run on every pull request: plan, apply, or both?
+    \item Why is Workload Identity Federation safer than committed keys?
+    \item How do SQLX dependencies determine Dataform's execution order?
+\end{itemize}}
 
 \capstone{Milestone 6}{Secure, Governed Data Mesh. Build a multi-project architecture. Project A ingests streaming PII data and uses DLP to tokenize it. Project B (Analytics) hosts BigLake tables. Project C (Governance) uses Dataplex to enforce row-level security and VPC Service Controls to lock down all API access.}
+
+\rubric{
+\begin{itemize}[label=-, nosep, leftmargin=1.5em]
+    \item End-to-end mesh deploys from a clean environment following the repo README (Terraform or documented gcloud scripts for all three projects).
+    \item Architecture diagram committed showing projects, VPC SC perimeter, and governance flows.
+    \item At least 3 automated data-quality tests (Dataplex AutoDQ scans or Dataform assertions) with a failing-case demonstration.
+    \item Monitoring/alerting evidence: audit-log-based alert for perimeter violations and DLP findings (screenshot or exported config).
+    \item Monthly cost estimate with 2 optimization decisions documented (DLP scan sampling, Dataplex tier, per-project budgets).
+    \item Security review: least-privilege roles per project, no hardcoded secrets, tokenized PII verified unreadable in the clear, negative perimeter test passed.
+\end{itemize}
+}
+
+\subsection*{Milestone 6 Capstone: Reference Solution Sketch}
+\begin{itemize}[label=-, leftmargin=1.5em]
+    \item \textbf{Architecture:} three projects --- A (ingest + DLP tokenization), B (BigLake analytics), C (Dataplex governance) --- inside one VPC Service Controls perimeter, everything provisioned by Terraform --- blast radius of any single compromise is one project.
+    \item \textbf{Steps:} (1) Terraform the three projects and perimeter; (2) stream PII into Project A and tokenize with DLP + Cloud KMS; (3) expose only tokenized tables as BigLake assets in Project B; (4) enforce row-level security and policy tags from Project C; (5) run the negative perimeter test and audit-log alert.
+    \item \textbf{Hardest part --- deterministic, key-managed tokenization:}
+\begin{lstlisting}[language=Python]
+from google.cloud import dlp_v2
+dlp = dlp_v2.DlpServiceClient()
+crypto = {"crypto_key": {"kms_wrapped": {
+            "wrapped_key": wrapped_key_bytes,
+            "crypto_key_name": kms_key_resource}},
+          "surrogate_info_type": {"name": "USER_TOKEN"}}
+# deterministic FFX: same input -> same token, joins still work,
+# but detokenization requires an auditable Cloud KMS permission
+\end{lstlisting}
+    \item \textbf{Pitfall:} the perimeter blocks Composer/Build API calls from outside --- add every CI and orchestration service to the perimeter or an ingress rule.
+    \item \textbf{Pitfall:} cross-project Terraform applies race --- order them with explicit \texttt{depends\_on} or separate state per project.
+    \item \textbf{Pitfall:} tokenized PII can still be re-identified through quasi-identifiers (zip + birthdate) --- run DLP risk analysis on the "safe" tables.
+\end{itemize}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[node distance=6mm and 10mm, every node/.style={draw, rounded corners, fill=blue!10, align=center, font=\footnotesize}]
+    \node[fill=teal!10] (pa) {Project A\\Ingest + DLP\\(tokenize PII)};
+    \node[right=of pa] (pb) {Project B\\BigLake Analytics};
+    \node[right=of pb] (pc) {Project C\\Dataplex Governance};
+    \begin{scope}[on background layer]
+        \node[draw, dashed, fill=gray!5, fit=(pa)(pb)(pc), inner sep=4mm, label={[font=\footnotesize]above:VPC Service Controls Perimeter}] (perim) {};
+    \end{scope}
+    \node[below=12mm of pb, fill=brown!10] (iam) {IAM + Workload Identity + KMS (CMEK)};
+    \node[above=16mm of pb, fill=violet!10] (audit) {Cloud Audit Logs + Monitoring};
+    \draw[-{Stealth}] (pa) -- (pb);
+    \draw[-{Stealth}] (pc) -- (pb);
+    \draw[-{Stealth}, dashed] (iam) -- (perim);
+    \draw[-{Stealth}, dashed] (audit) -- (perim);
+\end{tikzpicture}
+\caption{Milestone 6 reference architecture: multi-project security mesh behind VPC Service Controls.}
+\end{figure}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[node distance=5mm and 10mm,
+    entity/.style={draw, rounded corners, fill=blue!5, align=left, font=\scriptsize, inner sep=1.5mm},
+    title/.style={font=\scriptsize\bfseries}]
+    \node[entity] (raw) {\title RAW\_EVENTS (Proj A)\\[0.5mm]event\_id (PK)\\user\_id\\raw\_pii\\event\_ts};
+    \node[entity, right=of raw] (tok) {\title TOKENIZED\_EVENTS\\[0.5mm]event\_id (PK)\\user\_token\\payload\_safe};
+    \node[entity, right=of tok] (prod) {\title DATA\_PRODUCTS (Proj B)\\[0.5mm]product\_id (PK)\\domain\\bq\_table\\owner};
+    \node[entity, below=6mm of prod] (pol) {\title POLICY\_TAGS (Proj C)\\[0.5mm]tag\_id (PK)\\taxonomy\\allowed\_roles};
+    \draw[-{Stealth}] (raw) -- node[above, font=\scriptsize]{1:1} (tok);
+    \draw[-{Stealth}] (tok) -- node[above, font=\scriptsize]{1:N} (prod);
+    \draw[-{Stealth}, dashed] (pol) -- node[right, font=\scriptsize]{N:M} (prod);
+\end{tikzpicture}
+\caption{Capstone data model: secure data mesh with tokenized PII and centrally governed policy tags.}
+\end{figure}
+
+\newpage
+% ==========================================
+% APPENDICES
+% ==========================================
+\section{Appendix A: Glossary}
+\begin{description}[style=nextline]
+    \item[Slot] BigQuery's unit of compute capacity; queries consume slots from on-demand or edition-based reservations.
+    \item[BigLake] BigQuery storage engine that exposes GCS files as tables with fine-grained (row/column) security.
+    \item[Analytics Hub] BigQuery service for governed data sharing and data clean rooms across organizations.
+    \item[BI Engine] In-memory acceleration layer for BigQuery that speeds up dashboard queries.
+    \item[Dataflow] Managed runner for Apache Beam batch and streaming pipelines with autoscaling.
+    \item[Watermark] Beam's estimate of event-time completeness; data arriving behind it is considered late.
+    \item[Allowed Lateness] Windowing parameter controlling how long a window accepts late-arriving events.
+    \item[Pub/Sub Dead-Letter Topic] Topic that receives messages a subscription failed to deliver after N attempts.
+    \item[Spanner TrueTime] Globally synchronized clock API enabling Spanner's external consistency guarantees.
+    \item[Bigtable Row Key] Primary index of a Bigtable table; poor key design causes hotspotting.
+    \item[Dataproc] Managed Hadoop/Spark service; supports ephemeral and serverless clusters.
+    \item[Datastream] Serverless change data capture (CDC) service replicating database changes into GCS or BigQuery.
+    \item[Cloud Composer] Managed Apache Airflow environment (v2 runs on GKE with autoscaling).
+    \item[DAG] Directed Acyclic Graph --- an Airflow pipeline definition of tasks and dependencies.
+    \item[Dataform] BigQuery-native tool for SQL pipelines: SQLX models, assertions, and scheduled runs.
+    \item[SQLX] Dataform's SQL extension adding model configs, dependencies, and assertions to plain SQL.
+    \item[Assertion] Declarative data-quality test in Dataform (or dbt) that fails a run when rows violate a condition.
+    \item[Dataplex] Governance fabric organizing lakes, zones, and assets with Auto Data Quality and lineage.
+    \item[VPC Service Controls] Perimeter-based security that blocks data exfiltration even with valid IAM credentials.
+    \item[CMEK] Customer-Managed Encryption Keys in Cloud KMS, giving you key rotation and revocation control.
+    \item[DLP InfoType] A category of sensitive data (e.g., email, credit card) detected by Cloud DLP.
+    \item[Vertex AI Feature Store] Managed store for ML features with online and offline serving.
+    \item[Model Drift] Degradation of model performance when production data diverges from training data.
+    \item[LookML] Looker's semantic modeling language defining dimensions, measures, and explores.
+\end{description}
+
+\section{Appendix B: Assessment \& Grading Model}
+Each of the six capstones is graded on the following weighted rubric:
+
+\begin{center}
+\renewcommand{\arraystretch}{1.4}
+\begin{tabular}{@{} l c p{6.5cm} @{}}
+\toprule
+\textbf{Category} & \textbf{Weight} & \textbf{What is evaluated} \\
+\midrule
+Correctness & 30\% & Pipeline runs end-to-end from a clean environment and produces correct results. \\
+Reliability \& tests & 20\% & Automated data-quality tests, idempotent re-runs, failure handling (DLQ/retries). \\
+Security & 15\% & Least-privilege roles, no hardcoded secrets, PII handling, perimeter checks. \\
+Cost awareness & 15\% & Documented monthly estimate with at least 2 justified optimization decisions. \\
+Documentation & 10\% & README, architecture diagram, and runbook quality. \\
+Demo & 10\% & Live or recorded walkthrough explaining design trade-offs. \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The final readiness score combines the average capstone grade (70\%) with the two Professional Data Engineer mock exams from Week 24 (30\%). A mock-exam score below 70\% in any domain triggers a targeted one-week review loop before scheduling the real exam.
+
+\section{Appendix C: Interview Preparation}
+\begin{enumerate}
+    \item How would you design globally consistent transactions for a payment ledger? \textit{(Week 3)}
+    \item Explain BigQuery partitioning vs.\ clustering and when to combine them. \textit{(Week 6)}
+    \item How do you share data with a partner without exposing raw PII? \textit{(Weeks 8, 23)}
+    \item Walk through migrating an on-premise Hadoop cluster to GCP. \textit{(Week 9)}
+    \item How does CDC replication into BigQuery work, and how do you monitor its freshness? \textit{(Week 11)}
+    \item Design an idempotent, retry-safe orchestration layer for 15 dependent systems. \textit{(Week 12)}
+    \item How do you achieve exactly-once semantics in a Pub/Sub to Dataflow pipeline? \textit{(Weeks 13--14)}
+    \item Explain event time, watermarks, and how you handle very late mobile data. \textit{(Week 15)}
+    \item Describe a full MLOps lifecycle with drift detection and automated retraining. \textit{(Week 19)}
+    \item How do VPC Service Controls and Dataplex combine to secure a data mesh? \textit{(Weeks 21--22)}
+\end{enumerate}
+
+\newpage
+\section{Appendix D: Self-Check Answer Key}
+
+\textbf{Week 1:}
+\begin{enumerate}[nosep, leftmargin=1.5em]
+    \item Archive --- lowest storage price for rarely read data.
+    \item Only the storage class (access cost/latency), never the data itself.
+    \item Petabyte-scale transfers where bandwidth makes online transfer impractical.
+    \item Copy the object's older generation back, e.g.\ \texttt{gs://bucket/object\#generation}.
+    \item Deletion, corruption, and regional loss still need replication plus tested recovery.
+\end{enumerate}
+
+\textbf{Week 2:}
+\begin{enumerate}[nosep, leftmargin=1.5em]
+    \item A synchronous standby in another zone with automatic failover.
+    \item PITR replays WAL to a timestamp; in-place restore would destroy current data.
+    \item When traffic must stay inside the VPC and off the public internet.
+    \item Analytical scans and aggregations over large PostgreSQL datasets.
+    \item Continuous CDC replication followed by a short cutover window.
+\end{enumerate}
+
+\textbf{Week 3:}
+\begin{enumerate}[nosep, leftmargin=1.5em]
+    \item Globally agreed commit timestamps, enabling external (strong) consistency.
+    \item Monotonic keys concentrate writes on one split, causing hotspots.
+    \item Co-locating child rows with parents for fast local joins and cascades.
+    \item Synchronous multi-region replication coordinated by TrueTime.
+    \item Small or single-region workloads --- Spanner's cost and complexity dominate.
+\end{enumerate}
+
+\textbf{Week 4:}
+\begin{enumerate}[nosep, leftmargin=1.5em]
+    \item Sequential keys funnel writes onto a single tablet server.
+    \item Spreads load across tablets; sacrifices efficient range scans.
+    \item Routing and replication policy per application.
+    \item A heatmap of row-key access that exposes hotspots.
+    \item How many versions or how much cell history to retain.
+\end{enumerate}
+
+\textbf{Week 5:}
+\begin{enumerate}[nosep, leftmargin=1.5em]
+    \item Colossus (storage), Jupiter (network), Dremel (compute) scale independently.
+    \item Steady, high-utilization workloads needing predictable monthly spend.
+    \item Exactly what one row represents; every fact must match that grain.
+    \item When history matters; implemented with valid\_from, valid\_to, is\_current.
+    \item A business key has many historical rows; only one is current.
+\end{enumerate}
+
+\textbf{Week 6:}
+\begin{enumerate}[nosep, leftmargin=1.5em]
+    \item Partitioning prunes whole partitions; clustering sorts within them for finer pruning.
+    \item High-selectivity filters on columns that are not the partition key.
+    \item It precomputes query results at the cost of storage and refresh compute.
+    \item One worker processing far more rows or time than its peers in a stage.
+    \item Repeated dashboard queries; wasted on one-off ad-hoc scans.
+\end{enumerate}
+
+\textbf{Week 7:}
+\begin{enumerate}[nosep, leftmargin=1.5em]
+    \item External tables read files in place; native tables use BigQuery-managed storage.
+    \item \texttt{ST\_WITHIN} (or \texttt{ST\_CONTAINS} with arguments reversed).
+    \item Source-cloud egress charges plus cross-region latency.
+    \item BigQuery cannot reorganize data it does not store.
+    \item Small or fast-changing data where ingestion overhead is unjustified.
+\end{enumerate}
+
+\textbf{Week 8:}
+\begin{enumerate}[nosep, leftmargin=1.5em]
+    \item It applies BigQuery row/column security to files in GCS.
+    \item Metadata over unstructured files such as PDFs and images.
+    \item Linked datasets: subscribers query in place with no copy.
+    \item Each party's raw rows and PII from the other.
+    \item Central, auditable masking without maintaining per-role views.
+\end{enumerate}
+
+\textbf{Week 9:}
+\begin{enumerate}[nosep, leftmargin=1.5em]
+    \item You pay only for job runtime instead of an idle cluster.
+    \item Cheap but reclaimable --- use for workers and keep jobs idempotent.
+    \item Decouples storage from compute so each scales (and bills) independently.
+    \item Executor memory undersized for skewed partitions.
+    \item Pending YARN memory/containers beyond current capacity.
+\end{enumerate}
+
+\textbf{Week 10:}
+\begin{enumerate}[nosep, leftmargin=1.5em]
+    \item CDAP (Cask Data Application Platform).
+    \item Interactive cleaning on samples before scaled production runs.
+    \item Analysts building pipelines without writing Java or Python.
+    \item Sources and sinks reachable only inside the VPC.
+    \item Runtime arguments such as dates, paths, and table names.
+\end{enumerate}
+
+\textbf{Week 11:}
+\begin{enumerate}[nosep, leftmargin=1.5em]
+    \item By reading the source database's replication/write-ahead log.
+    \item Renaming a column; adding a nullable column is non-breaking.
+    \item Rows with unknown or mismatched fields, unless schema updates are relaxed.
+    \item The producer owns it; consumers version and agree to changes.
+    \item How far the destination lags the source.
+\end{enumerate}
+
+\textbf{Week 12:}
+\begin{enumerate}[nosep, leftmargin=1.5em]
+    \item Retries re-execute tasks; side effects must be safely repeatable.
+    \item The notification runs whether upstream tasks succeed or fail.
+    \item An autoscaling GKE cluster.
+    \item When the run depends on an external file's arrival, not a clock.
+    \item Only small metadata --- never large payloads.
+\end{enumerate}
+
+\textbf{Week 13:}
+\begin{enumerate}[nosep, leftmargin=1.5em]
+    \item It is forwarded to the dead-letter topic.
+    \item The broker rejects publishes that violate the Avro/proto schema.
+    \item Retry-induced duplicates; deduplicate on message IDs downstream.
+    \item Very high, steady throughput with zonal (not regional) tolerance.
+    \item Consumers are stuck or undersized and the backlog is growing.
+\end{enumerate}
+
+\textbf{Week 14:}
+\begin{enumerate}[nosep, leftmargin=1.5em]
+    \item A PTransform is an operation; a ParDo is an element-wise user function.
+    \item Logic bugs are caught cheaply before paying for runner deployment.
+    \item Shuffle and state handling, enabling faster autoscaling.
+    \item When you reuse a parameterized pipeline across teams or jobs.
+    \item It adds workers based on backlog and CPU utilization.
+\end{enumerate}
+
+\textbf{Week 15:}
+\begin{enumerate}[nosep, leftmargin=1.5em]
+    \item Event-time progress; events older than it are considered late.
+    \item State grows without bound, exhausting worker memory/disk and defeating autoscaling; timers fire as the watermark passes, so garbage collection frees each key's state after its TTL.
+    \item \texttt{SEEN} stores already-emitted event IDs per key; \texttt{EXPIRY} fires at the TTL to clear that bag.
+    \item Both inputs must share the same window assignment and join key, with outputs gated on watermark alignment; unmatched elements are buffered per window until allowed lateness expires.
+    \item Streaming Engine deduplicates shuffle records and the Storage Write API commits offsets atomically; at-least-once plus downstream dedup is cheaper when sinks lack exactly-once support or duplicates are tolerable.
+\end{enumerate}
+
+\textbf{Week 16:}
+\begin{enumerate}[nosep, leftmargin=1.5em]
+    \item Metrics are defined once in LookML and reused by every explore.
+    \item It activates warehouse data inside operational tools, not just reports.
+    \item The same customer syncs as duplicate or mismatched records.
+    \item Freshness versus API rate limits and per-call cost.
+    \item Governance, row-level security, and embedded analytics at scale.
+\end{enumerate}
+
+\textbf{Week 17:}
+\begin{enumerate}[nosep, leftmargin=1.5em]
+    \item Logistic regression for binary classification.
+    \item Automatic seasonality, holidays, and hyperparameter choices.
+    \item Precision, recall, and ROC AUC --- never accuracy alone.
+    \item No data movement; governance and security stay inside BigQuery.
+    \item A wide gap between training and evaluation metrics.
+\end{enumerate}
+
+\textbf{Week 18:}
+\begin{enumerate}[nosep, leftmargin=1.5em]
+    \item When data is tabular and custom architecture gains little.
+    \item Model versions, lineage, and deployment targets.
+    \item Online prediction serves the low-latency checkout flow.
+    \item Which input features most drove a given prediction.
+    \item Endpoints add managed scaling, authentication, and traffic splitting.
+\end{enumerate}
+
+\textbf{Week 19:}
+\begin{enumerate}[nosep, leftmargin=1.5em]
+    \item Keeps training and serving features consistent, preventing skew.
+    \item Online serving --- low-latency feature lookups per request.
+    \item A containerized, reusable step with a declared input/output contract.
+    \item Drift plus data-quality checks passing an evaluation gate.
+    \item Skew compares serving inputs to training; drift tracks input shift over time.
+\end{enumerate}
+
+\textbf{Week 20:}
+\begin{enumerate}[nosep, leftmargin=1.5em]
+    \item When a pretrained API solves the task without a custom model.
+    \item Retries with backoff, batching, and quota alerts.
+    \item The Natural Language API.
+    \item Store extracted text and labels in BigQuery with a search index.
+    \item Per-call pricing scales directly with message volume.
+\end{enumerate}
+
+\textbf{Week 21:}
+\begin{enumerate}[nosep, leftmargin=1.5em]
+    \item Exfiltration by valid credentials to destinations outside the perimeter.
+    \item No exportable key material exists to be leaked.
+    \item CMEK lives in Cloud KMS; with CSEK you supply the key yourself.
+    \item They let specified IPs or identities through the perimeter.
+    \item A deny result proves the perimeter actually enforces.
+\end{enumerate}
+
+\textbf{Week 22:}
+\begin{enumerate}[nosep, leftmargin=1.5em]
+    \item Raw zones hold unprocessed landings; curated zones are governed and quality-checked.
+    \item Structured metadata such as PII flags, owner, and quality scores.
+    \item Nulls, ranges, freshness, and distribution anomalies.
+    \item The domain owns the product; the center sets guardrails.
+    \item It traces the broken column back to the upstream pipeline.
+\end{enumerate}
+
+\textbf{Week 23:}
+\begin{enumerate}[nosep, leftmargin=1.5em]
+    \item A category of sensitive data, e.g.\ EMAIL\_ADDRESS, CREDIT\_CARD\_NUMBER.
+    \item Tokenization --- reversible only by holders of the key.
+    \item Detokenization then requires auditable KMS permissions.
+    \item New or previously undetected PII appearing over time.
+    \item Attempt to read raw values and verify the denial (negative test).
+\end{enumerate}
+
+\textbf{Week 24:}
+\begin{enumerate}[nosep, leftmargin=1.5em]
+    \item Remote state gives locking and survives local machines.
+    \item Rows violating its condition fail the pipeline run.
+    \item \texttt{terraform plan} plus Dataform compile/assert; apply only on merge.
+    \item Short-lived federated tokens replace committed key files.
+    \item \texttt{ref()} dependencies build the DAG that orders execution.
+\end{enumerate}
+
+\newpage
+\section{Appendix E: Datasets \& Project Data}
+
+\subsection*{Public datasets (BigQuery-hosted, no ingestion cost to store)}
+\begin{itemize}[label=-]
+    \item \textbf{NYC Taxi trips} --- \texttt{bigquery-public-data.new\_york\_taxi\_trips}: partitioned-by-design trip records; used in Week 5--6 SQL optimization labs and the Milestone 2 lakehouse capstone.
+    \item \textbf{StackOverflow} --- \texttt{bigquery-public-data.stackoverflow}: posts, users, and badges; used for Week 5 array/struct and window-function labs.
+    \item \textbf{GHCN weather} --- \texttt{bigquery-public-data.ghcn\_d}: daily global weather observations; used in Week 7 GIS/federated labs and BQML forecasting in Week 17.
+\end{itemize}
+
+\subsection*{Capstone datasets}
+\begin{itemize}[label=-]
+    \item \textbf{Olist Brazilian e-commerce} (Kaggle: \url{https://www.kaggle.com/datasets/olistbr/brazilian-ecommerce}) --- orders, items, customers, payments, reviews; primary dataset for the Milestone 1 multi-tier backend and Milestone 2 star-schema capstones.
+    \item \textbf{Simulated card transactions} --- generated by the Week 13 Pub/Sub publisher script; feeds the Milestone 4 fraud-detection capstone.
+    \item \textbf{Google Analytics sample} --- \texttt{bigquery-public-data.google\_analytics\_sample}; used for Week 17 BQML churn modeling.
+\end{itemize}
+
+\subsection*{Synthetic data generation}
+Use the Python \texttt{Faker} library for names, addresses, and transactions (e.g.\ \texttt{pip install faker}); expected volumes: Milestone 1 $\approx$ 10K rows per store, Milestone 2 $\approx$ 5 years / 10M fact rows, Milestones 3--4 $\approx$ 1K--5K streaming events per lab run, Milestone 5 $\approx$ 100K labeled training rows. Keep generators deterministic (seeded) so data-quality tests are reproducible.
+
+\newpage
+\section{Appendix F: Portfolio \& Presentation Guide}
+
+\subsection*{GitHub README structure (every capstone)}
+\begin{enumerate}[nosep]
+    \item \textbf{Problem} --- one paragraph: who has the pain and what decision the pipeline supports.
+    \item \textbf{Architecture diagram first} --- the TikZ/draw.io figure from this syllabus, before any code.
+    \item \textbf{Setup} --- exact commands to rebuild from a clean project (as the rubric requires).
+    \item \textbf{Screenshots} --- dashboard, DAG run, monitoring alert firing.
+    \item \textbf{Cost estimate} --- monthly table with your 2 documented optimization decisions.
+    \item \textbf{Lessons learned} --- 3 bullets: what broke, what you would change.
+\end{enumerate}
+
+\subsection*{Resume bullet templates (two per milestone)}
+\begin{itemize}[label=-]
+    \item \textbf{M1:} ``Built a multi-tier GCP data backend (Cloud SQL, Spanner, Bigtable, GCS) with VPC-private connectivity and automated failover tests.'' / ``Cut storage spend X\% via lifecycle policies across 4 storage classes.''
+    \item \textbf{M2:} ``Designed a governed BigQuery lakehouse with row/column-level security and materialized views serving executive dashboards.'' / ``Reduced query spend X\% by migrating on-demand workloads to slot Editions with partitioning and clustering.''
+    \item \textbf{M3:} ``Automated a batch ELT pipeline with Cloud Composer, Datastream CDC, and serverless Dataproc with end-to-end data-quality gates.'' / ``Achieved zero double-loads by making all Spark tasks idempotent under preemptible-VM retries.''
+    \item \textbf{M4:} ``Built a real-time fraud-detection pipeline (Pub/Sub, Dataflow sliding windows, BigQuery, Looker) with DLQ and watermark-lag alerting.'' / ``Implemented exactly-once semantics and late-data handling for mobile telemetry at X events/sec.''
+    \item \textbf{M5:} ``Shipped an end-to-end MLOps pipeline (BQML, Vertex AI, Composer) with drift monitoring and gated retraining.'' / ``Deployed an AutoML churn model to a Vertex endpoint with explainability and evaluation thresholds.''
+    \item \textbf{M6:} ``Provisioned a 3-project secure data mesh (VPC SC, Dataplex, DLP tokenization) entirely with Terraform and CI/CD.'' / ``Passed the Professional Data Engineer practice domains with 80\%+ after a self-built 24-week program.''
+\end{itemize}
+
+\subsection*{Talking about your project in interviews}
+Lead with the problem and the constraint (cost, latency, compliance), not the service list. Walk the interviewer through the architecture diagram top to bottom, then volunteer one trade-off you made and why (e.g.\ on-demand vs.\ slots, push vs.\ pull subscriptions, SCD1 vs.\ SCD2). Finish with a failure story --- a DLQ that filled, a watermark that lagged, a PITR drill that caught a bad delete --- and what you changed. Interviewers hire engineers who have operated systems, not just built demos.
 
 \newpage
 % ==========================================
@@ -369,7 +1554,7 @@
 21 & IAM \& VPC SC & Service Perimeters \& Access Levels & $\square$ \\
 22 & Dataplex \& Data Mesh & AutoDQ and Policy Tags & $\square$ \\
 23 & Cloud DLP & Python Tokenization/Masking Script & $\square$ \\
-24 & Exam Prep & \textbf{Cap 6: Secure Data Mesh Design} & $\square$ \\
+24 & DataOps \& Exam Prep & \textbf{Cap 6: Secure Data Mesh} + Terraform/Dataform CI/CD Repo & $\square$ \\
 
 \end{longtable}
 \end{center}

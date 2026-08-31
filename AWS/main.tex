@@ -18,6 +18,20 @@
 \usepackage{enumitem}   % For customized lists
 \usepackage{xcolor}     % For colored highlights
 \usepackage[colorlinks=true, linkcolor=blue]{hyperref} % For internal links
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta, positioning, shapes.geometric, backgrounds, fit}
+\usepackage{listings}
+\lstdefinestyle{code}{
+    basicstyle=\ttfamily\footnotesize,
+    breaklines=true,
+    frame=single,
+    backgroundcolor=\color{gray!8},
+    rulecolor=\color{gray!40},
+    columns=fullflexible,
+    keepspaces=true,
+    showstringspaces=false
+}
+\lstset{style=code}
 
 % --- CUSTOM COMMANDS ---
 \newcommand{\project}[1]{\vspace{1mm}\noindent\textbf{\textcolor{blue}{Hands-on Project:}} #1}
@@ -32,6 +46,30 @@
     \vspace{3mm}
 }
 \newcommand{\dayitem}[2]{\item \textbf{#1:} #2}
+% Rubric box: capstone acceptance criteria
+\newcommand{\rubric}[1]{
+    \vspace{1mm}
+    \noindent\fbox{
+        \parbox{0.97\textwidth}{
+            \textbf{\textcolor{orange}{Acceptance Criteria:}} #1
+        }
+    }
+    \vspace{2mm}
+}
+% Weekly curated resources
+\newcommand{\resources}[1]{\vspace{1mm}\noindent\textbf{\textcolor{violet}{Resources:}} #1}
+% Weekly self-check questions
+\newcommand{\selfcheck}[1]{\vspace{1mm}\noindent\textbf{\textcolor{purple}{Self-check:}} #1}
+% Production hardening note
+\newcommand{\prodnote}[1]{
+    \vspace{1mm}
+    \noindent\fbox{
+        \parbox{0.97\textwidth}{
+            \textbf{\textcolor{brown}{Production Note:}} \textit{#1}
+        }
+    }
+    \vspace{1mm}
+}
 
 \title{\Huge \textbf{AWS Master Data Engineer}\\ \Large 6-Month Exhaustive Training \& Certification Program}
 \author{Advanced Architecture, Hands-on Labs, and MLOps}
@@ -48,13 +86,32 @@
 \tableofcontents
 \newpage
 
+\section*{Prerequisites \& How to Use This Syllabus}
+\begin{itemize}[label=-]
+    \item \textbf{Prerequisite skills:} intermediate Python (Boto3), solid SQL, Git workflows (branching, pull requests), Linux/CLI basics, and Docker fundamentals.
+    \item \textbf{Weekly cadence:} approximately 10--12 hours per week --- Monday to Wednesday for theory, Thursday for the hands-on project, Friday for the architecture use case.
+    \item \textbf{Deliverable expectation:} every capstone must produce a git repository, an architecture diagram, a cost estimate, and a security review checklist, per the Acceptance Criteria boxes that follow each capstone.
+    \item \textbf{Assessment:} the 24-week tracking timetable at the end of this document doubles as the assessment checklist --- check off each week only when its project and deliverables are complete.
+\end{itemize}
+
+\noindent\textbf{Environment setup checklist:}
+\begin{itemize}[label=-]
+    \item Install Python 3.x, Git, Docker Desktop, and VS Code.
+    \item Install the AWS CLI v2 (plus the Session Manager plugin); verify with \texttt{aws sts get-caller-identity}.
+    \item Create an AWS free-tier account with guardrails: MFA on the root user, an IAM Identity Center admin role for daily work, and an AWS Budgets cost alert.
+    \item Clone the course repository structure: \texttt{data/}, \texttt{src/}, \texttt{tests/}, \texttt{infra/}, \texttt{docs/}.
+    \item Configure credentials via environment variables or named CLI profiles --- never hardcode keys in code or notebooks.
+\end{itemize}
+
 % ==========================================
 % MILESTONE 1
 % ==========================================
 \section{Milestone 1: Core Data Infrastructure \& Storage (Month 1)}
 \textit{Objective: Master the foundational storage options, relational databases, and NoSQL.}
+\par\noindent\textbf{Learning outcomes:} design S3 storage-class and lifecycle strategies, deploy and fail over Aurora Serverless clusters, model single-table DynamoDB schemas with GSIs, replicate relational data to S3 with DMS, and select the right cache tier for latency-sensitive workloads.
 
 \subsection*{Week 1: Amazon S3 \& Storage Foundations}
+\par\noindent\textbf{Outcomes:} compare S3 storage classes and retrieval trade-offs, configure lifecycle policies and versioning, select the right migration service (DataSync vs.\ Snow), and wire event notifications to SQS.
 \begin{itemize}[label=-]
     \dayitem{Monday}{S3 Architecture, Storage Classes (Standard, IA, Glacier Flexible Retrieval/Deep Archive).}
     \dayitem{Tuesday}{Lifecycle Policies, Versioning, Object Lock, and S3 Replication.}
@@ -62,17 +119,39 @@
     \dayitem{Thursday}{\project{Deploy an S3 bucket via AWS CLI, configure a 30-day lifecycle transition to Glacier, and set up event notifications to SQS.}}
     \dayitem{Friday}{\usecase{Design a multi-region, compliant disaster recovery storage architecture for a healthcare provider processing 10PB of X-ray images.}}
 \end{itemize}
+\resources{Amazon S3 documentation (\url{https://docs.aws.amazon.com/s3/}); Data Engineering Zoomcamp (\url{https://github.com/DataTalksClub/data-engineering-zoomcamp}).}
+\selfcheck{\begin{itemize}[label=-, leftmargin=1.5em, itemsep=0pt]
+    \item Which storage class suits data accessed once per quarter but needed within milliseconds?
+    \item What does a delete marker do in a versioned bucket, and how do you undo it?
+    \item When would you choose the Snow Family over DataSync for a migration?
+    \item How does Object Lock protect backups against ransomware?
+    \item Why buffer S3 event notifications through SQS instead of invoking Lambda directly?
+\end{itemize}}
+
+\prodnote{Practice versioned-object recovery before you need it: with bucket versioning enabled, a ``delete'' only adds a delete marker --- list prior versions with \texttt{aws s3api list-object-versions} and restore by removing the marker or copying a previous version. Pair versioning with Object Lock in compliance mode so an attacker with stolen credentials cannot permanently destroy backups.}
 
 \subsection*{Week 2: Relational Databases (RDS \& Aurora)}
+\par\noindent\textbf{Outcomes:} distinguish Multi-AZ from read replicas, deploy and fail over Aurora Serverless v2, plan an Oracle-to-Aurora migration with DMS/SCT, and execute a snapshot-restore DR drill with row-count verification.
 \begin{itemize}[label=-]
     \dayitem{Monday}{Amazon RDS Architecture, Multi-AZ deployments, and Read Replicas.}
     \dayitem{Tuesday}{Amazon Aurora: Cloud-native storage, Global Databases, and Aurora Serverless v2.}
     \dayitem{Wednesday}{Database Migration Service (AWS DMS) and Schema Conversion Tool (SCT).}
-    \dayitem{Thursday}{\project{Deploy an Amazon Aurora Serverless v2 cluster, create a cross-region read replica, and simulate a regional failover.}}
+    \dayitem{Thursday}{\project{Deploy an Amazon Aurora Serverless v2 cluster, create a cross-region read replica, and simulate a regional failover. DR drill: take a manual cluster snapshot, restore it to a \emph{new} cluster, verify row counts against the source with \texttt{COUNT(*)} on every table, then delete the restored cluster to stop charges.}}
     \dayitem{Friday}{\usecase{Architect a zero-downtime migration strategy from a monolithic on-premise Oracle ERP system to Amazon Aurora PostgreSQL.}}
 \end{itemize}
+\resources{Amazon RDS \& Aurora documentation (\url{https://docs.aws.amazon.com/rds/}); AWS DMS documentation (\url{https://docs.aws.amazon.com/dms/}).}
+\selfcheck{\begin{itemize}[label=-, leftmargin=1.5em, itemsep=0pt]
+    \item How does Multi-AZ differ from a Read Replica in purpose and replication mode?
+    \item How does Aurora's storage layer differ from a standard RDS volume?
+    \item What does the Schema Conversion Tool do that DMS alone cannot?
+    \item In a restore drill, why restore a snapshot to a new cluster instead of in place?
+    \item Which two values quantify your RPO and RTO during a failover drill?
+\end{itemize}}
+
+\prodnote{Snapshot restores always create a new cluster --- they are never in-place --- so a restore drill is the only safe way to prove backups work. Run the drill quarterly, record measured RTO/RPO, and verify data with row counts (or checksums) on every table before deleting the restored cluster. An untested backup is a hypothesis, not a recovery plan.}
 
 \subsection*{Week 3: High-Scale NoSQL (Amazon DynamoDB)}
+\par\noindent\textbf{Outcomes:} model single-table DynamoDB schemas, choose between LSI and GSI, configure Streams and TTL, and estimate RCU/WCU capacity for a high-traffic workload.
 \begin{itemize}[label=-]
     \dayitem{Monday}{DynamoDB core concepts: Partitions, RCU/WCU (Provisioned vs. On-Demand).}
     \dayitem{Tuesday}{Data Modeling: Primary keys, Sort keys, LSI vs. GSI (Global Secondary Indexes).}
@@ -80,8 +159,17 @@
     \dayitem{Thursday}{\project{Create a DynamoDB table, design a single-table schema for a forum, write a Python Boto3 script to insert items, and configure a GSI for querying.}}
     \dayitem{Friday}{\usecase{Design an ingestion and serving layer for a gaming leaderboard supporting 1 million reads/writes per second globally.}}
 \end{itemize}
+\resources{Amazon DynamoDB documentation (\url{https://docs.aws.amazon.com/dynamodb/}); Data Engineer Handbook (\url{https://github.com/DataExpert-io/data-engineer-handbook}).}
+\selfcheck{\begin{itemize}[label=-, leftmargin=1.5em, itemsep=0pt]
+    \item Why does partition-key choice determine hot-partition risk?
+    \item GSI vs.\ LSI: which can be added after the table is created?
+    \item What happens to a DynamoDB Streams record after 24 hours unconsumed?
+    \item Why do TTL deletions not consume write capacity?
+    \item Why prefer single-table design over one table per entity?
+\end{itemize}}
 
 \subsection*{Week 4: Hybrid Ingestion \& Caching}
+\par\noindent\textbf{Outcomes:} choose between ElastiCache engines and DAX, implement cache-aside query acceleration, explain GraphQL ingestion via AppSync, and design a low-latency API for spiky traffic.
 \begin{itemize}[label=-]
     \dayitem{Monday}{Amazon ElastiCache (Redis/Memcached) for database acceleration.}
     \dayitem{Tuesday}{DynamoDB Accelerator (DAX).}
@@ -89,25 +177,155 @@
     \dayitem{Thursday}{\project{Deploy a Redis cluster via ElastiCache. Write a Python script to cache query results from RDS to reduce database load.}}
     \dayitem{Friday}{\usecase{Architect a high-throughput, low-latency data API for a mobile application that experiences extreme traffic spikes during live sports events.}}
 \end{itemize}
+\resources{Amazon ElastiCache documentation (\url{https://docs.aws.amazon.com/elasticache/}); Amazon API Gateway documentation (\url{https://docs.aws.amazon.com/apigateway/}).}
+\selfcheck{\begin{itemize}[label=-, leftmargin=1.5em, itemsep=0pt]
+    \item Redis vs.\ Memcached: which supports persistence, replication, and complex data types?
+    \item When does DAX beat putting ElastiCache in front of DynamoDB?
+    \item What is a cache stampede and how do jittered TTLs prevent it?
+    \item Why does lazy-loading (cache-aside) suit spiky traffic better than write-through?
+    \item What does API Gateway throttling protect downstream?
+\end{itemize}}
 
 \capstone{Milestone 1}{Build an E-Commerce Multi-Tier Data Backend. Deploy Aurora Serverless for user profiles/billing, DynamoDB for active shopping carts and clickstream tracking, S3 for product images, and AWS DMS to continuously replicate Aurora data to S3 for analytics.}
+\rubric{\begin{itemize}[label=-, leftmargin=1.5em, itemsep=0pt]
+    \item End-to-end backend runs from a clean environment following the repo README.
+    \item Architecture diagram committed (draw.io/TikZ/PNG) showing all tiers and the DMS replication path.
+    \item At least 3 automated data-quality tests (e.g., row-count reconciliation between Aurora and S3) with a failing-case demonstration.
+    \item Monitoring/alerting evidence: CloudWatch alarm on DMS replication failure (screenshot or exported config).
+    \item Monthly cost estimate (RDS vs. Aurora Serverless, DynamoDB provisioned vs. on-demand) with 2 optimization decisions documented.
+    \item Security review: least-privilege IAM roles for DMS, no hardcoded secrets, PII columns in Aurora noted.
+\end{itemize}}
+
+\subsection*{Milestone 1 Capstone: Reference Solution Sketch}
+\begin{itemize}[label=-, itemsep=0pt]
+    \item \textbf{Architecture:} Aurora Serverless v2 for profiles/billing, DynamoDB (single-table, GSI) for carts/clickstream, S3 for images, DMS CDC from Aurora to S3 --- decouples analytics from the transactional tier.
+    \item \textbf{Steps:} provision Aurora, DynamoDB, and S3 with lifecycle rules; load the Olist seed data; create the DMS replication instance and source/target endpoints; start the CDC task; verify with row-count reconciliation queries; wire CloudWatch alarms on task failure and \texttt{CDCLatencyTarget}.
+    \item \textbf{Hardest part --- DMS task table mappings:}
+\begin{lstlisting}
+{
+  "rules": [{
+    "rule-type": "selection",
+    "rule-id": "1",
+    "object-locator": { "schema-name": "public", "table-name": "%" },
+    "rule-action": "include"
+  }]
+}
+\end{lstlisting}
+    \item \textbf{Pitfalls:} the DMS target-endpoint IAM role missing \texttt{s3:PutObject} fails the task silently; a hot cart partition key throttles provisioned DynamoDB tables; a forgotten replication instance leaks cost after the demo.
+\end{itemize}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+    node distance=0.55cm and 1.1cm,
+    box/.style={draw, rounded corners, fill=blue!10, align=center, font=\small, minimum height=0.9cm, inner sep=4pt},
+    side/.style={draw, rounded corners, fill=brown!10, align=center, font=\footnotesize, inner sep=3pt},
+    arr/.style={-{Stealth}, thick}
+]
+\node[box] (app) {E-Commerce\\Application};
+\node[box, right=of app, yshift=1.1cm] (aurora) {Aurora Serverless\\(Profiles, Billing)};
+\node[box, right=of app, yshift=-1.1cm] (ddb) {DynamoDB\\(Carts, Clickstream)};
+\node[box, right=of aurora] (dms) {AWS DMS\\(CDC)};
+\node[box, right=of dms, yshift=-1.1cm] (s3b) {S3 Data Lake\\(Images, CDC files)};
+\node[side, above=0.5cm of dms] (iam) {IAM least-privilege};
+\node[side, below=0.5cm of ddb] (cw) {CloudWatch alarms};
+\draw[arr] (app) -- (aurora);
+\draw[arr] (app) -- (ddb);
+\draw[arr] (app.east) -- (s3b.west);
+\draw[arr] (aurora) -- (dms);
+\draw[arr] (dms) -- (s3b);
+\draw[arr, dashed] (iam) -- (dms);
+\draw[arr, dashed] (cw) -- (ddb);
+\end{tikzpicture}
+\caption{Milestone 1 reference architecture: multi-tier e-commerce data backend}
+\end{figure}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+    node distance=0.7cm and 1.3cm,
+    entity/.style={draw, rounded corners, fill=gray!8, align=left, font=\scriptsize, inner sep=4pt},
+    rel/.style={-{Stealth}, thick},
+    lbl/.style={font=\scriptsize\itshape, fill=white, inner sep=1pt}
+]
+\node[entity] (customers) {\textbf{CUSTOMERS}\\customer\_id (PK)\\email\\region\\created\_at};
+\node[entity, right=of customers] (orders) {\textbf{ORDERS}\\order\_id (PK)\\customer\_id (FK)\\order\_ts\\total\_amount};
+\node[entity, right=of orders] (items) {\textbf{ORDER\_ITEMS}\\order\_id (FK)\\product\_id (FK)\\qty\\unit\_price};
+\node[entity, below=of items] (products) {\textbf{PRODUCTS}\\product\_id (PK)\\sku\\name\\image\_s3\_key};
+\node[entity, below=of customers] (events) {\textbf{CART\_EVENTS}\\event\_id (PK)\\customer\_id (FK)\\event\_type\\event\_ts};
+\draw[rel] (customers) -- node[lbl, above] {1:N} (orders);
+\draw[rel] (orders) -- node[lbl, above] {1:N} (items);
+\draw[rel] (products) -- node[lbl, right] {1:N} (items);
+\draw[rel] (customers) -- node[lbl, left] {1:N} (events);
+\end{tikzpicture}
+\caption{Capstone data model: e-commerce multi-tier backend}
+\end{figure}
 
 % ==========================================
 % MILESTONE 2
 % ==========================================
 \section{Milestone 2: Data Warehousing \& Analytics (Month 2)}
 \textit{Objective: Deep dive into Redshift optimization, Serverless analytics, and Data Lakes.}
+\par\noindent\textbf{Learning outcomes:} load and benchmark data in Redshift Serverless, tune distribution styles and sort keys, catalog S3 data with Glue and query it via Athena and Spectrum, and enforce row/column-level governance with Lake Formation.
 
-\subsection*{Week 5: Amazon Redshift Architecture \& Basics}
+\subsection*{Week 5: Amazon Redshift Architecture \& Dimensional Modeling}
+\par\noindent\textbf{Outcomes:} explain Redshift MPP and Serverless architectures, declare fact-table grain and build a star schema, load data with COPY, and implement SCD Type 2 upserts in SQL.
 \begin{itemize}[label=-]
     \dayitem{Monday}{Redshift MPP architecture, Leader vs. Compute nodes, RA3 nodes.}
     \dayitem{Tuesday}{Redshift Serverless vs. Provisioned pricing and scaling.}
-    \dayitem{Wednesday}{Data ingestion: COPY commands, Auto-Copy from S3.}
-    \dayitem{Thursday}{\project{Provision a Redshift Serverless endpoint. Load 10 million rows of synthetic JSON data from S3 using the COPY command with IAM roles.}}
+    \dayitem{Wednesday}{Data ingestion with COPY commands and Auto-Copy from S3. Kimball dimensional modeling: declare the grain first, then choose the fact type (transaction, periodic snapshot, accumulating snapshot), build conformed dimensions shared across data marts, and decide SCD Type 1 (overwrite) vs.\ Type 2 (versioned history) per attribute.}
+    \dayitem{Thursday}{\project{Provision a Redshift Serverless endpoint. Load 10 million rows of synthetic JSON data from S3 using the COPY command with IAM roles. Then declare the grain of a \texttt{fact\_sales} table and load conformed \texttt{dim\_customer}, \texttt{dim\_product}, and \texttt{dim\_date} dimensions around it.}}
+
+\begin{lstlisting}[language=SQL]
+-- SCD Type 2 upsert in Redshift: close changed rows, then insert new versions
+MERGE INTO dim_customer tgt
+USING stg_customer src
+  ON tgt.customer_id = src.customer_id AND tgt.is_current = TRUE
+WHEN MATCHED AND (tgt.segment <> src.segment OR tgt.city <> src.city)
+THEN UPDATE SET valid_to = CURRENT_DATE, is_current = FALSE
+WHEN NOT MATCHED
+THEN INSERT (customer_id, segment, city, valid_from, valid_to, is_current)
+     VALUES (src.customer_id, src.segment, src.city,
+             CURRENT_DATE, DATE '9999-12-31', TRUE);
+
+-- second pass: insert the new current versions of the rows just closed
+INSERT INTO dim_customer (customer_id, segment, city, valid_from, valid_to, is_current)
+SELECT src.customer_id, src.segment, src.city,
+       CURRENT_DATE, DATE '9999-12-31', TRUE
+FROM stg_customer src
+JOIN dim_customer tgt
+  ON tgt.customer_id = src.customer_id
+ AND tgt.is_current = FALSE
+ AND tgt.valid_to = CURRENT_DATE;
+\end{lstlisting}
     \dayitem{Friday}{\usecase{Estimate the monthly cost and recommend an architecture (RA3 vs. Serverless) for a BI workload that is heavily utilized only during end-of-month reporting.}}
 \end{itemize}
+\resources{Amazon Redshift documentation (\url{https://docs.aws.amazon.com/redshift/}); Data Engineering Zoomcamp (\url{https://github.com/DataTalksClub/data-engineering-zoomcamp}).}
+\selfcheck{\begin{itemize}[label=-, leftmargin=1.5em, itemsep=0pt]
+    \item Why must you declare the grain before adding columns to a fact table?
+    \item How do periodic snapshot and accumulating snapshot facts differ?
+    \item When is SCD Type 2 required instead of Type 1?
+    \item COPY vs.\ Auto-Copy: which suits continuous micro-batch loads from S3?
+    \item When does Redshift Serverless beat provisioned RA3 on cost?
+\end{itemize}}
+
+% Cost/performance trade-off comparison for the warehousing milestone
+\begin{center}
+\renewcommand{\arraystretch}{1.3}
+\begin{tabular}{@{} l l p{4.0cm} p{4.6cm} @{}}
+\toprule
+\textbf{Option} & \textbf{Billing model} & \textbf{Best for} & \textbf{Watch-outs} \\
+\midrule
+Redshift Serverless & RPU-hours, billed per second & Spiky or intermittent BI workloads, fast onboarding & Base-RPU floor cost; unbounded concurrency spikes the bill \\
+Redshift RA3 (provisioned) & Node-hours plus managed storage per TB-month & Steady, predictable 24/7 analytics at scale & Paying for idle capacity; resize/pause planning needed \\
+Athena & Per TB scanned (\$5/TB) & Ad-hoc SQL on S3 with zero infrastructure & Unpartitioned CSV scans explode cost; no indexes \\
+Redshift Spectrum & Per TB scanned, plus a running Redshift cluster & Joining S3 lake data with Redshift tables in one query & Requires an active cluster; per-TB fees accumulate on wide scans \\
+\bottomrule
+\end{tabular}
+\end{center}
 
 \subsection*{Week 6: Redshift Optimization \& Performance}
+\par\noindent\textbf{Outcomes:} choose distribution styles and sort keys for join-heavy workloads, configure WLM and concurrency scaling, benchmark table designs empirically, and diagnose CPU bottlenecks in daily aggregations.
 \begin{itemize}[label=-]
     \dayitem{Monday}{Distribution Styles (EVEN, KEY, ALL, AUTO).}
     \dayitem{Tuesday}{Sort Keys (Compound vs. Interleaved) and Compression Encodings.}
@@ -115,8 +333,17 @@
     \dayitem{Thursday}{\project{Create three identical tables in Redshift using different Distribution Styles. Benchmark the execution time of a complex JOIN query on each table.}}
     \dayitem{Friday}{\usecase{Re-architect a poorly performing multi-petabyte analytics table that is causing CPU bottlenecks during complex daily dashboard aggregations.}}
 \end{itemize}
+\resources{Redshift performance tuning guide (\url{https://docs.aws.amazon.com/redshift/latest/dg/c-optimizing-query-performance.html}); Data Engineer Handbook (\url{https://github.com/DataExpert-io/data-engineer-handbook}).}
+\selfcheck{\begin{itemize}[label=-, leftmargin=1.5em, itemsep=0pt]
+    \item Which distribution style avoids data movement when joining two large tables?
+    \item Compound vs.\ interleaved sort keys: which suits varied filter-column combinations?
+    \item What problem does concurrency scaling solve for BI dashboards?
+    \item When does a materialized view beat a plain view?
+    \item What does rising queue wait time in WLM tell you to change?
+\end{itemize}}
 
 \subsection*{Week 7: Data Lakehouse \& Amazon Athena}
+\par\noindent\textbf{Outcomes:} query S3 data with Athena and Spectrum, catalog data with Glue crawlers, convert raw files to Parquet for scan-cost reduction, and design a hybrid lakehouse architecture.
 \begin{itemize}[label=-]
     \dayitem{Monday}{Amazon Athena: Serverless Presto querying directly on S3.}
     \dayitem{Tuesday}{AWS Glue Data Catalog: Crawlers, Databases, and Tables.}
@@ -124,8 +351,17 @@
     \dayitem{Thursday}{\project{Set up a Glue Crawler to catalog an S3 bucket of raw CSVs. Write an Athena query to aggregate the data, then query the same catalog using Redshift Spectrum.}}
     \dayitem{Friday}{\usecase{Design a cost-effective "Lakehouse" architecture for a media company wanting to store 50PB of logs in S3 while querying them alongside core business data in Redshift.}}
 \end{itemize}
+\resources{Amazon Athena documentation (\url{https://docs.aws.amazon.com/athena/}); Apache Iceberg (\url{https://github.com/apache/iceberg}).}
+\selfcheck{\begin{itemize}[label=-, leftmargin=1.5em, itemsep=0pt]
+    \item Why does Parquet lower Athena cost compared with CSV?
+    \item What does a Glue crawler infer, and when does it infer wrong?
+    \item When is Redshift Spectrum preferable to Athena for the same S3 data?
+    \item How does partition pruning cut bytes scanned?
+    \item What makes Apache Iceberg a lakehouse format beyond plain Parquet files?
+\end{itemize}}
 
 \subsection*{Week 8: Data Sharing \& Lake Formation}
+\par\noindent\textbf{Outcomes:} configure Lake Formation row/column-level security, apply LF-Tag-based access control, share data across accounts with Redshift data sharing, and design a data clean room.
 \begin{itemize}[label=-]
     \dayitem{Monday}{AWS Lake Formation: Centralized data lake governance.}
     \dayitem{Tuesday}{Row-level and column-level security in Lake Formation.}
@@ -133,16 +369,100 @@
     \dayitem{Thursday}{\project{Configure AWS Lake Formation over an S3 bucket. Create a data permission policy that restricts a "marketing" IAM role from seeing the "PII\_Email" column in Athena.}}
     \dayitem{Friday}{\usecase{Architect a Data Clean Room for an ad agency to merge their CRM data with third-party advertiser data without exposing raw PII to either party.}}
 \end{itemize}
+\resources{AWS Lake Formation documentation (\url{https://docs.aws.amazon.com/lake-formation/}); AWS Clean Rooms documentation (\url{https://docs.aws.amazon.com/clean-rooms/}).}
+\selfcheck{\begin{itemize}[label=-, leftmargin=1.5em, itemsep=0pt]
+    \item What does the default \texttt{IAMAllowedPrincipals} grant do, and why revoke it?
+    \item How do LF-Tags differ from named-resource grants?
+    \item What does column-level security protect that table grants cannot?
+    \item How does Redshift data sharing avoid copying data between accounts?
+    \item Why is a clean room safer than exchanging raw CSV exports?
+\end{itemize}}
+
+\prodnote{Apply least-privilege in Lake Formation from day one: revoke the default \texttt{IAMAllowedPrincipals} super-group on new tables, grant permissions on named columns instead of \texttt{*}, and audit grants with CloudTrail Lake Formation data-plane events. A single overly broad \texttt{GRANT} silently defeats every column mask downstream.}
 
 \capstone{Milestone 2}{Enterprise Data Lakehouse Build. Ingest 5 years of retail data into S3 using Parquet. Catalog it with AWS Glue. Use Lake Formation to apply row/column level security policies based on department. Create Redshift Materialized Views to serve executive dashboards via Redshift Spectrum.}
+\rubric{\begin{itemize}[label=-, leftmargin=1.5em, itemsep=0pt]
+    \item End-to-end lakehouse reproducible from a clean environment following the repo README.
+    \item Architecture diagram committed (draw.io/TikZ/PNG) covering S3, Glue Catalog, Lake Formation, and Redshift.
+    \item At least 3 automated data-quality tests (schema, null-rate, and row-count checks on the Parquet zones) with a failing-case demonstration.
+    \item Monitoring/alerting evidence: Glue crawler/job failure alarm wired to SNS (screenshot or exported config).
+    \item Monthly cost estimate (Athena scanned bytes vs. Spectrum vs. Redshift provisioned) with 2 optimization decisions documented.
+    \item Security review: Lake Formation least-privilege grants, column masks on PII, no hardcoded credentials.
+\end{itemize}}
+
+\subsection*{Milestone 2 Capstone: Reference Solution Sketch}
+\begin{itemize}[label=-, itemsep=0pt]
+    \item \textbf{Architecture:} S3 Parquet lake in raw/curated zones, Glue Crawlers + Data Catalog, Lake Formation LF-Tags for row/column security, Athena for ad-hoc SQL, Redshift Spectrum + materialized views for dashboards.
+    \item \textbf{Steps:} land 5 years of retail data in the raw zone; convert to partitioned Parquet (\texttt{year=/month=}); run the crawler against the curated zone; revoke \texttt{IAMAllowedPrincipals} and grant LF-Tag-based permissions with PII column masks; create the Redshift external schema; build MVs for the executive dashboards.
+    \item \textbf{Hardest part --- external schema and MV:}
+\begin{lstlisting}[language=SQL]
+CREATE EXTERNAL SCHEMA lakehouse FROM DATA CATALOG
+  DATABASE 'retail_lake'
+  IAM_ROLE 'arn:aws:iam::123456789012:role/SpectrumRole';
+
+CREATE MATERIALIZED VIEW mv_monthly_sales AS
+SELECT d.year, d.month, p.category, SUM(f.amount) AS revenue
+FROM lakehouse.fact_sales f
+JOIN dim_date d ON f.date_key = d.date_key
+GROUP BY 1, 2, 3;
+\end{lstlisting}
+    \item \textbf{Pitfalls:} unpartitioned CSV scans explode Athena cost; crawlers merge schemas when raw files are inconsistent; Spectrum requires the Glue catalog and Redshift in the same region.
+\end{itemize}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+    node distance=0.55cm and 1.1cm,
+    box/.style={draw, rounded corners, fill=teal!10, align=center, font=\small, minimum height=0.9cm, inner sep=4pt},
+    side/.style={draw, rounded corners, fill=brown!10, align=center, font=\footnotesize, inner sep=3pt},
+    arr/.style={-{Stealth}, thick}
+]
+\node[box] (s3) {S3 Data Lake\\(Parquet zones)};
+\node[box, right=of s3] (crawler) {Glue Crawlers\\+ Data Catalog};
+\node[box, right=of crawler, yshift=1.0cm] (athena) {Athena\\(ad-hoc SQL)};
+\node[box, right=of crawler, yshift=-1.0cm] (spectrum) {Redshift Spectrum\\(federated SQL)};
+\node[box, right=of spectrum, yshift=1.0cm] (rs) {Redshift\\(MVs, dashboards)};
+\node[side, below=0.6cm of crawler] (lf) {Lake Formation (row/column security)};
+\draw[arr] (s3) -- (crawler);
+\draw[arr] (crawler) -- (athena);
+\draw[arr] (crawler) -- (spectrum);
+\draw[arr] (spectrum) -- (rs);
+\draw[arr, dashed] (lf) -- (crawler);
+\draw[arr, dashed] (lf.east) -- (spectrum.south);
+\end{tikzpicture}
+\caption{Milestone 2 reference architecture: governed enterprise lakehouse}
+\end{figure}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+    node distance=0.7cm and 1.2cm,
+    entity/.style={draw, rounded corners, fill=gray!8, align=left, font=\scriptsize, inner sep=4pt},
+    rel/.style={-{Stealth}, thick},
+    lbl/.style={font=\scriptsize\itshape, fill=white, inner sep=1pt}
+]
+\node[entity] (fact) {\textbf{FACT\_SALES}\\date\_key (FK)\\customer\_key (FK)\\product\_key (FK)\\store\_key (FK)\\qty, amount};
+\node[entity, above left=0.7cm and 1.2cm of fact] (dimdate) {\textbf{DIM\_DATE}\\date\_key (PK)\\day, month\\quarter, year};
+\node[entity, below left=0.7cm and 1.2cm of fact] (dimcust) {\textbf{DIM\_CUSTOMER}\\customer\_key (PK)\\segment, city\\valid\_from / valid\_to\\is\_current (SCD2)};
+\node[entity, above right=0.7cm and 1.2cm of fact] (dimprod) {\textbf{DIM\_PRODUCT}\\product\_key (PK)\\sku\\category, brand};
+\node[entity, below right=0.7cm and 1.2cm of fact] (dimstore) {\textbf{DIM\_STORE}\\store\_key (PK)\\store\_id\\region, format};
+\draw[rel] (dimdate) -- node[lbl, above left] {1:N} (fact);
+\draw[rel] (dimcust) -- node[lbl, below left] {1:N} (fact);
+\draw[rel] (dimprod) -- node[lbl, above right] {1:N} (fact);
+\draw[rel] (dimstore) -- node[lbl, below right] {1:N} (fact);
+\end{tikzpicture}
+\caption{Capstone data model: retail lakehouse star schema}
+\end{figure}
 
 % ==========================================
 % MILESTONE 3
 % ==========================================
 \section{Milestone 3: Batch Processing \& ETL Orchestration (Month 3)}
 \textit{Objective: Master Spark on EMR, Glue ETL, and Airflow orchestration.}
+\par\noindent\textbf{Learning outcomes:} submit and tune PySpark jobs on EMR, build serverless Glue ETL pipelines, configure DMS CDC replication to S3, and author production-grade Airflow DAGs on MWAA with failure alerting.
 
 \subsection*{Week 9: Amazon EMR (Managed Hadoop/Spark)}
+\par\noindent\textbf{Outcomes:} deploy EMR clusters with appropriate node types and Spot capacity, submit PySpark jobs against S3 via EMRFS, compare EMR deployment modes, and plan a Hadoop-to-EMR migration.
 \begin{itemize}[label=-]
     \dayitem{Monday}{EMR Architecture, Master/Core/Task nodes, and Spot Instances.}
     \dayitem{Tuesday}{EMR Serverless vs. EMR on EC2 vs. EMR on EKS.}
@@ -150,8 +470,17 @@
     \dayitem{Thursday}{\project{Deploy an EMR cluster with Spark. Submit a PySpark job that reads data from S3, performs a distributed aggregation, and writes the output back to S3 in Parquet format.}}
     \dayitem{Friday}{\usecase{Design a migration strategy for a 100-node on-premise Cloudera Hadoop cluster, prioritizing cost reduction and decoupling compute from storage in AWS.}}
 \end{itemize}
+\resources{Amazon EMR documentation (\url{https://docs.aws.amazon.com/emr/}); Apache Spark (\url{https://github.com/apache/spark}).}
+\selfcheck{\begin{itemize}[label=-, leftmargin=1.5em, itemsep=0pt]
+    \item Core vs.\ Task nodes: which tier can safely run on Spot Instances?
+    \item How does EMRFS decouple storage from compute?
+    \item When would you pick EMR on EKS over EMR on EC2?
+    \item What are bootstrap actions used for?
+    \item Why prefer transient clusters for recurring batch jobs?
+\end{itemize}}
 
 \subsection*{Week 10: Serverless ETL (AWS Glue)}
+\par\noindent\textbf{Outcomes:} build Glue ETL jobs with DynamicFrames and Glue Studio, tune DPUs and Flex execution, enforce idempotent re-runs with job bookmarks, and evaluate Glue vs.\ EMR fit.
 \begin{itemize}[label=-]
     \dayitem{Monday}{AWS Glue ETL: DynamicFrames vs. Spark DataFrames.}
     \dayitem{Tuesday}{Glue Studio (Visual ETL) and AWS Glue DataBrew (Data preparation).}
@@ -159,26 +488,167 @@
     \dayitem{Thursday}{\project{Build a visual ETL pipeline in Glue Studio that joins two tables, drops null values, transforms a timestamp, and loads the clean data into Redshift.}}
     \dayitem{Friday}{\usecase{Evaluate AWS Glue vs. Amazon EMR for a team of business analysts who need to build daily reporting pipelines without managing infrastructure.}}
 \end{itemize}
+\resources{AWS Glue documentation (\url{https://docs.aws.amazon.com/glue/}); Apache Spark (\url{https://github.com/apache/spark}).}
+\selfcheck{\begin{itemize}[label=-, leftmargin=1.5em, itemsep=0pt]
+    \item What does a DynamicFrame offer that a Spark DataFrame does not?
+    \item What do job bookmarks guarantee on a re-run?
+    \item When is Glue Flex execution the cheaper choice?
+    \item Why is Glue usually a better fit than EMR for analyst-built pipelines?
+    \item What compute does one DPU represent for billing?
+\end{itemize}}
 
-\subsection*{Week 11: Change Data Capture (AWS DMS \& EventBridge)}
+\prodnote{Make every Glue job idempotent: enable job bookmarks so retries reprocess only new partitions, write with overwrite-mode partitioned inserts rather than appends, and give jobs a deterministic run date parameter. A re-run after a mid-job failure must never create duplicate rows in Redshift.}
+
+\subsection*{Week 11: Change Data Capture (AWS DMS \& EventBridge) \& Data Contracts}
+\par\noindent\textbf{Outcomes:} configure DMS CDC replication to S3, define data contracts with the Glue Schema Registry, distinguish breaking from non-breaking schema changes, and monitor CDC lag metrics.
 \begin{itemize}[label=-]
     \dayitem{Monday}{AWS DMS architecture for continuous replication.}
     \dayitem{Tuesday}{Event-driven data pipelines using Amazon EventBridge.}
-    \dayitem{Wednesday}{AWS Lambda for lightweight serverless data transformations.}
+    \dayitem{Wednesday}{AWS Lambda for lightweight serverless data transformations. Data contracts with AWS Glue Schema Registry: Avro schemas, compatibility modes (BACKWARD, FORWARD, FULL), contract versioning, breaking vs.\ non-breaking changes (deleting a field or changing its type breaks consumers; adding an optional field does not), producer-owned contracts with consumer sign-off, and enforcing contracts inside Glue jobs.}
     \dayitem{Thursday}{\project{Configure a DMS task with CDC enabled to stream ongoing database changes from an RDS PostgreSQL instance to an S3 Data Lake bucket.}}
     \dayitem{Friday}{\usecase{Architect a near-real-time synchronization pipeline from an on-premise Oracle database to Amazon Redshift for live BI reporting.}}
 \end{itemize}
+\resources{AWS DMS documentation (\url{https://docs.aws.amazon.com/dms/}); Amazon EventBridge documentation (\url{https://docs.aws.amazon.com/eventbridge/}); AWS Glue Schema Registry (\url{https://docs.aws.amazon.com/glue/latest/dg/schema-registry.html}).}
+\selfcheck{\begin{itemize}[label=-, leftmargin=1.5em, itemsep=0pt]
+    \item Which CloudWatch metrics reveal CDC lag while a task shows ``running''?
+    \item BACKWARD vs.\ FULL compatibility: which permits deleting a field safely?
+    \item Who owns a data contract: producer, consumer, or both?
+    \item Why enforce the schema at ingestion instead of at query time?
+    \item Name one breaking and one non-breaking schema change.
+\end{itemize}}
+
+\prodnote{Monitor DMS CDC replication lag, not just task status: alarm on the \texttt{CDCLatencySource} and \texttt{CDCLatencyTarget} CloudWatch metrics, and validate that the source database retains enough transaction log history to survive a replication instance outage. Stale CDC with a ``running'' task is the classic silent failure.}
 
 \subsection*{Week 12: Pipeline Orchestration (Amazon MWAA)}
+\par\noindent\textbf{Outcomes:} author Airflow DAGs with sensors, operators, and failure alerting, deploy on MWAA, compare with Step Functions orchestration, and design self-healing multi-system pipelines.
 \begin{itemize}[label=-]
     \dayitem{Monday}{Apache Airflow concepts: DAGs, Operators, Tasks, and XComs.}
     \dayitem{Tuesday}{Amazon MWAA (Managed Workflows for Apache Airflow) architecture.}
     \dayitem{Wednesday}{AWS Step Functions for native AWS serverless orchestration.}
     \dayitem{Thursday}{\project{Write a Python DAG for MWAA that: 1. Waits for a file in S3. 2. Triggers an AWS Glue Job. 3. Runs an Athena query. 4. Sends an SNS alert on failure.}}
+
+\begin{lstlisting}[language=Python]
+from datetime import datetime
+from airflow import DAG
+from airflow.providers.amazon.aws.sensors.s3 import S3KeySensor
+from airflow.providers.amazon.aws.operators.glue import GlueJobOperator
+from airflow.providers.amazon.aws.operators.athena import AthenaOperator
+from airflow.providers.amazon.aws.operators.sns import SnsPublishOperator
+
+with DAG(
+    dag_id="daily_recon_pipeline",
+    schedule="@daily",
+    start_date=datetime(2026, 1, 1),
+    catchup=False,
+    default_args={"retries": 2, "retry_delay": 300},
+) as dag:
+    wait_for_file = S3KeySensor(
+        task_id="wait_for_file",
+        bucket_name="bank-raw-ingest",
+        bucket_key="recon/{{ ds }}/transactions.csv",
+        poke_interval=300, timeout=3600,
+    )
+    run_glue = GlueJobOperator(
+        task_id="run_glue", job_name="recon-etl", iam_role_name="GlueExecRole",
+    )
+    validate = AthenaOperator(
+        task_id="validate", query="SELECT COUNT(*) FROM recon.daily_load",
+        database="recon", output_location="s3://bank-athena-results/",
+    )
+    alert = SnsPublishOperator(
+        task_id="alert", target_arn="arn:aws:sns:us-east-1:123456789012:data-alerts",
+        message="Recon pipeline failed for {{ ds }}", trigger_rule="one_failed",
+    )
+    wait_for_file >> run_glue >> validate >> alert
+\end{lstlisting}
+
     \dayitem{Friday}{\usecase{Design a resilient, self-healing orchestration layer for a daily banking reconciliation process spanning 15 dependent systems using MWAA and Step Functions.}}
 \end{itemize}
+\resources{Apache Airflow (\url{https://github.com/apache/airflow}); Amazon MWAA documentation (\url{https://docs.aws.amazon.com/mwaa/}).}
+\selfcheck{\begin{itemize}[label=-, leftmargin=1.5em, itemsep=0pt]
+    \item What does \texttt{catchup=False} prevent when you deploy a DAG?
+    \item When are Step Functions a better orchestrator than Airflow?
+    \item What do retries with backoff protect a pipeline against?
+    \item Why tune an \texttt{S3KeySensor} \texttt{poke\_interval}?
+    \item When should data move through S3 instead of XComs?
+\end{itemize}}
+
+\prodnote{Wire MWAA and Glue failures to CloudWatch alarms that publish to an SNS topic subscribed by the on-call runbook (e.g., via Lambda or Incident Manager). Alarm on \texttt{FailedTasks} / DAG duration anomalies in MWAA and on Glue job \texttt{ERROR} logs --- never rely on someone noticing a red box in the Airflow UI. Every alert must link to a runbook entry with triage steps.}
 
 \capstone{Milestone 3}{Automated Batch ELT Pipeline. Use EventBridge to trigger an AWS Step Function state machine upon file upload to S3. The state machine triggers a Glue DataBrew data quality check, runs an EMR Serverless Spark job to calculate complex ML features, and loads the output into Redshift.}
+\rubric{\begin{itemize}[label=-, leftmargin=1.5em, itemsep=0pt]
+    \item End-to-end pipeline runs from a clean environment following the repo README (upload a file, pipeline completes).
+    \item Architecture diagram committed (draw.io/TikZ/PNG) showing EventBridge, Step Functions, DataBrew, EMR, and Redshift.
+    \item At least 3 automated data-quality checks in DataBrew/Glue with a failing-case demonstration that halts the load.
+    \item Monitoring/alerting evidence: Step Functions \texttt{ExecutionsFailed} alarm and MWAA/Step Functions failure notification to SNS.
+    \item Monthly cost estimate (EMR Serverless vCPU-hours, Glue DPUs, Step Functions transitions) with 2 optimization decisions documented.
+    \item Security review: task-scoped IAM roles per pipeline stage, secrets in Secrets Manager, no hardcoded credentials in DAGs or scripts.
+\end{itemize}}
+
+\subsection*{Milestone 3 Capstone: Reference Solution Sketch}
+\begin{itemize}[label=-, itemsep=0pt]
+    \item \textbf{Architecture:} EventBridge rule on S3 upload triggers a Step Functions state machine: DataBrew DQ check gates an EMR Serverless Spark feature job that loads Redshift; MWAA handles cross-day scheduling dependencies.
+    \item \textbf{Steps:} enable S3 event notifications to EventBridge; define the state machine with a Choice state on the DQ result; create the EMR Serverless application and Spark job; COPY the curated output into Redshift; publish failures to SNS.
+    \item \textbf{Hardest part --- the DQ gate Choice state (ASL):}
+\begin{lstlisting}
+"CheckDataQuality": {
+  "Type": "Choice",
+  "Choices": [{
+    "Variable": "$.dq_status",
+    "StringEquals": "FAILED",
+    "Next": "AlertAndHalt"
+  }],
+  "Default": "RunSparkFeatures"
+}
+\end{lstlisting}
+    \item \textbf{Pitfalls:} Step Functions has a 256\,KB payload limit --- pass S3 keys, never data; DataBrew profile jobs scan full datasets and surprise on cost; missing bucket event configuration means the pipeline never fires.
+\end{itemize}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+    node distance=0.55cm and 1.0cm,
+    box/.style={draw, rounded corners, fill=orange!10, align=center, font=\small, minimum height=0.9cm, inner sep=4pt},
+    side/.style={draw, rounded corners, fill=brown!10, align=center, font=\footnotesize, inner sep=3pt},
+    arr/.style={-{Stealth}, thick}
+]
+\node[box] (s3) {S3 upload\\(raw file)};
+\node[box, right=of s3] (eb) {EventBridge\\rule};
+\node[box, right=of eb] (sf) {Step Functions\\state machine};
+\node[box, right=of sf, yshift=1.0cm] (dq) {Glue DataBrew\\DQ check};
+\node[box, right=of sf, yshift=-1.0cm] (emr) {EMR Serverless\\Spark features};
+\node[box, right=of emr, yshift=1.0cm] (rs) {Redshift\\(curated)};
+\node[side, below=0.6cm of sf] (mwaa) {MWAA (Airflow) cross-DAG deps};
+\draw[arr] (s3) -- (eb);
+\draw[arr] (eb) -- (sf);
+\draw[arr] (sf) -- (dq);
+\draw[arr] (sf) -- (emr);
+\draw[arr] (dq) -- (rs);
+\draw[arr] (emr) -- (rs);
+\draw[arr, dashed] (mwaa) -- (sf);
+\end{tikzpicture}
+\caption{Milestone 3 reference architecture: automated batch ELT pipeline}
+\end{figure}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+    node distance=0.7cm and 1.3cm,
+    entity/.style={draw, rounded corners, fill=gray!8, align=left, font=\scriptsize, inner sep=4pt},
+    rel/.style={-{Stealth}, thick},
+    lbl/.style={font=\scriptsize\itshape, fill=white, inner sep=1pt}
+]
+\node[entity] (files) {\textbf{INGESTION\_FILES}\\file\_id (PK)\\s3\_key\\uploaded\_at\\status};
+\node[entity, right=of files, yshift=1.1cm] (dq) {\textbf{DQ\_RESULTS}\\check\_id (PK)\\file\_id (FK)\\rule\_name\\passed};
+\node[entity, right=of files, yshift=-1.1cm] (feat) {\textbf{FEATURE\_ROWS}\\feature\_id (PK)\\file\_id (FK)\\entity\_id\\features\_json};
+\node[entity, right=of feat, yshift=1.1cm] (facts) {\textbf{CURATED\_FACTS}\\fact\_id (PK)\\feature\_id (FK)\\load\_ts\\amount};
+\draw[rel] (files) -- node[lbl, above left] {1:N} (dq);
+\draw[rel] (files) -- node[lbl, below left] {1:N} (feat);
+\draw[rel] (feat) -- node[lbl, above] {N:1} (facts);
+\draw[rel] (dq) -- node[lbl, above] {N:1} (facts);
+\end{tikzpicture}
+\caption{Capstone data model: automated batch ELT pipeline}
+\end{figure}
 
 \newpage
 % ==========================================
@@ -186,17 +656,62 @@
 % ==========================================
 \section{Milestone 4: Streaming \& Real-Time Analytics (Month 4)}
 \textit{Objective: Conquer unbounded data, Kinesis, Kafka, and real-time visualization.}
+\par\noindent\textbf{Learning outcomes:} design and scale Kinesis Data Streams, build producers and consumers with Boto3, configure Firehose delivery with inline transformation, implement Flink windowed aggregations, and publish real-time QuickSight dashboards.
 
 \subsection*{Week 13: Message Queuing \& Streaming Ingestion}
+\par\noindent\textbf{Outcomes:} size Kinesis streams from shard throughput limits, write retrying Boto3 producers with per-key ordering, build idempotent consumers, and compare Kinesis with MSK.
 \begin{itemize}[label=-]
     \dayitem{Monday}{Decoupling with Amazon SQS and SNS (Fan-out pattern).}
     \dayitem{Tuesday}{Amazon Kinesis Data Streams (KDS): Shards, Partition Keys, and scaling.}
     \dayitem{Wednesday}{Amazon MSK (Managed Streaming for Apache Kafka) vs. Kinesis.}
     \dayitem{Thursday}{\project{Create a Kinesis Data Stream. Write a Python producer script (Boto3) to stream mock IoT temperature sensor data, and a consumer to print the data.}}
+
+\begin{lstlisting}[language=Python]
+import json, random, time
+import boto3
+
+kinesis = boto3.client("kinesis", region_name="us-east-1")
+STREAM = "iot-temperature-stream"
+
+def make_reading(sensor_id: int) -> dict:
+    return {
+        "sensor_id": f"sensor-{sensor_id}",
+        "ts": int(time.time()),
+        "temp_c": round(random.uniform(15.0, 35.0), 2),
+        "battery_pct": random.randint(20, 100),
+    }
+
+while True:
+    records = []
+    for sensor_id in range(1, 51):
+        records.append({
+            "Data": json.dumps(make_reading(sensor_id)).encode("utf-8"),
+            "PartitionKey": f"sensor-{sensor_id}",  # per-sensor ordering
+        })
+    resp = kinesis.put_records(StreamName=STREAM, Records=records)
+    if resp["FailedRecordCount"]:
+        # retry only failed records with backoff (ProvisionedThroughputExceeded)
+        failed = [r for r, o in zip(records, resp["Records"]) if "ErrorCode" in o]
+        time.sleep(0.5)
+        kinesis.put_records(StreamName=STREAM, Records=failed)
+    time.sleep(1)
+\end{lstlisting}
+
     \dayitem{Friday}{\usecase{Architect a global telemetry ingestion point for 5 million mobile games, ensuring exactly-once processing semantics and strict message ordering.}}
 \end{itemize}
+\resources{Amazon Kinesis documentation (\url{https://docs.aws.amazon.com/kinesis/}); Apache Kafka (\url{https://github.com/apache/kafka}).}
+\selfcheck{\begin{itemize}[label=-, leftmargin=1.5em, itemsep=0pt]
+    \item Which two throughput limits determine how many shards a stream needs?
+    \item Why does partition-key choice control per-entity ordering?
+    \item What does a rising \texttt{IteratorAgeMilliseconds} warn about?
+    \item How do you build exactly-once effects on at-least-once delivery?
+    \item Kinesis vs.\ MSK: which is billed per shard-hour and record volume?
+\end{itemize}}
+
+\prodnote{Design consumers to be idempotent --- Kinesis delivers at-least-once, so deduplicate on a record ID (e.g., in Redis or a DynamoDB conditional put) before writing downstream. Route poison records that fail repeatedly to a dead-letter location (SQS DLQ or an S3 error prefix) instead of blocking the shard iterator, and alarm on \texttt{IteratorAgeMilliseconds} to catch slow consumers before the 24-hour retention window expires.}
 
 \subsection*{Week 14: Real-Time Delivery (Kinesis Firehose)}
+\par\noindent\textbf{Outcomes:} configure Firehose delivery with inline Lambda transformation, convert JSON to Parquet in flight, enable source-record backup, and design real-time anonymization before delivery.
 \begin{itemize}[label=-]
     \dayitem{Monday}{Amazon Kinesis Data Firehose architecture and destinations.}
     \dayitem{Tuesday}{Inline data transformation using AWS Lambda in Firehose.}
@@ -204,26 +719,143 @@
     \dayitem{Thursday}{\project{Connect a Kinesis Firehose delivery stream to your KDS. Configure a Lambda function to uppercase all incoming strings, convert the data to Parquet, and output to S3.}}
     \dayitem{Friday}{\usecase{Design a pipeline to anonymize incoming healthcare HL7 messages in real-time before streaming them into a Redshift cluster for analysis.}}
 \end{itemize}
+\resources{Kinesis Data Firehose documentation (\url{https://docs.aws.amazon.com/firehose/}); AWS Lambda documentation (\url{https://docs.aws.amazon.com/lambda/}).}
+\selfcheck{\begin{itemize}[label=-, leftmargin=1.5em, itemsep=0pt]
+    \item Name three native Firehose destinations.
+    \item Why enable source-record backup to S3 on a delivery stream?
+    \item What do inline Lambda transformations add to latency and cost?
+    \item Why convert JSON to Parquet during Firehose delivery?
+    \item Where does data land when Redshift delivery keeps failing?
+\end{itemize}}
+
+\prodnote{Always enable Firehose source-record backup to an S3 raw prefix and configure retry duration for Lambda transformations. For Redshift destinations, alarm on \texttt{DeliveryToRedshift.Success} and keep the intermediate S3 bucket lifecycle-tiered --- failed deliveries silently accumulate there otherwise.}
 
 \subsection*{Week 15: Stream Processing (Apache Flink on AWS)}
+\par\noindent\textbf{Outcomes:} explain event time vs.\ processing time, apply watermarks for late events, implement tumbling/sliding/session windows and stream-stream joins in Flink SQL, manage keyed state with the RocksDB state backend and state TTL, distinguish checkpoints from savepoints, and deliver end-to-end exactly-once with transactional or idempotent sinks.
 \begin{itemize}[label=-]
     \dayitem{Monday}{Managed Service for Apache Flink (formerly Kinesis Data Analytics).}
     \dayitem{Tuesday}{Event Time vs. Processing Time and Watermarks in Flink.}
-    \dayitem{Wednesday}{Windowing strategies: Tumbling, Sliding, and Session windows.}
+    \dayitem{Wednesday}{Windowing strategies: Tumbling, Sliding, and Session windows. Stream-stream joins: interval and window joins bounded by watermarks, and their state retention implications. State management deep dive: keyed state, the RocksDB state backend, checkpointing vs.\ savepoints, state TTL, and why unbounded state kills streaming jobs.}
     \dayitem{Thursday}{\project{Write a Flink SQL application that reads from a Kinesis Stream, groups user clicks into 5-minute Tumbling Windows, counts the clicks, and writes the output to a new stream.}}
-    \dayitem{Friday}{\usecase{Troubleshoot a scenario where a streaming dashboard is showing inaccurate daily aggregations due to mobile devices going offline and uploading data late.}}
+    \dayitem{Friday}{End-to-end exactly-once delivery: checkpointing plus idempotent or transactional sinks (two-phase commit to Kafka/S3) vs.\ at-least-once with downstream dedup. \usecase{Troubleshoot a scenario where a streaming dashboard is showing inaccurate daily aggregations due to mobile devices going offline and uploading data late.}}
 \end{itemize}
+\begin{lstlisting}[language=SQL]
+-- Watermarks declared in DDL on both input streams
+CREATE TABLE impressions (
+  ad_id STRING, imp_ts TIMESTAMP(3),
+  WATERMARK FOR imp_ts AS imp_ts - INTERVAL '10' SECOND
+) WITH ('connector' = 'kinesis', 'stream' = 'imps', ...);
 
-\subsection*{Week 16: Business Intelligence \& Amazon QuickSight}
+CREATE TABLE clicks (
+  user_id STRING, ad_id STRING, click_ts TIMESTAMP(3),
+  WATERMARK FOR click_ts AS click_ts - INTERVAL '5' SECOND
+) WITH ('connector' = 'kinesis', 'stream' = 'clicks', ...);
+
+-- Interval join: attribute clicks to impressions seen up to 15 min prior.
+-- Watermarks let Flink drop state older than the join interval.
+SELECT i.ad_id, c.user_id, c.click_ts
+FROM impressions i
+JOIN clicks c ON i.ad_id = c.ad_id
+WHERE c.click_ts BETWEEN i.imp_ts AND i.imp_ts + INTERVAL '15' MINUTE;
+\end{lstlisting}
+\resources{Amazon Managed Service for Apache Flink documentation (\url{https://docs.aws.amazon.com/managed-flink/}); Apache Flink documentation (\url{https://nightlies.apache.org/flink/flink-docs-stable/}).}
+\selfcheck{\begin{itemize}[label=-, leftmargin=1.5em, itemsep=0pt]
+    \item Why does unbounded keyed state eventually kill a streaming job?
+    \item Checkpoint vs.\ savepoint: which do you trigger before a redeployment, and why?
+    \item In a stream-stream interval join, what bounds how long join state is retained?
+    \item Which two components combine for end-to-end exactly-once delivery to Kafka or S3?
+    \item When is at-least-once plus downstream dedup preferred over exactly-once?
+\end{itemize}}
+
+\prodnote{Enforce savepoint discipline on every deployment: stop the job with a savepoint, never with a plain cancel, and pin the application to restore from that savepoint on the next start. Checkpoint state cannot survive code changes that alter the operator graph, and Managed Service for Apache Flink snapshots are not portable across incompatible changes --- a missed savepoint before redeploy means reprocessing or lost state.}
+
+\subsection*{Week 16: Business Intelligence (Amazon QuickSight) \& Reverse ETL}
+\par\noindent\textbf{Outcomes:} build QuickSight dashboards on Redshift and Athena, enforce row-level security on shared datasets, implement reverse ETL via UNLOAD to a CRM API, and reason about sync-frequency trade-offs.
 \begin{itemize}[label=-]
     \dayitem{Monday}{Amazon QuickSight Architecture and SPICE engine.}
     \dayitem{Tuesday}{Connecting QuickSight to Redshift, Athena, and S3.}
-    \dayitem{Wednesday}{Row-level security (RLS) and ML Insights in QuickSight.}
+    \dayitem{Wednesday}{Row-level security (RLS) and ML Insights in QuickSight. Reverse ETL: Redshift \texttt{UNLOAD} of curated segments/audiences to S3, a Lambda function pushing them to a CRM/marketing API, identity resolution (matching the same person across systems before sync), and sync-frequency trade-offs (hourly freshness vs.\ API rate limits and cost).}
     \dayitem{Thursday}{\project{Connect Amazon QuickSight to your Redshift cluster. Create a real-time dashboard monitoring sales, apply a filter, and set up an ML Anomaly Detection alert.}}
     \dayitem{Friday}{\usecase{Design the BI access layer for an enterprise where 500 analysts need to query centralized data, ensuring regional sales managers can only see data for their specific regions (RLS).}}
 \end{itemize}
+\resources{Amazon QuickSight documentation (\url{https://docs.aws.amazon.com/quicksight/}); Redshift UNLOAD documentation (\url{https://docs.aws.amazon.com/redshift/latest/dg/r_UNLOAD.html}); Data Engineer Handbook (\url{https://github.com/DataExpert-io/data-engineer-handbook}).}
+\selfcheck{\begin{itemize}[label=-, leftmargin=1.5em, itemsep=0pt]
+    \item What does SPICE accelerate, and what is its capacity limit?
+    \item How does QuickSight row-level security filter a shared dataset?
+    \item What is reverse ETL, and which operational systems does it feed?
+    \item Why must identity resolution happen before syncing audiences to a CRM?
+    \item Hourly vs.\ daily sync: which trade-offs decide the frequency?
+\end{itemize}}
 
 \capstone{Milestone 4}{Real-Time Fraud Detection. Build a Python script simulating credit card swipes sent to Kinesis Data Streams. Create a Managed Flink application that uses a Sliding Window to detect if a card is used in two different cities within 10 minutes, flags it, routes it via Firehose to Redshift, and displays the live fraud alerts in QuickSight.}
+\rubric{\begin{itemize}[label=-, leftmargin=1.5em, itemsep=0pt]
+    \item End-to-end stream runs from a clean environment following the repo README (producer to dashboard).
+    \item Architecture diagram committed (draw.io/TikZ/PNG) covering Kinesis, Flink, Firehose, Redshift, and QuickSight.
+    \item At least 3 automated tests: window-logic unit test, late-event handling test, and a DLQ routing test with a failing-case demonstration.
+    \item Monitoring/alerting evidence: alarm on \texttt{IteratorAgeMilliseconds} and Flink restart metric (screenshot or exported config).
+    \item Monthly cost estimate (Kinesis shard-hours vs. MSK, Flink KPUs, Firehose volume) with 2 optimization decisions documented.
+    \item Security review: stream encryption with KMS, least-privilege consumer roles, card PAN never persisted in plain text.
+\end{itemize}}
+
+\subsection*{Milestone 4 Capstone: Reference Solution Sketch}
+\begin{itemize}[label=-, itemsep=0pt]
+    \item \textbf{Architecture:} Kinesis Data Streams ingest $\rightarrow$ Managed Flink sliding-window detection on event time $\rightarrow$ Firehose (S3 raw backup + Redshift alert delivery) $\rightarrow$ QuickSight live dashboard.
+    \item \textbf{Steps:} create the stream with on-demand capacity; write the swipe producer with \texttt{card\_id} as partition key; build the Flink SQL app detecting cross-city use; route flagged alerts through Firehose to Redshift; build the QuickSight dashboard; deduplicate alert writes on \texttt{txn\_id}.
+    \item \textbf{Hardest part --- the two-city sliding-window query:}
+\begin{lstlisting}[language=SQL]
+SELECT card_id, window_start, window_end,
+       COUNT(DISTINCT city) AS city_count
+FROM TABLE(HOP(TABLE swipes, DESCRIPTOR(event_ts),
+               INTERVAL '10' MINUTES, INTERVAL '1' MINUTES))
+GROUP BY card_id, window_start, window_end
+HAVING COUNT(DISTINCT city) > 1;
+\end{lstlisting}
+    \item \textbf{Pitfalls:} processing-time windows flag false positives on late mobile events; under-provisioned Flink KPUs cause backpressure that ages the shard iterator; the raw card PAN must be tokenized before anything lands in Redshift.
+\end{itemize}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+    node distance=0.55cm and 1.0cm,
+    box/.style={draw, rounded corners, fill=violet!10, align=center, font=\small, minimum height=0.9cm, inner sep=4pt},
+    side/.style={draw, rounded corners, fill=brown!10, align=center, font=\footnotesize, inner sep=3pt},
+    arr/.style={-{Stealth}, thick}
+]
+\node[box] (prod) {Producers\\(swipe simulators)};
+\node[box, right=of prod] (kds) {Kinesis Data\\Streams};
+\node[box, right=of kds] (flink) {Managed Flink\\(sliding window)};
+\node[box, right=of flink, yshift=1.0cm] (fh) {Firehose $\rightarrow$ S3\\(raw backup)};
+\node[box, right=of flink, yshift=-1.0cm] (rs) {Redshift\\(fraud alerts)};
+\node[box, right=of rs, yshift=1.0cm] (qs) {QuickSight\\live dashboard};
+\node[side, below=0.6cm of kds] (dlq) {DLQ + idempotent consumers};
+\draw[arr] (prod) -- (kds);
+\draw[arr] (kds) -- (flink);
+\draw[arr] (flink) -- (fh);
+\draw[arr] (flink) -- (rs);
+\draw[arr] (rs) -- (qs);
+\draw[arr, dashed] (dlq) -- (kds);
+\end{tikzpicture}
+\caption{Milestone 4 reference architecture: real-time fraud detection stream}
+\end{figure}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+    node distance=0.7cm and 1.3cm,
+    entity/.style={draw, rounded corners, fill=gray!8, align=left, font=\scriptsize, inner sep=4pt},
+    rel/.style={-{Stealth}, thick},
+    lbl/.style={font=\scriptsize\itshape, fill=white, inner sep=1pt}
+]
+\node[entity] (cust) {\textbf{CUSTOMERS}\\customer\_id (PK)\\name\\home\_city};
+\node[entity, right=of cust] (cards) {\textbf{CARDS}\\card\_id (PK)\\customer\_id (FK)\\network\\status};
+\node[entity, right=of cards] (txns) {\textbf{TRANSACTIONS}\\txn\_id (PK)\\card\_id (FK)\\city, amount\\event\_ts};
+\node[entity, below=of txns] (alerts) {\textbf{FRAUD\_ALERTS}\\alert\_id (PK)\\txn\_id (FK)\\rule\_name\\window\_start};
+\draw[rel] (cust) -- node[lbl, above] {1:N} (cards);
+\draw[rel] (cards) -- node[lbl, above] {1:N} (txns);
+\draw[rel] (txns) -- node[lbl, right] {1:N} (alerts);
+\end{tikzpicture}
+\caption{Capstone data model: real-time fraud detection}
+\end{figure}
 
 
 % ==========================================
@@ -231,17 +863,56 @@
 % ==========================================
 \section{Milestone 5: Machine Learning Operationalization (Month 5)}
 \textit{Objective: Embed AI into data pipelines and manage the MLOps lifecycle with SageMaker.}
+\par\noindent\textbf{Learning outcomes:} train in-database models with Redshift ML, prepare data and deploy endpoints in SageMaker, build Feature-Store-backed SageMaker Pipelines with Model Monitor drift detection, and integrate managed AI APIs into Lambda/Glue pipelines.
 
 \subsection*{Week 17: In-Database Machine Learning (Redshift ML)}
+\par\noindent\textbf{Outcomes:} train Redshift ML models via SQL, select problem types and objectives, score live data with model functions, and judge when to graduate to full SageMaker.
 \begin{itemize}[label=-]
     \dayitem{Monday}{Redshift ML architecture (integration with SageMaker Autopilot).}
     \dayitem{Tuesday}{Creating models: Regression, Classification, and K-Means.}
     \dayitem{Wednesday}{Model evaluation and scoring directly via SQL queries.}
     \dayitem{Thursday}{\project{Use Redshift ML to train a logistic regression model on sample customer data to predict churn. Run a SQL query using the new model function to predict churn on live data.}}
+
+\begin{lstlisting}[language=SQL]
+CREATE MODEL customer_churn_model
+FROM (
+    SELECT tenure_months, monthly_spend, support_tickets,
+           avg_session_min, is_churned
+    FROM analytics.customers
+)
+TARGET is_churned
+FUNCTION fn_predict_churn
+IAM_ROLE 'arn:aws:iam::123456789012:role/RedshiftMLRole'
+SETTINGS (
+    S3_BUCKET 'ml-artifacts-bucket',
+    PROBLEM_TYPE 'binary_classification',
+    OBJECTIVE 'F1'
+);
+
+-- score live customers once the model state is READY
+SELECT customer_id, churn_prob
+FROM (
+    SELECT customer_id,
+           fn_predict_churn(tenure_months, monthly_spend,
+                            support_tickets, avg_session_min) AS churn_prob
+    FROM analytics.customers_current
+)
+WHERE churn_prob > 0.7;
+\end{lstlisting}
+
     \dayitem{Friday}{\usecase{Architect a system to automatically forecast daily inventory needs for 1,000 retail stores using purely SQL-based pipelines to minimize data movement.}}
 \end{itemize}
+\resources{Redshift ML documentation (\url{https://docs.aws.amazon.com/redshift/latest/dg/machine-learning.html}); Data Engineer Handbook (\url{https://github.com/DataExpert-io/data-engineer-handbook}).}
+\selfcheck{\begin{itemize}[label=-, leftmargin=1.5em, itemsep=0pt]
+    \item What part of training does Redshift ML delegate to SageMaker?
+    \item Why is in-database ML attractive for SQL-only forecasting pipelines?
+    \item What does the \texttt{FUNCTION} clause of \texttt{CREATE MODEL} define?
+    \item Why choose F1 over accuracy for imbalanced churn data?
+    \item When should you graduate from Redshift ML to full SageMaker?
+\end{itemize}}
 
 \subsection*{Week 18: Amazon SageMaker Foundations}
+\par\noindent\textbf{Outcomes:} prepare data with Data Wrangler, train and deploy XGBoost via Autopilot, choose between real-time/serverless/batch endpoints, and secure training-data access through Lake Formation.
 \begin{itemize}[label=-]
     \dayitem{Monday}{SageMaker Studio, Notebook Instances, and SageMaker Data Wrangler.}
     \dayitem{Tuesday}{Built-in Algorithms (XGBoost, BlazingText) vs. Custom Containers.}
@@ -249,8 +920,17 @@
     \dayitem{Thursday}{\project{Use SageMaker Data Wrangler to clean an S3 dataset. Train an XGBoost model using SageMaker Autopilot. Deploy the model to a serverless endpoint and send a test payload.}}
     \dayitem{Friday}{\usecase{Design a workflow for data scientists to train custom PyTorch models on GPU instances while securely accessing training data stored in a governed S3 data lake.}}
 \end{itemize}
+\resources{Amazon SageMaker documentation (\url{https://docs.aws.amazon.com/sagemaker/}); Data Engineering Zoomcamp (\url{https://github.com/DataTalksClub/data-engineering-zoomcamp}).}
+\selfcheck{\begin{itemize}[label=-, leftmargin=1.5em, itemsep=0pt]
+    \item Real-time vs.\ serverless vs.\ batch transform: which fits sporadic traffic?
+    \item What does SageMaker Data Wrangler export after interactive cleaning?
+    \item When do you need a custom container instead of built-in XGBoost?
+    \item How does Autopilot pick its final model?
+    \item Why route training-data access through Lake Formation instead of direct S3?
+\end{itemize}}
 
 \subsection*{Week 19: MLOps \& SageMaker Pipelines}
+\par\noindent\textbf{Outcomes:} build SageMaker Pipelines with Feature Store integration, gate deployments through the Model Registry, configure Model Monitor drift detection, and design a human-approved retraining loop.
 \begin{itemize}[label=-]
     \dayitem{Monday}{SageMaker Feature Store: Online vs. Offline serving.}
     \dayitem{Tuesday}{SageMaker Pipelines for MLOps orchestration.}
@@ -258,8 +938,19 @@
     \dayitem{Thursday}{\project{Build a simple SageMaker Pipeline (Preprocess $\rightarrow$ Train $\rightarrow$ Evaluate $\rightarrow$ Register). Execute the pipeline from a Jupyter notebook.}}
     \dayitem{Friday}{\usecase{Architect an MLOps lifecycle that detects data drift in a production recommendation engine and automatically triggers a retraining pipeline using EventBridge.}}
 \end{itemize}
+\resources{SageMaker Pipelines documentation (\url{https://docs.aws.amazon.com/sagemaker/latest/dg/pipelines.html}); OpenLineage (\url{https://github.com/OpenLineage/OpenLineage}).}
+\selfcheck{\begin{itemize}[label=-, leftmargin=1.5em, itemsep=0pt]
+    \item Online vs.\ offline Feature Store: which serves training, which inference?
+    \item What does the Model Registry gate before deployment?
+    \item Data drift vs.\ concept drift: what is the difference?
+    \item Why gate automatic retraining behind human approval?
+    \item What baseline does Model Monitor need to detect violations?
+\end{itemize}}
+
+\prodnote{Treat drift alerts as incidents, not curiosities: Model Monitor violations should publish to SNS with a runbook that defines who acknowledges, what the rollback path is (previous Model Registry version), and when retraining auto-triggers. Gate automatic retraining behind a human approval step in the pipeline --- drift can also mean broken upstream ingestion, and retraining on corrupt data makes things worse.}
 
 \subsection*{Week 20: Unstructured Data \& AI Services}
+\par\noindent\textbf{Outcomes:} extract text and metadata with Textract and Rekognition, integrate AI APIs into Lambda/Glue pipelines, index results into OpenSearch, and manage PII risk in OCR output.
 \begin{itemize}[label=-]
     \dayitem{Monday}{Amazon Rekognition (Images/Video) and Amazon Textract (OCR).}
     \dayitem{Tuesday}{Amazon Comprehend (NLP) and Amazon Translate.}
@@ -267,8 +958,92 @@
     \dayitem{Thursday}{\project{Write a Lambda function triggered by an S3 upload that sends a scanned PDF document to Amazon Textract, extracts the key-value pairs, and saves them as JSON back to S3.}}
     \dayitem{Friday}{\usecase{Design a scalable pipeline to process terabytes of uploaded user images, extract text (OCR), tag objects, and make the metadata searchable using OpenSearch.}}
 \end{itemize}
+\resources{Amazon Textract documentation (\url{https://docs.aws.amazon.com/textract/}); Amazon Rekognition documentation (\url{https://docs.aws.amazon.com/rekognition/}).}
+\selfcheck{\begin{itemize}[label=-, leftmargin=1.5em, itemsep=0pt]
+    \item Textract vs.\ Comprehend: which extracts key-value pairs from scanned forms?
+    \item Why trigger AI APIs from S3 events via Lambda?
+    \item When must you switch from synchronous to asynchronous Textract jobs?
+    \item How do you make extracted document metadata searchable?
+    \item What PII risks exist when persisting raw OCR output?
+\end{itemize}}
 
 \capstone{Milestone 5}{End-to-End MLOps Pipeline. Use MWAA (Airflow) to orchestrate a pipeline that extracts features via Athena, pushes them to SageMaker Feature Store, trains a custom model using SageMaker Training Jobs, registers the model in the Model Registry, and sets up SageMaker Model Monitor for serving skew.}
+\rubric{\begin{itemize}[label=-, leftmargin=1.5em, itemsep=0pt]
+    \item End-to-end MLOps pipeline executes from a clean environment following the repo README (feature extraction to monitored endpoint).
+    \item Architecture diagram committed (draw.io/TikZ/PNG) covering Feature Store, Pipelines, Model Registry, and Model Monitor.
+    \item At least 3 automated tests: feature-validation check, model-quality gate (metric threshold) in the pipeline, and a drift-injection test demonstrating a Monitor violation.
+    \item Monitoring/alerting evidence: Model Monitor violation alarm to SNS and MWAA task-failure alert (screenshot or exported config).
+    \item Monthly cost estimate (training instance-hours, endpoint vs. batch transform, Feature Store reads/writes) with 2 optimization decisions documented.
+    \item Security review: training data access scoped via Lake Formation, model artifacts in a KMS-encrypted bucket, no credentials in notebooks.
+\end{itemize}}
+
+\subsection*{Milestone 5 Capstone: Reference Solution Sketch}
+\begin{itemize}[label=-, itemsep=0pt]
+    \item \textbf{Architecture:} Athena feature extraction $\rightarrow$ SageMaker Feature Store (offline for training, online for serving) $\rightarrow$ SageMaker Pipeline (preprocess $\rightarrow$ train $\rightarrow$ evaluate $\rightarrow$ register) $\rightarrow$ Model Registry approval $\rightarrow$ endpoint with Model Monitor; MWAA orchestrates; drift violations feed back to retraining via EventBridge.
+    \item \textbf{Steps:} create the feature group and ingest features; define pipeline steps with \texttt{sagemaker.workflow}; gate registration on an F1 threshold; build the Model Monitor baseline and schedule; wire violations to SNS with a human approval step before retraining.
+    \item \textbf{Hardest part --- the pipeline quality gate:}
+\begin{lstlisting}[language=Python]
+cond = ConditionStep(
+    name="QualityGate",
+    conditions=[ConditionGreaterThanOrEqualTo(
+        left=JsonGet(step=eval_step, property_file=metrics,
+                     json_path="classification.f1"),
+        right=0.80)],
+    if_steps=[register_step],
+    else_steps=[FailStep(name="RejectModel",
+                         error_message="F1 below 0.80")],
+)
+\end{lstlisting}
+    \item \textbf{Pitfalls:} online/offline feature skew when transforms are coded twice; a Monitor baseline computed from stale training data misses real drift; a forgotten always-on endpoint dwarfs the entire training bill --- use serverless endpoints or batch transform.
+\end{itemize}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+    node distance=0.55cm and 0.9cm,
+    box/.style={draw, rounded corners, fill=blue!10, align=center, font=\small, minimum height=0.9cm, inner sep=4pt},
+    side/.style={draw, rounded corners, fill=brown!10, align=center, font=\footnotesize, inner sep=3pt},
+    arr/.style={-{Stealth}, thick}
+]
+\node[box] (s3) {S3 training\\data};
+\node[box, right=of s3] (fs) {Feature Store\\(offline/online)};
+\node[box, right=of fs] (pipe) {SageMaker\\Pipeline};
+\node[box, right=of pipe] (reg) {Model\\Registry};
+\node[box, right=of reg] (ep) {SageMaker\\Endpoint};
+\node[side, below=0.7cm of pipe] (mm) {Model Monitor (drift)};
+\node[side, above=0.5cm of fs] (mwaa) {MWAA orchestration};
+\draw[arr] (s3) -- (fs);
+\draw[arr] (fs) -- (pipe);
+\draw[arr] (pipe) -- (reg);
+\draw[arr] (reg) -- (ep);
+\draw[arr] (ep.south) |- (mm.east);
+\draw[arr, dashed] (mm.west) -| (pipe.south);
+\draw[arr, dashed] (mwaa) -- (fs);
+\draw[arr, dashed] (mwaa.east) -| (pipe.north);
+\end{tikzpicture}
+\caption{Milestone 5 reference architecture: MLOps lifecycle with drift feedback loop}
+\end{figure}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+    node distance=0.7cm and 1.1cm,
+    entity/.style={draw, rounded corners, fill=gray!8, align=left, font=\scriptsize, inner sep=4pt},
+    rel/.style={-{Stealth}, thick},
+    lbl/.style={font=\scriptsize\itshape, fill=white, inner sep=1pt}
+]
+\node[entity] (fg) {\textbf{FEATURE\_GROUPS}\\feature\_group (PK)\\record\_id\\event\_time\\version};
+\node[entity, right=of fg] (jobs) {\textbf{TRAINING\_JOBS}\\job\_id (PK)\\feature\_group (FK)\\started\_at\\metrics};
+\node[entity, right=of jobs] (models) {\textbf{MODEL\_VERSIONS}\\model\_version (PK)\\job\_id (FK)\\status\\approved\_by};
+\node[entity, below=of models] (eps) {\textbf{ENDPOINTS}\\endpoint\_id (PK)\\model\_version (FK)\\url\\instance\_type};
+\node[entity, left=of eps] (drift) {\textbf{DRIFT\_REPORTS}\\report\_id (PK)\\endpoint\_id (FK)\\violation\_type\\report\_ts};
+\draw[rel] (fg) -- node[lbl, above] {1:N} (jobs);
+\draw[rel] (jobs) -- node[lbl, above] {1:N} (models);
+\draw[rel] (models) -- node[lbl, right] {1:N} (eps);
+\draw[rel] (eps) -- node[lbl, above] {1:N} (drift);
+\end{tikzpicture}
+\caption{Capstone data model: end-to-end MLOps pipeline}
+\end{figure}
 
 \newpage
 % ==========================================
@@ -276,8 +1051,10 @@
 % ==========================================
 \section{Milestone 6: Security, Governance \& Exam Prep (Month 6)}
 \textit{Objective: Secure the perimeter, implement Data Mesh, and prepare for certification.}
+\par\noindent\textbf{Learning outcomes:} enforce least-privilege IAM and private networking for data services, automate data-quality rulesets and lineage, detect and quarantine PII with Macie, provision data infrastructure with Terraform and dbt, and build a CI/CD pipeline for data workloads.
 
 \subsection*{Week 21: Security, IAM \& Networking}
+\par\noindent\textbf{Outcomes:} apply least-privilege IAM with boundaries and SCPs, secure traffic with VPC endpoints and PrivateLink, manage keys and secrets with KMS and Secrets Manager, and design an anti-exfiltration data perimeter.
 \begin{itemize}[label=-]
     \dayitem{Monday}{AWS IAM Deep Dive: Roles, Policies, Boundaries, and SCPs.}
     \dayitem{Tuesday}{VPC Networking: Endpoints (Gateway vs. Interface) and PrivateLink.}
@@ -285,35 +1062,518 @@
     \dayitem{Thursday}{\project{Create a VPC Endpoint for S3 to ensure traffic doesn't traverse the public internet. Attempt to access the S3 bucket from an EC2 instance without an Internet Gateway.}}
     \dayitem{Friday}{\usecase{Design a highly secure data perimeter for a healthcare provider ensuring no data exfiltration can occur to outside AWS accounts even if IAM credentials are compromised.}}
 \end{itemize}
+\resources{AWS IAM documentation (\url{https://docs.aws.amazon.com/iam/}); AWS PrivateLink documentation (\url{https://docs.aws.amazon.com/privatelink/}).}
+\selfcheck{\begin{itemize}[label=-, leftmargin=1.5em, itemsep=0pt]
+    \item Gateway vs.\ interface VPC endpoint: which is free for S3 traffic?
+    \item What does a permissions boundary limit on a role?
+    \item Why is automatic Secrets Manager rotation better than static keys?
+    \item How do SCPs differ from IAM policies?
+    \item What exfiltration path does PrivateLink close that security groups cannot?
+\end{itemize}}
+
+\prodnote{Cost guardrail: interface VPC endpoints are billed per AZ-hour plus per-GB --- for high-volume S3 traffic always prefer the free Gateway endpoint, and consolidate interface endpoints (e.g., one shared services VPC) instead of one per workload VPC. Also set up AWS Budgets alerts per account before the security hardening project, so the perimeter itself doesn't produce a surprise bill.}
 
 \subsection*{Week 22: Data Governance \& Quality}
+\par\noindent\textbf{Outcomes:} author Glue Data Quality rulesets with alerting, implement tag-based cross-account sharing, trace failures with lineage, and design a domain-owned data mesh.
 \begin{itemize}[label=-]
     \dayitem{Monday}{AWS Lake Formation: Cross-account data sharing and Tag-based access control.}
     \dayitem{Tuesday}{AWS Glue Data Quality: Automated rulesets and alerts.}
     \dayitem{Wednesday}{Data Lineage with Amazon SageMaker ML Lineage Tracking.}
     \dayitem{Thursday}{\project{Implement an AWS Glue Data Quality ruleset within an ETL job to fail the pipeline if a required column is more than 5\% null. Route failure alerts to SNS.}}
+
+\begin{lstlisting}
+Rules = [
+    IsComplete "order_id",
+    IsUnique "order_id",
+    ColumnValues "order_amount" >= 0,
+    ColumnLength "email" between 5 and 254,
+    Completeness "email" >= 0.95 with threshold 0.9
+]
+
+# In the Glue job (PySpark) evaluate and route the outcome:
+#   from awsglue.data_quality import DataQualityEvaluator  # pseudocode shape
+#   dq_results = EvaluateDataQuality.apply(frame, ruleset)
+#   if dq_results.status == "FAILED":
+#       sns.publish(TopicArn=ALERTS_TOPIC, Message=str(dq_results))
+#       raise RuntimeError("DQ gate failed - load halted")
+\end{lstlisting}
+
     \dayitem{Friday}{\usecase{Architect a Data Mesh for a global conglomerate with 5 independent domains, ensuring centralized governance via Lake Formation but decentralized data engineering.}}
 \end{itemize}
+\resources{AWS Glue Data Quality documentation (\url{https://docs.aws.amazon.com/glue/latest/dg/glue-data-quality.html}); Great Expectations (\url{https://github.com/great-expectations/great_expectations}); DataHub (\url{https://github.com/datahub-project/datahub}).}
+\selfcheck{\begin{itemize}[label=-, leftmargin=1.5em, itemsep=0pt]
+    \item What happens to the pipeline when a Glue DQ rule fails?
+    \item How do LF-Tags simplify cross-account data sharing?
+    \item Why consult lineage when a data-quality check fails?
+    \item \texttt{ColumnExists} vs.\ \texttt{Completeness}: which catches schema drift?
+    \item In a data mesh, who owns the quality of a data product?
+\end{itemize}}
+
+\prodnote{Handle schema drift explicitly: register schemas in the Glue Schema Registry (or enforce contracts via DQ rules like \texttt{ColumnExists}), and decide per pipeline whether new columns are adopted, ignored, or page the on-call. Combine DQ rule results with OpenLineage/DataHub so a quality failure can be traced to the exact upstream table that introduced it.}
 
 \subsection*{Week 23: Compliance \& Data Privacy (Amazon Macie)}
+\par\noindent\textbf{Outcomes:} discover and classify PII with Macie, build auditable quarantine workflows, propagate erasure requests across lake zones, warehouse, streams, and backups, and implement crypto-shredding with per-subject KMS keys.
 \begin{itemize}[label=-]
     \dayitem{Monday}{Amazon Macie: Automated PII discovery and classification in S3.}
-    \dayitem{Tuesday}{Masking, Tokenization, and Crypto-based hashing in pipelines.}
+    \dayitem{Tuesday}{Masking, Tokenization, and Crypto-based hashing in pipelines. GDPR ``right to erasure'' propagation: an erasure request must reach raw S3 lake zones, curated/warehouse tables in Redshift, streaming buffers bounded by Kinesis retention windows (24 hours to 365 days), downstream derived tables and aggregates, caches, and clones/backups including Glacier archives and Redshift snapshots. Practical pattern: crypto-shredding with per-subject KMS keys --- encrypt each data subject's records under a subject-specific KMS data key, then delete that key to render every copy (including backups and cross-region replicas) permanently unrecoverable --- versus row-level deletes with downstream replay through CDC. Handle legal-hold and audit-trail exceptions explicitly: an S3 Object Lock legal hold overrides retention and blocks deletion until released, so erasure jobs must check hold status and route held records to an exception queue rather than failing or silently skipping them.}
     \dayitem{Wednesday}{AWS CloudTrail and AWS Config for auditing data access.}
     \dayitem{Thursday}{\project{Enable Amazon Macie on an S3 bucket. Upload a CSV containing mock credit card numbers. Review the Macie findings report and trigger a Lambda function to quarantine the file.}}
     \dayitem{Friday}{\usecase{Design a pipeline that ingests third-party customer data, automatically identifies PII using Macie, tokenizes it using a KMS key in Glue, and stores the safe version in the data warehouse.}}
 \end{itemize}
+\resources{Amazon Macie documentation (\url{https://docs.aws.amazon.com/macie/}); AWS CloudTrail documentation (\url{https://docs.aws.amazon.com/cloudtrail/}).}
+\selfcheck{\begin{itemize}[label=-, leftmargin=1.5em, itemsep=0pt]
+    \item What does Macie detect beyond regex-matched patterns?
+    \item Why quarantine suspect files with Object Lock instead of deleting them?
+    \item Tokenization vs.\ hashing: which transformation is reversible?
+    \item What do CloudTrail data events record for S3?
+    \item Why tune Macie custom data identifiers before rollout?
+\end{itemize}}
 
-\subsection*{Week 24: Final Certification Preparation}
+\prodnote{Quarantine workflows must be non-destructive and auditable: move suspect objects to a quarantine bucket with Object Lock rather than deleting them, and log the Macie finding ID with every quarantine action to CloudTrail. Tune Macie custom data identifiers before rollout --- an over-broad regex generates thousands of findings and trains the team to ignore real PII alerts.}
+
+\prodnote{A naive \texttt{DELETE} does not erase data on AWS: S3 versioning retains prior object versions, Redshift snapshots and automated backups keep deleted rows until they expire, Kinesis records persist for the full retention window, and Glacier archives are immutable until their retention period ends. Erasure runbooks must enumerate every copy location, then either crypto-shred the subject's KMS key (which covers backups too) or schedule versioned-object deletion plus snapshot expiry --- and verify afterwards with a Macie re-scan that no residual PII remains.}
+
+\subsection*{Week 24: Production DataOps (IaC, dbt \& CI/CD) \& Certification Prep}
+\par\noindent\textbf{Outcomes:} provision data infrastructure with Terraform, build tested dbt models on Redshift, implement GitHub Actions CI/CD with environment promotion, and execute zero-downtime expand-contract schema migrations.
 \begin{itemize}[label=-]
-    \dayitem{Monday}{Review AWS Certified Data Engineer – Associate/Professional Domains.}
-    \dayitem{Tuesday}{Whitepaper Review: Big Data Analytics Options on AWS.}
-    \dayitem{Wednesday}{Full-length Mock Exam 1 (Identify weak domains).}
-    \dayitem{Thursday}{Targeted review of weak domains (e.g., Kinesis vs. MSK, Redshift optimization).}
-    \dayitem{Friday}{Full-length Mock Exam 2.}
+    \dayitem{Monday}{Terraform for AWS data infrastructure: provisioning S3 buckets, Redshift Serverless, Glue jobs, and IAM roles as code; CloudFormation and CDK as alternative IaC approaches.}
+    \dayitem{Tuesday}{dbt on Redshift: models, tests, documentation, and managing dependencies with sources and \texttt{ref()}.}
+    \dayitem{Wednesday}{CI/CD concepts for data pipelines: GitHub Actions workflows and environment promotion from Dev to Prod. Zero-downtime schema evolution with the expand $\rightarrow$ migrate $\rightarrow$ contract pattern: first add the new nullable column (expand); then dual-write new writes and backfill history while reads still use the old column (migrate); then switch reads over via a backward-compatible view shim for consumers and, only after all consumers are verified, drop the old column in a later release (contract). Coordinate each phase as its own dbt model change and GitHub Actions deployment so Redshift DDL never breaks running dashboards or Glue jobs mid-release.}
+    \dayitem{Thursday}{\project{Create a GitHub repository containing a Terraform module that provisions an S3 data lake bucket and a Glue job, plus a dbt project with 3 models and 5 tests against Redshift. Add a GitHub Actions workflow that runs dbt tests on every pull request and deploys on merge to main.}}
+
+\begin{lstlisting}
+resource "aws_s3_bucket" "data_lake" {
+  bucket = "acme-data-lake-prod"
+  tags   = { Environment = "prod", Owner = "data-platform" }
+}
+
+resource "aws_s3_bucket_versioning" "data_lake" {
+  bucket = aws_s3_bucket.data_lake.id
+  versioning_configuration { status = "Enabled" }
+}
+
+resource "aws_s3_bucket_lifecycle_configuration" "data_lake" {
+  bucket = aws_s3_bucket.data_lake.id
+
+  rule {
+    id     = "tier-raw-to-glacier"
+    status = "Enabled"
+    filter { prefix = "raw/" }
+
+    transition {
+      days          = 30
+      storage_class = "GLACIER"
+    }
+    noncurrent_version_expiration { noncurrent_days = 90 }
+  }
+}
+\end{lstlisting}
+
+    \dayitem{Friday}{Compressed certification prep: review the AWS Certified Data Engineer -- Associate exam domains, note your weak areas, and schedule both full-length mock exams for the weekend following the program.}
 \end{itemize}
+\resources{Terraform AWS Provider (\url{https://registry.terraform.io/providers/hashicorp/aws/latest/docs}); dbt Core (\url{https://github.com/dbt-labs/dbt-core}); GitHub Actions documentation (\url{https://docs.github.com/actions}).}
+\selfcheck{\begin{itemize}[label=-, leftmargin=1.5em, itemsep=0pt]
+    \item Why store Terraform state remotely with locking?
+    \item What do dbt tests validate that table schemas alone cannot?
+    \item Why promote dbt runs Dev $\rightarrow$ Prod instead of sharing one workspace?
+    \item Why prefer OIDC federation over long-lived AWS keys in CI?
+    \item What must the PR-check workflow prove before merge to main?
+\end{itemize}}
+
+\prodnote{Keep Terraform state in a remote S3 backend with DynamoDB locking and restrict \texttt{terraform apply} to CI --- engineers run \texttt{plan} in pull requests only. Gate the deploy workflow on dbt tests passing in the Dev workspace, and require an approval environment for Prod promotion. Never store AWS credentials in repo secrets as long-lived keys; use OIDC federation from GitHub Actions to an IAM role.}
+
+\prodnote{Deploy order matters more than the migration plan: one team renamed \texttt{order\_amount} to \texttt{total\_amount} and shipped the dbt model change and the QuickSight dataset change in a single GitHub Actions release --- the dbt migration applied minutes before the dashboard refresh, and every executive dashboard errored for an hour because nothing pointed at the old column during the gap. The fix that stuck: contract-phase drops go in a separate pull request, merged no sooner than one full deploy cycle after all consumers are verified on the new schema, with the compatibility view shim kept until then.}
 
 \capstone{Milestone 6}{Secure, Governed Data Mesh. Build a multi-account architecture using AWS Organizations. Account A ingests streaming PII data and uses Macie/Lambda to tokenize it. Account B (Analytics) hosts Redshift. Account C (Governance) uses Lake Formation to enforce cross-account tag-based security and VPC Endpoints to lock down all traffic.}
+\rubric{\begin{itemize}[label=-, leftmargin=1.5em, itemsep=0pt]
+    \item End-to-end multi-account pipeline deployable from a clean environment following the repo README (IaC/CLI scripts included).
+    \item Architecture diagram committed (draw.io/TikZ/PNG) showing all three accounts, the governance mesh, and VPC endpoints.
+    \item At least 3 automated data-quality/policy tests (e.g., PII column inaccessible cross-account, Macie quarantine trigger, DQ ruleset) with a failing-case demonstration.
+    \item Monitoring/alerting evidence: CloudTrail data-event alarms and Macie finding notifications to SNS (screenshot or exported config).
+    \item Monthly cost estimate (Macie scan volume, Redshift Serverless RPUs, VPC endpoint hours) with 2 optimization decisions documented.
+    \item Security review: SCPs attached in AWS Organizations, tag-based least-privilege in Lake Formation, no hardcoded secrets, PII tokenization verified.
+\end{itemize}}
+
+\subsection*{Milestone 6 Capstone: Reference Solution Sketch}
+\begin{itemize}[label=-, itemsep=0pt]
+    \item \textbf{Architecture:} three accounts under AWS Organizations --- A ingests via Kinesis with Macie + Lambda tokenization, B hosts Redshift Serverless analytics, C governs via Lake Formation LF-Tags; VPC endpoints keep all traffic off the public internet.
+    \item \textbf{Steps:} create the OU structure and attach SCPs; share the Glue catalog cross-account via RAM/Lake Formation; define LF-Tags and tag-based grants; wire Macie findings through EventBridge to the tokenization Lambda; alarm on CloudTrail data events; lock S3/Redshift behind gateway and interface endpoints.
+    \item \textbf{Hardest part --- the anti-exfiltration SCP:}
+\begin{lstlisting}
+{
+  "Effect": "Deny",
+  "Action": ["s3:PutObject", "s3:PutObjectAcl"],
+  "Resource": "arn:aws:s3:::*/*",
+  "Condition": {
+    "StringNotEquals": {
+      "aws:PrincipalAccount": ["111111111111", "222222222222"]
+    }
+  }
+}
+\end{lstlisting}
+    \item \textbf{Pitfalls:} a missing cross-account KMS key policy makes shared data unreadable with no obvious error; LF-Tag matching is case-sensitive --- a casing mismatch silently denies grants; one interface endpoint per account per AZ adds up fast on the bill.
+\end{itemize}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+    node distance=0.5cm and 0.8cm,
+    acct/.style={draw, rounded corners, dashed, inner sep=6pt},
+    box/.style={draw, rounded corners, fill=teal!10, align=center, font=\footnotesize, minimum height=0.8cm, inner sep=3pt},
+    side/.style={draw, rounded corners, fill=brown!10, align=center, font=\footnotesize, inner sep=3pt},
+    arr/.style={-{Stealth}, thick}
+]
+\node[box] (ing) {Kinesis\\ingestion};
+\node[box, right=of ing] (macie) {Macie + Lambda\\tokenize};
+\node[box, right=of macie] (s3a) {S3 (sanitized)};
+\node[box, right=of s3a] (rs) {Redshift\\analytics};
+\node[side, below=0.7cm of rs] (lf) {Lake Formation\\tag-based grants};
+\begin{scope}[on background layer]
+\node[acct, fit=(ing)(macie)(s3a), label={[font=\footnotesize\bfseries]above:Account A: Ingestion}] (a) {};
+\node[acct, fit=(rs), label={[font=\footnotesize\bfseries]above:Account B: Analytics}] (b) {};
+\node[acct, fit=(lf), label={[font=\footnotesize\bfseries]below:Account C: Governance}] (c) {};
+\end{scope}
+\node[side, left=0.6cm of a.north west, anchor=east] (vpce) {VPC endpoints\\(no public path)};
+\draw[arr] (ing) -- (macie);
+\draw[arr] (macie) -- (s3a);
+\draw[arr] (s3a) -- (rs);
+\draw[arr, dashed] (lf) -- (s3a.south east);
+\draw[arr, dashed] (lf) -- (rs);
+\draw[arr, dashed] (vpce.south) |- (ing.west);
+\end{tikzpicture}
+\caption{Milestone 6 reference architecture: multi-account governed data mesh}
+\end{figure}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+    node distance=0.7cm and 1.2cm,
+    entity/.style={draw, rounded corners, fill=gray!8, align=left, font=\scriptsize, inner sep=4pt},
+    rel/.style={-{Stealth}, thick},
+    lbl/.style={font=\scriptsize\itshape, fill=white, inner sep=1pt}
+]
+\node[entity] (domains) {\textbf{DATA\_DOMAINS}\\domain\_id (PK)\\name\\owner\_account};
+\node[entity, right=of domains] (datasets) {\textbf{DATASETS}\\dataset\_id (PK)\\domain\_id (FK)\\s3\_location\\classification};
+\node[entity, right=of datasets, yshift=1.1cm] (grants) {\textbf{ACCESS\_GRANTS}\\grant\_id (PK)\\dataset\_id (FK)\\principal\\permissions};
+\node[entity, right=of datasets, yshift=-1.1cm] (findings) {\textbf{MACIE\_FINDINGS}\\finding\_id (PK)\\dataset\_id (FK)\\severity\\status};
+\node[entity, below=of domains] (tags) {\textbf{LF\_TAGS}\\tag\_key (PK)\\tag\_value\\description};
+\draw[rel] (domains) -- node[lbl, above] {1:N} (datasets);
+\draw[rel] (datasets) -- node[lbl, above left] {1:N} (grants);
+\draw[rel] (datasets) -- node[lbl, below left] {1:N} (findings);
+\draw[rel] (tags) -- node[lbl, below] {N:M} (datasets);
+\end{tikzpicture}
+\caption{Capstone data model: multi-account governed data mesh}
+\end{figure}
+
+\newpage
+% ==========================================
+% APPENDICES
+% ==========================================
+\section{Appendix A: Glossary}
+\begin{description}[leftmargin=3.5cm, style=nextline, itemsep=1pt]
+    \item[S3 Storage Class] Durability/cost tier of an S3 object (Standard, IA, Glacier) chosen by access pattern and lifecycle rules.
+    \item[Object Lock] S3 write-once-read-many protection preventing deletion or overwrite for a retention period.
+    \item[Aurora Serverless v2] Auto-scaling Aurora configuration that adjusts capacity in ACU increments based on load.
+    \item[AWS DMS] Managed service for one-time migrations and continuous CDC replication between database engines.
+    \item[CDC] Change Data Capture --- streaming inserts, updates, and deletes from source transaction logs to targets.
+    \item[RCU/WCU] DynamoDB Read/Write Capacity Units; the billing and throughput model for provisioned tables.
+    \item[GSI] Global Secondary Index --- an alternate query key structure on a DynamoDB table with its own throughput.
+    \item[RA3 node] Redshift node type with managed storage, decoupling compute from data volume.
+    \item[Distribution Style] Redshift rule (EVEN, KEY, ALL, AUTO) governing how rows are spread across compute slices.
+    \item[Redshift Spectrum] Redshift feature querying exabytes of S3 data in place via the Glue Data Catalog.
+    \item[Glue Data Catalog] Central Hive-metastore-compatible metadata store shared by Athena, Redshift, EMR, and Glue.
+    \item[Lake Formation] Governance layer enforcing database/table/column permissions over S3 data lake objects.
+    \item[LF-Tag] Key-value attribute in Lake Formation enabling tag-based access control instead of named grants.
+    \item[DPU] Data Processing Unit --- Glue's compute billing unit (4 vCPU, 16 GB) allocated per job.
+    \item[Job Bookmark] Glue mechanism tracking processed data so re-runs handle only new or changed partitions.
+    \item[MWAA] Managed Workflows for Apache Airflow --- AWS-hosted Airflow with autoscaling workers.
+    \item[Kinesis Shard] Fixed-throughput unit of a Kinesis stream (1 MB/s in, 2 MB/s out); partition keys map to shards.
+    \item[Iterator Age] Kinesis consumer lag metric; rising values signal the consumer is falling behind retention.
+    \item[Watermark] Flink event-time threshold declaring how long late events are accepted into a window.
+    \item[SPICE] QuickSight's in-memory calculation engine for fast dashboard queries.
+    \item[Feature Store] SageMaker repository for versioned ML features with online (low-latency) and offline (S3) stores.
+    \item[Model Registry] SageMaker catalog of versioned, approved model artifacts with deployment lineage.
+    \item[Model Monitor] SageMaker service detecting data-quality and drift violations on production endpoints.
+    \item[Macie] ML-driven service discovering and classifying PII and sensitive data in S3.
+    \item[VPC Endpoint] Private network path to AWS services (Gateway for S3/DynamoDB, Interface via PrivateLink) avoiding the public internet.
+\end{description}
+
+\section{Appendix B: Assessment \& Grading Model}
+Each monthly capstone is graded on the following weighted rubric:
+
+\begin{center}
+\renewcommand{\arraystretch}{1.3}
+\begin{tabular}{@{} l c p{7.5cm} @{}}
+\toprule
+\textbf{Category} & \textbf{Weight} & \textbf{What is evaluated} \\
+\midrule
+Correctness & 30\% & Pipeline runs end-to-end and produces the specified outputs from a clean environment. \\
+Reliability \& tests & 20\% & Data-quality tests, failure handling, retries, and a demonstrated failing case. \\
+Security & 15\% & Least-privilege IAM, encryption, no hardcoded secrets, PII handling. \\
+Cost awareness & 15\% & Monthly estimate with at least 2 documented optimization decisions. \\
+Documentation & 10\% & README, architecture diagram, and runbook quality. \\
+Demo & 10\% & Live or recorded walkthrough of the working system. \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The two full-length mock exams scheduled for the weekend after Week 24 feed the final certification readiness score: a consistent score of 80\%+ across both mocks indicates readiness to book the AWS Certified Data Engineer -- Associate exam; below that, revisit the weak domains noted during Week 24 Friday before booking.
+
+\section{Appendix C: Interview Preparation}
+\begin{enumerate}[itemsep=1pt]
+    \item How would you design an S3 lifecycle strategy to minimize cost for a 10PB archive? (Week 1)
+    \item When would you choose Aurora Serverless v2 over provisioned RDS, and how do you plan failover? (Week 2)
+    \item Explain single-table design in DynamoDB and when a GSI beats an LSI. (Week 3)
+    \item A Redshift JOIN is slow --- walk through how distribution styles and sort keys would guide your fix. (Week 6)
+    \item How do Athena, Spectrum, and Redshift differ, and how would you build a governed lakehouse combining them? (Weeks 7--8)
+    \item Glue vs. EMR: how do you choose, and how do job bookmarks guarantee idempotent re-runs? (Weeks 9--10)
+    \item How do you detect and respond to DMS CDC replication lag before it corrupts downstream reports? (Week 11)
+    \item Design an Airflow DAG on MWAA with failure alerting; how do CloudWatch alarms and SNS runbooks fit in? (Week 12)
+    \item Kinesis delivers at-least-once --- how do you make consumers idempotent and handle poison records? (Week 13)
+    \item Describe how you would implement least-privilege, tag-based governance across three AWS accounts with Lake Formation. (Weeks 22--23, Capstone 6)
+\end{enumerate}
+
+\newpage
+% ==========================================
+\section{Appendix D: Self-Check Answer Key}
+Terse answers to the weekly self-check questions.
+
+\noindent\textbf{Week 1:}
+\begin{enumerate}[itemsep=0pt, leftmargin=2em]
+    \item S3 Standard-IA: millisecond retrieval, lower storage price, per-GB retrieval fee.
+    \item It hides the object; prior versions survive --- delete the marker to restore.
+    \item When bandwidth is insufficient or data is petabyte-scale offline.
+    \item WORM retention blocks deletion/overwrite, even with stolen credentials.
+    \item SQS buffers and retries events, decoupling Lambda from burst failures.
+\end{enumerate}
+\noindent\textbf{Week 2:}
+\begin{enumerate}[itemsep=0pt, leftmargin=2em]
+    \item Multi-AZ: synchronous standby for failover; replicas: asynchronous read scaling.
+    \item Aurora storage is distributed, six-way replicated across three AZs, self-healing.
+    \item SCT converts schemas and code; DMS only moves data.
+    \item Restores always create a new cluster --- validates backups without touching production.
+    \item Replication lag (RPO) and time-to-available (RTO).
+\end{enumerate}
+\noindent\textbf{Week 3:}
+\begin{enumerate}[itemsep=0pt, leftmargin=2em]
+    \item Skewed keys concentrate throughput on one partition, causing throttling.
+    \item GSI --- addable anytime; LSI only at table creation.
+    \item It expires permanently; unconsumed stream data is lost.
+    \item TTL deletes run in the background at no write cost.
+    \item Single-table fetches related items in one query, avoiding joins.
+\end{enumerate}
+\noindent\textbf{Week 4:}
+\begin{enumerate}[itemsep=0pt, leftmargin=2em]
+    \item Redis; Memcached is a simple, non-persistent cache.
+    \item DAX is API-transparent --- no client-side cache logic needed.
+    \item Simultaneous misses hammering the database; jittered TTLs stagger expiry.
+    \item It caches only what is actually requested, avoiding cold-data writes.
+    \item Downstream backends from request bursts beyond their capacity.
+\end{enumerate}
+\noindent\textbf{Week 5:}
+\begin{enumerate}[itemsep=0pt, leftmargin=2em]
+    \item The grain defines what one row means; mixed grains corrupt aggregations.
+    \item Periodic repeats one row per interval; accumulating updates one row across milestones.
+    \item When attribute-change history must be preserved for analysis.
+    \item Auto-Copy: continuous, event-driven ingestion of new S3 files.
+    \item Spiky workloads with idle periods --- no charge while paused.
+\end{enumerate}
+\noindent\textbf{Week 6:}
+\begin{enumerate}[itemsep=0pt, leftmargin=2em]
+    \item KEY distribution on the join column --- collocates matching rows.
+    \item Interleaved, when queries filter on varying column combinations.
+    \item Sudden concurrency spikes that would otherwise queue dashboards.
+    \item When repeated expensive aggregations justify precomputed, refreshable results.
+    \item Add capacity/concurrency scaling or retune WLM queues.
+\end{enumerate}
+\noindent\textbf{Week 7:}
+\begin{enumerate}[itemsep=0pt, leftmargin=2em]
+    \item Columnar layout plus compression scans far fewer bytes.
+    \item Schema and partitions; wrong on inconsistent or deeply nested files.
+    \item When joining S3 data with Redshift tables in a single query.
+    \item Athena/Spectrum skip entire S3 prefixes outside the filter.
+    \item ACID transactions, schema evolution, and time travel on S3.
+\end{enumerate}
+\noindent\textbf{Week 8:}
+\begin{enumerate}[itemsep=0pt, leftmargin=2em]
+    \item Grants everyone effective super access; revoking enforces Lake Formation control.
+    \item Tags grant by attribute, scaling without per-table administration.
+    \item Sensitive PII columns inside otherwise shareable tables.
+    \item Consumers query the producer's live data read-only, no copies.
+    \item Queries run without either party seeing the other's raw PII.
+\end{enumerate}
+\noindent\textbf{Week 9:}
+\begin{enumerate}[itemsep=0pt, leftmargin=2em]
+    \item Task nodes --- compute only, no HDFS data to lose.
+    \item Data persists in S3 independently of cluster lifetime.
+    \item When standardizing workloads on shared Kubernetes fleets.
+    \item Installing libraries and configuring nodes before jobs start.
+    \item You pay per job run instead of for idle cluster hours.
+\end{enumerate}
+\noindent\textbf{Week 10:}
+\begin{enumerate}[itemsep=0pt, leftmargin=2em]
+    \item Schema handling, \texttt{resolveChoice}, and bookmark-aware sources.
+    \item Re-runs process only new or unprocessed data.
+    \item Non-urgent jobs on spare capacity at discounted DPU pricing.
+    \item Serverless and visual --- no cluster management for analysts.
+    \item 4 vCPUs and 16 GB memory, billed per second.
+\end{enumerate}
+\noindent\textbf{Week 11:}
+\begin{enumerate}[itemsep=0pt, leftmargin=2em]
+    \item \texttt{CDCLatencySource} and \texttt{CDCLatencyTarget} rising.
+    \item BACKWARD permits reading newer data (deleting fields); FULL allows both directions.
+    \item Producer owns the schema; consumers sign off on changes.
+    \item Bad records are quarantined before they pollute the lake.
+    \item Breaking: delete a field/change its type; non-breaking: add an optional field.
+\end{enumerate}
+\noindent\textbf{Week 12:}
+\begin{enumerate}[itemsep=0pt, leftmargin=2em]
+    \item Backfilling hundreds of missed historical runs on deploy.
+    \item Pure-AWS, event-driven, short-lived workflows without DAG code.
+    \item Transient failures: throttling, network blips, race conditions.
+    \item Over-frequent pokes waste API calls and cost; too slow delays the pipeline.
+    \item Payloads beyond XCom's small size limit --- large data goes via S3.
+\end{enumerate}
+\noindent\textbf{Week 13:}
+\begin{enumerate}[itemsep=0pt, leftmargin=2em]
+    \item 1 MB/s ingress and 2 MB/s egress per shard.
+    \item Same key routes to the same shard, preserving per-key order.
+    \item Consumers falling behind before the 24-hour retention expires.
+    \item Idempotent writes deduplicated on a record ID.
+    \item Kinesis; MSK is billed per provisioned broker-hour.
+\end{enumerate}
+\noindent\textbf{Week 14:}
+\begin{enumerate}[itemsep=0pt, leftmargin=2em]
+    \item S3, Redshift, OpenSearch (also Splunk and HTTP endpoints).
+    \item Enables replay/recovery if transformation or delivery fails.
+    \item Per-invocation latency plus Lambda GB-second charges.
+    \item Columnar output slashes downstream Athena/Spectrum scan costs.
+    \item An S3 error prefix after retries are exhausted.
+\end{enumerate}
+\noindent\textbf{Week 15:}
+\begin{enumerate}[itemsep=0pt, leftmargin=2em]
+    \item State without TTL grows forever, bloating RocksDB, slowing checkpoints, and causing backpressure or failure.
+    \item A savepoint --- a manually triggered, versioned snapshot; checkpoints are for automatic failure recovery and may not survive graph changes.
+    \item The watermark and the join interval: once the watermark passes the interval bound, older state can be dropped.
+    \item Checkpointing plus a transactional two-phase-commit (or idempotent) sink.
+    \item When the sink lacks transactions and dedup on a stable record ID is cheaper than exactly-once overhead.
+\end{enumerate}
+\noindent\textbf{Week 16:}
+\begin{enumerate}[itemsep=0pt, leftmargin=2em]
+    \item Dashboard queries; per-dataset in-memory capacity, requiring refresh.
+    \item Dataset rules filter rows per user or group at query time.
+    \item Syncing curated warehouse data back into CRM, marketing, and support tools.
+    \item The same person across systems must resolve to one identity first.
+    \item Freshness needs vs.\ API rate limits, cost, and warehouse load.
+\end{enumerate}
+\noindent\textbf{Week 17:}
+\begin{enumerate}[itemsep=0pt, leftmargin=2em]
+    \item Training/AutoML to SageMaker Autopilot; inference stays in SQL.
+    \item Zero data movement and fast SQL-only iteration.
+    \item The inference function name and signature used in queries.
+    \item F1 balances precision and recall on the minority churn class.
+    \item Custom algorithms, GPUs, or dedicated real-time endpoints needed.
+\end{enumerate}
+\noindent\textbf{Week 18:}
+\begin{enumerate}[itemsep=0pt, leftmargin=2em]
+    \item Serverless endpoints --- they scale to zero between requests.
+    \item The transformation recipe as code or pipeline steps.
+    \item Custom frameworks, dependencies, or non-built-in algorithms.
+    \item Trains and tunes many candidates, ranking by validation metric.
+    \item Enforces governed, auditable access instead of uncontrolled copies.
+\end{enumerate}
+\noindent\textbf{Week 19:}
+\begin{enumerate}[itemsep=0pt, leftmargin=2em]
+    \item Offline store (S3) for training; online store for low-latency inference.
+    \item Only approved model versions become deployable.
+    \item Data drift: input distribution shifts; concept drift: the target relationship changes.
+    \item Drift may mean broken ingestion --- retraining on corrupt data is worse.
+    \item Baseline statistics and constraints computed from training data.
+\end{enumerate}
+\noindent\textbf{Week 20:}
+\begin{enumerate}[itemsep=0pt, leftmargin=2em]
+    \item Textract; Comprehend analyzes text semantics, not layout.
+    \item Serverless, event-driven processing with no servers to manage.
+    \item Large documents exceed synchronous payload/timeout limits.
+    \item Index the extracted JSON into OpenSearch.
+    \item OCR text may contain PII --- encrypt, classify, and restrict access.
+\end{enumerate}
+\noindent\textbf{Week 21:}
+\begin{enumerate}[itemsep=0pt, leftmargin=2em]
+    \item The Gateway endpoint; interface endpoints bill per AZ-hour plus GB.
+    \item The maximum permissions the role can ever obtain.
+    \item Rotation shrinks the exposure window of any leaked credential.
+    \item SCPs bound entire accounts/OUs; IAM policies grant within them.
+    \item The public internet --- traffic stays on the AWS backbone.
+\end{enumerate}
+\noindent\textbf{Week 22:}
+\begin{enumerate}[itemsep=0pt, leftmargin=2em]
+    \item The job can halt the load and raise an SNS alert.
+    \item Grants follow tags across accounts without per-table administration.
+    \item To trace the failure to the upstream table that introduced it.
+    \item \texttt{ColumnExists} catches drift; \texttt{Completeness} catches nulls.
+    \item The domain team that publishes the data product.
+\end{enumerate}
+\noindent\textbf{Week 23:}
+\begin{enumerate}[itemsep=0pt, leftmargin=2em]
+    \item ML-based classification of sensitive data types and context.
+    \item Object Lock preserves evidence immutably; deletion is irreversible.
+    \item Tokenization (via the token vault); hashing is one-way.
+    \item Object-level API calls such as \texttt{GetObject} and \texttt{PutObject}.
+    \item Over-broad regexes flood findings and train teams to ignore alerts.
+\end{enumerate}
+\noindent\textbf{Week 24:}
+\begin{enumerate}[itemsep=0pt, leftmargin=2em]
+    \item Prevents concurrent state corruption and enables team/CI collaboration.
+    \item Business rules: uniqueness, accepted values, referential relationships.
+    \item Isolates experiments; production receives only tested code.
+    \item Short-lived tokens --- no long-lived keys to leak from secrets.
+    \item dbt tests pass and the Terraform plan is clean.
+\end{enumerate}
+
+% ==========================================
+\section{Appendix E: Datasets \& Project Data}
+Prefer AWS-hosted open data from the Registry of Open Data on AWS (\url{https://registry.opendata.aws}) --- they sit in public S3 buckets next to your compute, so no egress cost or download step.
+
+\begin{itemize}[label=-]
+    \item \textbf{NYC Taxi \& Limousine Trip Records} (\url{https://registry.opendata.aws/nyc-tlc-trip-records-pds/}, \texttt{s3://nyc-tlc/}): billions of trip rows in CSV/Parquet. Used in Week 5 COPY benchmarking, the Week 6 distribution-style benchmark, and the Milestone 2 lakehouse capstone.
+    \item \textbf{NOAA Global Historical Climatology Network (GHCN)} (\url{https://registry.opendata.aws/ghcn/}, \texttt{s3://noaa-ghcn-pds/}): daily weather observations from 100k+ stations. Feeds the Milestone 3 batch ELT capstone and Week 15 late-arriving-data exercises.
+    \item \textbf{Olist Brazilian E-Commerce dataset} (\url{https://www.kaggle.com/datasets/olistbr/brazilian-ecommerce}): 100k orders across customers, sellers, products, payments, and reviews --- a natural star schema. Used in the Milestone 1 e-commerce capstone and the Week 5 dimensional-modeling exercises; mirror the CSVs into your own S3 bucket.
+\end{itemize}
+
+\noindent\textbf{Synthetic data:} generate customers, orders, and clickstream with Python Faker (\url{https://github.com/joke2k/faker}); the Week 13 producer script shows the pattern for streaming events. Expected volumes per milestone: Milestone 1 $\sim$1M rows in Aurora/DynamoDB; Milestone 2 $\sim$10M rows as Parquet in S3; Milestone 3 $\sim$50M raw events per batch; Milestone 4 $\sim$5k events/minute sustained; Milestone 5 $\sim$100k feature rows; Milestone 6 small governed samples ($\sim$100k rows) with injected PII.
+
+% ==========================================
+\section{Appendix F: Portfolio \& Presentation Guide}
+Each capstone should ship as a public GitHub repository you can walk an interviewer through.
+
+\noindent\textbf{README structure (in this order):}
+\begin{enumerate}[itemsep=1pt]
+    \item \textbf{Problem:} one paragraph --- who hurts, at what scale, and what ``done'' means.
+    \item \textbf{Architecture diagram first:} reviewers decide in 10 seconds; lead with the picture.
+    \item \textbf{Setup:} exact commands to reproduce from a clean environment (prereqs, IaC, seed data).
+    \item \textbf{Screenshots:} working dashboard, pipeline run, and one alarm firing.
+    \item \textbf{Cost estimate:} monthly table with the two optimization decisions you made.
+    \item \textbf{Lessons learned:} one failure you hit and how you fixed it.
+\end{enumerate}
+
+\noindent\textbf{Resume bullet templates (two per milestone --- fill in the brackets):}
+\begin{itemize}[label=-, itemsep=1pt]
+    \item \textbf{M1:} Built a multi-tier e-commerce data backend on Aurora Serverless, DynamoDB, and S3 with DMS CDC replication, reconciling [N] rows/day with automated data-quality tests.
+    \item \textbf{M1:} Designed multi-region S3 lifecycle and DR strategy, cutting projected storage spend [X]\% via Glacier transitions and validated restores.
+    \item \textbf{M2:} Built a governed lakehouse (S3/Parquet, Glue Catalog, Lake Formation column-level security) serving Redshift Spectrum dashboards to [N] analysts.
+    \item \textbf{M2:} Benchmarked Athena vs.\ Spectrum vs.\ Redshift Serverless, documenting a cost decision saving $\sim$\$[X]/month at [N] TB scanned.
+    \item \textbf{M3:} Automated a batch ELT pipeline with EventBridge and Step Functions orchestrating Glue data-quality gates and EMR Serverless Spark into Redshift.
+    \item \textbf{M3:} Authored MWAA (Airflow) DAGs with idempotent Glue bookmarks and SNS runbook alerting, eliminating duplicate loads on re-runs.
+    \item \textbf{M4:} Built a real-time fraud-detection stream (Kinesis $\rightarrow$ Flink sliding windows $\rightarrow$ Redshift $\rightarrow$ QuickSight) flagging cross-city card use within 10 minutes.
+    \item \textbf{M4:} Implemented idempotent Kinesis consumers with DLQ routing, sustaining [N] events/minute with zero duplicate alerts.
+    \item \textbf{M5:} Productionized an MLOps pipeline: Athena feature extraction $\rightarrow$ SageMaker Feature Store $\rightarrow$ Pipelines $\rightarrow$ Model Registry with Model Monitor drift alarms.
+    \item \textbf{M5:} Gated auto-retraining behind metric thresholds and human approval, catching [N] injected drift violations before deployment.
+    \item \textbf{M6:} Deployed a three-account governed data mesh with Lake Formation LF-Tags, Macie tokenization quarantine, and VPC endpoint lockdown via Terraform.
+    \item \textbf{M6:} Built GitHub Actions CI/CD with OIDC federation and dbt tests gating Dev$\rightarrow$Prod promotion for [N] data models.
+\end{itemize}
+
+\noindent\textbf{Talking about your project in interviews:} open with the problem and its scale (``10M rows nightly, 500 analysts''), then show the architecture diagram and narrate two design decisions with their trade-offs --- interviewers score reasoning, not service names. Have one failure story ready (what broke, how you detected it, what you changed). Close with numbers: cost per month, latency, row counts. If asked ``what would you do differently,'' you pass only if you have a real answer --- write it in the README's lessons-learned section while the project is fresh.
 
 \newpage
 % ==========================================
@@ -345,20 +1605,20 @@
 3 & Amazon DynamoDB & DynamoDB Single-Table Design \& GSI & $\square$ \\
 4 & Hybrid Ingestion \& Caches & \textbf{Cap 1: E-Commerce Multi-Tier Data} & $\square$ \\
 \midrule
-5 & Redshift Architecture & COPY from S3 to Redshift Serverless & $\square$ \\
+5 & Redshift Architecture \& Dimensional Modeling & COPY from S3 to Redshift Serverless \& star-schema load & $\square$ \\
 6 & Redshift Optimization & Dist/Sort Keys Benchmark & $\square$ \\
 7 & Athena \& Lakehouse & Glue Crawler \& Athena vs Spectrum & $\square$ \\
 8 & AWS Lake Formation & \textbf{Cap 2: Enterprise Data Lakehouse} & $\square$ \\
 \midrule
 9 & Amazon EMR & Spark Job on EMR Cluster & $\square$ \\
 10 & AWS Glue ETL & Glue Studio Visual Pipeline & $\square$ \\
-11 & AWS DMS \& EventBridge & RDS to S3 CDC via DMS & $\square$ \\
+11 & AWS DMS, EventBridge \& Data Contracts & RDS to S3 CDC via DMS & $\square$ \\
 12 & Amazon MWAA (Airflow) & \textbf{Cap 3: Automated Batch ELT} & $\square$ \\
 \midrule
 13 & Amazon Kinesis Data Streams & IoT Producer/Consumer Scripting & $\square$ \\
 14 & Kinesis Data Firehose & Firehose inline Lambda format conversion & $\square$ \\
 15 & Managed Apache Flink & Flink Tumbling Windows on Streams & $\square$ \\
-16 & Amazon QuickSight & \textbf{Cap 4: Real-Time Fraud Telemetry} & $\square$ \\
+16 & Amazon QuickSight \& Reverse ETL & \textbf{Cap 4: Real-Time Fraud Telemetry} & $\square$ \\
 \midrule
 17 & Redshift ML & Churn Prediction SQL Models & $\square$ \\
 18 & SageMaker Foundations & Autopilot Deployment \& Endpoint Test & $\square$ \\
@@ -368,7 +1628,7 @@
 21 & IAM \& VPC Endpoints & S3 Gateway Endpoint implementation & $\square$ \\
 22 & Glue Data Quality & Automated DQ Rulesets \& Alerts & $\square$ \\
 23 & Amazon Macie & PII Discovery \& Lambda Quarantine & $\square$ \\
-24 & Exam Prep & \textbf{Cap 6: Secure Data Mesh Design} & $\square$ \\
+24 & Production DataOps (IaC, dbt \& CI/CD) \& Certification Prep & \textbf{Cap 6: Secure Data Mesh Design} \& Terraform/dbt repo with CI/CD & $\square$ \\
 
 \end{longtable}
 \end{center}

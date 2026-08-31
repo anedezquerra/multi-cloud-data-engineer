@@ -18,6 +18,20 @@
 \usepackage{enumitem}   % For customized lists
 \usepackage{xcolor}     % For colored highlights
 \usepackage[colorlinks=true, linkcolor=blue]{hyperref} % For internal links
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta, positioning, shapes.geometric, backgrounds, fit}
+\usepackage{listings}
+\lstdefinestyle{code}{
+    basicstyle=\ttfamily\footnotesize,
+    breaklines=true,
+    frame=single,
+    backgroundcolor=\color{gray!8},
+    rulecolor=\color{gray!40},
+    columns=fullflexible,
+    keepspaces=true,
+    showstringspaces=false
+}
+\lstset{style=code}
 
 % --- CUSTOM COMMANDS ---
 \newcommand{\project}[1]{\textbf{\textcolor{blue}{Hands-on Project:}} #1}
@@ -32,6 +46,30 @@
     \vspace{3mm}
 }
 \newcommand{\dayitem}[2]{\item \textbf{#1:} #2}
+% Rubric box: capstone acceptance criteria
+\newcommand{\rubric}[1]{
+    \vspace{1mm}
+    \noindent\fbox{
+        \parbox{0.97\textwidth}{
+            \textbf{\textcolor{orange}{Acceptance Criteria:}} #1
+        }
+    }
+    \vspace{2mm}
+}
+% Weekly curated resources
+\newcommand{\resources}[1]{\vspace{1mm}\noindent\textbf{\textcolor{violet}{Resources:}} #1}
+% Production hardening note
+\newcommand{\prodnote}[1]{
+    \vspace{1mm}
+    \noindent\fbox{
+        \parbox{0.97\textwidth}{
+            \textbf{\textcolor{brown}{Production Note:}} \textit{#1}
+        }
+    }
+    \vspace{1mm}
+}
+% Weekly self-check questions
+\newcommand{\selfcheck}[1]{\vspace{1mm}\noindent\textbf{\textcolor{purple}{Self-check:}} #1}
 
 \title{\Huge \textbf{Snowflake Master Data Engineer}\\ \Large 6-Month Exhaustive Architecture, Snowpark, and DataOps Program}
 \author{Multi-Cluster Data Warehousing, Streaming, Governance, and AI Integration}
@@ -49,12 +87,35 @@
 \newpage
 
 % ==========================================
+% PREREQUISITES
+% ==========================================
+\section*{Prerequisites \& How to Use This Syllabus}
+\addcontentsline{toc}{section}{Prerequisites \& How to Use This Syllabus}
+\begin{itemize}[label=-]
+    \item \textbf{Prerequisite skills:} Intermediate SQL, Python scripting, Git fundamentals, basic Linux/CLI usage, and familiarity with cloud object storage (S3 or Azure Blob). Docker fundamentals help for local dbt and connector work.
+    \item \textbf{Weekly cadence:} Expect 10--12 hours per week: Monday--Wednesday for theory, Thursday for a hands-on project, and Friday for an architecture use case.
+    \item \textbf{Deliverable expectation:} Every capstone must produce a git repository, an architecture diagram, a cost estimate (credits + storage), and a security review checklist, per the Acceptance Criteria boxes.
+    \item \textbf{Assessment:} The 24-week tracking timetable at the end of this document doubles as the assessment checklist; every box should be checked before the final SnowPro readiness review.
+\end{itemize}
+
+\noindent\textbf{Environment setup checklist:}
+\begin{itemize}[label=-]
+    \item Install Python 3.x, Git, Docker Desktop, and VS Code (with the Python and Snowflake extensions).
+    \item Install the platform CLIs: the Snowflake CLI (\texttt{snow}) and SnowSQL; verify with \texttt{snow connection test}.
+    \item Create a free Snowflake trial account (30 days / \$400 credit) or sandbox and record your account identifier.
+    \item Clone a course repo structure: \texttt{data/}, \texttt{src/}, \texttt{tests/}, \texttt{infra/}, \texttt{docs/}.
+    \item Configure credentials via environment variables or key-pair authentication --- never hardcode secrets in code or Git.
+\end{itemize}
+
+% ==========================================
 % MILESTONE 1
 % ==========================================
 \section{Milestone 1: Architecture, Warehouses \& Storage Engine (Month 1)}
 \textit{Objective: Master the 3-layer architecture, micro-partitions, virtual warehouses, and zero-copy cloning.}
+\par\noindent\textbf{Learning outcomes:} explain the 3-layer architecture, analyze micro-partition clustering depth, configure multi-cluster warehouse scaling, design storage-efficient table layouts, implement zero-copy clone recovery workflows.
 
 \subsection*{Week 1: Multi-Cluster Shared Data Architecture \& Storage}
+\par\noindent\textbf{Outcomes:} explain the 3-layer architecture and micro-partition metadata, measure clustering depth with \texttt{SYSTEM\$CLUSTERING\_INFORMATION}, define a clustering key on a 10M-row table, justify auto-clustering cost against pruning benefit.
 \begin{itemize}[label=-]
     \dayitem{Monday}{Snowflake's 3-Layer Architecture: Database Storage, Query Processing (Compute), and Cloud Services.}
     \dayitem{Tuesday}{Micro-partitions: Immutable columnar storage, metadata tracking, and clustering keys.}
@@ -62,8 +123,17 @@
     \dayitem{Thursday}{\project{Deploy a Snowflake database, create a 10-million-row synthetic table, inspect system metadata via \texttt{SYSTEM\$CLUSTERING\_INFORMATION}, and define a custom Clustering Key.}}
     \dayitem{Friday}{\usecase{Design an enterprise storage structure for a global telecommunications company processing 5TB of CDR (Call Detail Record) logs daily, balancing auto-clustering costs against query speed.}}
 \end{itemize}
+\resources{Snowflake Architecture Overview (\url{https://docs.snowflake.com/en/user-guide/intro-key-concepts}); Data Engineer Handbook (\url{https://github.com/DataExpert-io/data-engineer-handbook}).}
+\selfcheck{\begin{itemize}[label=-, nosep, leftmargin=4mm]
+    \item Name Snowflake's three architectural layers and one responsibility of each.
+    \item Why are micro-partitions immutable, and what two features does that enable?
+    \item What does \texttt{SYSTEM\$CLUSTERING\_INFORMATION} measure?
+    \item When does a clustering key stop paying for itself?
+    \item What per-partition metadata lets Snowflake prune scans?
+\end{itemize}}
 
 \subsection*{Week 2: Virtual Warehouses \& Compute Scaling}
+\par\noindent\textbf{Outcomes:} size virtual warehouses and predict credit burn, configure auto-suspend/resume and resource monitors, observe multi-cluster scaling under concurrent load, compare billing models across warehouse types.
 \begin{itemize}[label=-]
     \dayitem{Monday}{Virtual Warehouse sizing (XS to 6XL), credit consumption, and local SSD caching.}
     \dayitem{Tuesday}{Auto-suspend, Auto-resume, and Warehouse State management.}
@@ -71,8 +141,35 @@
     \dayitem{Thursday}{\project{Configure a Multi-Cluster Warehouse with auto-scaling (Min: 1, Max: 5). Write a Python script using the Snowflake Connector to simulate 100 concurrent queries and observe cluster scaling in snowsight.}}
     \dayitem{Friday}{\usecase{Architect a compute isolation strategy for an enterprise where BI dashboards, ETL batch processes, and ad-hoc data science queries run concurrently without compute contention.}}
 \end{itemize}
+\prodnote{Cost guardrails: set \texttt{AUTO\_SUSPEND = 60} seconds and keep \texttt{AUTO\_RESUME = TRUE} on all warehouses; attach a Resource Monitor with a monthly credit quota and notify-at-75\%, suspend-at-100\% actions so runaway BI queries cannot silently burn the budget.}
+\resources{Virtual Warehouses docs (\url{https://docs.snowflake.com/en/user-guide/warehouses-overview}); Data Engineering Zoomcamp (\url{https://github.com/DataTalksClub/data-engineering-zoomcamp}).}
+
+\vspace{1mm}
+\noindent\textbf{Compute cost comparison:}
+\begin{center}
+\renewcommand{\arraystretch}{1.3}
+\begin{tabular}{@{} l p{3.8cm} p{3.6cm} p{4.2cm} @{}}
+\toprule
+\textbf{Option} & \textbf{Billing model} & \textbf{Best for} & \textbf{Watch-outs} \\
+\midrule
+Standard warehouse (XS--XL) & Per-second credits while running; doubles per size (XS $\approx$ 1 cr/hr, S = 2, M = 4, L = 8, XL = 16) & General SQL, ETL, and BI of predictable size & Oversizing wastes credits; remote spill signals undersize \\
+Multi-cluster warehouse & Per-cluster credits for every running cluster & Concurrency spikes from many simultaneous BI users & Max-clusters misconfiguration multiplies cost; scale-in lag \\
+Snowpark-optimized warehouse & 1.5$\times$ standard credit rate; 16$\times$ memory per node & Memory-heavy Python/ML and large UDF batches & Poor value for plain SQL; watch memory vs. credit trade-off \\
+Serverless (Snowpipe, Tasks, SOS) & Snowflake-managed credits per usage; no warehouse & Event ingestion, light orchestration, point lookups & Harder to budget; track via \texttt{ACCOUNT\_USAGE} metering views \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\selfcheck{\begin{itemize}[label=-, nosep, leftmargin=4mm]
+    \item How does credit consumption scale from XS to XL?
+    \item What is the difference between auto-suspend and auto-resume?
+    \item When does the Standard scaling policy add clusters before Economy would?
+    \item Why set \texttt{AUTO\_SUSPEND = 60} rather than 600 seconds?
+    \item What happens to the local SSD cache when a warehouse suspends?
+\end{itemize}}
 
 \subsection*{Week 3: Tables, Views, Materialized Views \& Search Optimization}
+\par\noindent\textbf{Outcomes:} choose among permanent/transient/temporary tables, build secure and materialized views, enable Search Optimization for point lookups, evaluate clustering vs.\ materialized view vs.\ SOS cost trade-offs.
 \begin{itemize}[label=-]
     \dayitem{Monday}{Table Types: Permanent, Transient, and Temporary tables.}
     \dayitem{Tuesday}{Standard Views, Secure Views, and Materialized Views (maintenance overhead vs. speed).}
@@ -80,25 +177,105 @@
     \dayitem{Thursday}{\project{Create Transient tables for intermediate ETL staging, build a Materialized View for daily aggregations, and enable Search Optimization on a high-cardinality UUID column.}}
     \dayitem{Friday}{\usecase{Evaluate cost vs. performance trade-offs between Automatic Clustering, Materialized Views, and Search Optimization for an e-commerce platform's analytics layer.}}
 \end{itemize}
+\resources{Search Optimization Service docs (\url{https://docs.snowflake.com/en/user-guide/search-optimization-service}).}
+\selfcheck{\begin{itemize}[label=-, nosep, leftmargin=4mm]
+    \item Which table types survive session end, and which skip Fail-safe?
+    \item When does a materialized view beat a standard view?
+    \item What workload does the Search Optimization Service accelerate?
+    \item Why are secure views required for shares and clean rooms?
+    \item What ongoing cost do materialized views carry?
+\end{itemize}}
 
 \subsection*{Week 4: Zero-Copy Cloning, Time Travel \& Fail-Safe}
+\par\noindent\textbf{Outcomes:} query history with \texttt{AT}/\texttt{BEFORE}, recover dropped objects via \texttt{UNDROP}, provision zero-copy QA clones, execute a replication failover and failback drill.
 \begin{itemize}[label=-]
     \dayitem{Monday}{Time Travel mechanics: Querying historical data (\texttt{AT} | \texttt{BEFORE}) up to 90 days.}
     \dayitem{Tuesday}{Fail-safe storage: Non-configurable 7-day disaster recovery tier.}
     \dayitem{Wednesday}{Zero-Copy Cloning: Metadata-only duplication of databases, schemas, and tables.}
-    \dayitem{Thursday}{\project{Simulate an accidental \texttt{DROP TABLE}. Restore it using \texttt{UNDROP}. Create a Zero-Copy Clone of a Production database into a QA environment, modify data, and prove zero storage duplication.}}
+    \dayitem{Thursday}{\project{Simulate an accidental \texttt{DROP TABLE}. Restore it using \texttt{UNDROP}. Create a Zero-Copy Clone of a Production database into a QA environment, modify data, and prove zero storage duplication. DR drill extension: configure a database replication / failover group targeting a second region (or second trial account connection), refresh the replica, promote it (failover), verify reads and writes succeed, then fail back.}}
     \dayitem{Friday}{\usecase{Architect a zero-cost instant staging and testing environment workflow for a DevOps pipeline using Zero-Copy Cloning and ephemeral transient schemas.}}
 \end{itemize}
+\prodnote{Recovery boundaries matter: Time Travel (self-service, up to 90 days) covers accidental changes; Fail-safe (7 days, restorable only by Snowflake Support) is the last resort; database replication and failover groups protect against regional loss --- replicas are read-only until promoted, RPO equals the refresh schedule, and failback requires reversing the replication direction. Test failover quarterly: an untested replica is not a DR plan.}
+\resources{Time Travel \& Fail-safe docs (\url{https://docs.snowflake.com/en/user-guide/data-time-travel}); Zero-Copy Cloning docs (\url{https://docs.snowflake.com/en/user-guide/object-clone}); Database Replication \& Failover docs (\url{https://docs.snowflake.com/en/user-guide/database-replication-intro}).}
+\selfcheck{\begin{itemize}[label=-, nosep, leftmargin=4mm]
+    \item What three reference types do \texttt{AT} and \texttt{BEFORE} accept?
+    \item Who can restore data from Fail-safe, and for how long?
+    \item Why does a fresh zero-copy clone consume no extra storage?
+    \item How does database replication differ from Time Travel for DR?
+    \item What breaks a clone's zero-copy property over time?
+\end{itemize}}
 
 \capstone{Milestone 1}{Multi-Tier E-Commerce Data Backend \& Disaster Recovery System. Design an enterprise Snowflake architecture. Set up isolated multi-cluster warehouses for ETL and BI. Load raw e-commerce data into permanent tables, configure transient staging layers, set up custom clustering keys, implement Search Optimization on user IDs, and build an automated Time Travel backup testing script.}
+\rubric{
+\begin{itemize}[label=-, leftmargin=4mm, nosep]
+    \item Pipeline runs from a clean environment following the repo README.
+    \item Architecture diagram committed (draw.io/TikZ/PNG) showing the 3-layer design.
+    \item At least 3 automated checks on clustering depth and storage footprint with a failing-case demonstration.
+    \item Monitoring evidence: Resource Monitor with credit quota exported (screenshot or DDL).
+    \item Monthly cost estimate (credits + storage) with 2 optimization decisions documented.
+    \item Security review: least-privilege warehouse grants, no hardcoded credentials, PII columns identified.
+\end{itemize}
+}
+\subsection*{Milestone 1 Capstone: Reference Solution Sketch}
+\begin{itemize}[label=-, nosep]
+    \item \textbf{Architecture:} permanent RAW/MART databases with transient STAGING schemas, a multi-cluster ETL warehouse plus an auto-suspending BI warehouse under resource monitors, clustering keys on \texttt{order\_ts}, zero-copy clones for QA, and a replication/failover group for DR --- chosen to isolate workloads and minimize recluster and idle-compute spend.
+    \item \textbf{Steps:} (1) create databases, schemas, and roles; (2) load Olist data via \texttt{COPY INTO}; (3) inspect \texttt{SYSTEM\$CLUSTERING\_INFORMATION} and set clustering keys; (4) size warehouses and attach resource monitors; (5) script the QA clone refresh; (6) configure the replication group and run the failover/failback drill; (7) document the monthly cost estimate.
+    \item \textbf{Hardest part --- cheap, repeatable QA refresh:}
+\end{itemize}
+\begin{lstlisting}[language=SQL, caption={Zero-copy QA refresh + clustering check}]
+CREATE OR REPLACE DATABASE qa_analytics CLONE prod_analytics;
+ALTER WAREHOUSE etl_wh SET RESOURCE_MONITOR = rm_etl_monthly;
+SELECT SYSTEM$CLUSTERING_INFORMATION(
+  'PROD_ANALYTICS.MART.ORDERS', '(ORDER_TS)');
+\end{lstlisting}
+\begin{itemize}[label=-, nosep]
+    \item \textbf{Pitfall:} cloning production PII into QA before masking policies exist --- tag and mask first.
+    \item \textbf{Pitfall:} clustering keys on low-cardinality columns recluster forever with no pruning gain.
+    \item \textbf{Pitfall:} permanent staging tables silently pay Fail-safe storage; use transient.
+\end{itemize}
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}[node distance=5mm and 7mm, font=\small]
+    \node[draw, rounded corners, fill=orange!10, align=center] (mp) {Immutable\\Micro-partitions\\(50--500MB compressed)};
+    \node[draw, rounded corners, fill=blue!10, align=center, right=of mp] (storage) {Database Storage\\Layer (S3/Blob/GCS)};
+    \node[draw, rounded corners, fill=green!10, align=center, above=12mm of storage] (wh1) {WH: ETL\\(Multi-Cluster)};
+    \node[draw, rounded corners, fill=green!10, align=center, right=of wh1] (wh2) {WH: BI\\(Auto-suspend)};
+    \node[draw, rounded corners, fill=violet!10, align=center, above=12mm of wh1] (cs) {Cloud Services Layer\\(Auth, Optimizer, Metadata)};
+    \node[draw, rounded corners, fill=gray!10, align=center, left=of cs] (tt) {Time Travel\\+ Fail-safe};
+    \draw[-{Stealth}] (storage) -- (mp);
+    \draw[-{Stealth}] (wh1) -- (storage);
+    \draw[-{Stealth}] (wh2) |- (storage.east);
+    \draw[-{Stealth}] (cs) -- (wh1);
+    \draw[-{Stealth}] (cs) -| (wh2);
+    \draw[-{Stealth}] (tt) -- (cs);
+    \draw[-{Stealth}] (storage) -| (tt.south);
+\end{tikzpicture}
+\caption{Milestone 1 reference architecture: 3-layer storage, compute, and cloud services with micro-partitions.}
+\end{figure}
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}[node distance=4mm and 9mm, font=\scriptsize,
+    entity/.style={draw, rounded corners, align=left, fill=blue!8, inner sep=1.6mm}]
+    \node[entity] (cust) {\textbf{CUSTOMERS}\\customer\_id PK\\name\\region\\created\_ts};
+    \node[entity, right=of cust] (orders) {\textbf{ORDERS}\\order\_id PK\\customer\_id FK\\order\_ts\\status\\order\_total};
+    \node[entity, right=of orders] (items) {\textbf{ORDER\_ITEMS}\\order\_id FK\\product\_id FK\\quantity\\unit\_price};
+    \node[entity, right=of items] (prod) {\textbf{PRODUCTS}\\product\_id PK\\category\\list\_price};
+    \draw[-{Stealth}] (cust) -- node[above]{1:N} (orders);
+    \draw[-{Stealth}] (orders) -- node[above]{1:N} (items);
+    \draw[-{Stealth}] (items) -- node[above]{N:1} (prod);
+\end{tikzpicture}
+\caption{Capstone data model: e-commerce orders backend.}
+\end{figure}
 
 % ==========================================
 % MILESTONE 2
 % ==========================================
 \section{Milestone 2: Data Ingestion, Streams \& Tasks (ELT Engine) (Month 2)}
 \textit{Objective: Master staging, continuous loading with Snowpipe, CDC streams, and task orchestration.}
+\par\noindent\textbf{Learning outcomes:} configure storage integrations with IAM, implement Snowpipe auto-ingest, build CDC pipelines with Streams and MERGE, orchestrate serverless Task DAGs, design error-notification workflows.
 
 \subsection*{Week 5: Data Staging \& Storage Integrations}
+\par\noindent\textbf{Outcomes:} create internal and external stages, secure access with storage integrations and scoped IAM, load CSV/Parquet with \texttt{COPY INTO} and patterns, control load failures with \texttt{ON\_ERROR} options.
 \begin{itemize}[label=-]
     \dayitem{Monday}{Internal Stages (User, Table, Named) vs. External Stages (S3, GCS, Azure Blob).}
     \dayitem{Tuesday}{Secure authentication via Storage Integrations (IAM roles without hardcoded keys).}
@@ -106,26 +283,110 @@
     \dayitem{Thursday}{\project{Create an AWS IAM Role, set up a Snowflake Storage Integration, create an External Stage pointing to an S3 bucket, and execute a \texttt{COPY INTO} command with pattern matching.}}
     \dayitem{Friday}{\usecase{Design an ingestion pipeline for a logistics company receiving millions of compressed Parquet files per hour from IoT fleet sensors across AWS and Azure.}}
 \end{itemize}
+\prodnote{Storage Integrations eliminate hardcoded keys; scope the IAM role to a single bucket prefix, enable \texttt{BLOCKED\_IP\_LIST} network policies where applicable, and rotate external stage credentials by re-describing the integration's \texttt{STORAGE\_AWS\_IAM\_USER\_ARN} after rotation.}
+\resources{Data Loading Overview (\url{https://docs.snowflake.com/en/user-guide-data-load}); Apache Kafka docs (\url{https://kafka.apache.org/documentation/}).}
+\selfcheck{\begin{itemize}[label=-, nosep, leftmargin=4mm]
+    \item Name the three internal stage types; when do you need an external stage?
+    \item Why prefer a Storage Integration over hardcoded cloud keys?
+    \item What does the \texttt{ON\_ERROR} option of \texttt{COPY INTO} control?
+    \item Why is Parquet the most efficient format for analytics loads?
+    \item How do you restrict a load to files matching a name pattern?
+\end{itemize}}
 
 \subsection*{Week 6: Continuous Ingestion (Snowpipe \& Snowpipe Streaming)}
+\par\noindent\textbf{Outcomes:} configure auto-ingest Snowpipe with SQS events, call the Snowpipe REST API, stream rows with the Snowpipe Streaming API, enforce exactly-once ingestion with channel offset tokens, keep micro-batch backlogs bounded, monitor and alert on pipe health.
 \begin{itemize}[label=-]
     \dayitem{Monday}{Snowpipe Architecture: Event-driven auto-ingestion via SQS / Event Grid notifications.}
     \dayitem{Tuesday}{Snowpipe REST API for programmatic ingestion calls.}
-    \dayitem{Wednesday}{Snowpipe Streaming API: Direct row-set streaming into Snowflake tables (sub-second latency).}
+    \dayitem{Wednesday}{Snowpipe Streaming API: Direct row-set streaming into Snowflake tables (sub-second latency). Exactly-once ingestion via per-channel offset tokens: the client attaches a monotonically increasing offset token to each row batch, Snowflake persists it with the committed data, and a retried batch re-sending the same token is discarded as a duplicate. Contrast with unbounded micro-batch backlogs: when producers outpace a pipe's load throughput, queued files/messages grow without bound, end-to-end latency climbs from seconds to hours, and catch-up credit burn spikes --- size ingestion for peak rate and alert on backlog depth, not just pipe errors.}
     \dayitem{Thursday}{\project{Configure an S3 bucket event notification to trigger a Snowpipe automatically whenever a new CSV arrives. Verify continuous ingestion using \texttt{SYSTEM\$PIPE\_STATUS}.}}
+\begin{lstlisting}[language=SQL, caption={Snowpipe auto-ingest with SQS notification}]
+CREATE PIPE raw_csv_pipe AUTO_INGEST = TRUE AS
+  COPY INTO raw.events (id, payload, load_ts)
+  FROM (
+    SELECT $1, $2, CURRENT_TIMESTAMP()
+    FROM @raw_stage/events/
+  )
+  FILE_FORMAT = (TYPE = CSV SKIP_HEADER = 1
+                 FIELD_OPTIONALLY_ENCLOSED_BY = '"');
+
+-- Show the SQS notification channel for the S3 event rule
+SHOW PIPES LIKE 'raw_csv_pipe';
+-- Wire notification_channel ARN into the S3 bucket
+-- event configuration, then verify:
+SELECT SYSTEM$PIPE_STATUS('raw_csv_pipe');
+\end{lstlisting}
     \dayitem{Friday}{\usecase{Architect a real-time fraud detection ingestion pipeline processing credit card swipes using Snowpipe Streaming vs. traditional micro-batching.}}
 \end{itemize}
+\prodnote{Enable pipe error notifications via \texttt{ERROR\_INTEGRATION} (SNS/EventBridge) so failed loads page the on-call engineer; use the pipe's file-level load history (\texttt{INFORMATION\_SCHEMA.COPY\_HISTORY}) to retry only failed files, since Snowpipe is at-least-once and \texttt{COPY INTO} is idempotent per file for 64 days.}
+\resources{Snowpipe docs (\url{https://docs.snowflake.com/en/user-guide/data-load-snowpipe}); Data Engineering Zoomcamp (\url{https://github.com/DataTalksClub/data-engineering-zoomcamp}).}
+\selfcheck{\begin{itemize}[label=-, nosep, leftmargin=4mm]
+    \item What triggers Snowpipe auto-ingest on AWS?
+    \item How does Snowpipe Streaming differ from classic Snowpipe?
+    \item How does a channel offset token make Snowpipe Streaming exactly-once?
+    \item Why do unbounded micro-batch backlogs hurt, and what do you alert on?
+    \item Why is classic Snowpipe at-least-once, and how do you deduplicate?
+\end{itemize}}
 
 \subsection*{Week 7: Change Data Capture (CDC) with Streams}
+\par\noindent\textbf{Outcomes:} create standard and append-only streams, interpret \texttt{METADATA\$ACTION}/\texttt{METADATA\$ISUPDATE}, consume stream offsets transactionally with idempotent \texttt{MERGE} and dedup keys, join stream deltas to dimensions in near-real-time, detect and recover stale streams.
 \begin{itemize}[label=-]
-    \dayitem{Monday}{Snowflake Streams: Standard, Append-Only, and Insert-Only stream types.}
+    \dayitem{Monday}{Snowflake Streams: Standard, Append-Only, and Insert-Only stream types. State management: a stream's offset is its consumption state --- it records exactly which change records have been committed downstream. Compare with Dynamic Tables, which maintain incremental-refresh state internally (changed micro-partitions plus dependency versions) and degrade to a full refresh when the defining query uses constructs incremental refresh cannot track or after base-table DDL --- a full refresh reprocesses the entire base, so keep frequently-changing layers incrementally refreshable.}
     \dayitem{Tuesday}{Understanding Stream metadata columns (\texttt{METADATA\$ACTION}, \texttt{METADATA\$ISUPDATE}, \texttt{METADATA\$ROW\_ID}).}
-    \dayitem{Wednesday}{Consuming streams in \texttt{MERGE} statements for incremental updates.}
+    \dayitem{Wednesday}{Consuming streams in idempotent \texttt{MERGE} statements for incremental updates: dedup keys (e.g. a change-event ID) make re-runs no-ops, and stream-to-dimension joins in the \texttt{MERGE} source subquery (or inside a Dynamic Table) enrich deltas in near-real-time. Watch SCD staleness: if the dimension layer refreshes more slowly than the fact stream, new facts may join to a missing or outdated dimension row; absorb late-arriving dimension members by loosening the dimension layer's target lag and re-running the idempotent \texttt{MERGE} instead of dropping unmatched rows.}
     \dayitem{Thursday}{\project{Create a primary target table and a Standard Stream over a landing table. Perform \texttt{INSERT}, \texttt{UPDATE}, and \texttt{DELETE} operations on the landing table, then write a \texttt{MERGE} statement to sync changes to the target.}}
+\begin{lstlisting}[language=SQL, caption={Stream + MERGE CDC pattern}]
+CREATE OR REPLACE STREAM raw.customer_stream
+  ON TABLE raw.customer_landing
+  APPEND_ONLY = FALSE;
+
+MERGE INTO gold.customers AS tgt
+USING raw.customer_stream AS src
+  ON tgt.customer_id = src.customer_id
+WHEN MATCHED AND src.METADATA$ACTION = 'DELETE'
+  THEN DELETE
+WHEN MATCHED AND src.METADATA$ACTION = 'INSERT'
+  THEN UPDATE SET name = src.name,
+                  email = src.email,
+                  updated_ts = CURRENT_TIMESTAMP()
+WHEN NOT MATCHED AND src.METADATA$ACTION = 'INSERT'
+  THEN INSERT (customer_id, name, email, updated_ts)
+       VALUES (src.customer_id, src.name, src.email,
+               CURRENT_TIMESTAMP());
+\end{lstlisting}
+\begin{lstlisting}[language=SQL, caption={Idempotent stream MERGE with a dedup key}]
+-- gold.order_events carries the dedup key event_id
+MERGE INTO gold.order_events AS tgt
+USING (
+  SELECT event_id, order_id, status, event_ts
+  FROM raw.order_stream
+  WHERE METADATA$ACTION = 'INSERT'
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY event_id ORDER BY event_ts DESC) = 1
+) AS src
+ON tgt.event_id = src.event_id      -- dedup key match
+WHEN NOT MATCHED THEN
+  INSERT (event_id, order_id, status, event_ts)
+  VALUES (src.event_id, src.order_id, src.status, src.event_ts);
+-- The stream offset advances only if this transaction
+-- commits; a failed run leaves the offset untouched, and
+-- a re-run matches on event_id and applies nothing.
+\end{lstlisting}
     \dayitem{Friday}{\usecase{Design an incremental CDC pipeline synchronizing an operational MySQL database into Snowflake via AWS DMS and Snowflake Streams.}}
 \end{itemize}
+\prodnote{A stream's offset goes stale when Time Travel retention on the source table expires (1 day default, up to 90 days on Enterprise) or after the 14-day hard limit for unconsumed change data --- monitor \texttt{SYSTEM\$STREAM\_HAS\_DATA} plus the \texttt{STALE} column in \texttt{SHOW STREAMS}, and re-create the stream + re-snapshot the target when \texttt{STALE = true}.}
+\prodnote{Stream staleness forces a re-bootstrap via full reload: drop and re-create the stream to re-anchor the offset, then truncate-and-reload (or \texttt{INSERT OVERWRITE}) the downstream target from the source, reconciling the gap window with a key-based anti-join audit. Budget the full-reload credit cost and downstream downtime into the pipeline's RTO --- frequent staleness means the consumer cadence is slower than the 14-day retention, not that the stream design is wrong.}
+\resources{Streams on Tables docs (\url{https://docs.snowflake.com/en/user-guide/streams-intro}); Data Engineer Handbook (\url{https://github.com/DataExpert-io/data-engineer-handbook}).}
+\selfcheck{\begin{itemize}[label=-, nosep, leftmargin=4mm]
+    \item What does \texttt{METADATA\$ISUPDATE} indicate in a standard stream?
+    \item What serves as a stream's consumption state, and when does it advance?
+    \item How does a dedup key make a stream-consuming \texttt{MERGE} idempotent?
+    \item When does a Dynamic Table's incremental refresh degrade to full refresh?
+    \item How do you absorb late-arriving dimension members in a stream-to-dimension join?
+\end{itemize}}
 
 \subsection*{Week 8: Orchestration with Snowflake Tasks}
+\par\noindent\textbf{Outcomes:} schedule tasks with CRON or intervals, compose task-tree DAGs with \texttt{AFTER}, wire error notifications and failure suspension, write idempotent task steps.
 \begin{itemize}[label=-]
     \dayitem{Monday}{Snowflake Tasks: Scheduling SQL, CRON expressions, and execution parameters.}
     \dayitem{Tuesday}{Task Trees (DAGs): Master and Child tasks using \texttt{AFTER} clauses.}
@@ -133,25 +394,132 @@
     \dayitem{Thursday}{\project{Build a multi-step DAG using Tasks: Task 1 checks if a Stream has data (\texttt{SYSTEM\$STREAM\_HAS\_DATA}), Task 2 consumes the Stream via \texttt{MERGE}, and Task 3 truncates the staging environment.}}
     \dayitem{Friday}{\usecase{Architect an automated, serverless, self-healing ELT orchestration engine handling 50 dependent business data transformations without external orchestrators.}}
 \end{itemize}
+\prodnote{Wire task-graph failures to a Notification Integration (SNS $\rightarrow$ Slack/PagerDuty) via \texttt{ALTER TASK ... SET ERROR\_INTEGRATION}; add \texttt{SUSPEND\_TASK\_AFTER\_NUM\_FAILURES} to stop cascading failures, and make every task step idempotent (MERGE or \texttt{INSERT OVERWRITE}) so retries never double-apply.}
+\resources{Snowflake Tasks docs (\url{https://docs.snowflake.com/en/user-guide/tasks-intro}); Apache Airflow docs (\url{https://airflow.apache.org/docs/}).}
+\selfcheck{\begin{itemize}[label=-, nosep, leftmargin=4mm]
+    \item Which two schedule types can a Snowflake task use?
+    \item How do child tasks declare dependencies in a task tree?
+    \item What is a serverless task and how is it billed?
+    \item Why must every task step be idempotent?
+    \item How do you alert on a task-graph failure?
+\end{itemize}}
 
 \capstone{Milestone 2}{Real-Time CDC \& Automated ELT Pipeline. Build a continuous ingestion engine. Configure an External Stage on AWS S3 with Snowpipe auto-ingestion into a raw JSON landing table. Attach a Standard Stream to track changes, and orchestrate a DAG using Serverless Tasks to parse JSON, execute incremental \texttt{MERGE} statements into a Gold schema, and send error alerts on failure.}
+\rubric{
+\begin{itemize}[label=-, leftmargin=4mm, nosep]
+    \item End-to-end ingestion runs from a clean environment following the repo README.
+    \item Architecture diagram committed showing stage $\rightarrow$ pipe $\rightarrow$ stream $\rightarrow$ task DAG.
+    \item At least 3 automated data-quality checks (e.g. row-count reconciliation, duplicate-key detection, JSON parse-failure quarantine) with a failing-case demonstration.
+    \item Monitoring/alerting evidence: pipe error integration and task error notification config exported.
+    \item Monthly cost estimate (Snowpipe credits + serverless tasks) with 2 optimization decisions documented.
+    \item Security review: storage integration IAM scoping, no hardcoded secrets, stream/role least privilege.
+\end{itemize}
+}
+\subsection*{Milestone 2 Capstone: Reference Solution Sketch}
+\begin{itemize}[label=-, nosep]
+    \item \textbf{Architecture:} S3 $\rightarrow$ external stage with storage integration $\rightarrow$ auto-ingest Snowpipe $\rightarrow$ raw VARIANT landing table $\rightarrow$ standard stream $\rightarrow$ serverless task DAG (gate $\rightarrow$ MERGE $\rightarrow$ cleanup) $\rightarrow$ Gold schema, with SNS error notifications --- chosen for sub-minute latency at serverless cost.
+    \item \textbf{Steps:} (1) create the IAM role and storage integration; (2) create the stage and pipe with \texttt{AUTO\_INGEST}; (3) wire the S3 event rule to the pipe's SQS channel; (4) create the standard stream; (5) build the gated task tree; (6) attach \texttt{ERROR\_INTEGRATION} notifications; (7) add row-count reconciliation checks between landing and Gold.
+    \item \textbf{Hardest part --- gating task runs on stream data:}
+\end{itemize}
+\begin{lstlisting}[language=SQL, caption={Serverless task gated on the stream offset}]
+CREATE OR REPLACE TASK t_merge_customers  -- no WAREHOUSE = serverless
+  AFTER t_gate
+WHEN SYSTEM$STREAM_HAS_DATA('raw.customer_stream')
+AS
+  CALL sp_merge_customers();  -- idempotent MERGE procedure
+\end{lstlisting}
+\begin{itemize}[label=-, nosep]
+    \item \textbf{Pitfall:} an unconsumed stream goes stale after 14 days --- monitor \texttt{STALE} and re-snapshot.
+    \item \textbf{Pitfall:} SQS events redeliver; a non-idempotent MERGE double-applies changes.
+    \item \textbf{Pitfall:} an S3 event rule on the wrong prefix silently starves the pipe.
+\end{itemize}
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}[node distance=5mm and 7mm, font=\small]
+    \node[draw, rounded corners, fill=orange!10, align=center] (s3) {S3 Bucket\\(CSV/JSON drops)};
+    \node[draw, rounded corners, fill=blue!10, align=center, right=of s3] (stage) {External Stage\\+ Storage Integ.};
+    \node[draw, rounded corners, fill=green!10, align=center, right=of stage] (pipe) {Snowpipe\\(auto-ingest)};
+    \node[draw, rounded corners, fill=green!10, align=center, right=of pipe] (raw) {Raw Landing\\Table};
+    \node[draw, rounded corners, fill=violet!10, align=center, below=of raw] (stream) {Standard Stream\\(CDC)};
+    \node[draw, rounded corners, fill=violet!10, align=center, left=of stream] (tasks) {Serverless Task\\DAG (MERGE)};
+    \node[draw, rounded corners, fill=yellow!15, align=center, left=of tasks] (gold) {Gold Schema\\(conformed dims)};
+    \node[draw, rounded corners, fill=gray!10, align=center, above=of tasks] (alerts) {SNS/Slack Error\\Notification};
+    \draw[-{Stealth}] (s3) -- node[above, font=\scriptsize]{SQS event} (stage);
+    \draw[-{Stealth}] (stage) -- (pipe);
+    \draw[-{Stealth}] (pipe) -- (raw);
+    \draw[-{Stealth}] (raw) -- (stream);
+    \draw[-{Stealth}] (stream) -- (tasks);
+    \draw[-{Stealth}] (tasks) -- (gold);
+    \draw[-{Stealth}, dashed] (pipe) |- (alerts);
+    \draw[-{Stealth}, dashed] (tasks) -- (alerts);
+\end{tikzpicture}
+\caption{Milestone 2 reference architecture: event-driven ELT from S3 stage to Snowpipe, Streams, Tasks, and Gold.}
+\end{figure}
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}[node distance=4mm and 9mm, font=\scriptsize,
+    entity/.style={draw, rounded corners, align=left, fill=green!10, inner sep=1.6mm}]
+    \node[entity] (landing) {\textbf{RAW.CUSTOMER\_LANDING}\\customer\_id\\name\\email\\load\_ts};
+    \node[entity, right=of landing] (stream) {\textbf{CUSTOMER\_STREAM}\\METADATA\$ACTION\\METADATA\$ISUPDATE\\offset};
+    \node[entity, right=of stream] (gold) {\textbf{GOLD.CUSTOMERS}\\customer\_id PK\\name\\email\\updated\_ts};
+    \node[entity, below=6mm of gold] (gorders) {\textbf{GOLD.ORDERS}\\order\_id PK\\customer\_id FK\\order\_ts\\total};
+    \draw[-{Stealth}] (landing) -- node[above]{1:1 CDC} (stream);
+    \draw[-{Stealth}] (stream) -- node[above]{MERGE} (gold);
+    \draw[-{Stealth}] (gold) -- node[right]{1:N} (gorders);
+\end{tikzpicture}
+\caption{Capstone data model: real-time CDC customer/order sync.}
+\end{figure}
 
 % ==========================================
 % MILESTONE 3
 % ==========================================
 \section{Milestone 3: Advanced SQL, Semi-Structured Data \& Dynamic Tables (Month 3)}
 \textit{Objective: Master VARIANT processing, query profiling, Dynamic Tables, and advanced analytics SQL.}
+\par\noindent\textbf{Learning outcomes:} parse nested JSON with FLATTEN, diagnose query profiles and spilling, build declarative Dynamic Table DAGs, write window-function analytics with QUALIFY, document cost/performance trade-offs.
 
-\subsection*{Week 9: Semi-Structured Data Processing}
+\subsection*{Week 9: Semi-Structured Data Processing \& Data Contracts}
+\par\noindent\textbf{Outcomes:} model payloads in \texttt{VARIANT}, extract nested fields with \texttt{LATERAL FLATTEN} and explicit casts, enforce data contracts with CHECK constraints, quarantine schema-drift records.
 \begin{itemize}[label=-]
     \dayitem{Monday}{The \texttt{VARIANT}, \texttt{OBJECT}, and \texttt{ARRAY} data types in Snowflake.}
     \dayitem{Tuesday}{Dot notation, Bracket notation, and explicit casting of semi-structured fields.}
-    \dayitem{Wednesday}{\texttt{FLATTEN} and \texttt{LATERAL FLATTEN}: Unpacking nested arrays and objects into tabular rows.}
-    \dayitem{Thursday}{\project{Load raw deeply nested JSON clickstream logs into a \texttt{VARIANT} column. Write queries using \texttt{LATERAL FLATTEN} to extract array elements and build a clean dimensional table.}}
+    \dayitem{Wednesday}{\texttt{FLATTEN} and \texttt{LATERAL FLATTEN}: Unpacking nested arrays and objects into tabular rows. Data contracts for VARIANT payloads: schema validation at ingest with CHECK constraints on extracted fields (or dbt \texttt{contract: enforced} model constraints), handling schema drift in evolving JSON, and contract ownership --- the producer defines the contract, consumers version and approve changes (breaking vs. non-breaking).}
+    \dayitem{Thursday}{\project{Load raw deeply nested JSON clickstream logs into a \texttt{VARIANT} column. Write queries using \texttt{LATERAL FLATTEN} to extract array elements and build a clean dimensional table. Contract extension: enforce the agreed schema at ingest with CHECK constraints on the extracted columns, then deliberately drift the JSON (rename a key) and observe the rejection.}}
     \dayitem{Friday}{\usecase{Architect a flexible schema-on-read ingestion pipeline for a SaaS company whose mobile apps emit changing JSON payload schemas without breaking production downstream models.}}
 \end{itemize}
+\begin{lstlisting}[language=SQL, caption={Contract enforcement on extracted VARIANT fields}]
+CREATE OR REPLACE TABLE silver.events (
+  event_id   STRING,
+  event_type STRING NOT NULL,
+  event_ts   TIMESTAMP_NTZ NOT NULL,
+  amount     NUMBER(12,2),
+  CONSTRAINT events_contract_chk
+    CHECK (event_type IN ('CLICK', 'VIEW', 'PURCHASE')
+           AND (amount IS NULL OR amount >= 0))
+);
+
+INSERT INTO silver.events
+SELECT payload:event_id::STRING,
+       payload:event_type::STRING,
+       payload:ts::TIMESTAMP_NTZ,
+       payload:amount::NUMBER(12,2)
+FROM raw.events_landing
+WHERE payload IS NOT NULL;
+-- Rows violating the CHECK are rejected at ingest.
+-- dbt alternative: contract: {enforced: true} with column
+-- data_types and constraints declared in the model YAML.
+\end{lstlisting}
+\prodnote{Schema drift defense: land raw payloads in a single \texttt{VARIANT} column, quarantine unparseable records into a dead-letter table using \texttt{TRY\_PARSE\_JSON} + \texttt{VALIDATION\_MODE}, and version downstream extractors with explicit casts so missing keys fail loudly in CI rather than silently returning NULL in production.}
+\resources{Semi-structured Data docs (\url{https://docs.snowflake.com/en/user-guide/semistructured-intro}); dbt model contracts (\url{https://docs.getdbt.com/docs/collaborate/govern/model-contracts}); Data Engineering Zoomcamp (\url{https://github.com/DataTalksClub/data-engineering-zoomcamp}).}
+\selfcheck{\begin{itemize}[label=-, nosep, leftmargin=4mm]
+    \item Which Snowflake type stores arbitrary JSON efficiently, and how?
+    \item Why cast VARIANT fields explicitly at extraction time?
+    \item What does \texttt{LATERAL FLATTEN} do that a plain join cannot?
+    \item How do CHECK constraints enforce a contract on extracted fields?
+    \item Who owns a data contract, and who approves breaking changes?
+\end{itemize}}
 
 \subsection*{Week 10: Query Tuning, Performance \& Profiling}
+\par\noindent\textbf{Outcomes:} read query profiles for pruning and spill metrics, eliminate Cartesian joins, fix remote spilling by refactoring or resizing, audit a high-cost workload end-to-end.
 \begin{itemize}[label=-]
     \dayitem{Monday}{Reading the Query Profile in Snowsight: Identifying bottlenecks, pruning, and scan metrics.}
     \dayitem{Tuesday}{Spilling to Local Storage vs. Spilling to Remote Storage (and how to fix it).}
@@ -159,26 +527,152 @@
     \dayitem{Thursday}{\project{Identify a slow query. Use the Query Profile to diagnose disk spilling. Refactor the query using CTEs, eliminate Cartesian joins, resize the warehouse, and verify execution speedup.}}
     \dayitem{Friday}{\usecase{Perform an enterprise cost and performance audit on a query pipeline consuming \$20,000/month, optimizing micro-partition pruning and warehouse allocation.}}
 \end{itemize}
+\prodnote{Spilling mitigation: bytes spilled to remote storage is the strongest signal to upsize the warehouse; reduce spill by pre-aggregating before wide joins, filtering early to improve micro-partition pruning, and avoiding \texttt{SELECT *} on wide tables --- validate each change in the Query Profile scan/operator metrics.}
+\resources{Query Profile docs (\url{https://docs.snowflake.com/en/user-guide/ui-query-profile}); Data Engineer Handbook (\url{https://github.com/DataExpert-io/data-engineer-handbook}).}
+\selfcheck{\begin{itemize}[label=-, nosep, leftmargin=4mm]
+    \item Which Query Profile metric signals poor micro-partition pruning?
+    \item What does spilling to remote storage tell you to do first?
+    \item How do you eliminate an accidental Cartesian join?
+    \item When is upsizing the warehouse better than rewriting SQL?
+    \item Why does \texttt{SELECT *} hurt on wide columnar tables?
+\end{itemize}}
 
 \subsection*{Week 11: Dynamic Tables (Declarative Data Pipelines)}
+\par\noindent\textbf{Outcomes:} choose between dynamic tables, materialized views, and streams + tasks, set per-layer target lags, build a Bronze--Silver--Gold dynamic-table DAG, monitor refresh history and full-refresh fallbacks.
 \begin{itemize}[label=-]
     \dayitem{Monday}{Dynamic Tables vs. Materialized Views vs. Tasks + Streams.}
     \dayitem{Tuesday}{Target Lag (\texttt{TARGET\_LAG = '5 minutes'}) and automated refresh mechanics.}
     \dayitem{Wednesday}{Incremental Refresh vs. Full Refresh triggers and dependency DAGs.}
     \dayitem{Thursday}{\project{Build a 3-tier pipeline (Bronze $\rightarrow$ Silver $\rightarrow$ Gold) using purely Dynamic Tables. Configure different target lags for each layer and observe automated dependency refresh.}}
+\begin{lstlisting}[language=SQL, caption={Dynamic Tables Bronze-Silver-Gold chain}]
+CREATE OR REPLACE DYNAMIC TABLE bronze.events
+  TARGET_LAG = '5 minutes' WAREHOUSE = etl_wh AS
+  SELECT id, payload:event_type::STRING AS event_type,
+         payload:ts::TIMESTAMP_NTZ AS event_ts
+  FROM raw.events_landing;
+
+CREATE OR REPLACE DYNAMIC TABLE silver.daily_events
+  TARGET_LAG = '15 minutes' WAREHOUSE = etl_wh AS
+  SELECT event_type, DATE_TRUNC('day', event_ts) AS day,
+         COUNT(*) AS event_count
+  FROM bronze.events
+  GROUP BY 1, 2;
+
+CREATE OR REPLACE DYNAMIC TABLE gold.event_kpis
+  TARGET_LAG = '1 hour' WAREHOUSE = bi_wh AS
+  SELECT day, SUM(event_count) AS total_events
+  FROM silver.daily_events GROUP BY 1;
+\end{lstlisting}
     \dayitem{Friday}{\usecase{Re-architect a complex 200-task Airflow DAG into a declarative Snowflake Dynamic Tables network, reducing operational maintenance and pipeline latency.}}
 \end{itemize}
+\prodnote{Dynamic Table operations: monitor refresh history via \texttt{INFORMATION\_SCHEMA.DYNAMIC\_TABLE\_REFRESH\_HISTORY}, set realistic target lags (every layer's lag must be $\ge$ the upstream lag plus refresh time), and watch for automatic incremental-to-full refresh fallbacks after schema changes --- they can multiply credit spend.}
+\resources{Dynamic Tables docs (\url{https://docs.snowflake.com/en/user-guide/dynamic-tables-about}).}
+\selfcheck{\begin{itemize}[label=-, nosep, leftmargin=4mm]
+    \item What does \texttt{TARGET\_LAG} control on a dynamic table?
+    \item When does Snowflake fall back from incremental to full refresh?
+    \item How do dynamic tables differ from materialized views?
+    \item Why must downstream lag exceed upstream lag plus refresh time?
+    \item Where do you check refresh history and failures for a dynamic table?
+\end{itemize}}
 
-\subsection*{Week 12: Advanced Analytics SQL}
+\subsection*{Week 12: Advanced Analytics SQL \& Dimensional Modeling}
+\par\noindent\textbf{Outcomes:} write window-function analytics with \texttt{QUALIFY}, declare fact grain and model a star schema, implement SCD Type 2 loads from streams, compute cohort retention and churn.
 \begin{itemize}[label=-]
-    \dayitem{Monday}{Window Functions: \texttt{PARTITION BY}, \texttt{ORDER BY}, and Frame specifications (\texttt{ROWS} / \texttt{RANGE}).}
-    \dayitem{Tuesday}{The \texttt{QUALIFY} clause: Filtering window function outputs directly without subqueries.}
-    \dayitem{Wednesday}{Grouping Sets, \texttt{CUBE}, \texttt{ROLLUP}, and Pivoting / Unpivoting tables.}
-    \dayitem{Thursday}{\project{Write a financial analytics query calculating a 30-day moving average and cumulative sum of customer transactions, using \texttt{QUALIFY} to retain only top-ranked records.}}
+    \dayitem{Monday}{Window Functions: \texttt{PARTITION BY}, \texttt{ORDER BY}, and Frame specifications (\texttt{ROWS} / \texttt{RANGE}); the \texttt{QUALIFY} clause for filtering window outputs without subqueries.}
+    \dayitem{Tuesday}{Grouping Sets, \texttt{CUBE}, \texttt{ROLLUP}, and Pivoting / Unpivoting tables.}
+    \dayitem{Wednesday}{Kimball dimensional modeling in Snowflake: declaring the grain first; fact types (transaction, periodic snapshot, accumulating snapshot); conformed dimensions shared across marts; star vs. snowflake schema trade-offs --- denormalized star schemas favor micro-partition pruning and fewer joins, snowflaking only pays off for very large shared dimensions; SCD Type 1 (overwrite) vs. Type 2 (versioned rows with validity windows).}
+    \dayitem{Thursday}{\project{Build a star schema (\texttt{fct\_orders} at one-row-per-order-line grain, conformed \texttt{dim\_customers} / \texttt{dim\_products}). Write a financial analytics query calculating a 30-day moving average and cumulative sum of customer transactions, using \texttt{QUALIFY} to retain only top-ranked records. Then implement the SCD Type 2 load below, driven by the customer stream from Week 7.}}
+\begin{lstlisting}[language=SQL, caption={SCD Type 2 from a stream: close current rows, then insert new versions}]
+-- Step 1: close the current version of changed rows
+MERGE INTO gold.dim_customers tgt
+USING raw.customer_stream src
+  ON tgt.customer_id = src.customer_id AND tgt.is_current = TRUE
+WHEN MATCHED AND src.METADATA$ACTION = 'INSERT' AND
+     (tgt.name <> src.name OR tgt.region <> src.region)
+  THEN UPDATE SET is_current = FALSE,
+                  valid_to = CURRENT_TIMESTAMP();
+
+-- Step 2: insert the new versions
+INSERT INTO gold.dim_customers
+  (customer_id, name, region, is_current, valid_from, valid_to)
+SELECT customer_id, name, region, TRUE, CURRENT_TIMESTAMP(), NULL
+FROM raw.customer_stream
+WHERE METADATA$ACTION = 'INSERT';
+\end{lstlisting}
     \dayitem{Friday}{\usecase{Build an analytical reporting engine calculating customer retention cohorts and month-over-month churn across 50 million subscription billing records.}}
 \end{itemize}
+\resources{Window Functions reference (\url{https://docs.snowflake.com/en/sql-reference/functions-analytic}); Kimball dimensional modeling techniques (\url{https://www.kimballgroup.com/data-warehouse-business-intelligence-resources/kimball-techniques/dimensional-modeling-techniques/}).}
+\selfcheck{\begin{itemize}[label=-, nosep, leftmargin=4mm]
+    \item What does \texttt{QUALIFY} filter without a subquery?
+    \item Why must you declare the grain before building a fact table?
+    \item Name the three Kimball fact types.
+    \item When does a snowflake schema beat a star schema in Snowflake?
+    \item What physically changes in a dimension under SCD Type 2?
+\end{itemize}}
 
 \capstone{Milestone 3}{Semi-Structured Telemetry Lakehouse \& Declarative Pipeline. Ingest 10GB of nested JSON IoT telemetry data. Flatten the JSON payloads into tabular Bronze Dynamic Tables. Build Silver and Gold Dynamic Tables with incremental target lags, using advanced SQL window functions and \texttt{QUALIFY} clauses to compute real-time anomaly metrics.}
+\rubric{
+\begin{itemize}[label=-, leftmargin=4mm, nosep]
+    \item Bronze-to-Gold pipeline refreshes end-to-end from a clean environment per the README.
+    \item Architecture diagram committed showing the Dynamic Tables DAG with target lags.
+    \item At least 3 automated data-quality tests (null-rate, freshness, anomaly bounds) with a failing-case demonstration.
+    \item Monitoring evidence: refresh-history query or alert config for lag breaches.
+    \item Monthly cost estimate comparing Dynamic Tables vs. the equivalent Task DAG, with 2 optimization decisions.
+    \item Security review: VARIANT landing table access scoped, no PII in raw payloads logged.
+\end{itemize}
+}
+\subsection*{Milestone 3 Capstone: Reference Solution Sketch}
+\begin{itemize}[label=-, nosep]
+    \item \textbf{Architecture:} raw VARIANT landing with contract CHECK constraints $\rightarrow$ Bronze/Silver/Gold dynamic tables at 5/15/60-minute target lags, with window-function anomaly metrics and refresh-history alerting --- chosen to replace a hand-built task DAG with declarative, auto-ordered refresh.
+    \item \textbf{Steps:} (1) land JSON telemetry in a VARIANT column; (2) extract with explicit casts into contract-checked Silver tables; (3) create the 3-tier dynamic-table chain with escalating lags; (4) compute anomaly metrics with window functions and \texttt{QUALIFY}; (5) alert on refresh failures and lag breaches from \texttt{DYNAMIC\_TABLE\_REFRESH\_HISTORY}.
+    \item \textbf{Hardest part --- rolling-window anomaly detection:}
+\end{itemize}
+\begin{lstlisting}[language=SQL, caption={Anomaly flag via 7-day rolling average}]
+SELECT device_id, day, reading_count,
+       AVG(reading_count) OVER (
+         PARTITION BY device_id ORDER BY day
+         ROWS BETWEEN 6 PRECEDING AND CURRENT ROW) AS avg_7d
+FROM silver.daily_metrics
+QUALIFY reading_count > 3 * avg_7d;
+\end{lstlisting}
+\begin{itemize}[label=-, nosep]
+    \item \textbf{Pitfall:} downstream lag shorter than upstream lag plus refresh time causes perpetual staleness.
+    \item \textbf{Pitfall:} a schema change forces incremental $\rightarrow$ full refresh fallback --- a credit spike.
+    \item \textbf{Pitfall:} hard casts instead of \texttt{TRY\_*} kill the load on schema drift.
+\end{itemize}
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}[node distance=5mm and 8mm, font=\small]
+    \node[draw, rounded corners, fill=orange!10, align=center] (src) {IoT JSON\\Telemetry (VARIANT)};
+    \node[draw, rounded corners, fill=brown!15, align=center, right=of src] (bronze) {Bronze DT\\lag: 5 min};
+    \node[draw, rounded corners, fill=gray!20, align=center, right=of bronze] (silver) {Silver DT\\lag: 15 min};
+    \node[draw, rounded corners, fill=yellow!25, align=center, right=of silver] (gold) {Gold DT\\lag: 1 hour};
+    \node[draw, rounded corners, fill=violet!10, align=center, below=of silver] (mon) {Refresh History\\Monitoring};
+    \node[draw, rounded corners, fill=green!10, align=center, above=of silver] (bi) {BI Dashboards\\+ Anomaly SQL};
+    \draw[-{Stealth}] (src) -- (bronze);
+    \draw[-{Stealth}] (bronze) -- (silver);
+    \draw[-{Stealth}] (silver) -- (gold);
+    \draw[-{Stealth}, dashed] (bronze) |- (mon);
+    \draw[-{Stealth}, dashed] (silver) -- (mon);
+    \draw[-{Stealth}, dashed] (gold) |- (mon);
+    \draw[-{Stealth}] (gold) -- (bi);
+\end{tikzpicture}
+\caption{Milestone 3 reference architecture: Dynamic Tables Bronze-Silver-Gold DAG with target lags.}
+\end{figure}
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}[node distance=4mm and 9mm, font=\scriptsize,
+    entity/.style={draw, rounded corners, align=left, fill=brown!10, inner sep=1.6mm}]
+    \node[entity] (dev) {\textbf{DEVICES}\\device\_id PK\\site\\firmware\_ver};
+    \node[entity, right=of dev] (tel) {\textbf{TELEMETRY\_EVENTS}\\event\_id PK\\device\_id FK\\payload VARIANT\\event\_ts};
+    \node[entity, right=of tel] (met) {\textbf{DAILY\_METRICS}\\device\_id FK\\day PK\\reading\_count\\avg\_value};
+    \node[entity, below=6mm of met] (al) {\textbf{ANOMALIES}\\anomaly\_id PK\\device\_id FK\\detected\_ts\\score};
+    \draw[-{Stealth}] (dev) -- node[above]{1:N} (tel);
+    \draw[-{Stealth}] (tel) -- node[above]{N:1 roll-up} (met);
+    \draw[-{Stealth}] (met) -- node[right]{1:N} (al);
+\end{tikzpicture}
+\caption{Capstone data model: IoT telemetry lakehouse.}
+\end{figure}
 
 \newpage
 % ==========================================
@@ -186,17 +680,57 @@
 % ==========================================
 \section{Milestone 4: Snowpark Python, UDFs \& Enterprise Data Engineering (Month 4)}
 \textit{Objective: Master Snowpark Python DataFrames, UDFs, Stored Procedures, and API integrations.}
+\par\noindent\textbf{Learning outcomes:} build lazy-evaluation Snowpark DataFrames, author vectorized Python UDFs, orchestrate transformations with stored procedures, integrate external REST APIs via External Functions, migrate PySpark logic to Snowpark.
 
 \subsection*{Week 13: Snowpark Python Fundamentals}
+\par\noindent\textbf{Outcomes:} create Snowpark sessions with key-pair auth, compose lazy DataFrame transformations, verify SQL pushdown with \texttt{explain()}, persist results with \texttt{save\_as\_table}.
 \begin{itemize}[label=-]
     \dayitem{Monday}{Snowpark Architecture: Client-side Lazy Evaluation vs. Server-side Pushdown execution.}
     \dayitem{Tuesday}{\texttt{Snowpark Session} creation, DataFrame operations, and transformations.}
     \dayitem{Wednesday}{Translating SQL to Snowpark DataFrames: \texttt{select}, \texttt{filter}, \texttt{join}, and \texttt{group\_by}.}
     \dayitem{Thursday}{\project{Set up a local Python environment. Create a Snowpark Session, load data from a Snowflake table, build complex filter/join transformations using Snowpark DataFrames, and execute \texttt{collect()}.}}
+\begin{lstlisting}[language=Python, caption={Snowpark Python DataFrame transformation}]
+from snowflake.snowpark import Session
+from snowflake.snowpark.functions import col, avg, current_timestamp
+
+session = Session.builder.configs({
+    "account": "xy12345.us-east-1",
+    "user": "de_pipeline",
+    "password": "<from-env>",
+    "role": "ENGINEER",
+    "warehouse": "ETL_WH",
+    "database": "ANALYTICS",
+    "schema": "SILVER",
+}).create()
+
+orders = session.table("bronze.orders")
+customers = session.table("gold.dim_customers")
+
+result = (orders
+    .filter(col("status") == "COMPLETE")
+    .join(customers, orders["customer_id"] == customers["customer_id"])
+    .group_by(customers["region"])
+    .agg(avg("order_total").alias("avg_order_value"))
+    .with_column("computed_ts", current_timestamp()))
+
+result.write.save_as_table("silver.regional_order_kpis",
+                           mode="overwrite")
+session.close()
+\end{lstlisting}
     \dayitem{Friday}{\usecase{Design a PySpark to Snowpark migration roadmap for a enterprise data team, translating Spark DataFrames to native Snowpark Python without data extraction.}}
 \end{itemize}
+\prodnote{Never embed Snowflake credentials in Snowpark client code --- use key-pair auth or environment variables; pin \texttt{snowflake-snowpark-python} versions to match the server-side package channel, and validate pushdown by checking that \texttt{df.explain()} shows a single SQL statement rather than local collection of large frames.}
+\resources{Snowpark Python Developer Guide (\url{https://docs.snowflake.com/en/developer-guide/snowpark/python/index}); Apache Spark docs (\url{https://spark.apache.org/docs/latest/}).}
+\selfcheck{\begin{itemize}[label=-, nosep, leftmargin=4mm]
+    \item What does lazy evaluation mean for Snowpark DataFrames?
+    \item How do you verify a transformation was pushed down?
+    \item When does \texttt{collect()} become dangerous?
+    \item Why pin \texttt{snowflake-snowpark-python} to the server package channel?
+    \item Which auth method should Snowpark client code use in CI?
+\end{itemize}}
 
 \subsection*{Week 14: User-Defined Functions (UDFs) \& Vectorized UDFs}
+\par\noindent\textbf{Outcomes:} author scalar and vectorized Python UDFs, return tabular results with UDTFs, source packages from the Anaconda channel, benchmark vectorized against scalar execution.
 \begin{itemize}[label=-]
     \dayitem{Monday}{Scalar UDFs in Python and SQL.}
     \dayitem{Tuesday}{Vectorized UDFs using Python Type Hints (\texttt{pandas\_udf}) and PyArrow for high performance.}
@@ -204,8 +738,17 @@
     \dayitem{Thursday}{\project{Write a Vectorized Python UDF using Pandas to compute text sentiment scores over a million customer review rows directly inside Snowflake's compute engine.}}
     \dayitem{Friday}{\usecase{Architect a high-performance geospatial processing pipeline utilizing custom Python UDFs to perform spatial distance calculations over taxi trip data.}}
 \end{itemize}
+\resources{Python UDFs docs (\url{https://docs.snowflake.com/en/developer-guide/udf/python/udf-python}); Data Engineer Handbook (\url{https://github.com/DataExpert-io/data-engineer-handbook}).}
+\selfcheck{\begin{itemize}[label=-, nosep, leftmargin=4mm]
+    \item What makes a vectorized UDF faster than a scalar UDF?
+    \item When do you choose a UDTF over a scalar UDF?
+    \item Why can a SQL UDF beat a Python UDF?
+    \item What serialization carries batches into Python UDFs?
+    \item Where do Python UDF package dependencies come from?
+\end{itemize}}
 
 \subsection*{Week 15: Stored Procedures in Python \& Anaconda Packages}
+\par\noindent\textbf{Outcomes:} distinguish stored procedures from UDFs, write Python stored procedures with Snowpark, use third-party Anaconda packages, choose owner's- vs.\ caller's-rights execution.
 \begin{itemize}[label=-]
     \dayitem{Monday}{UDFs vs. Stored Procedures (Data transformation vs. Administrative orchestration).}
     \dayitem{Tuesday}{Writing Python Stored Procedures using \texttt{snowflake-snowpark-python}.}
@@ -213,25 +756,109 @@
     \dayitem{Thursday}{\project{Build a Python Stored Procedure that accepts a table name as input, uses \texttt{scikit-learn} to train a linear regression model on the data, and writes prediction results back to a target table.}}
     \dayitem{Friday}{\usecase{Design an automated ML feature engineering pipeline running entirely inside Snowflake, eliminating the need to export training data to external compute clusters.}}
 \end{itemize}
+\resources{Stored Procedures in Python (\url{https://docs.snowflake.com/en/developer-guide/stored-procedure/stored-procedures-python}); Data Engineering Zoomcamp (\url{https://github.com/DataTalksClub/data-engineering-zoomcamp}).}
+\selfcheck{\begin{itemize}[label=-, nosep, leftmargin=4mm]
+    \item How does a stored procedure differ from a UDF?
+    \item Why parameterize a procedure with a table name?
+    \item How do you make scikit-learn available to a Python procedure?
+    \item Owner's-rights vs. caller's-rights procedures: when use each?
+    \item How do procedures fit into a task DAG?
+\end{itemize}}
 
-\subsection*{Week 16: External Functions \& API Integrations}
+\subsection*{Week 16: External Functions, API Integrations \& Reverse ETL}
+\par\noindent\textbf{Outcomes:} build External Functions through API integrations, batch and cache API calls to control cost, sync changed segments to a CRM via reverse ETL, weigh managed tools against building in-house.
 \begin{itemize}[label=-]
     \dayitem{Monday}{External Functions Architecture: API Integrations + AWS API Gateway / Azure API Management.}
-    \dayitem{Tuesday}{Invoking external REST APIs safely from Snowflake SQL queries.}
-    \dayitem{Wednesday}{Handling API rate limits, batching, and authentication headers.}
-    \dayitem{Thursday}{\project{Configure an External Function that calls an AWS Lambda endpoint to geocode addresses stored in a Snowflake table in real-time.}}
+    \dayitem{Tuesday}{Invoking external REST APIs safely from Snowflake SQL queries; handling API rate limits, batching, and authentication headers.}
+    \dayitem{Wednesday}{Reverse ETL: pushing curated Gold segments back into operational systems (CRM, marketing, support tools) using scheduled Tasks + External Functions calling the CRM/marketing REST API; identity resolution across systems (matching warehouse keys to CRM contact IDs); sync-frequency trade-offs (freshness vs. credits + API quota); managed alternatives such as Census and Hightouch and when to buy instead of build.}
+    \dayitem{Thursday}{\project{Configure an External Function that calls an AWS Lambda endpoint to geocode addresses stored in a Snowflake table in real-time. Reverse-ETL extension: build a Gold \texttt{customer\_segments} table, then a scheduled Task that calls a mock CRM upsert API via an External Function to sync only members whose segment changed since the last run.}}
     \dayitem{Friday}{\usecase{Architect a real-time address verification and currency conversion pipeline integrating third-party SaaS APIs with Snowflake Data Engineering workflows.}}
 \end{itemize}
+\prodnote{External Functions are synchronous and billed per call --- batch rows per invocation, enforce API rate limits at the gateway (API Gateway throttling), use an API Integration with a least-privilege IAM role, and cache lookups in a results table so repeat calls for identical keys never re-hit the paid endpoint.}
+\resources{External Functions docs (\url{https://docs.snowflake.com/en/sql-reference/external-functions-introduction}); Census Reverse ETL docs (\url{https://docs.getcensus.com/}).}
+\selfcheck{\begin{itemize}[label=-, nosep, leftmargin=4mm]
+    \item Which two objects does an External Function need to reach an API?
+    \item Why batch multiple rows per External Function call?
+    \item How do you avoid re-paying for repeated identical lookups?
+    \item What is reverse ETL, and which Snowflake objects drive it natively?
+    \item What trade-off does higher sync frequency impose on reverse ETL?
+\end{itemize}}
 
 \capstone{Milestone 4}{End-to-End Snowpark Python Engineering Pipeline. Build a complete Python-driven data pipeline. Use Snowpark Python to read staging tables, execute vectorized Pandas UDFs for text enrichment, trigger an External Function to validate postal addresses via external APIs, and wrap the entire process in a Snowpark Stored Procedure.}
+\rubric{
+\begin{itemize}[label=-, leftmargin=4mm, nosep]
+    \item Stored procedure runs end-to-end from a clean environment following the repo README.
+    \item Architecture diagram committed (client, Snowpark pushdown, External Function path).
+    \item At least 3 automated tests on UDF outputs (unit + in-database) with a failing-case demonstration.
+    \item Monitoring evidence: query history export proving pushdown and UDF execution metrics.
+    \item Monthly cost estimate (warehouse credits + External Function calls) with 2 optimization decisions.
+    \item Security review: key-pair auth, API Integration least privilege, no secrets in code.
+\end{itemize}
+}
+\subsection*{Milestone 4 Capstone: Reference Solution Sketch}
+\begin{itemize}[label=-, nosep]
+    \item \textbf{Architecture:} Snowpark client with key-pair auth pushing DataFrame SQL down to Snowflake compute; a vectorized Pandas UDF for review sentiment; a Python stored procedure orchestrating the pipeline; an External Function via API Gateway + Lambda for address validation with a results cache; a scheduled task reverse-ETLing changed segments to the CRM --- chosen to keep all data in-platform and pay only for batched API calls.
+    \item \textbf{Steps:} (1) create the session from environment variables; (2) build transformations and verify pushdown with \texttt{explain()}; (3) register the vectorized UDF on a stage; (4) wrap the flow in a procedure with \texttt{PACKAGES}; (5) create the API integration and External Function; (6) cache geocode results keyed by address hash; (7) schedule the change-only reverse-ETL task.
+    \item \textbf{Hardest part --- the vectorized sentiment UDF:}
+\end{itemize}
+\begin{lstlisting}[language=Python, caption={Vectorized Pandas UDF for sentiment}]
+from snowflake.snowpark.functions import pandas_udf
+import pandas as pd
+
+@pandas_udf(name="sentiment_score", is_permanent=True,
+            stage_location="@udf_stage", replace=True,
+            session=session)
+def sentiment_score(s: pd.Series) -> pd.Series:
+    return (s.str.count(r"(?i)great|love|excellent")
+           - s.str.count(r"(?i)bad|terrible|poor"))
+\end{lstlisting}
+\begin{itemize}[label=-, nosep]
+    \item \textbf{Pitfall:} \texttt{collect()} on large frames exhausts client memory --- write with \texttt{save\_as\_table}.
+    \item \textbf{Pitfall:} one row per External Function call explodes the API bill; batch and cache.
+    \item \textbf{Pitfall:} unpinned package versions break against the Anaconda channel at deploy time.
+\end{itemize}
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}[node distance=5mm and 8mm, font=\small]
+    \node[draw, rounded corners, fill=blue!10, align=center] (client) {Python Client\\(Snowpark Session)};
+    \node[draw, rounded corners, fill=green!10, align=center, right=of client] (spark) {Snowpark API\\(lazy DataFrames)};
+    \node[draw, rounded corners, fill=violet!10, align=center, right=of spark] (compute) {Snowflake Compute\\(SQL pushdown)};
+    \node[draw, rounded corners, fill=orange!10, align=center, below=of compute] (udf) {Vectorized UDFs\\+ Stored Procs};
+    \node[draw, rounded corners, fill=yellow!20, align=center, below=of client] (extfn) {External Function\\(API Integration)};
+    \node[draw, rounded corners, fill=gray!15, align=center, below=of spark] (gw) {AWS API Gateway\\$\rightarrow$ Lambda};
+    \draw[-{Stealth}] (client) -- (spark);
+    \draw[-{Stealth}] (spark) -- (compute);
+    \draw[-{Stealth}] (compute) -- (udf);
+    \draw[-{Stealth}] (compute) -| (extfn.east);
+    \draw[-{Stealth}] (extfn) -- (gw);
+    \draw[-{Stealth}, dashed] (gw) -| node[right, font=\scriptsize]{results} (compute.south east);
+\end{tikzpicture}
+\caption{Milestone 4 reference architecture: Snowpark client pushdown plus External Functions via API Gateway.}
+\end{figure}
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}[node distance=4mm and 9mm, font=\scriptsize,
+    entity/.style={draw, rounded corners, align=left, fill=orange!12, inner sep=1.6mm}]
+    \node[entity] (cust) {\textbf{CUSTOMERS}\\customer\_id PK\\name\\address};
+    \node[entity, right=of cust] (rev) {\textbf{REVIEWS}\\review\_id PK\\customer\_id FK\\review\_text\\sentiment\_score};
+    \node[entity, below=6mm of cust] (addr) {\textbf{ADDRESS\_VALIDATIONS}\\customer\_id FK\\validated\_addr\\geocode\\is\_valid};
+    \node[entity, below=6mm of rev] (seg) {\textbf{CUSTOMER\_SEGMENTS}\\customer\_id FK\\segment\\synced\_ts};
+    \draw[-{Stealth}] (cust) -- node[above]{1:N} (rev);
+    \draw[-{Stealth}] (cust) -- node[right]{1:N} (addr);
+    \draw[-{Stealth}] (rev) -- node[right]{N:1 agg} (seg);
+\end{tikzpicture}
+\caption{Capstone data model: Snowpark enrichment and reverse-ETL segments.}
+\end{figure}
 
 % ==========================================
 % MILESTONE 5
 % ==========================================
 \section{Milestone 5: Security, Governance, Data Sharing \& Clean Rooms (Month 5)}
 \textit{Objective: Master RBAC, Column/Row level security, Data Sharing, and Snowflake Clean Rooms.}
+\par\noindent\textbf{Learning outcomes:} design functional/access role hierarchies, enforce tag-based masking and row access policies, publish secure shares and Reader Accounts, build privacy-preserving clean rooms, audit access with ACCOUNT\_USAGE views.
 
 \subsection*{Week 17: Role-Based Access Control (RBAC) Deep Dive}
+\par\noindent\textbf{Outcomes:} design functional/access role hierarchies, grant privileges only through roles, audit access with \texttt{ACCOUNT\_USAGE} views, separate administrative duties across system roles.
 \begin{itemize}[label=-]
     \dayitem{Monday}{System-defined roles (\texttt{ACCOUNTADMIN}, \texttt{SECURITYADMIN}, \texttt{SYSADMIN}, \texttt{USERADMIN}) and best practices.}
     \dayitem{Tuesday}{Custom Role Hierarchies: Functional Roles vs. Access Roles.}
@@ -239,17 +866,40 @@
     \dayitem{Thursday}{\project{Design and execute a production RBAC schema: Create Access Roles for \texttt{READ\_GOLD} and \texttt{WRITE\_SILVER}, assign them to Functional Roles (\texttt{ANALYST}, \texttt{ENGINEER}), and grant to Users.}}
     \dayitem{Friday}{\usecase{Architect an enterprise security hierarchy for 500 users across 10 business units, strictly enforcing least-privilege access and separating administrative duties.}}
 \end{itemize}
+\prodnote{Least-privilege hygiene: never grant business work directly to \texttt{ACCOUNTADMIN}; enforce MFA on all human users, grant privileges only to access roles (never directly to users), and audit grants weekly via \texttt{SNOWFLAKE.ACCOUNT\_USAGE.GRANTS\_TO\_ROLES} and \texttt{LOGIN\_HISTORY}.}
+\resources{Access Control Overview (\url{https://docs.snowflake.com/en/user-guide/security-access-control-overview}); Data Engineer Handbook (\url{https://github.com/DataExpert-io/data-engineer-handbook}).}
+\selfcheck{\begin{itemize}[label=-, nosep, leftmargin=4mm]
+    \item Which system role must never run daily business workloads?
+    \item Access roles vs. functional roles: what is the difference?
+    \item Why grant privileges to roles and never directly to users?
+    \item What do secondary roles change in a session?
+    \item Which \texttt{ACCOUNT\_USAGE} views audit who can access a table?
+\end{itemize}}
 
 \subsection*{Week 18: Column \& Row Level Security, Data Tagging}
+\par\noindent\textbf{Outcomes:} classify PII with object tags, enforce tag-based masking and row access policies, propagate GDPR erasure across schemas, clones, streams, and shares via crypto-shredding, handle legal holds with retention policies.
 \begin{itemize}[label=-]
     \dayitem{Monday}{Object Tagging: Assigning metadata tags to databases, schemas, tables, and columns.}
     \dayitem{Tuesday}{Dynamic Data Masking Policies: Obfuscating PII data based on user roles.}
-    \dayitem{Wednesday}{Row Access Policies: Restricting row-level visibility based on user context (\texttt{CURRENT\_ROLE()}).}
+    \dayitem{Wednesday}{Row Access Policies: Restricting row-level visibility based on user context (\texttt{CURRENT\_ROLE()}). GDPR right-to-erasure propagation: a deletion request must reach every copy --- raw landing tables, curated Silver/Gold schemas, Snowpipe Streaming channel buffers (within their retention window), Streams (pending CDC offsets replay deletes downstream), zero-copy clones (clones share micro-partitions with the source, so erase in the source then recreate or swap clones), and Reader Accounts / data shares (secure views must filter erased subjects). Crypto-shredding pattern: encrypt PII per data subject with keys held in an external KMS reached via External Functions (or customer-managed keys with Tri-Secret Secure); destroying the subject's key renders every copy --- including backups and Fail-safe --- unreadable, versus row-level deletes that require downstream replay. Legal hold: exempt held subjects via a hold table checked by the erasure task, with extended \texttt{DATA\_RETENTION\_TIME\_IN\_DAYS} documented as the audit-trail exception.}
     \dayitem{Thursday}{\project{Create a Tag-Based Masking Policy that automatically masks SSN columns for non-HR roles. Build a Row Access Policy restricting sales reps to seeing only their region's rows.}}
     \dayitem{Friday}{\usecase{Design a HIPAA/GDPR compliance framework in Snowflake that automatically classifies sensitive PII data and enforces dynamic masking across all analytical schemas.}}
 \end{itemize}
+\prodnote{Masking policies must be tested against every consuming role (including \texttt{ACCOUNTADMIN} simulations); combine tag-based masking with \texttt{OBJECT\_TAGGING} lineage reports, and remember masking does not protect against inference via aggregate queries --- add Row Access Policies for full coverage.}
+\prodnote{Why naive \texttt{DELETE} is insufficient for GDPR erasure: deleted rows remain queryable via Time Travel for the retention window (up to 90 days) and restorable from Fail-safe for 7 more days (see the Week 4 recovery-boundaries note), and they persist in clones created before the delete, in unconsumed Stream offsets, in Snowpipe Streaming buffers, and in reader-account views. Either set \texttt{DATA\_RETENTION\_TIME\_IN\_DAYS = 0} on PII schemas and wait out Fail-safe, or prefer crypto-shredding so all historical and copied bytes become unreadable the moment the subject's key is destroyed.}
+\resources{Column-level Security docs (\url{https://docs.snowflake.com/en/user-guide/security-column-intro}); Row-level Security docs (\url{https://docs.snowflake.com/en/user-guide/security-row-intro}).}
+\selfcheck{\begin{itemize}[label=-, nosep, leftmargin=4mm]
+    \item What session context does a masking policy evaluate?
+    \item How does tag-based masking scale across hundreds of columns?
+    \item What do row access policies typically filter on?
+    \item Why doesn't masking protect against aggregate inference?
+    \item How do you test a masking policy before rollout?
+    \item Why does a plain \texttt{DELETE} not satisfy a GDPR erasure request?
+    \item How does crypto-shredding erase data held in clones and Fail-safe?
+\end{itemize}}
 
 \subsection*{Week 19: Snowflake Data Sharing \& Marketplace}
+\par\noindent\textbf{Outcomes:} create secure shares and reader accounts, publish and consume Marketplace listings, expose secure views instead of base tables, verify zero-copy consumer access.
 \begin{itemize}[label=-]
     \dayitem{Monday}{Snowflake Secure Data Sharing Architecture (Zero-copy live data access without ETL).}
     \dayitem{Tuesday}{Direct Shares vs. Reader Accounts (sharing data with non-Snowflake customers).}
@@ -257,8 +907,17 @@
     \dayitem{Thursday}{\project{Create a Secure Share, add secure views to the share, grant access to a simulated consumer account, and verify zero data copying.}}
     \dayitem{Friday}{\usecase{Architect a B2B data distribution platform for a financial data provider, serving live stock market feeds to 100 enterprise clients using Reader Accounts.}}
 \end{itemize}
+\resources{Secure Data Sharing docs (\url{https://docs.snowflake.com/en/user-guide/data-sharing-intro}); Snowflake Marketplace docs (\url{https://docs.snowflake.com/en/user-guide/data-marketplace-intro}).}
+\selfcheck{\begin{itemize}[label=-, nosep, leftmargin=4mm]
+    \item Why is secure data sharing called zero-copy?
+    \item When do you need a Reader Account?
+    \item Which object types can be added to a share?
+    \item Why share secure views instead of base tables?
+    \item How does a Marketplace listing differ from a direct share?
+\end{itemize}}
 
 \subsection*{Week 20: Snowflake Data Clean Rooms \& Native Apps}
+\par\noindent\textbf{Outcomes:} explain clean-room and differential-privacy mechanics, build a two-party overlap analysis on hashed identifiers, enforce minimum cohort sizes, describe the Native App framework.
 \begin{itemize}[label=-]
     \dayitem{Monday}{Data Clean Room concepts: Multi-party privacy-preserving analytics without raw data exposure.}
     \dayitem{Tuesday}{Differential Privacy and cryptographic hashing in Clean Rooms.}
@@ -266,8 +925,79 @@
     \dayitem{Thursday}{\project{Build a two-party Data Clean Room scenario: Allow an advertiser and a publisher to intersect customer lists and compute overlap metrics without exposing email addresses.}}
     \dayitem{Friday}{\usecase{Design a healthcare research Data Clean Room allowing hospital networks and pharmaceutical companies to run joint ML studies without sharing raw patient records.}}
 \end{itemize}
+\resources{Snowflake Data Clean Rooms docs (\url{https://docs.snowflake.com/en/user-guide/cleanrooms-intro}); Native App Framework docs (\url{https://docs.snowflake.com/en/developer-guide/native-apps/native-apps-about}).}
+\selfcheck{\begin{itemize}[label=-, nosep, leftmargin=4mm]
+    \item What problem does a data clean room solve?
+    \item Why hash emails before an overlap analysis?
+    \item What does differential privacy add to query results?
+    \item What can a Snowflake Native App ship to consumers?
+    \item Why must clean-room analyses enforce minimum group sizes?
+\end{itemize}}
 
 \capstone{Milestone 5}{Governed Multi-Tenant Data Platform \& Secure Share. Build a production security perimeter. Implement an Access/Functional RBAC role hierarchy, create Tag-Based Dynamic Data Masking for PII, enforce Row Access Policies for regional multi-tenancy, and build a Secure Data Share to expose anonymized aggregated Gold datasets to external Reader Accounts.}
+\rubric{
+\begin{itemize}[label=-, leftmargin=4mm, nosep]
+    \item Full governance stack deploys from a clean environment following the repo README.
+    \item Architecture diagram committed (role hierarchy, policies, share topology).
+    \item At least 3 automated policy tests (masking as unauthorized role, row policy bypass attempt, share content validation) with failing-case demonstrations.
+    \item Monitoring evidence: access audit query against ACCOUNT\_USAGE exported.
+    \item Monthly cost estimate (Reader Accounts, SOS, governance features) with 2 optimization decisions.
+    \item Security review: MFA enforced, separation of duties documented, PII classification report attached.
+\end{itemize}
+}
+\subsection*{Milestone 5 Capstone: Reference Solution Sketch}
+\begin{itemize}[label=-, nosep]
+    \item \textbf{Architecture:} access roles (\texttt{READ\_GOLD}, \texttt{WRITE\_SILVER}) rolled up under functional roles (\texttt{ANALYST}, \texttt{ENGINEER}); \texttt{pii\_*} tags driving tag-based masking; row access policies per region for multi-tenancy; aggregated Gold secure views exposed through a secure share to Reader Accounts; per-subject encryption keys in an external KMS enabling crypto-shredding erasure --- chosen so governance follows the data everywhere, including shares and clones.
+    \item \textbf{Steps:} (1) DDL the role hierarchy and grants; (2) tag PII columns; (3) attach the masking policy to the tag; (4) attach the row access policy; (5) publish secure views via a share and a reader account; (6) write the erasure procedure that destroys the subject's KMS key after checking the legal-hold table; (7) audit with \texttt{ACCESS\_HISTORY} and \texttt{GRANTS\_TO\_ROLES}.
+    \item \textbf{Hardest part --- tag-based masking policy:}
+\end{itemize}
+\begin{lstlisting}[language=SQL, caption={Tag-based dynamic masking policy}]
+CREATE OR REPLACE MASKING POLICY pii_mask AS
+  (val STRING) RETURNS STRING ->
+  CASE WHEN IS_ROLE_IN_SESSION('HR_ROLE') THEN val
+       ELSE '***MASKED***' END;
+
+ALTER TAG pii_email SET MASKING POLICY pii_mask;
+-- every column tagged pii_email is now masked by role
+\end{lstlisting}
+\begin{itemize}[label=-, nosep]
+    \item \textbf{Pitfall:} sharing base tables instead of secure views leaks unmasked columns.
+    \item \textbf{Pitfall:} testing masking only as an admin role hides policy gaps --- test as each consumer role.
+    \item \textbf{Pitfall:} deleting rows but leaving clones, Time Travel, and Fail-safe readable (see Week 18).
+\end{itemize}
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}[node distance=5mm and 8mm, font=\small]
+    \node[draw, rounded corners, fill=blue!10, align=center] (gold) {Gold Datasets\\(aggregated)};
+    \node[draw, rounded corners, fill=orange!10, align=center, below=of gold] (tag) {Tag-Based Masking\\+ Row Access Policies};
+    \node[draw, rounded corners, fill=green!10, align=center, below=of tag] (share) {Secure Data Share\\(zero-copy)};
+    \node[draw, rounded corners, fill=violet!10, align=center, right=of tag] (rbac) {RBAC Hierarchy\\(Access $\rightarrow$ Functional Roles)};
+    \node[draw, rounded corners, fill=gray!15, align=center, right=of share] (reader) {Reader Accounts\\(external consumers)};
+    \node[draw, rounded corners, fill=yellow!20, align=center, right=of gold] (cr) {Data Clean Room\\(privacy-preserving joins)};
+    \draw[-{Stealth}] (gold) -- (tag);
+    \draw[-{Stealth}] (tag) -- (share);
+    \draw[-{Stealth}] (share) -- (reader);
+    \draw[-{Stealth}] (rbac) -- (tag);
+    \draw[-{Stealth}] (gold) -- (cr);
+    \draw[-{Stealth}, dashed] (cr) |- (share);
+\end{tikzpicture}
+\caption{Milestone 5 reference architecture: governance and secure sharing perimeter.}
+\end{figure}
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}[node distance=4mm and 9mm, font=\scriptsize,
+    entity/.style={draw, rounded corners, align=left, fill=violet!10, inner sep=1.6mm}]
+    \node[entity] (users) {\textbf{USERS}\\user\_id PK\\role FK\\region FK};
+    \node[entity, right=of users] (roles) {\textbf{ROLES}\\role\_id PK\\role\_name\\parent\_role FK};
+    \node[entity, below=6mm of users] (sales) {\textbf{SALES}\\sale\_id PK\\region FK\\amount\\sale\_ts};
+    \node[entity, below=6mm of roles] (regs) {\textbf{REGIONS}\\region\_id PK\\region\_name\\tenant\_id};
+    \draw[-{Stealth}] (users) -- node[above]{N:1} (roles);
+    \draw[-{Stealth}] (users) -- node[right]{1:N} (sales);
+    \draw[-{Stealth}] (sales) -- node[above]{N:1} (regs);
+    \draw[-{Stealth}] (roles) edge[loop above] node{hierarchy} ();
+\end{tikzpicture}
+\caption{Capstone data model: multi-tenant governed sales platform.}
+\end{figure}
 
 \newpage
 % ==========================================
@@ -275,8 +1005,10 @@
 % ==========================================
 \section{Milestone 6: Cortex AI, Unistore, DataOps \& Certification (Month 6)}
 \textit{Objective: Master Cortex AI, Hybrid Tables, Terraform/dbt DataOps workflows, and SnowPro certification.}
+\par\noindent\textbf{Learning outcomes:} provision infrastructure with Terraform, automate migrations with schemachange, test models with dbt and DMFs, build cost observability with Resource Monitors and Alerts, assemble RAG pipelines with Cortex AI.
 
 \subsection*{Week 21: Unistore \& Hybrid Tables (Hybrid OLTP + OLAP)}
+\par\noindent\textbf{Outcomes:} create hybrid tables with enforced constraints, run millisecond point reads and writes, join OLTP and OLAP data without CDC, decide when Unistore fits a workload.
 \begin{itemize}[label=-]
     \dayitem{Monday}{Unistore Architecture: Combining transactional (OLTP) and analytical (OLAP) workloads.}
     \dayitem{Tuesday}{Hybrid Tables: Primary Keys, Foreign Keys, Unique Constraints, and Indexes.}
@@ -284,8 +1016,17 @@
     \dayitem{Thursday}{\project{Create a Hybrid Table with Primary Key constraints and secondary indexes. Execute high-frequency single-row \texttt{INSERT} and \texttt{UPDATE} queries, then join it directly with an OLAP analytical table.}}
     \dayitem{Friday}{\usecase{Architect an e-commerce order management system where real-time order writes hit Hybrid Tables and are immediately available for analytical dashboards without CDC delays.}}
 \end{itemize}
+\resources{Hybrid Tables (Unistore) docs (\url{https://docs.snowflake.com/en/user-guide/tables-hybrid}); Data Engineer Handbook (\url{https://github.com/DataExpert-io/data-engineer-handbook}).}
+\selfcheck{\begin{itemize}[label=-, nosep, leftmargin=4mm]
+    \item What workload are Hybrid Tables designed for?
+    \item Which constraints do Hybrid Tables enforce that standard tables do not?
+    \item Why are point lookups fast on Hybrid Tables?
+    \item What is Unistore's core idea?
+    \item When should you still choose a standard columnar table?
+\end{itemize}}
 
 \subsection*{Week 22: Snowflake Cortex AI \& Vector Search}
+\par\noindent\textbf{Outcomes:} call Cortex serverless LLM functions from SQL, generate embeddings with \texttt{CORTEX.EMBED\_TEXT\_768}, build a vector-search RAG pipeline, monitor Cortex token spend.
 \begin{itemize}[label=-]
     \dayitem{Monday}{Snowflake Cortex AI: Serverless LLM functions (\texttt{CORTEX.COMPLETE}, \texttt{CORTEX.EXTRACT\_ANSWER}).}
     \dayitem{Tuesday}{\texttt{CORTEX.EMBED\_TEXT\_768} and generating vector embeddings natively inside SQL.}
@@ -293,17 +1034,68 @@
     \dayitem{Thursday}{\project{Build a native RAG pipeline inside Snowflake: Extract text from PDFs using \texttt{PARSE\_DOCUMENT}, generate vector embeddings with Cortex AI, store them in a Vector column, and search using vector distance functions.}}
     \dayitem{Friday}{\usecase{Design an enterprise document intelligence pipeline that automatically parses incoming PDF invoices, extracts line items via Cortex AI, and indexes them for vector search.}}
 \end{itemize}
+\prodnote{Cortex AI is billed per token/row processed --- gate LLM functions behind warehouse-level Resource Monitors, pre-filter rows before \texttt{CORTEX.COMPLETE} calls, and log invocation volume via \texttt{SNOWFLAKE.ACCOUNT\_USAGE.CORTEX\_FUNCTIONS\_USAGE\_HISTORY} to catch runaway spend.}
+\resources{Snowflake Cortex docs (\url{https://docs.snowflake.com/en/user-guide/snowflake-cortex/overview}).}
+\selfcheck{\begin{itemize}[label=-, nosep, leftmargin=4mm]
+    \item Name two Cortex serverless LLM functions.
+    \item What does \texttt{CORTEX.EMBED\_TEXT\_768} produce?
+    \item How do you find similar documents using a Vector column?
+    \item How is Cortex AI billed, and how do you cap its spend?
+    \item What does \texttt{PARSE\_DOCUMENT} extract from PDFs?
+\end{itemize}}
 
-\subsection*{Week 23: Production DataOps (dbt, Terraform \& Schemachange)}
+\subsection*{Week 23: Production DataOps \& Observability (dbt, Terraform, Schemachange \& Snowflake Alerts)}
+\par\noindent\textbf{Outcomes:} provision objects with Terraform, enforce dbt tests and DMFs, run backward-compatible schemachange migrations, apply expand-contract for zero-downtime schema evolution, build cost-anomaly alerts.
 \begin{itemize}[label=-]
-    \dayitem{Monday}{Managing Snowflake infrastructure as code using Terraform.}
-    \dayitem{Tuesday}{Database Migration Management with \texttt{schemachange} / Flyway.}
-    \dayitem{Wednesday}{Integrating Snowflake with dbt (data build tool): Models, tests, and documentation.}
-    \dayitem{Thursday}{\project{Set up a GitHub repository with dbt and \texttt{schemachange}. Build a CI/CD pipeline using GitHub Actions that automatically deploys Snowflake table changes and runs dbt models on pull requests.}}
+    \dayitem{Monday}{Managing Snowflake infrastructure as code using Terraform; Snowflake Resource Monitors: credit quotas with notify-at / suspend-immediately triggers.}
+    \dayitem{Tuesday}{dbt models and data-quality testing: generic tests (\texttt{unique}, \texttt{not\_null}, \texttt{accepted\_values}, \texttt{relationships}) and singular tests; Snowflake Data Metric Functions (DMFs) for freshness, volume, and null-count monitoring.}
+    \dayitem{Wednesday}{Database Migration Management with \texttt{schemachange} / Flyway; Snowflake Alerts (scheduled condition $\rightarrow$ notification); cost-anomaly detection queries against \texttt{SNOWFLAKE.ACCOUNT\_USAGE} (\texttt{WAREHOUSE\_METERING\_HISTORY}, \texttt{QUERY\_HISTORY}). Zero-downtime schema evolution with the expand $\rightarrow$ migrate $\rightarrow$ contract pattern: add the new nullable column in one release, dual-write and backfill it, switch reads to it, then drop the old column in a later release; keep backward-compatible view shims (\texttt{CREATE OR REPLACE VIEW} aliasing old column names onto new ones) so dashboards and consumers keep working mid-migration; coordinate ordering across schemachange versioned scripts and dbt deployments (\texttt{on\_schema\_change} on incremental models --- \texttt{append\_new\_columns} for expand, \texttt{sync\_all\_columns} only after consumers migrate --- plus CI gates that fail the contract step while any dbt model or BI extract still references the old column).}
+    \dayitem{Thursday}{\project{Set up a GitHub repository with dbt and \texttt{schemachange}. Build a CI/CD pipeline using GitHub Actions that automatically deploys Snowflake table changes and runs dbt models on pull requests. Observability extension: create a Resource Monitor with 75\%-notify / 100\%-suspend triggers, define a Snowflake Alert that fires when daily credits deviate 2$\times$ from the trailing 7-day average in \texttt{WAREHOUSE\_METERING\_HISTORY}, and wire it to a Notification Integration.}}
+\begin{lstlisting}[language=SQL, caption={dbt model + schema.yml tests block}]
+-- models/marts/fct_orders.sql
+{{ config(materialized='incremental', unique_key='order_id') }}
+SELECT order_id, customer_id, order_ts, order_total, status
+FROM {{ ref('stg_orders') }}
+{% if is_incremental() %}
+WHERE order_ts > (SELECT MAX(order_ts) FROM {{ this }})
+{% endif %}
+
+-- models/marts/schema.yml
+-- version: 2
+-- models:
+--   - name: fct_orders
+--     tests:
+--       - dbt_utils.unique_combination_of_columns:
+--           combination_of_columns: [order_id]
+--     columns:
+--       - name: order_id
+--         tests: [unique, not_null]
+--       - name: status
+--         tests:
+--           - accepted_values:
+--               values: ['NEW', 'COMPLETE', 'CANCELLED']
+--       - name: customer_id
+--         tests:
+--           - relationships:
+--               to: ref('dim_customers')
+--               field: customer_id
+\end{lstlisting}
     \dayitem{Friday}{\usecase{Architect a multi-environment (Dev, QA, Prod) DataOps deployment framework ensuring automated testing, zero-downtime schema migrations, and Git-driven approval workflows.}}
 \end{itemize}
+\prodnote{Schedule DMF evaluation per table via \texttt{ALTER TABLE ... SET DATA\_METRIC\_SCHEDULE = '60 MINUTE'} and alert on threshold breaches by querying \texttt{SNOWFLAKE.LOCAL.DATA\_METRIC\_FUNCTION\_RESULTS}; wire Snowflake Alerts to Slack/email through a Notification Integration (\texttt{TYPE = QUEUE} with SNS, or \texttt{TYPE = EMAIL}) so credit anomalies and data-metric breaches page the on-call engineer instead of hiding in Snowsight.}
+\prodnote{Failure story --- deploy order broke a dashboard: a schemachange script dropped \texttt{order\_total} in the same release that dbt introduced \texttt{order\_total\_v2}; the contract step ran before dbt rebuilt the shim view, so the executive revenue dashboard errored for 40 minutes. Rule: expand and contract in separate releases, keep the compatibility view until every consumer migrates, and gate the contract migration on a CI check proving no dbt model or BI extract still references the old column.}
+\resources{dbt Core (\url{https://github.com/dbt-labs/dbt-core}); Snowflake Alerts \& Notifications docs (\url{https://docs.snowflake.com/en/user-guide/alerts}).}
+\selfcheck{\begin{itemize}[label=-, nosep, leftmargin=4mm]
+    \item Why manage Snowflake objects with Terraform instead of UI clicks?
+    \item Which four dbt generic tests should every model carry?
+    \item What does a Data Metric Function monitor?
+    \item How does schemachange apply migrations safely?
+    \item Which query detects a warehouse cost anomaly?
+    \item Walk through the expand-contract sequence for renaming a column.
+\end{itemize}}
 
 \subsection*{Week 24: SnowPro Advanced Data Engineer Exam Preparation}
+\par\noindent\textbf{Outcomes:} map the SnowPro Advanced exam domains, complete a timed 65-question practice exam, remediate weak areas from missed questions, verify certification readiness.
 \begin{itemize}[label=-]
     \dayitem{Monday}{Reviewing SnowPro Advanced Data Engineer Domain 1: Data Movement (30\%).}
     \dayitem{Tuesday}{Reviewing Domain 2: Performance Tuning (30\%) \& Domain 3: Storage and Protection (20\%).}
@@ -311,8 +1103,373 @@
     \dayitem{Thursday}{\project{Take a full-length 65-question practice exam under timed conditions. Review missed questions, focusing on obscure syntax, clustering depth math, and warehouse scaling edge cases.}}
     \dayitem{Friday}{Final Review and Certification Readiness Verification.}
 \end{itemize}
+\resources{SnowPro Advanced Data Engineer study guide (\url{https://learn.snowflake.com/en/certifications/snowpro-advanced-data-engineer/}); Data Engineering Zoomcamp (\url{https://github.com/DataTalksClub/data-engineering-zoomcamp}).}
+\selfcheck{\begin{itemize}[label=-, nosep, leftmargin=4mm]
+    \item Which SnowPro Advanced domains carry the most weight?
+    \item How does clustering depth relate to pruning efficiency?
+    \item When does the Economy scaling policy delay adding clusters?
+    \item What is a good elimination strategy for scenario questions?
+    \item How should you review a missed practice-exam question?
+\end{itemize}}
 
 \capstone{Milestone 6}{Production-Grade Autonomous Data Mesh Engine. Build an enterprise-ready Data Mesh architecture. Deploy infrastructure via Terraform. Build a Dynamic Table transformation layer managed by dbt and GitHub Actions CI/CD. Integrate Hybrid Tables for transaction processing, implement Cortex AI for LLM text enrichment, lock down the platform with RBAC and Dynamic Data Masking, and execute a dry-run SnowPro practice evaluation.}
+\rubric{
+\begin{itemize}[label=-, leftmargin=4mm, nosep]
+    \item Full Data Mesh deploys from a clean environment via Terraform + GitHub Actions per the README.
+    \item Architecture diagram committed (DataOps flow and Snowflake landing zone).
+    \item At least 3 automated dbt tests plus DMF monitors with a failing-case demonstration in CI.
+    \item Monitoring evidence: Resource Monitor, cost-anomaly Alert, and notification delivery screenshot/config.
+    \item Monthly cost estimate with credit anomaly baselines and 2 optimization decisions documented.
+    \item Security review: Terraform-managed least-privilege roles, masked PII, no secrets in CI variables.
+\end{itemize}
+}
+\subsection*{Milestone 6 Capstone: Reference Solution Sketch}
+\begin{itemize}[label=-, nosep]
+    \item \textbf{Architecture:} Terraform-managed landing zone across Dev/QA/Prod; schemachange versioned migrations; dbt models with tests and DMFs; GitHub Actions CI/CD with an expand-contract gate; resource monitors and cost-anomaly alerts to Slack; hybrid tables for order writes; Cortex AI for text enrichment --- chosen so every change is reviewed, tested, and backward-compatible before Prod.
+    \item \textbf{Steps:} (1) \texttt{terraform apply} per environment; (2) run schemachange in CI against the change-history table; (3) \texttt{dbt build} with generic tests; (4) schedule DMFs and the cost-anomaly alert; (5) demonstrate an expand-contract column rename across two releases with a view shim; (6) run the timed SnowPro mock exam.
+    \item \textbf{Hardest part --- the CI deploy with a contract gate:}
+\end{itemize}
+\begin{lstlisting}[caption={GitHub Actions deploy job (pseudocode)}]
+deploy:
+  steps:
+    - uses: actions/checkout@v4
+    - run: schemachange -f migrations -a $SNOW_ACCOUNT
+    - run: dbt build --target prod
+    - name: Contract gate
+      run: python ci/check_no_old_column_refs.py  # fail if old column referenced
+\end{lstlisting}
+\begin{itemize}[label=-, nosep]
+    \item \textbf{Pitfall:} expand and contract in one release breaks dashboards (see the Week 23 failure story).
+    \item \textbf{Pitfall:} password auth in CI variables instead of key-pair secrets.
+    \item \textbf{Pitfall:} dbt incremental models without \texttt{unique\_key} silently duplicate rows.
+\end{itemize}
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}[node distance=5mm and 7mm, font=\small]
+    \node[draw, rounded corners, fill=gray!15, align=center] (git) {Git Repo\\(dbt + Terraform)};
+    \node[draw, rounded corners, fill=blue!10, align=center, right=of git] (cicd) {GitHub Actions\\CI/CD};
+    \node[draw, rounded corners, fill=orange!10, align=center, right=of cicd] (tf) {Terraform\\(infra)};
+    \node[draw, rounded corners, fill=orange!10, align=center, below=of tf] (schemachange) {schemachange\\(migrations)};
+    \node[draw, rounded corners, fill=orange!10, align=center, below=of cicd] (dbt) {dbt\\(models + tests)};
+    \node[draw, rounded corners, fill=green!10, align=center, right=of schemachange] (sf) {Snowflake\\(Dev/QA/Prod)};
+    \node[draw, rounded corners, fill=violet!10, align=center, below=of dbt] (obs) {Resource Monitors\\+ Alerts $\rightarrow$ Slack};
+    \draw[-{Stealth}] (git) -- (cicd);
+    \draw[-{Stealth}] (cicd) -- (tf);
+    \draw[-{Stealth}] (cicd) -- (dbt);
+    \draw[-{Stealth}] (cicd) -- (schemachange);
+    \draw[-{Stealth}] (tf) -- (sf);
+    \draw[-{Stealth}] (dbt) -- (sf);
+    \draw[-{Stealth}] (schemachange) -- (sf);
+    \draw[-{Stealth}, dashed] (sf) |- (obs);
+\end{tikzpicture}
+\caption{Milestone 6 reference architecture: DataOps pipeline from Git through CI/CD to Snowflake with observability.}
+\end{figure}
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}[node distance=4mm and 9mm, font=\scriptsize,
+    entity/.style={draw, rounded corners, align=left, fill=gray!12, inner sep=1.6mm}]
+    \node[entity] (dom) {\textbf{DOMAINS}\\domain\_id PK\\owner\\data\_contract};
+    \node[entity, right=of dom] (prod) {\textbf{DATA\_PRODUCTS}\\product\_id PK\\domain\_id FK\\gold\_table\\sla\_lag};
+    \node[entity, right=of prod] (ord) {\textbf{ORDERS (Hybrid)}\\order\_id PK\\customer\_id FK\\status\\total};
+    \node[entity, below=6mm of prod] (doc) {\textbf{DOCUMENTS}\\doc\_id PK\\product\_id FK\\parsed\_text\\embedding VECTOR};
+    \draw[-{Stealth}] (dom) -- node[above]{1:N} (prod);
+    \draw[-{Stealth}] (prod) -- node[above]{1:N} (ord);
+    \draw[-{Stealth}] (prod) -- node[right]{1:N} (doc);
+\end{tikzpicture}
+\caption{Capstone data model: autonomous data mesh with hybrid orders and Cortex-indexed documents.}
+\end{figure}
+
+\newpage
+% ==========================================
+% APPENDICES
+% ==========================================
+\section{Appendix A: Glossary}
+\begin{description}[leftmargin=4.2cm, style=nextline]
+    \item[Micro-partition] Immutable, compressed columnar storage unit (50--500MB) that Snowflake automatically organizes and prunes at query time.
+    \item[Virtual Warehouse] Independent MPP compute cluster that executes queries; billed in credits per second while running.
+    \item[Cloud Services Layer] Snowflake's coordination plane handling authentication, optimization, metadata, and access control.
+    \item[Zero-Copy Clone] Metadata-only copy of a database, schema, or table sharing the same underlying micro-partitions.
+    \item[Time Travel] Ability to query, clone, or restore historical table state within the retention window (up to 90 days).
+    \item[Fail-safe] Non-configurable 7-day recovery tier after Time Travel expires, restorable only by Snowflake Support.
+    \item[Storage Integration] Snowflake object storing IAM/cloud credentials so external stages authenticate without hardcoded keys.
+    \item[Snowpipe] Serverless continuous ingestion service loading staged files as they arrive, triggered by cloud event notifications.
+    \item[Stream] CDC object recording row-level inserts, updates, and deletes on a source table with a transactional offset.
+    \item[Task] Scheduled SQL or stored-procedure execution unit; tasks chain into DAGs via \texttt{AFTER} dependencies.
+    \item[Dynamic Table] Declarative table that auto-refreshes from a query within a target lag, building DAGs automatically.
+    \item[Snowpark] Developer API (Python/Java/Scala) that translates DataFrame operations into SQL executed inside Snowflake.
+    \item[Vectorized UDF] Python UDF processing batches of rows as Pandas DataFrames via PyArrow for near-native performance.
+    \item[External Function] User-defined function that invokes a remote REST endpoint through an API Integration and API Gateway.
+    \item[RBAC Hierarchy] Role structure separating access roles (privileges on objects) from functional roles (business duties).
+    \item[Masking Policy] Column-level policy dynamically obfuscating sensitive values based on the querying role's context.
+    \item[Row Access Policy] Policy attached to a table that filters visible rows based on session context such as \texttt{CURRENT\_ROLE()}.
+    \item[Secure Data Share] Zero-copy object granting live, read-only access to selected objects across Snowflake accounts.
+    \item[Reader Account] Provider-managed account letting non-Snowflake consumers query shared data.
+    \item[Data Clean Room] Governed environment for multi-party analytics that computes joins without exposing raw rows.
+    \item[Hybrid Table (Unistore)] Row-store table type with primary keys and indexes for OLTP-style point operations alongside OLAP.
+    \item[Cortex AI] Snowflake's serverless LLM function family (\texttt{COMPLETE}, \texttt{EMBED\_TEXT}, \texttt{EXTRACT\_ANSWER}) usable from SQL.
+    \item[Resource Monitor] Object tracking credit consumption that triggers notify, suspend, or suspend-immediately actions at quotas.
+    \item[Snowflake Alert] Scheduled object evaluating a SQL condition and executing an action (e.g. notification) when true.
+    \item[Data Metric Function (DMF)] Built-in or custom metric (freshness, volume, null count) scheduled on tables for quality monitoring.
+    \item[schemachange] Lightweight Python database-migration tool applying versioned SQL scripts to Snowflake from Git.
+\end{description}
+
+\section{Appendix B: Assessment \& Grading Model}
+Each milestone capstone is scored out of 100 points using the weights below. A passing capstone requires $\geq$70 points with no zero in Security.
+
+\begin{center}
+\renewcommand{\arraystretch}{1.3}
+\begin{tabular}{@{} l c p{7.5cm} @{}}
+\toprule
+\textbf{Dimension} & \textbf{Weight} & \textbf{Evidence} \\
+\midrule
+Correctness & 30\% & Pipeline reproduces from README; outputs match specification. \\
+Reliability \& Tests & 20\% & Automated tests (dbt tests, DMFs, reconciliation) with failing-case demo. \\
+Security & 15\% & Least-privilege roles, no hardcoded secrets, PII handling documented. \\
+Cost Awareness & 15\% & Credit/storage estimate with 2 documented optimization decisions. \\
+Documentation & 10\% & Architecture diagram, runbook, and clear README. \\
+Demo & 10\% & 15-minute walkthrough including failure recovery. \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The final readiness score averages the six capstone scores (70\%) with the two timed mock-exam results from Week 24 (30\%). A readiness score $\geq$80\% indicates strong SnowPro Advanced Data Engineer preparedness.
+
+\section{Appendix C: Interview Preparation}
+\begin{enumerate}
+    \item Explain Snowflake's 3-layer architecture and why storage and compute can scale independently. (Week 1)
+    \item How do you control credit spend on warehouses shared by BI and ETL workloads? (Weeks 2, 23)
+    \item Walk through recovering a table dropped 5 days ago, and 12 days ago. (Week 4)
+    \item Compare Snowpipe, Snowpipe Streaming, and COPY INTO --- when would you choose each? (Week 6)
+    \item Design a CDC pipeline from an OLTP database into Snowflake. How do you handle stream staleness? (Week 7)
+    \item When would you use Dynamic Tables instead of Streams + Tasks? What are the trade-offs? (Weeks 8, 11)
+    \item A query spills to remote storage. How do you diagnose and fix it? (Week 10)
+    \item How does Snowpark achieve pushdown, and when does work happen client-side? (Week 13)
+    \item Design least-privilege access for 500 users with PII columns across 10 business units. (Weeks 17--18)
+    \item Build a CI/CD pipeline deploying Snowflake schema changes and dbt models. How do you add cost-anomaly alerting? (Week 23)
+\end{enumerate}
+
+\newpage
+\section{Appendix D: Self-Check Answer Key}
+
+\noindent\textbf{Week 1:}
+\begin{enumerate}[nosep, leftmargin=6mm]
+    \item Storage (data), compute/warehouses (queries), cloud services (auth, optimizer, metadata).
+    \item Immutability enables Time Travel and zero-copy cloning cheaply.
+    \item Clustering depth and overlap of the table's micro-partitions.
+    \item When reclustering credit cost exceeds query pruning savings.
+    \item Min/max ranges per column, row counts, and distinct-value counts.
+\end{enumerate}
+\noindent\textbf{Week 2:}
+\begin{enumerate}[nosep, leftmargin=6mm]
+    \item Credits double per size step: XS 1, S 2, M 4, L 8, XL 16 per hour.
+    \item Suspend stops billing when idle; resume restarts on the next query.
+    \item Standard adds clusters immediately when queries queue; Economy waits.
+    \item Idle time bills per-second; shorter suspend windows waste fewer credits.
+    \item It is dropped; the resumed warehouse starts with a cold cache.
+\end{enumerate}
+\noindent\textbf{Week 3:}
+\begin{enumerate}[nosep, leftmargin=6mm]
+    \item Permanent/transient persist; temporary are session-scoped; transient/temporary skip Fail-safe.
+    \item When an expensive aggregation is queried repeatedly over slowly changing data.
+    \item Point lookups on high-cardinality columns in very large tables.
+    \item They hide the view definition and underlying objects from consumers.
+    \item Background storage and compute to keep results refreshed.
+\end{enumerate}
+\noindent\textbf{Week 4:}
+\begin{enumerate}[nosep, leftmargin=6mm]
+    \item Timestamp, offset in seconds, or statement query ID.
+    \item Only Snowflake Support, within the 7-day Fail-safe window.
+    \item The clone shares the source's micro-partitions until either side changes.
+    \item Replication copies data cross-region for failover; Time Travel is same-region history.
+    \item Writes create new micro-partitions owned privately by the clone.
+\end{enumerate}
+\noindent\textbf{Week 5:}
+\begin{enumerate}[nosep, leftmargin=6mm]
+    \item User, table, and named stages; external stages for cloud buckets.
+    \item Centralized IAM credentials; rotation without key sprawl.
+    \item Whether errors abort the load, skip the file, or skip rows.
+    \item Parquet: columnar, compressed, splittable, with embedded schema.
+    \item The \texttt{PATTERN} option with a regular expression.
+\end{enumerate}
+\noindent\textbf{Week 6:}
+\begin{enumerate}[nosep, leftmargin=6mm]
+    \item S3 event notifications delivered through the pipe's SQS queue.
+    \item Streaming writes row-sets directly via API with sub-second latency.
+    \item Retried batches re-send the same offset token; Snowflake discards duplicates.
+    \item Queue grows unboundedly, latency climbs, catch-up credits spike; alert on backlog depth.
+    \item Events can redeliver; deduplicate via file metadata or merge keys.
+\end{enumerate}
+\noindent\textbf{Week 7:}
+\begin{enumerate}[nosep, leftmargin=6mm]
+    \item The row pair is an UPDATE captured as delete plus insert.
+    \item The stream offset; it advances only when the consuming transaction commits.
+    \item Re-runs match on the dedup key and apply nothing, so duplicates never land.
+    \item When the query uses untrackable constructs or after base-table DDL.
+    \item Loosen the dimension layer's target lag and re-run the idempotent MERGE.
+\end{enumerate}
+\noindent\textbf{Week 8:}
+\begin{enumerate}[nosep, leftmargin=6mm]
+    \item CRON expressions or a fixed interval in minutes.
+    \item With the \texttt{AFTER} clause naming predecessor task(s).
+    \item Snowflake-managed compute billed per task-execution credits.
+    \item Retries after failure must never double-apply changes.
+    \item Set \texttt{ERROR\_INTEGRATION} to an SNS/queue notification integration.
+\end{enumerate}
+\noindent\textbf{Week 9:}
+\begin{enumerate}[nosep, leftmargin=6mm]
+    \item VARIANT, stored as compressed binary columnar data.
+    \item Explicit casts make downstream types stable and validation possible.
+    \item It pivots nested array elements into one row per element.
+    \item They reject loads whose extracted values violate declared rules.
+    \item The producer owns it; consumers review and version changes jointly.
+\end{enumerate}
+\noindent\textbf{Week 10:}
+\begin{enumerate}[nosep, leftmargin=6mm]
+    \item Partitions scanned high relative to partitions total in the scan node.
+    \item Upsize the warehouse or reduce the query's memory footprint.
+    \item Add the missing join predicate and qualify ambiguous keys.
+    \item When remote spill dominates and the SQL is already lean.
+    \item It scans every column, defeating columnar pruning.
+\end{enumerate}
+\noindent\textbf{Week 11:}
+\begin{enumerate}[nosep, leftmargin=6mm]
+    \item Maximum staleness of the table relative to its sources.
+    \item After unsupported changes, e.g., schema changes or non-incremental SQL.
+    \item Dynamic tables run arbitrary SQL in DAGs; MVs are single-query, auto-maintained.
+    \item So upstream data is fresh before the downstream refresh starts.
+    \item \texttt{INFORMATION\_SCHEMA.DYNAMIC\_TABLE\_REFRESH\_HISTORY}.
+\end{enumerate}
+\noindent\textbf{Week 12:}
+\begin{enumerate}[nosep, leftmargin=6mm]
+    \item Window function results, e.g., \texttt{ROW\_NUMBER() = 1} per partition.
+    \item It defines what one row means, preventing double-counting.
+    \item Transaction, periodic snapshot, and accumulating snapshot.
+    \item Rarely; denormalized stars exploit pruning and avoid join fan-out.
+    \item A new versioned row is inserted; the old row is end-dated.
+\end{enumerate}
+\noindent\textbf{Week 13:}
+\begin{enumerate}[nosep, leftmargin=6mm]
+    \item Operations build a plan; nothing executes until an action runs.
+    \item \texttt{df.explain()} shows a single SQL statement against Snowflake.
+    \item On large results it pulls all rows into client memory.
+    \item Version mismatches cause UDF/procedure serialization errors.
+    \item Key-pair auth with the private key held in a secret store.
+\end{enumerate}
+\noindent\textbf{Week 14:}
+\begin{enumerate}[nosep, leftmargin=6mm]
+    \item It processes batches as Pandas DataFrames, amortizing call overhead.
+    \item When each input row must produce zero-to-many output rows.
+    \item No Python sandbox spin-up; the engine inlines pure SQL.
+    \item Apache Arrow columnar batches.
+    \item The Anaconda Snowflake channel, declared in the handler spec.
+\end{enumerate}
+\noindent\textbf{Week 15:}
+\begin{enumerate}[nosep, leftmargin=6mm]
+    \item Procedures orchestrate and run DML; UDFs return computed values.
+    \item To reuse one training/admin routine across many tables.
+    \item List it in the procedure's \texttt{PACKAGES} clause (Anaconda channel).
+    \item Owner's for controlled elevation; caller's to inherit invoker privileges.
+    \item Tasks can \texttt{CALL} procedures as scheduled DAG steps.
+\end{enumerate}
+\noindent\textbf{Week 16:}
+\begin{enumerate}[nosep, leftmargin=6mm]
+    \item An API Integration plus a remote service behind an API gateway.
+    \item Per-call billing and rate limits make one row per call expensive.
+    \item Cache results in a lookup table keyed by input.
+    \item Pushing curated warehouse data to operational tools; Tasks + External Functions.
+    \item More credits and API calls; match the slowest acceptable freshness.
+\end{enumerate}
+\noindent\textbf{Week 17:}
+\begin{enumerate}[nosep, leftmargin=6mm]
+    \item \texttt{ACCOUNTADMIN}; reserve it for account-level setup only.
+    \item Access roles hold object privileges; functional roles map to job duties.
+    \item Preserves least privilege and simplifies revocation and audits.
+    \item Privileges become the union of primary plus secondary roles.
+    \item \texttt{GRANTS\_TO\_ROLES} and \texttt{ACCESS\_HISTORY}.
+\end{enumerate}
+\noindent\textbf{Week 18:}
+\begin{enumerate}[nosep, leftmargin=6mm]
+    \item Session context, e.g., \texttt{CURRENT\_ROLE()}, mapped to a CASE result.
+    \item One policy attached to a tag covers every tagged column automatically.
+    \item \texttt{CURRENT\_ROLE()} or \texttt{CURRENT\_USER()} against an entitlement table.
+    \item Aggregates can leak masked values; add row access policies too.
+    \item Query as each consuming role and compare outputs.
+    \item Deleted rows persist in Time Travel, Fail-safe, clones, streams, and shares.
+    \item Destroying the subject's key makes every encrypted copy unreadable everywhere.
+\end{enumerate}
+\noindent\textbf{Week 19:}
+\begin{enumerate}[nosep, leftmargin=6mm]
+    \item Consumers query the provider's storage live; nothing is copied.
+    \item When the consumer has no Snowflake account of their own.
+    \item Tables, secure views, secure materialized views, and secure UDFs.
+    \item They restrict columns/rows and hide definitions from consumers.
+    \item Listings are discoverable by any account; direct shares target named accounts.
+\end{enumerate}
+\noindent\textbf{Week 20:}
+\begin{enumerate}[nosep, leftmargin=6mm]
+    \item Multi-party analytics without exposing either side's raw rows.
+    \item Hashing lets parties match identities without revealing raw PII.
+    \item Calibrated noise preventing re-identification of individuals.
+    \item Packaged code, data, and UI installed in the consumer's account.
+    \item Small cohorts leak individuals; enforce minimum aggregation thresholds.
+\end{enumerate}
+\noindent\textbf{Week 21:}
+\begin{enumerate}[nosep, leftmargin=6mm]
+    \item OLTP-style single-row operations alongside analytics.
+    \item Enforced primary key, unique, and foreign key constraints.
+    \item Row-based storage with secondary indexes suits point access.
+    \item One platform serving both transactional and analytical workloads.
+    \item For large scans/aggregations where columnar pruning wins.
+\end{enumerate}
+\noindent\textbf{Week 22:}
+\begin{enumerate}[nosep, leftmargin=6mm]
+    \item \texttt{COMPLETE} and \texttt{EXTRACT\_ANSWER} (also \texttt{EMBED\_TEXT}, \texttt{SENTIMENT}).
+    \item A 768-dimension embedding vector for the input text.
+    \item Order by a vector distance function over stored embeddings.
+    \item Per token/row; cap with Resource Monitors and pre-filtering.
+    \item Text and layout content from documents into queryable form.
+\end{enumerate}
+\noindent\textbf{Week 23:}
+\begin{enumerate}[nosep, leftmargin=6mm]
+    \item Versioned, reviewable, reproducible infrastructure across environments.
+    \item \texttt{unique}, \texttt{not\_null}, \texttt{accepted\_values}, \texttt{relationships}.
+    \item Freshness, volume, or null counts scheduled per table.
+    \item Versioned SQL scripts applied in order with a change-history table.
+    \item Daily credits vs. trailing 7-day average in \texttt{WAREHOUSE\_METERING\_HISTORY}.
+    \item Add nullable new column, dual-write and backfill, switch reads, drop the old column later.
+\end{enumerate}
+\noindent\textbf{Week 24:}
+\begin{enumerate}[nosep, leftmargin=6mm]
+    \item Data Movement and Performance Tuning at 30\% each.
+    \item Higher depth means more overlapping partitions and worse pruning.
+    \item It waits for about six minutes of sustained queuing.
+    \item Eliminate options that fight Snowflake's managed-service model.
+    \item Re-read the feature docs, then rework the scenario by hand.
+\end{enumerate}
+
+\section{Appendix E: Datasets \& Project Data}
+
+\begin{itemize}[label=-]
+    \item \textbf{\texttt{SNOWFLAKE\_SAMPLE\_DATA} (built-in, zero setup):} The shared database available in every account. Use \texttt{TPCH\_SF1}/\texttt{TPCH\_SF10} (orders, lineitems, customers) for Milestones 1, 3, and 10--12 modeling and tuning work, and the \texttt{WEATHER} schema (GHCN daily weather observations) for time-series analytics practice.
+    \item \textbf{Olist Brazilian e-commerce public dataset} (\url{https://www.kaggle.com/datasets/olistbr/brazilian-ecommerce}): nine CSVs (orders, items, payments, reviews, customers, sellers, products) --- the primary dataset for the Milestone 1, 2, and 5 capstones; load via \texttt{COPY INTO} from an external stage.
+    \item \textbf{Synthetic generation:} For volume tests, generate rows natively with \texttt{SELECT ... FROM TABLE(GENERATOR(ROWCOUNT => 10000000))} and \texttt{SEQ8()}/\texttt{RANDOM()}, or write a Snowpark Python generator using Faker for realistic names/emails. Expected volumes: Milestone 1 $\sim$10M rows; Milestone 2 $\sim$100K--1M change events; Milestone 3 $\sim$10GB JSON telemetry; Milestones 4--6 $\sim$1M rows per domain.
+\end{itemize}
+
+\section{Appendix F: Portfolio \& Presentation Guide}
+
+\noindent\textbf{GitHub README structure per capstone:} (1) one-paragraph problem statement; (2) architecture diagram first --- reviewers skim; (3) setup steps runnable from a clean trial account; (4) screenshots of pipelines, Snowsight profiles, and alerts firing; (5) cost estimate in credits/storage with optimization decisions; (6) lessons learned, including one failure you debugged.
+
+\noindent\textbf{Resume bullet templates (two per milestone):}
+\begin{itemize}[label=-, nosep]
+    \item \textbf{M1:} ``Architected a multi-cluster Snowflake backend isolating ETL and BI workloads, cutting query contention by X\%.'' / ``Implemented zero-copy cloning and Time Travel recovery runbooks, reducing environment provisioning from hours to minutes.''
+    \item \textbf{M2:} ``Built an event-driven ELT pipeline (S3 $\rightarrow$ Snowpipe $\rightarrow$ Streams $\rightarrow$ Tasks) processing N events/day with idempotent MERGE semantics.'' / ``Designed serverless task DAGs with SNS error alerting, achieving $<$X-minute pipeline latency at \$Y/month.''
+    \item \textbf{M3:} ``Re-architected JSON telemetry ingestion into a declarative Dynamic Tables Bronze-Silver-Gold DAG with 5-minute freshness.'' / ``Enforced VARIANT data contracts via CHECK constraints, rejecting X\% malformed records before they reached analysts.''
+    \item \textbf{M4:} ``Developed Snowpark Python pipelines with vectorized Pandas UDFs, eliminating data egress to external Spark clusters.'' / ``Shipped a reverse-ETL sync from Snowflake to the CRM via Tasks + External Functions with change-only deltas.''
+    \item \textbf{M5:} ``Implemented tag-based dynamic masking and row access policies for GDPR-compliant multi-tenant analytics.'' / ``Published zero-copy Secure Data Shares to N external partners via Reader Accounts.''
+    \item \textbf{M6:} ``Automated Snowflake infrastructure with Terraform and dbt CI/CD, deploying schema changes with zero downtime.'' / ``Built cost-anomaly alerting on WAREHOUSE\_METERING\_HISTORY, catching a 2$\times$ credit spike within one hour.''
+\end{itemize}
+
+\noindent\textbf{Talking about your project in interviews:} Lead with the business problem and the constraint (latency, cost, compliance), then the architecture in one sentence, then the two hardest trade-offs you made and why. Quantify everything (rows, latency, credits, dollars). When asked what you would do differently, name a real limitation you hit --- e.g., a Dynamic Table falling back to full refresh --- and what it taught you. Interviewers trust candidates who discuss failures concretely.
 
 \newpage
 % ==========================================
@@ -349,15 +1506,15 @@
 7 & Change Data Capture (Streams) & Standard Stream \& MERGE Synchronization & $\square$ \\
 8 & Snowflake Tasks & \textbf{Cap 2: Real-Time CDC \& ELT Pipeline} & $\square$ \\
 \midrule
-9 & Semi-Structured Data & VARIANT JSON Flattening \& Parsing & $\square$ \\
+9 & Semi-Structured Data \& Contracts & VARIANT JSON Flattening \& Contract Checks & $\square$ \\
 10 & Query Profile \& Tuning & Spilling Diagnosis \& Query Refactoring & $\square$ \\
 11 & Dynamic Tables & Bronze-Silver-Gold Target Lag Engine & $\square$ \\
-12 & Advanced Analytics SQL & \textbf{Cap 3: Telemetry Lakehouse} & $\square$ \\
+12 & Advanced SQL \& Dimensional Modeling & \textbf{Cap 3: Telemetry Lakehouse} & $\square$ \\
 \midrule
 13 & Snowpark Python Fundamentals & Snowpark Session \& Pushdown Execution & $\square$ \\
 14 & Vectorized Python UDFs & Pandas Vectorized Sentiment UDF & $\square$ \\
 15 & Python Stored Procedures & In-Database ML Training Procedure & $\square$ \\
-16 & External Functions & \textbf{Cap 4: Snowpark Python Engineering} & $\square$ \\
+16 & External Functions \& Reverse ETL & \textbf{Cap 4: Snowpark Python Engineering} & $\square$ \\
 \midrule
 17 & Role-Based Access Control & Functional \& Access Role Hierarchy & $\square$ \\
 18 & Column/Row Level Governance & Tag-Based Dynamic Data Masking & $\square$ \\
@@ -366,7 +1523,7 @@
 \midrule
 21 & Unistore \& Hybrid Tables & Hybrid Table Transaction Execution & $\square$ \\
 22 & Cortex AI \& Vector Search & Native SQL RAG Pipeline with Cortex & $\square$ \\
-23 & DataOps (dbt \& Terraform) & GitHub Actions CI/CD for Snowflake & $\square$ \\
+23 & DataOps \& Observability & dbt Tests, DMFs \& Cost-Anomaly Alerts & $\square$ \\
 24 & Certification Preparation & \textbf{Cap 6: Autonomous Data Mesh Engine} & $\square$ \\
 
 \end{longtable}

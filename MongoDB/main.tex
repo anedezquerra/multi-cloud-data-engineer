@@ -13,11 +13,26 @@
 
 % --- ADDITIONAL PACKAGES ---
 \usepackage{amssymb}    % For checkboxes \square
+\usepackage{amsmath}    % For \text{} inside math mode
 \usepackage{booktabs}   % For professional tables
 \usepackage{longtable}  % For multi-page tracking table
 \usepackage{enumitem}   % For customized lists
 \usepackage{xcolor}     % For colored highlights
 \usepackage[colorlinks=true, linkcolor=blue]{hyperref} % For internal links
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta, positioning, shapes.geometric, backgrounds, fit}
+\usepackage{listings}
+\lstdefinestyle{code}{
+    basicstyle=\ttfamily\footnotesize,
+    breaklines=true,
+    frame=single,
+    backgroundcolor=\color{gray!8},
+    rulecolor=\color{gray!40},
+    columns=fullflexible,
+    keepspaces=true,
+    showstringspaces=false
+}
+\lstset{style=code}
 
 % --- CUSTOM COMMANDS ---
 \newcommand{\project}[1]{\textbf{\textcolor{blue}{Hands-on Project:}} #1}
@@ -32,6 +47,30 @@
     \vspace{3mm}
 }
 \newcommand{\dayitem}[2]{\item \textbf{#1:} #2}
+% Weekly self-check questions
+\newcommand{\selfcheck}[1]{\vspace{1mm}\noindent\textbf{\textcolor{purple}{Self-check:}} #1}
+% Rubric box: capstone acceptance criteria
+\newcommand{\rubric}[1]{
+    \vspace{1mm}
+    \noindent\fbox{
+        \parbox{0.97\textwidth}{
+            \textbf{\textcolor{orange}{Acceptance Criteria:}} #1
+        }
+    }
+    \vspace{2mm}
+}
+% Weekly curated resources
+\newcommand{\resources}[1]{\vspace{1mm}\noindent\textbf{\textcolor{violet}{Resources:}} #1}
+% Production hardening note
+\newcommand{\prodnote}[1]{
+    \vspace{1mm}
+    \noindent\fbox{
+        \parbox{0.97\textwidth}{
+            \textbf{\textcolor{brown}{Production Note:}} \textit{#1}
+        }
+    }
+    \vspace{1mm}
+}
 
 \title{\Huge \textbf{MongoDB Master Data Engineer \& Senior Architect}\\ \Large 6-Month Exhaustive Architecture, Aggregation, Security, and DataOps Program}
 \author{Distributed Systems, WiredTiger Internals, Vector Search, and Kubernetes DataOps}
@@ -48,13 +87,32 @@
 \tableofcontents
 \newpage
 
+\section*{Prerequisites \& How to Use This Syllabus}
+\begin{itemize}[label=-]
+    \item \textbf{Prerequisite skills:} intermediate Python, solid SQL fundamentals, Git workflows, Linux/CLI basics (or Windows PowerShell equivalents), and Docker fundamentals for running local \texttt{mongod}/\texttt{mongos} deployments.
+    \item \textbf{Weekly cadence:} approximately 10--12 hours per week --- Monday to Wednesday for theory and internals, Thursday for the hands-on project, Friday for the architecture use case.
+    \item \textbf{Deliverable expectation:} every capstone must produce a git repository, an architecture diagram, a cost estimate, and a security review checklist (per the Acceptance Criteria boxes that follow each capstone).
+    \item \textbf{Assessment:} the 24-week tracking timetable at the end of this document doubles as the assessment checklist --- tick each week only when its project and resources are complete.
+\end{itemize}
+
+\textbf{Environment setup checklist:}
+\begin{itemize}[label=-]
+    \item Install Python 3.x, Git, Docker Desktop, and VS Code (with the MongoDB for VS Code extension).
+    \item Install the platform CLIs: \texttt{mongosh}, local \texttt{mongod}/\texttt{mongos} binaries, the Atlas CLI (\texttt{atlas}), and Terraform.
+    \item Create a free-tier account: an Atlas M0 sandbox cluster with the sample datasets loaded (see Appendix E).
+    \item Clone or create a course repository structured as \texttt{data/}, \texttt{src/}, \texttt{tests/}, \texttt{infra/}, \texttt{docs/}.
+    \item Configure credentials via environment variables (\texttt{MONGODB\_URI}, Atlas API keys) --- never hardcode secrets in code or commits.
+\end{itemize}
+
 % ==========================================
 % MILESTONE 1
 % ==========================================
 \section{Milestone 1: WiredTiger Internals, Schema Patterns \& Migration (Month 1)}
 \textit{Objective: Master the WiredTiger engine, document data modeling patterns, and relational-to-document migration.}
+\par\noindent\textbf{Learning outcomes:} tune WiredTiger cache and interpret eviction metrics, apply document schema design patterns, enforce \texttt{\$jsonSchema} validation, execute a zero-downtime RDBMS migration with CDC.
 
 \subsection*{Week 1: MongoDB Core Architecture \& WiredTiger Storage Engine}
+\par\noindent\textbf{Outcomes:} size the WiredTiger cache against the OS page cache, interpret eviction metrics in \texttt{db.serverStatus().wiredTiger}, explain journal vs.\ checkpoint durability, detect checkpoint I/O spikes.
 \begin{itemize}[label=-]
     \dayitem{Monday}{MongoDB process architecture: \texttt{mongod} daemon, thread pools, and memory management.}
     \dayitem{Tuesday}{WiredTiger Internals: B-Trees, eviction policies, cache size configuration, and page allocation.}
@@ -62,26 +120,99 @@
     \dayitem{Thursday}{\project{Configure a local WiredTiger deployment. Modify \texttt{storage.wiredTiger.engineConfig.cacheSizeGB}, generate 10 million inserts using \texttt{mgeneratejs}, and analyze eviction metrics via \texttt{db.serverStatus().wiredTiger}.}}
     \dayitem{Friday}{\usecase{Architect a high-throughput financial ledger engine, balancing WiredTiger cache allocation against OS page cache to eliminate checkpoint I/O spikes.}}
 \end{itemize}
+\resources{MongoDB WiredTiger documentation (\url{https://www.mongodb.com/docs/manual/core/wiredtiger/}); Data Engineering Zoomcamp (\url{https://github.com/DataTalksClub/data-engineering-zoomcamp}).}
+\selfcheck{\begin{itemize}[label=-, itemsep=0pt, leftmargin=1.5em]
+    \item What is WiredTiger's default checkpoint interval?
+    \item What does the journal protect that checkpoints alone do not?
+    \item Which \texttt{serverStatus} section exposes cache eviction metrics?
+    \item Why should the WiredTiger cache not consume all available RAM?
+    \item What production symptom indicates checkpoint I/O spikes?
+\end{itemize}}
 
-\subsection*{Week 2: Advanced Schema Design Patterns}
+\subsection*{Week 2: Advanced Schema Design Patterns \& Analytics Modeling}
+\par\noindent\textbf{Outcomes:} apply Attribute, Bucket, Subset, and Computed patterns to concrete models, build an SCD Type 2 history collection from a Change Stream, expose a star-schema-style view via the Atlas SQL Interface.
 \begin{itemize}[label=-]
     \dayitem{Monday}{Core Design Patterns: Polymorphic, Attribute, Bucket, and Outlier Patterns.}
-    \dayitem{Tuesday}{Operational Patterns: Computed, Subset, Extended Reference, and Schema Versioning Patterns.}
+    \dayitem{Tuesday}{Operational Patterns: Computed, Subset, Extended Reference, and Schema Versioning Patterns. \textbf{Modeling for analytics:} star-schema-style collections and read-optimized views for the Atlas SQL Interface / BI Connector, grain declaration for aggregation pipelines, and SCD Type 1 (overwrite) vs. Type 2 (versioned history) in documents.}
     \dayitem{Wednesday}{Data Lifecycle Patterns: Time-To-Live (TTL), Pre-allocation, and Archival Patterns.}
-    \dayitem{Thursday}{\project{Refactor a monolithic e-commerce product catalog. Implement the Attribute Pattern for dynamic specs and the Subset Pattern to optimize working set memory.}}
+    \dayitem{Thursday}{\project{Refactor a monolithic e-commerce product catalog. Implement the Attribute Pattern for dynamic specs and the Subset Pattern to optimize working set memory. Then build an SCD Type 2 \texttt{dim\_customers} history collection driven by a Change Stream on the operational \texttt{customers} collection, and expose a star-schema-style reporting view (fact orders + conformed dimensions) through the Atlas SQL Interface.}}
+\begin{lstlisting}[language=Python]
+from datetime import datetime, timezone
+from pymongo import MongoClient
+
+db = MongoClient("mongodb://localhost:27017").analytics
+
+def apply_scd2(dim: dict) -> None:
+    """SCD Type 2: expire the current version, insert the new one."""
+    now = datetime.now(timezone.utc)
+    db.dim_customers.update_one(
+        {"customer_id": dim["customer_id"], "valid_to": None},
+        {"$set": {"valid_to": now}})
+    db.dim_customers.insert_one(
+        {**dim, "valid_from": now, "valid_to": None})
+
+# History is maintained by a Change Stream on the source collection.
+ops = db.oltp  # operational database
+with ops.customers.watch(
+        [{"$match": {"operationType": {"$in": ["insert", "update"]}}}]) as cs:
+    for change in cs:
+        apply_scd2(change["fullDocument"])
+\end{lstlisting}
     \dayitem{Friday}{\usecase{Design an IoT device metrics schema processing 100,000 events/sec using the Bucket Pattern to reduce document count and metadata overhead by 95\%.}}
 \end{itemize}
+\resources{MongoDB Schema Design Patterns blog series (\url{https://www.mongodb.com/blog/post/building-with-patterns-a-summary}); Data Engineer Handbook (\url{https://github.com/DataExpert-io/data-engineer-handbook}).}
+\selfcheck{\begin{itemize}[label=-, itemsep=0pt, leftmargin=1.5em]
+    \item Which pattern fits products with highly variable attributes?
+    \item How does the Bucket Pattern reduce document count and index size?
+    \item When should you apply the Subset Pattern?
+    \item What does the Computed Pattern move from read time to write time?
+    \item Contrast SCD Type 1 vs. Type 2 in a document collection.
+\end{itemize}}
 
-\subsection*{Week 3: Modeling Relationships \& Modern Anti-Patterns}
+\subsection*{Week 3: Modeling Relationships, Anti-Patterns \& Data Contracts}
+\par\noindent\textbf{Outcomes:} choose embedding vs.\ referencing per relationship, identify unbounded-array and 16MB-bloat anti-patterns, author a strict \texttt{\$jsonSchema} validator, classify schema changes as breaking vs.\ non-breaking.
 \begin{itemize}[label=-]
     \dayitem{Monday}{Embedding vs. Referencing: 1:1, 1:N (few), 1:N (many), and N:M relationship choices.}
     \dayitem{Tuesday}{Document Anti-Patterns: Unbounded Arrays, Bloated Documents ($>16\text{MB}$), and Massive Collections.}
-    \dayitem{Wednesday}{JSON Schema Validation: Enforcing structural constraints, data types, and enum validation rules.}
+    \dayitem{Wednesday}{JSON Schema Validation as Data Contracts: \texttt{\$jsonSchema} as a versioned contract --- schema versioning pattern, breaking (renaming/removing required fields, narrowing types) vs. non-breaking changes (adding optional fields), producer-vs-consumer ownership, and CI validation of representative documents before deploy.}
     \dayitem{Thursday}{\project{Write a JSON Schema validator for an enterprise HR system. Restrict document sizes, mandate required fields, and use \texttt{\$jsonSchema} in \texttt{createCollection}.}}
+\begin{lstlisting}[language=Python]
+from pymongo import MongoClient
+
+client = MongoClient("mongodb://localhost:27017")
+db = client.hr
+
+employee_schema = {
+    "$jsonSchema": {
+        "bsonType": "object",
+        "required": ["employee_id", "name", "department", "hire_date"],
+        "properties": {
+            "employee_id": {"bsonType": "string", "pattern": "^EMP-[0-9]{6}$"},
+            "name":        {"bsonType": "string", "minLength": 1},
+            "department":  {"enum": ["Engineering", "Sales", "HR", "Finance"]},
+            "salary":      {"bsonType": ["int", "double"], "minimum": 0},
+            "hire_date":   {"bsonType": "date"},
+        },
+    }
+}
+
+db.create_collection("employees", validator=employee_schema,
+                     validationLevel="strict", validationAction="error")
+\end{lstlisting}
     \dayitem{Friday}{\usecase{Analyze a legacy system failing due to \texttt{BSONObj size exceeds 16MB} errors on user activity logs, re-architecting it using parent-referencing and capped collections.}}
 \end{itemize}
+\resources{MongoDB \$jsonSchema validation docs (\url{https://www.mongodb.com/docs/manual/core/schema-validation/}); Data Engineering Zoomcamp (\url{https://github.com/DataTalksClub/data-engineering-zoomcamp}).}
+\selfcheck{\begin{itemize}[label=-, itemsep=0pt, leftmargin=1.5em]
+    \item When do you embed a 1:N relationship instead of referencing it?
+    \item Why are unbounded arrays considered an anti-pattern?
+    \item Give one breaking and one non-breaking schema change.
+    \item What does \texttt{validationAction: "warn"} do?
+    \item Who owns a data contract, and where is it enforced?
+\end{itemize}}
+\prodnote{Schema-drift contract testing in CI: before deploying application changes, run a CI step that validates a set of representative documents (sampled from production-like staging data) against the collection's \texttt{\$jsonSchema} validator via a dry-run insert into a scratch collection. This catches producer-side schema drift \emph{before} strict validators start rejecting writes in production.}
 
 \subsection*{Week 4: Relational to Document Migration Strategy}
+\par\noindent\textbf{Outcomes:} map a 3NF schema into document collections, configure Relational Migrator initial sync and CDC, design a dual-write plus shadow-read cutover with rollback, verify row-count parity.
 \begin{itemize}[label=-]
     \dayitem{Monday}{Analyzing RDBMS schemas: Identifying Third Normal Form (3NF) tables to merge into single documents.}
     \dayitem{Tuesday}{MongoDB Relational Migrator: Mapping, transformation rules, and CDC (Change Data Capture) setup.}
@@ -89,25 +220,117 @@
     \dayitem{Thursday}{\project{Set up MongoDB Relational Migrator. Map a 12-table PostgreSQL e-commerce schema into 3 MongoDB collections, execute initial sync, and verify CDC.}}
     \dayitem{Friday}{\usecase{Design a zero-downtime migration strategy for a 15TB PostgreSQL database to MongoDB Atlas, guaranteeing instant rollback capability and zero data loss.}}
 \end{itemize}
+\resources{MongoDB Relational Migrator docs (\url{https://www.mongodb.com/docs/relational-migrator/}); Data Engineer Handbook (\url{https://github.com/DataExpert-io/data-engineer-handbook}).}
+\selfcheck{\begin{itemize}[label=-, itemsep=0pt, leftmargin=1.5em]
+    \item What are dual-writes, and what risk do they introduce?
+    \item Why is CDC required after the initial sync?
+    \item What do shadow reads validate before cutover?
+    \item Why must migration writes be idempotent?
+    \item What makes a migration instantly rollback-able?
+\end{itemize}}
+\prodnote{Dual-write migrations are a classic source of divergence: make every write idempotent (natural keys + upserts), log mismatches from shadow-read comparisons to a dead-letter collection, and rehearse the rollback path before cutover day.}
 
 \capstone{Milestone 1}{Relational Monolith Modernization Engine. Design a complete migration architecture. Convert an open-source 15-table SQL database schema into an optimized document model utilizing Attribute, Bucket, and Subset patterns. Deploy JSON Schema validation, execute continuous CDC sync via Relational Migrator, and run performance benchmarks proving a 5x query speedup.}
+\rubric{\begin{itemize}[label=-, leftmargin=1.5em, itemsep=0pt]
+    \item End-to-end migration runs from a clean environment following the repo README.
+    \item Architecture diagram committed (draw.io/TikZ/PNG) showing source RDBMS, CDC path, and target document model.
+    \item At least 3 automated data-quality tests (schema validation + row-count parity + spot-check queries) with a failing-case demonstration.
+    \item Monitoring/alerting evidence: CDC lag metric and WiredTiger cache dashboard (screenshot or exported config).
+    \item Monthly cost estimate for the target Atlas/local deployment with 2 optimization decisions documented.
+    \item Security review: least-privilege migration user, no hardcoded secrets, PII handling noted.
+\end{itemize}}
+
+\subsection*{Milestone 1 Capstone: Reference Solution Sketch}
+\begin{itemize}[label=-, itemsep=0pt]
+    \item \textbf{Architecture:} PostgreSQL source $\to$ Relational Migrator (initial sync + CDC) $\to$ Atlas replica set with \texttt{\$jsonSchema} validators --- chosen because managed CDC eliminates hand-rolled oplog tailing.
+    \item Model the 15 tables into 3 collections: \texttt{customers} (embedded addresses), \texttt{orders} (embedded items, Subset Pattern for hot fields), \texttt{products} (Attribute Pattern for variable specs).
+    \item Write the target \texttt{\$jsonSchema} validators first; the schema \emph{is} the migration contract.
+    \item Run initial sync, then CDC; build a parity checker comparing row counts and checksums per table.
+    \item Run shadow reads in parallel for 48 hours, logging divergences to a dead-letter collection before cutover.
+\begin{lstlisting}[language=Python]
+# Parity check: row counts + hash of sorted natural keys
+def parity(pg_rows, mongo_docs) -> bool:
+    a = sorted(r["id"] for r in pg_rows)
+    b = sorted(d["legacy_id"] for d in mongo_docs)
+    return len(a) == len(b) and hash(tuple(a)) == hash(tuple(b))
+\end{lstlisting}
+    \item \textbf{Pitfall:} dual-writes diverge on partial failure --- make every write idempotent via upserts on natural keys.
+    \item \textbf{Pitfall:} cutting over before CDC lag is zero loses the last transactions --- gate cutover on lag $< 1$s.
+    \item \textbf{Pitfall:} 1:1 table mapping yields a slow document model --- merge 3NF tables into aggregates deliberately.
+\end{itemize}
+
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}[
+    node distance=4mm and 7mm,
+    box/.style={draw, rounded corners, fill=blue!10, align=center, minimum height=8mm, inner sep=2mm, font=\small},
+    sidebox/.style={draw, rounded corners, fill=orange!15, align=center, minimum height=8mm, inner sep=2mm, font=\small},
+    arr/.style={-{Stealth}, thick}
+]
+\node[box] (app) {Application\\writes};
+\node[box, right=of app] (mongod) {\texttt{mongod}};
+\node[box, right=of mongod] (cache) {WiredTiger\\cache};
+\node[box, right=of cache] (journal) {Journal\\(WAL)};
+\node[box, right=of journal] (ckpt) {Checkpoint\\(60s)};
+\node[box, right=of ckpt] (disk) {Disk\\data files};
+\draw[arr] (app) -- (mongod);
+\draw[arr] (mongod) -- (cache);
+\draw[arr] (cache) -- (journal);
+\draw[arr] (journal) -- (ckpt);
+\draw[arr] (ckpt) -- (disk);
+\node[sidebox, below=of cache] (schema) {Schema patterns\\+ \$jsonSchema};
+\node[sidebox, below=of ckpt] (cdc) {CDC / Relational\\Migrator};
+\draw[arr, dashed] (schema) -- (cache);
+\draw[arr, dashed] (cdc) -- (ckpt);
+\end{tikzpicture}
+\caption{Milestone 1 reference architecture: WiredTiger write path from application to durable checkpoint, with schema validation and migration side processes.}
+\end{figure}
+
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}[
+    node distance=8mm and 16mm,
+    ent/.style={draw, rounded corners, fill=green!8, align=left, inner sep=2mm, font=\footnotesize},
+    arr/.style={-{Stealth}, thick},
+    lbl/.style={font=\scriptsize\itshape}
+]
+\node[ent] (cust) {\textbf{customers}\\ \_id: ObjectId\\ name: string\\ email: string\\ region: string\\ addresses: [embedded]};
+\node[ent, right=of cust] (orders) {\textbf{orders}\\ \_id: ObjectId\\ customer\_id: ref $\to$ customers\\ order\_date: date\\ items: [embedded \{sku, qty, price\}]\\ total: decimal};
+\node[ent, right=of orders] (prod) {\textbf{products}\\ \_id: ObjectId\\ sku: string\\ name: string\\ attrs: [attribute pattern]};
+\draw[arr] (orders) -- node[lbl, above] {N:1 ref} (cust);
+\draw[arr] (orders) -- node[lbl, above] {N:M ref (items.sku)} (prod);
+\end{tikzpicture}
+\caption{Capstone data model: Relational Monolith Modernization --- embedded arrays for addresses and order items, references for customer/product lookups.}
+\end{figure}
 
 % ==========================================
 % MILESTONE 2
 % ==========================================
 \section{Milestone 2: High Availability, Sharding Mechanics \& Scalability (Month 2)}
 \textit{Objective: Master Consensus protocols, distributed sharding internals, and global data placement.}
+\par\noindent\textbf{Learning outcomes:} deploy and break replica sets safely, choose write/read concerns for durability targets, design shard keys and refine them live, implement zone sharding for data-residency compliance.
 
 \subsection*{Week 5: Replica Set Internals \& Consensus Protocol}
+\par\noindent\textbf{Outcomes:} explain Raft-like elections and arbiter risks, size the oplog, select write/read concerns for a durability target, trigger and observe a controlled failover under \texttt{w:majority}.
 \begin{itemize}[label=-]
     \dayitem{Monday}{Raft-like Consensus: Elections, Priority, Votes, Heartbeats, and Arbiter risks.}
     \dayitem{Tuesday}{The Oplog (Operations Log): Oplog sizing, idempotent updates, and replication lag debugging.}
     \dayitem{Wednesday}{Write Concerns (\texttt{w:1}, \texttt{w:majority}, \texttt{j:true}) and Read Concerns (\texttt{local}, \texttt{majority}, \texttt{linearizable}).}
-    \dayitem{Thursday}{\project{Deploy a 3-node Replica Set locally. Simulate network partitions using \texttt{iptables}, observe primary elections, and test write availability under \texttt{w:majority}.}}
+    \dayitem{Thursday}{\project{Deploy a 3-node Replica Set locally. Force primary elections with \texttt{rs.stepDown()} and simulate node loss with \texttt{db.shutdownServer()} on a secondary, observing failover behavior and write availability under \texttt{w:majority}. On Windows, the firewall-based partition equivalent is \texttt{netsh advfirewall} (block the mongod port inbound/outbound); for cloud deployments, toggle entries in the Atlas Network Access List to cut connectivity.}}
     \dayitem{Friday}{\usecase{Architect a multi-datacenter replica set configuration for a banking system requiring zero data loss (\texttt{w:majority}) and sub-second disaster recovery.}}
 \end{itemize}
+\resources{MongoDB Replication docs (\url{https://www.mongodb.com/docs/manual/replication/}); Data Engineering Zoomcamp (\url{https://github.com/DataTalksClub/data-engineering-zoomcamp}).}
+\selfcheck{\begin{itemize}[label=-, itemsep=0pt, leftmargin=1.5em]
+    \item Why can \texttt{w:1} writes be rolled back during failover?
+    \item What is the oplog, and why must updates be idempotent?
+    \item Why are arbiters a risk in majority elections?
+    \item What does \texttt{j:true} add to a write concern?
+    \item Which read concern avoids reading rolled-back data?
+\end{itemize}}
+\prodnote{Write-concern trade-offs under failover: \texttt{w:1} writes acknowledged on the old primary can be rolled back when a new primary is elected; only \texttt{w:majority} (typically with \texttt{j:true}) guarantees durability across elections. Pair \texttt{w:majority} writes with \texttt{readConcern: "majority"} (and retryable writes) if you must never read rolled-back data, and budget the added latency.}
 
 \subsection*{Week 6: Sharding Architecture \& Chunk Allocations}
+\par\noindent\textbf{Outcomes:} identify the roles of \texttt{mongos}, CSRS, and shards, compare hash vs.\ range shard keys, explain chunk splitting and balancer movement, diagnose a hot shard from a monotonic key.
 \begin{itemize}[label=-]
     \dayitem{Monday}{Sharding Components: \texttt{mongos} routers, Config Server Replica Sets (CSRS), and Shard nodes.}
     \dayitem{Tuesday}{Shard Keys: Range-based vs. Hash-based vs. Compound Shard Keys.}
@@ -115,8 +338,18 @@
     \dayitem{Thursday}{\project{Deploy a 2-shard cluster with CSRS and \texttt{mongos}. Enable sharding on a collection, configure Hash-based sharding on \texttt{\_id}, and monitor chunk distribution.}}
     \dayitem{Friday}{\usecase{Diagnose a production sharding failure caused by a monotonically increasing shard key (\texttt{createdAt}) creating hot-shard write bottlenecks.}}
 \end{itemize}
+\resources{MongoDB Sharding docs (\url{https://www.mongodb.com/docs/manual/sharding/}); Data Engineer Handbook (\url{https://github.com/DataExpert-io/data-engineer-handbook}).}
+\selfcheck{\begin{itemize}[label=-, itemsep=0pt, leftmargin=1.5em]
+    \item What roles do \texttt{mongos} and the CSRS play?
+    \item Hash-based vs. range-based shard keys: what is the trade-off?
+    \item Why does a monotonically increasing shard key create a hot shard?
+    \item What is a chunk, and when is it split?
+    \item What does the balancer move, and at what cost?
+\end{itemize}}
+\prodnote{Chunk migrations are not free: each move copies data and briefly locks source chunks, adding read/write latency on the donor shard. Restrict the balancer to a low-traffic window (\texttt{sh.setBalancerState} / balancing window settings) during peak-sensitive periods, and alert on excessive migration rates as a symptom of a poor shard key.}
 
 \subsection*{Week 7: Cluster Balancing \& Shard Key Optimization}
+\par\noindent\textbf{Outcomes:} score shard keys on cardinality, frequency, and monotonicity, refine a shard key live with \texttt{refineCollectionShardKey}, distinguish targeted from scatter-gather queries via \texttt{explain()}.
 \begin{itemize}[label=-]
     \dayitem{Monday}{Evaluating Shard Keys: Cardinality, Frequency, and Rate of Change.}
     \dayitem{Tuesday}{Refining Shard Keys: Live shard key modification (\texttt{refineCollectionShardKey}).}
@@ -124,8 +357,17 @@
     \dayitem{Thursday}{\project{Simulate a hot-shard scenario using a low-cardinality shard key. Use \texttt{refineCollectionShardKey} to add a suffix field live without cluster downtime.}}
     \dayitem{Friday}{\usecase{Re-architect a 50TB sharded telemetry cluster to eliminate scatter-gather queries for 90\% of analytical read requests.}}
 \end{itemize}
+\resources{MongoDB shard key guidance (\url{https://www.mongodb.com/docs/manual/core/sharding-shard-key/}); Data Engineering Zoomcamp (\url{https://github.com/DataTalksClub/data-engineering-zoomcamp}).}
+\selfcheck{\begin{itemize}[label=-, itemsep=0pt, leftmargin=1.5em]
+    \item Name the three properties of a good shard key.
+    \item What does \texttt{refineCollectionShardKey} allow without downtime?
+    \item Why are scatter-gather queries expensive?
+    \item Why is a low-cardinality shard key problematic?
+    \item What metric pattern reveals a hot shard?
+\end{itemize}}
 
 \subsection*{Week 8: Global Clusters \& Multi-Region Architectures}
+\par\noindent\textbf{Outcomes:} configure zone sharding for data residency, pin EU chunks to EU shards and verify placement, choose read preferences and tag sets for locality, design a GDPR-compliant global cluster.
 \begin{itemize}[label=-]
     \dayitem{Monday}{Zone Sharding: Pinning specific data chunks to geographical shards.}
     \dayitem{Tuesday}{Global Clusters in MongoDB Atlas: Local reads/writes with global consistency.}
@@ -133,16 +375,95 @@
     \dayitem{Thursday}{\project{Configure Zone Sharding on a Global User collection. Pin European users to \texttt{Shard\_EU} and US users to \texttt{Shard\_US} based on \texttt{country\_code}.}}
     \dayitem{Friday}{\usecase{Architect a GDPR-compliant global platform requiring European user data to reside strictly within EU physical borders while allowing global analytics queries.}}
 \end{itemize}
+\resources{MongoDB Global Clusters / zone sharding docs (\url{https://www.mongodb.com/docs/atlas/global-clusters/}); Data Engineer Handbook (\url{https://github.com/DataExpert-io/data-engineer-handbook}).}
+\selfcheck{\begin{itemize}[label=-, itemsep=0pt, leftmargin=1.5em]
+    \item What does zone sharding pin to a shard?
+    \item How do you enforce EU-only residency for EU user data?
+    \item What does the \texttt{nearest} read preference do?
+    \item What are tag sets used for?
+    \item Why do global clusters favor local reads and writes?
+\end{itemize}}
 
 \capstone{Milestone 2}{Globally Distributed Multi-Region Sharded Cluster. Deploy a 4-shard MongoDB cluster spanning 3 simulated cloud regions. Implement Zone Sharding to partition user data by continent. Refine shard keys on a live database with 20 million documents, measure scatter-gather query reduction, and simulate an entire region outage while maintaining write availability.}
+\rubric{\begin{itemize}[label=-, leftmargin=1.5em, itemsep=0pt]
+    \item Cluster deploys end-to-end from a clean environment following the repo README (mongos, CSRS, 4 shards scripted).
+    \item Architecture diagram committed (draw.io/TikZ/PNG) showing shards, zones, mongos, and CSRS.
+    \item At least 3 automated data-quality tests (document counts per zone, shard-key distribution check, failover write-ack test) with a failing-case demonstration.
+    \item Monitoring/alerting evidence: replication lag and balancer activity alerts (screenshot or exported config).
+    \item Monthly cost estimate for the multi-region deployment with 2 optimization decisions documented.
+    \item Security review: least-privilege roles, no hardcoded secrets, data-residency (GDPR) handling noted.
+\end{itemize}}
+
+\subsection*{Milestone 2 Capstone: Reference Solution Sketch}
+\begin{itemize}[label=-, itemsep=0pt]
+    \item \textbf{Architecture:} 4-shard Atlas cluster across 3 regions behind \texttt{mongos}, CSRS for metadata, zone sharding pinning user chunks by \texttt{country\_code} --- chosen because zone ranges give auditable residency guarantees.
+    \item Provision shards and CSRS first; add zones and chunk ranges \emph{before} loading data so documents never land outside their region.
+    \item Load 20M synthetic users (mgeneratejs); verify distribution with \texttt{sh.status()} and per-zone counts.
+    \item Refine the shard key live (\texttt{refineCollectionShardKey} adding a random suffix) to remove the hot shard; measure scatter-gather before/after.
+\begin{lstlisting}
+// Residency verification: every EU chunk lives only on EU shards
+sh.addShardToZone("shardEU", "EU");
+sh.updateZoneKeyRange("app.users",
+  { country_code: "DE" }, { country_code: "DF" }, "EU");
+// then assert: sh.status() shows no EU-tagged chunk on a non-EU shard
+\end{lstlisting}
+    \item Simulate a region outage (stop one shard's nodes); confirm \texttt{w:majority} writes continue via remaining electors.
+    \item \textbf{Pitfall:} assigning zones after bulk load triggers a massive chunk-migration storm --- zone first, load second.
+    \item \textbf{Pitfall:} a 2-node region cannot form a majority alone --- place electors across at least 3 fault domains.
+    \item \textbf{Pitfall:} measuring scatter-gather only by latency hides cost --- count shards hit in \texttt{explain("executionStats")}.
+\end{itemize}
+
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}[
+    node distance=4mm and 7mm,
+    box/.style={draw, rounded corners, fill=blue!10, align=center, minimum height=8mm, inner sep=2mm, font=\small},
+    sidebox/.style={draw, rounded corners, fill=orange!15, align=center, minimum height=8mm, inner sep=2mm, font=\small},
+    arr/.style={-{Stealth}, thick}
+]
+\node[box] (app) {Application};
+\node[box, right=of app] (mongos) {\texttt{mongos}\\router};
+\node[box, right=of mongos] (csrs) {CSRS\\(config servers)};
+\node[box, below=8mm of mongos, xshift=-12mm] (shardA) {Shard 1\\Zone: EU};
+\node[box, right=of shardA] (shardB) {Shard 2\\Zone: US};
+\node[box, right=of shardB] (shardC) {Shard N\\Zone: APAC};
+\draw[arr] (app) -- (mongos);
+\draw[arr] (mongos) -- (csrs);
+\draw[arr] (mongos) -- (shardA);
+\draw[arr] (mongos) -- (shardB);
+\draw[arr] (mongos) -- (shardC);
+\node[sidebox, below=of shardB] (bal) {Balancer\\(zone-aware chunks)};
+\draw[arr, dashed] (bal) -- (shardB);
+\end{tikzpicture}
+\caption{Milestone 2 reference architecture: sharded cluster with \texttt{mongos} routing, CSRS metadata, and zone-labeled shards for data residency.}
+\end{figure}
+
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}[
+    node distance=8mm and 16mm,
+    ent/.style={draw, rounded corners, fill=green!8, align=left, inner sep=2mm, font=\footnotesize},
+    arr/.style={-{Stealth}, thick},
+    lbl/.style={font=\scriptsize\itshape}
+]
+\node[ent] (users) {\textbf{users}\\ \_id: ObjectId\\ country\_code: string (shard key)\\ profile: \{embedded\}\\ createdAt: date};
+\node[ent, right=of users] (sessions) {\textbf{sessions}\\ \_id: ObjectId\\ user\_id: ref $\to$ users\\ startedAt: date\\ device: string};
+\node[ent, right=of sessions] (tel) {\textbf{telemetry}\\ \_id: ObjectId\\ user\_id: ref $\to$ users\\ ts: date (shard key suffix)\\ metrics: [bucket pattern]};
+\draw[arr] (sessions) -- node[lbl, above] {N:1 ref} (users);
+\draw[arr] (tel) -- node[lbl, above] {N:1 ref} (sessions);
+\end{tikzpicture}
+\caption{Capstone data model: Globally Distributed Sharded Cluster --- shard-key fields marked; referencing keeps user documents small while zone sharding pins residency.}
+\end{figure}
 
 % ==========================================
 % MILESTONE 3
 % ==========================================
 \section{Milestone 3: Aggregation Framework, Indexes \& Performance Tuning (Month 3)}
 \textit{Objective: Master compound index mechanics, analytical aggregation pipelines, and query execution profiling.}
+\par\noindent\textbf{Learning outcomes:} design ESR-compliant compound indexes, build multi-stage pipelines with \texttt{\$lookup}/\texttt{\$facet}/\texttt{\$setWindowFields}, read \texttt{explain()} plans, eliminate slow queries and unused indexes.
 
 \subsection*{Week 9: Index Mechanics \& Query Optimizer}
+\par\noindent\textbf{Outcomes:} select single/compound/multikey/partial index types, apply the ESR rule to compound index design, prove coverage with \texttt{explain("executionStats")}, plan a rolling index build safely.
 \begin{itemize}[label=-]
     \dayitem{Monday}{Index Types: Single Field, Compound, Multikey (Arrays), Partial, Sparse, and TTL Indexes.}
     \dayitem{Tuesday}{The ESR Rule: Equality, Sort, Range order in Compound Index design.}
@@ -150,17 +471,63 @@
     \dayitem{Thursday}{\project{Create a 5-million document collection. Write queries violating the ESR rule, analyze index usage via \texttt{explain("executionStats")}, and build an optimal compound index.}}
     \dayitem{Friday}{\usecase{Optimize an enterprise search pipeline that is suffering from high CPU usage caused by un-indexed array queries (\texttt{Multikey Index Bounds}).}}
 \end{itemize}
+\resources{MongoDB indexing docs \& ESR rule (\url{https://www.mongodb.com/docs/manual/tutorial/equality-sort-range-rule/}); Data Engineering Zoomcamp (\url{https://github.com/DataTalksClub/data-engineering-zoomcamp}).}
+\selfcheck{\begin{itemize}[label=-, itemsep=0pt, leftmargin=1.5em]
+    \item State the ESR rule for compound index field order.
+    \item What makes a query ``covered''?
+    \item What restriction applies to array fields in compound indexes?
+    \item When is a partial index preferable to a full index?
+    \item Why use rolling index builds on large replica sets?
+\end{itemize}}
+\prodnote{Building an index on a busy primary blocks or degrades writes and spikes WiredTiger cache pressure. On replica sets, prefer rolling index builds (build on each secondaries-first via standalone mode, then step down the primary) for large collections, and always schedule builds in a low-traffic window with \texttt{currentOp} monitoring.}
 
 \subsection*{Week 10: Aggregation Pipeline Mastery - Stage 1}
+\par\noindent\textbf{Outcomes:} compose core stages with early \texttt{\$match}, reshape documents with \texttt{\$unwind}/\texttt{\$facet}, implement \texttt{\$lookup} and \texttt{\$graphLookup} joins, enable \texttt{allowDiskUse} deliberately.
 \begin{itemize}[label=-]
     \dayitem{Monday}{Core Stages: \texttt{\$match}, \texttt{\$project}, \texttt{\$group}, \texttt{\$sort}, and \texttt{\$limit}.}
     \dayitem{Tuesday}{Complex Reshaping: \texttt{\$unwind}, \texttt{\$arrayToObject}, \texttt{\$objectToArray}, and \texttt{\$facet}.}
     \dayitem{Wednesday}{Joins in MongoDB: \texttt{\$lookup} (Uncorrelated, Correlated, Subqueries) and \texttt{\$graphLookup}.}
     \dayitem{Thursday}{\project{Write a \texttt{\$graphLookup} pipeline over an organizational hierarchy collection to compute deep reporting chains and total team headcount recursively.}}
+\begin{lstlisting}[language=Python]
+pipeline = [
+    {"$match": {"order_date": {"$gte": start, "$lt": end}}},
+    {"$lookup": {
+        "from": "customers",
+        "localField": "customer_id",
+        "foreignField": "_id",
+        "as": "customer"}},
+    {"$unwind": "$customer"},
+    {"$facet": {
+        "revenue_by_region": [
+            {"$group": {"_id": "$customer.region",
+                        "revenue": {"$sum": "$total"},
+                        "orders": {"$count": {}}}},
+            {"$sort": {"revenue": -1}}],
+        "top_products": [
+            {"$unwind": "$items"},
+            {"$group": {"_id": "$items.sku",
+                        "units": {"$sum": "$items.qty"}}},
+            {"$sort": {"units": -1}},
+            {"$limit": 10}],
+        "summary": [
+            {"$group": {"_id": None,
+                        "total_revenue": {"$sum": "$total"}}}]}}
+]
+results = list(db.orders.aggregate(pipeline, allowDiskUse=True))
+\end{lstlisting}
     \dayitem{Friday}{\usecase{Design an analytical pipeline that replaces 10 disparate SQL JOIN queries with a single optimized \texttt{\$lookup} and \texttt{\$facet} pipeline.}}
 \end{itemize}
+\resources{MongoDB aggregation pipeline docs (\url{https://www.mongodb.com/docs/manual/core/aggregation-pipeline/}); Data Engineer Handbook (\url{https://github.com/DataExpert-io/data-engineer-handbook}).}
+\selfcheck{\begin{itemize}[label=-, itemsep=0pt, leftmargin=1.5em]
+    \item Why place \texttt{\$match} as early as possible in a pipeline?
+    \item What does \texttt{\$facet} do in a single pass?
+    \item When do you need \texttt{\$graphLookup} instead of \texttt{\$lookup}?
+    \item What does \texttt{\$unwind} do to an array field?
+    \item What does \texttt{allowDiskUse} permit, and at what cost?
+\end{itemize}}
 
 \subsection*{Week 11: Aggregation Pipeline Mastery - Stage 2}
+\par\noindent\textbf{Outcomes:} compute windowed metrics with \texttt{\$setWindowFields}, choose accumulators per stage context, respect the 100MB stage RAM limit, build moving-average and ranking pipelines.
 \begin{itemize}[label=-]
     \dayitem{Monday}{Window Functions: \texttt{\$setWindowFields}, \texttt{\$denseRank}, \texttt{\$derivative}, and \texttt{\$exponentialMovingAverage}.}
     \dayitem{Tuesday}{Accumulators in \texttt{\$group} vs. \texttt{\$project} vs. \texttt{\$setWindowFields}.}
@@ -168,8 +535,18 @@
     \dayitem{Thursday}{\project{Build a financial analytics pipeline using \texttt{\$setWindowFields} to calculate a 30-day moving average and exponential smoothing over transaction logs.}}
     \dayitem{Friday}{\usecase{Architect a real-time leaderboard and metrics processing engine using \texttt{\$setWindowFields} over a stream of 50 million gaming event documents.}}
 \end{itemize}
+\resources{MongoDB \$setWindowFields docs (\url{https://www.mongodb.com/docs/manual/reference/operator/aggregation/setWindowFields/}); Apache Spark repo for batch-window comparisons (\url{https://github.com/apache/spark}).}
+\selfcheck{\begin{itemize}[label=-, itemsep=0pt, leftmargin=1.5em]
+    \item What class of calculations does \texttt{\$setWindowFields} enable?
+    \item What happens when a stage exceeds the 100MB RAM limit?
+    \item What is the difference between \texttt{\$rank} and \texttt{\$denseRank}?
+    \item What does \texttt{\$derivative} compute over a window?
+    \item How is a 30-day moving-average window specified?
+\end{itemize}}
+\prodnote{Pipelines that exceed the 100MB per-stage RAM limit abort unless \texttt{allowDiskUse} is set --- but disk-spilling sorts/groups are 10--100x slower. Push selective \texttt{\$match} and \texttt{\$project} stages as early as possible, and treat heavy disk spilling in slow logs as a capacity-planning red flag.}
 
 \subsection*{Week 12: Performance Profiling \& Query Tuning}
+\par\noindent\textbf{Outcomes:} enable and query the database profiler, read \texttt{IXSCAN} vs.\ \texttt{COLLSCAN} plans, prune unused indexes with \texttt{\$indexStats}, diagnose queued-ticket saturation.
 \begin{itemize}[label=-]
     \dayitem{Monday}{Database Profiler (\texttt{db.setProfilingLevel}), System Profile Collection (\texttt{system.profile}).}
     \dayitem{Tuesday}{Reading \texttt{explain()} plans: \texttt{IXSCAN}, \texttt{COLLSCAN}, \texttt{SORT\_KEY\_GENERATOR}, and \texttt{FETCH}.}
@@ -177,16 +554,101 @@
     \dayitem{Thursday}{\project{Profile an un-optimized database. Identify unindexed queries, remove redundant/unused indexes using \texttt{\$indexStats}, and fix memory spill warnings.}}
     \dayitem{Friday}{\usecase{Perform an architectural audit on a MongoDB cluster experiencing high \texttt{qr/qw} (queued read/write) tickets, tuning slow queries and index structures.}}
 \end{itemize}
+\resources{MongoDB database profiler \& explain() docs (\url{https://www.mongodb.com/docs/manual/tutorial/manage-the-database-profiler/}); DuckDB repo for analytical benchmarking comparisons (\url{https://github.com/duckdb/duckdb}).}
+\selfcheck{\begin{itemize}[label=-, itemsep=0pt, leftmargin=1.5em]
+    \item What do \texttt{IXSCAN} vs. \texttt{COLLSCAN} in \texttt{explain()} mean?
+    \item What does the \texttt{system.profile} collection store?
+    \item What does \texttt{\$indexStats} help you find?
+    \item What do high \texttt{qr/qw} ticket counts indicate?
+    \item What does \texttt{SORT\_KEY\_GENERATOR} in a plan signal?
+\end{itemize}}
 
 \capstone{Milestone 3}{Real-Time Analytical Engine over 100 Million Documents. Build a multi-stage aggregation pipeline calculating rolling financial metrics, multi-faceted customer filters, and organizational hierarchy trees using \texttt{\$graphLookup} and \texttt{\$setWindowFields}. Optimize execution using ESR-compliant compound indexes, ensuring all queries are fully covered with zero disk spilling.}
+\rubric{\begin{itemize}[label=-, leftmargin=1.5em, itemsep=0pt]
+    \item Pipeline runs end-to-end from a clean environment following the repo README (100M-doc dataset generator included).
+    \item Architecture diagram committed (draw.io/TikZ/PNG) showing pipeline stages and index design.
+    \item At least 3 automated data-quality tests (aggregation result parity vs. reference SQL, cardinality checks, edge-case empty input) with a failing-case demonstration.
+    \item Monitoring/alerting evidence: \texttt{explain("executionStats")} output showing IXSCAN-only plans and zero disk spills.
+    \item Monthly cost estimate for the compute/storage footprint with 2 optimization decisions documented.
+    \item Security review: read-only analytics role, no hardcoded secrets, PII masking in outputs noted.
+\end{itemize}}
+
+\subsection*{Milestone 3 Capstone: Reference Solution Sketch}
+\begin{itemize}[label=-, itemsep=0pt]
+    \item \textbf{Architecture:} a dedicated analytics replica set (or analytics nodes) serving aggregation pipelines over ESR compound indexes, with \texttt{\$merge} writing precomputed results --- chosen to isolate analytical load from OLTP primaries.
+    \item Generate 100M documents; profile the naive pipeline first to record a COLLSCAN baseline.
+    \item Design one compound index per dominant query shape using the ESR rule; validate coverage via \texttt{explain("executionStats")}.
+    \item Build the pipeline: early \texttt{\$match} $\to$ \texttt{\$lookup} $\to$ \texttt{\$facet} $\to$ \texttt{\$setWindowFields} $\to$ \texttt{\$merge}.
+\begin{lstlisting}[language=Python]
+# Hardest part: a fully covered rolling-metric window over 100M docs
+pipeline = [
+    {"$match": {"ts": {"$gte": start}}},          # index range
+    {"$setWindowFields": {
+        "partitionBy": "$account_id",
+        "sortBy": {"ts": 1},
+        "output": {"avg30d": {"$avg": "$amount",
+            "window": {"range": [-30, 0], "unit": "day"}}}}},
+    {"$merge": {"into": "acct_metrics",
+                "on": "_id", "whenMatched": "replace"}}]
+\end{lstlisting}
+    \item \textbf{Pitfall:} \texttt{\$lookup} before \texttt{\$match} joins 100M docs needlessly --- filter first.
+    \item \textbf{Pitfall:} \texttt{\$setWindowFields} requires a sort; an unsorted window returns nondeterministic results.
+    \item \textbf{Pitfall:} ``covered'' is lost the moment the projection includes an unindexed field --- verify zero FETCH stages.
+\end{itemize}
+
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}[
+    node distance=4mm and 6mm,
+    box/.style={draw, rounded corners, fill=blue!10, align=center, minimum height=8mm, inner sep=2mm, font=\small},
+    sidebox/.style={draw, rounded corners, fill=orange!15, align=center, minimum height=8mm, inner sep=2mm, font=\small},
+    arr/.style={-{Stealth}, thick}
+]
+\node[box] (match) {\texttt{\$match}};
+\node[box, right=of match] (lookup) {\texttt{\$lookup}};
+\node[box, right=of lookup] (facet) {\texttt{\$facet}};
+\node[box, right=of facet] (group) {\texttt{\$group}\\/\texttt{\$setWindowFields}};
+\node[box, right=of group] (merge) {\texttt{\$merge}\\/\texttt{\$out}};
+\draw[arr] (match) -- (lookup);
+\draw[arr] (lookup) -- (facet);
+\draw[arr] (facet) -- (group);
+\draw[arr] (group) -- (merge);
+\node[sidebox, below=of lookup] (esr) {ESR compound index\\(Equality, Sort, Range)};
+\node[sidebox, below=of group] (prof) {Profiler +\\explain()};
+\draw[arr, dashed] (esr) -- (match);
+\draw[arr, dashed] (prof) -- (group);
+\end{tikzpicture}
+\caption{Milestone 3 reference architecture: aggregation pipeline stage flow with ESR index guidance and profiling feedback loop.}
+\end{figure}
+
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}[
+    node distance=8mm and 18mm,
+    ent/.style={draw, rounded corners, fill=green!8, align=left, inner sep=2mm, font=\footnotesize},
+    arr/.style={-{Stealth}, thick},
+    lbl/.style={font=\scriptsize\itshape}
+]
+\node[ent] (orders) {\textbf{orders}\\ \_id: ObjectId\\ order\_date: date\\ customer\_id: ref $\to$ customers\\ items: [embedded \{sku, qty, price\}]\\ total: decimal};
+\node[ent, right=of orders] (customers) {\textbf{customers}\\ \_id: ObjectId\\ name: string\\ region: string\\ segment: string};
+\node[ent, below=of orders] (products) {\textbf{products}\\ \_id: ObjectId\\ sku: string\\ category: string\\ price: decimal};
+\node[ent, right=of products] (employees) {\textbf{employees}\\ \_id: ObjectId\\ name: string\\ title: string\\ manager\_id: ref $\to$ employees};
+\draw[arr] (orders) -- node[lbl, above] {N:1 ref} (customers);
+\draw[arr] (orders) -- node[lbl, left] {N:M ref (items.sku)} (products);
+\draw[arr] (employees.north east) to[out=60, in=0, looseness=3] node[lbl, above] {N:1 self (manager)} (employees.east);
+\end{tikzpicture}
+\caption{Capstone data model: Real-Time Analytical Engine --- orders join customers and products via \texttt{\$lookup}; the employees self-reference powers \texttt{\$graphLookup} hierarchies.}
+\end{figure}
 
 % ==========================================
 % MILESTONE 4
 % ==========================================
 \section{Milestone 4: Atlas Ecosystem, Search, Vector Search \& Streaming (Month 4)}
 \textit{Objective: Master Lucene-powered Atlas Search, Atlas Vector Search, Atlas Stream Processing, and Event Services.}
+\par\noindent\textbf{Learning outcomes:} build Atlas Search indexes with custom analyzers, implement Hybrid Search (BM25 + vectors), author windowed Atlas Stream Processing pipelines, consume Change Streams with resumability.
 
 \subsection*{Week 13: Atlas Search (Lucene Integration)}
+\par\noindent\textbf{Outcomes:} define Atlas Search indexes with custom analyzers, compose \texttt{compound} queries with \texttt{autocomplete} and \texttt{phrase}, implement faceting and relevance boosting in \texttt{\$search}.
 \begin{itemize}[label=-]
     \dayitem{Monday}{Atlas Search Architecture: Apache Lucene integration and \texttt{\$search} pipeline stage.}
     \dayitem{Tuesday}{Index Definitions: Analyzers, Tokenizers (Standard, Keyword, Ngram), and Field Mappings.}
@@ -194,8 +656,17 @@
     \dayitem{Thursday}{\project{Create an Atlas Search Index with Custom Analyzers. Write a \texttt{\$search} pipeline using \texttt{autocomplete} for a real-time product search box.}}
     \dayitem{Friday}{\usecase{Architect an e-commerce search platform featuring fuzzy matching, relevance boosting, facets, and highlighting across a 10-million item catalog.}}
 \end{itemize}
+\resources{Atlas Search docs (\url{https://www.mongodb.com/docs/atlas/atlas-search/}); Apache Kafka repo (\url{https://github.com/apache/kafka}).}
+\selfcheck{\begin{itemize}[label=-, itemsep=0pt, leftmargin=1.5em]
+    \item Which engine powers Atlas Search?
+    \item Which aggregation stage invokes Atlas Search?
+    \item Which operator suits type-ahead search boxes?
+    \item What does an analyzer do to indexed text?
+    \item When would you choose an ngram tokenizer?
+\end{itemize}}
 
 \subsection*{Week 14: Atlas Vector Search \& GenAI Architectures}
+\par\noindent\textbf{Outcomes:} explain embeddings and distance metrics, create HNSW vector indexes, run \texttt{\$vectorSearch} queries, combine BM25 and vector results into a hybrid RAG retrieval stage.
 \begin{itemize}[label=-]
     \dayitem{Monday}{Vector Search Foundations: Embeddings, High-dimensional spaces, and Distance Metrics (Cosine, Dot Product, Euclidean).}
     \dayitem{Tuesday}{Vector Indexing: Hierarchical Navigable Small World (HNSW) and Inverted File (IVF) indexes.}
@@ -203,26 +674,177 @@
     \dayitem{Thursday}{\project{Build a Retrieval-Augmented Generation (RAG) backend. Store HuggingFace text embeddings in MongoDB Atlas, build a Vector Index, and query using \texttt{\$vectorSearch}.}}
     \dayitem{Friday}{\usecase{Architect an enterprise semantic search and recommendation engine performing Hybrid Search over unstructured PDF documents and structural metadata.}}
 \end{itemize}
+\resources{Atlas Vector Search docs (\url{https://www.mongodb.com/docs/atlas/atlas-vector-search/vector-search-overview/}); Data Engineer Handbook (\url{https://github.com/DataExpert-io/data-engineer-handbook}).}
+\selfcheck{\begin{itemize}[label=-, itemsep=0pt, leftmargin=1.5em]
+    \item What is an embedding?
+    \item What property makes HNSW indexes fast?
+    \item What does hybrid search combine?
+    \item When is cosine distance preferred over Euclidean?
+    \item What role does \texttt{\$vectorSearch} play in a RAG pipeline?
+\end{itemize}}
 
 \subsection*{Week 15: Atlas Stream Processing (ASP) \& Event-Driven Pipelines}
+\par\noindent\textbf{Outcomes:} stand up an ASP workspace with Kafka/Change-Stream connections, implement tumbling/hopping window aggregations, manage window/checkpoint state growth, join streams against Atlas collections with \texttt{\$lookup}, build end-to-end exactly-once sinks via checkpointing + idempotent \texttt{\$merge} upserts on a dedup key, route poison events to a dead-letter queue.
 \begin{itemize}[label=-]
     \dayitem{Monday}{Atlas Stream Processing (ASP) Concepts: Streams, Workspaces, Connections, and Pipelines.}
-    \dayitem{Tuesday}{Streaming Ingestion: Consuming from Kafka, Kinesis, and MongoDB Change Streams.}
-    \dayitem{Wednesday}{Windowing in ASP: Tumbling, Hop, and Session Windows.}
-    \dayitem{Thursday}{\project{Set up an Atlas Stream Processing pipeline consuming from a Kafka topic, aggregating events over 5-minute Tumbling Windows, and merging into an Atlas collection.}}
-    \dayitem{Friday}{\usecase{Design a real-time fraud detection pipeline processing streaming credit card events via ASP before persisting materialized summary alerts to MongoDB.}}
+    \dayitem{Tuesday}{Streaming Ingestion: Consuming from Kafka, Kinesis, and MongoDB Change Streams. \textbf{Stream joins:} \texttt{\$lookup} against Atlas collections inside ASP pipelines (stream-collection enrichment), time-windowed stream-stream joins, and late-arrival implications for join matches.}
+    \dayitem{Wednesday}{Windowing in ASP: Tumbling, Hop, and Session Windows. \textbf{State management:} how ASP maintains window and checkpoint state, checkpoint intervals and their latency/recovery trade-off, state growth from high-cardinality group keys, and why unbounded state kills streaming jobs (memory pressure, slow checkpoints, restart storms).}
+    \dayitem{Thursday}{\project{Set up an Atlas Stream Processing pipeline consuming from a Kafka topic, aggregating events over 5-minute Tumbling Windows, and merging into an Atlas collection. Make it end-to-end exactly-once: checkpointing plus an idempotent \texttt{\$merge} upsert keyed on a deterministic dedup key, with a dead-letter queue for poison events.}}
+\begin{lstlisting}[language=Java]
+// ASP pipeline: enrich events, then exactly-once sink via idempotent upsert
+pipeline = [
+  { $source: { connectionName: "kafka_orders" } },
+  { $lookup: {                          // stream-collection join
+      from: { connectionName: "atlas_db", db: "shop", coll: "customers" },
+      localField: "customer_id", foreignField: "_id", as: "customer" } },
+  { $set: { dedup_key: { $concat: ["$customer_id", ":", "$event_id"] } } },
+  { $merge: {                           // exactly-once sink
+      into: { connectionName: "atlas_db", db: "shop", coll: "enriched_orders" },
+      on: "dedup_key",                  // upsert on the dedup key
+      whenMatched: "replace", whenNotMatched: "insert" } }
+]
+\end{lstlisting}
+    \dayitem{Friday}{\usecase{Design a real-time fraud detection pipeline processing streaming credit card events via ASP --- enriching each event with cardholder data via \texttt{\$lookup}, joining against a velocity stream over a time window --- before persisting materialized summary alerts to MongoDB with idempotent upserts and a dead-letter queue for malformed events.}}
 \end{itemize}
+\resources{Atlas Stream Processing docs (\url{https://www.mongodb.com/docs/atlas/atlas-stream-processing/}); Apache Kafka repo (\url{https://github.com/apache/kafka}).}
+\selfcheck{\begin{itemize}[label=-, itemsep=0pt, leftmargin=1.5em]
+    \item Why does unbounded state from high-cardinality keys kill a streaming job?
+    \item What does \texttt{\$lookup} enable inside an ASP pipeline?
+    \item What do late-arriving events imply for time-windowed joins?
+    \item How do checkpointing + idempotent \texttt{\$merge} deliver end-to-end exactly-once?
+    \item What happens when a resume token outlives the oplog window?
+\end{itemize}}
+\prodnote{Streaming sinks must be idempotent: at-least-once delivery from Kafka/ASP means duplicate window emissions. Use deterministic \texttt{\_id} keys (window start + group key) with \texttt{\$merge} upserts, route poison events to a dead-letter topic, and alert on consumer lag rather than silently falling behind.}
+\prodnote{Resume tokens are not immortal: a consumer paused longer than the oplog retention window finds its token invalidated, because the oplog entries it needs have rolled off. The re-bootstrap procedure: stop the consumer, take a fresh snapshot (full initial read or consistent dump of the source collections), open a new change stream from the post-snapshot point, and resume token checkpointing from there --- and size the oplog to comfortably exceed your worst-case downtime SLA so this never fires unexpectedly.}
 
-\subsection*{Week 16: Atlas Data Services \& Serverless Integration}
+\subsection*{Week 16: Atlas Data Services, Serverless Integration \& Reverse ETL}
+\par\noindent\textbf{Outcomes:} build resumable Change Stream consumers with persisted tokens, trigger Atlas Functions on writes, implement a reverse-ETL sync to a CRM with identity resolution, size serverless connection pools.
 \begin{itemize}[label=-]
     \dayitem{Monday}{MongoDB Change Streams: Resume tokens, pre/post-images, and event filters.}
-    \dayitem{Tuesday}{Atlas Triggers \& Functions: Event-driven serverless functions on DB writes.}
+    \dayitem{Tuesday}{Atlas Triggers \& Functions: Event-driven serverless functions on DB writes. \textbf{Reverse ETL:} pushing curated aggregates (e.g. customer-360 scores) back into operational systems via Change Streams + Atlas Functions calling a CRM API --- identity resolution (matching on stable keys / hashed emails) and sync-frequency trade-offs (real-time vs. batch).}
     \dayitem{Wednesday}{Atlas Data API \& GraphQL API: HTTPS-based database interactions.}
     \dayitem{Thursday}{\project{Build a microservice utilizing Change Streams to listen for document updates, triggering an Atlas Function to sync changes to an external search index.}}
+\begin{lstlisting}[language=Python]
+from pymongo import MongoClient
+
+client = MongoClient("mongodb+srv://<cluster>.mongodb.net/")
+collection = client.shop.orders
+resume_token = load_resume_token()  # persisted checkpoint, e.g. in a collection
+
+pipeline = [{"$match": {"operationType": {"$in": ["insert", "update"]}}}]
+try:
+    with collection.watch(pipeline, resume_after=resume_token) as stream:
+        for change in stream:
+            doc = change["fullDocument"]
+            sync_to_search_index(doc)          # external index update
+            save_resume_token(stream.resume_token)  # checkpoint AFTER processing
+except Exception:
+    # Re-open with the last saved resume token; no events are lost.
+    with collection.watch(pipeline, resume_after=load_resume_token()) as stream:
+        for change in stream:
+            sync_to_search_index(change["fullDocument"])
+            save_resume_token(stream.resume_token)
+\end{lstlisting}
     \dayitem{Friday}{\usecase{Architect an event-driven serverless platform utilizing Change Streams, Atlas Triggers, and ASP to process order fulfillment events asynchronously.}}
 \end{itemize}
+\resources{MongoDB Change Streams docs (\url{https://www.mongodb.com/docs/manual/changeStreams/}); Data Engineering Zoomcamp (\url{https://github.com/DataTalksClub/data-engineering-zoomcamp}).}
+\selfcheck{\begin{itemize}[label=-, itemsep=0pt, leftmargin=1.5em]
+    \item What does a change-stream resume token identify?
+    \item Why persist the resume token only after processing an event?
+    \item What is reverse ETL?
+    \item What problem does identity resolution solve in CRM syncs?
+    \item Real-time vs. batch sync: what is the trade-off?
+\end{itemize}}
+\prodnote{Connection pool sizing for serverless functions: each cold-starting function opens a fresh connection pool, and a burst of hundreds of concurrent functions can exhaust \texttt{maxPoolSize} $\times$ instances against the cluster's connection limit. Reuse clients across warm invocations (global scope), set a small \texttt{maxPoolSize} (e.g. 1--10) for short-lived functions, and prefer the Atlas Data API or connection pooling proxies for spiky workloads.}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.3}
+\begin{tabular}{@{} l l p{4.2cm} p{4.6cm} @{}}
+\toprule
+\textbf{Atlas option} & \textbf{Billing model} & \textbf{Best for} & \textbf{Watch-outs} \\
+\midrule
+Atlas Flex & Low fixed monthly fee & Dev/test, small apps, early milestones of this course & 5GB storage cap; limited metrics, backup, and peering options \\
+Atlas Serverless & Per-operation (read/write units) + storage & Spiky, unpredictable, or idle-heavy workloads & Cold-start latency; no custom WiredTiger cache or sharding knobs \\
+Dedicated M10 & Fixed hourly per node & Baseline production: full metrics, backups, PITR & Paying for idle capacity off-peak; limited RAM/IOPS headroom \\
+Dedicated M30+ & Higher fixed hourly per node & Sharded/heavy workloads, NVMe storage, large caches & Cost scales fast multi-region; right-size before scaling out \\
+\bottomrule
+\end{tabular}
+\end{center}
 
 \capstone{Milestone 4}{Agentic E-Commerce Recommendation \& Search Engine. Build an advanced Atlas backend. Ingest product catalogs into MongoDB, index embeddings with Atlas Vector Search, implement Hybrid Search (\texttt{\$search} + \texttt{\$vectorSearch}), and process streaming user activity using Atlas Stream Processing over 5-minute sliding windows to generate real-time personalized recommendations.}
+\rubric{\begin{itemize}[label=-, leftmargin=1.5em, itemsep=0pt]
+    \item End-to-end system runs from a clean environment following the repo README (seed data + index definitions scripted).
+    \item Architecture diagram committed (draw.io/TikZ/PNG) showing Search, Vector Search, and ASP data flows.
+    \item At least 3 automated data-quality tests (search relevance spot-checks, embedding dimension validation, windowed-aggregation correctness) with a failing-case demonstration.
+    \item Monitoring/alerting evidence: ASP stream health and Atlas Search index status (screenshot or exported config).
+    \item Monthly cost estimate for Atlas Search nodes + streaming workspace with 2 optimization decisions documented.
+    \item Security review: least-privilege API keys, no hardcoded secrets, PII handling in user-activity events noted.
+\end{itemize}}
+
+\subsection*{Milestone 4 Capstone: Reference Solution Sketch}
+\begin{itemize}[label=-, itemsep=0pt]
+    \item \textbf{Architecture:} Atlas cluster $\to$ Change Streams + ASP (Kafka source) $\to$ windowed \texttt{\$merge} into \texttt{recommendations}, served by a hybrid \texttt{\$search} + \texttt{\$vectorSearch} endpoint --- one platform for OLTP, search, and streaming.
+    \item Seed the catalog; generate 768-d embeddings per product and store \texttt{model\_version} for re-embedding rollouts.
+    \item Create the vector index (HNSW, cosine) and the search index (custom analyzer) via API scripts, not the UI.
+    \item Implement hybrid retrieval: run \texttt{\$vectorSearch} and \texttt{\$search}, then merge with reciprocal-rank fusion.
+\begin{lstlisting}[language=Python]
+# Reciprocal-rank fusion of BM25 and vector hits (the hardest part)
+def hybrid(bm25, vec, k: int = 60) -> list:
+    score = {}
+    for rank, doc in enumerate(bm25):
+        score[doc["_id"]] = score.get(doc["_id"], 0) + 1 / (k + rank + 1)
+    for rank, doc in enumerate(vec):
+        score[doc["_id"]] = score.get(doc["_id"], 0) + 1 / (k + rank + 1)
+    return sorted(score, key=score.get, reverse=True)[:20]
+\end{lstlisting}
+    \item ASP: consume clickstream events, aggregate per user in 5-minute windows, \texttt{\$merge} upserts keyed on \texttt{user\_id + window\_start}.
+    \item \textbf{Pitfall:} embedding dimension drift (768 vs.\ 1024) silently zeroes recall --- validate dimensions in CI.
+    \item \textbf{Pitfall:} windowed \texttt{\$merge} without deterministic \texttt{\_id} duplicates rows on replay.
+    \item \textbf{Pitfall:} Atlas Search index rebuilds lag large bulk loads --- poll index status before serving traffic.
+\end{itemize}
+
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}[
+    node distance=4mm and 7mm,
+    box/.style={draw, rounded corners, fill=blue!10, align=center, minimum height=8mm, inner sep=2mm, font=\small},
+    sidebox/.style={draw, rounded corners, fill=orange!15, align=center, minimum height=8mm, inner sep=2mm, font=\small},
+    arr/.style={-{Stealth}, thick}
+]
+\node[box] (cs) {Change\\Streams};
+\node[box, right=of cs] (asp) {Atlas Stream\\Processing};
+\node[box, right=of asp] (search) {Atlas Search\\+ Vector Search};
+\node[box, right=of search] (app) {Application\\(RAG / UX)};
+\draw[arr] (cs) -- (asp);
+\draw[arr] (asp) -- (search);
+\draw[arr] (search) -- (app);
+\node[sidebox, below=of asp] (kafka) {Kafka / Kinesis\\sources};
+\node[sidebox, below=of search] (atlasdb) {Atlas cluster\\(operational data)};
+\draw[arr, dashed] (kafka) -- (asp);
+\draw[arr, dashed] (atlasdb) -- (search);
+\end{tikzpicture}
+\caption{Milestone 4 reference architecture: Atlas ecosystem flow from Change Streams through ASP into Search/Vector Search serving the application.}
+\end{figure}
+
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}[
+    node distance=8mm and 18mm,
+    ent/.style={draw, rounded corners, fill=green!8, align=left, inner sep=2mm, font=\footnotesize},
+    arr/.style={-{Stealth}, thick},
+    lbl/.style={font=\scriptsize\itshape}
+]
+\node[ent] (products) {\textbf{products}\\ \_id: ObjectId\\ sku: string\\ title: string (Atlas Search)\\ description: string\\ category: string};
+\node[ent, right=of products] (emb) {\textbf{product\_embeddings}\\ \_id: ObjectId\\ product\_id: ref $\to$ products\\ vector: [float] (768-d)\\ model\_version: string};
+\node[ent, below=of products] (events) {\textbf{user\_events}\\ \_id: ObjectId\\ user\_id: string\\ event\_type: string\\ product\_id: ref $\to$ products\\ ts: date (streamed)};
+\node[ent, right=of events] (recs) {\textbf{recommendations}\\ \_id: ObjectId (window + user)\\ user\_id: string\\ items: [embedded \{product\_id, score\}]\\ window\_start: date};
+\draw[arr] (emb) -- node[lbl, above] {N:1 ref} (products);
+\draw[arr] (events) -- node[lbl, left] {N:1 ref} (products);
+\draw[arr, dashed] (events) -- node[lbl, above] {ASP window} (recs);
+\draw[arr] (recs) -- node[lbl, right] {N:M ref (items)} (emb);
+\end{tikzpicture}
+\caption{Capstone data model: Agentic E-Commerce Engine --- embeddings reference products; streamed user events feed windowed recommendation documents.}
+\end{figure}
 
 \newpage
 % ==========================================
@@ -230,8 +852,10 @@
 % ==========================================
 \section{Milestone 5: Enterprise Security, Governance, Encryption \& Compliance (Month 5)}
 \textit{Objective: Master RBAC, Client-Side Field Level Encryption (CSFLE), Queryable Encryption (QE), and Auditing.}
+\par\noindent\textbf{Learning outcomes:} configure enterprise authentication and least-privilege RBAC, implement CSFLE/QE with a KMS, enforce network isolation with PrivateLink, design audit and data-lifecycle governance.
 
 \subsection*{Week 17: Authentication, Authorization \& RBAC}
+\par\noindent\textbf{Outcomes:} configure SCRAM/x.509/LDAP authentication, design least-privilege custom roles per collection and action, restrict service accounts to specific pipeline stages, detect authorization-failure anomalies.
 \begin{itemize}[label=-]
     \dayitem{Monday}{Authentication Mechanisms: SCRAM-SHA-256, x.509 Certificates, LDAP, Kerberos, and OIDC.}
     \dayitem{Tuesday}{Role-Based Access Control (RBAC): Built-in roles, Custom Roles, and Privilege Actions.}
@@ -239,17 +863,38 @@
     \dayitem{Thursday}{\project{Deploy an x.509-authenticated MongoDB cluster. Create custom RBAC roles using \texttt{grantPrivilegesToRole} to restrict a service user to specific pipeline stages.}}
     \dayitem{Friday}{\usecase{Architect a enterprise security model integrating Active Directory (LDAP) with MongoDB Atlas, enforcing least-privilege role hierarchies.}}
 \end{itemize}
+\resources{MongoDB security checklist \& RBAC docs (\url{https://www.mongodb.com/docs/manual/administration/security-checklist/}); Data Engineering Zoomcamp (\url{https://github.com/DataTalksClub/data-engineering-zoomcamp}).}
+\selfcheck{\begin{itemize}[label=-, itemsep=0pt, leftmargin=1.5em]
+    \item SCRAM-SHA-256 vs. x.509: which suits services at scale?
+    \item Why create custom RBAC roles?
+    \item What does \texttt{grantPrivilegesToRole} modify?
+    \item What is the least-privilege rule for service accounts?
+    \item Why alert on spikes of authorization failures?
+\end{itemize}}
+\prodnote{Least-privilege in practice: grant roles per collection and action, never \texttt{readWriteAnyDatabase} for service accounts. Rotate x.509 certificates and LDAP-bound credentials on a schedule, and alert on authorization failures --- a spike usually means a misconfigured role or a probing attacker.}
 
 \subsection*{Week 18: Client-Side Field Level Encryption (CSFLE) \& Queryable Encryption}
+\par\noindent\textbf{Outcomes:} manage DEKs in a key vault wrapped by a KMS master key, choose deterministic vs.\ random encryption, run equality queries over QE-encrypted fields, execute GDPR erasure via crypto-shredding.
 \begin{itemize}[label=-]
     \dayitem{Monday}{CSFLE Architecture: Key Vault Collections, Data Encryption Keys (DEK), and Master Keys (KMS).}
     \dayitem{Tuesday}{Encryption Algorithms: Deterministic Encryption vs. Random Encryption.}
     \dayitem{Wednesday}{Queryable Encryption (QE): Searching encrypted fields directly using fast equality queries without decrypting on the server.}
     \dayitem{Thursday}{\project{Configure Queryable Encryption (QE) in Python using AWS KMS. Encrypt sensitive PII fields (SSN, Credit Card), and run equality queries on the encrypted data.}}
-    \dayitem{Friday}{\usecase{Design a HIPAA/PCI-DSS compliant database architecture for a healthcare provider, securing all patient records using Queryable Encryption.}}
+    \dayitem{Friday}{GDPR Right-to-Erasure via crypto-shredding: assign one DEK per data subject (\texttt{keyAltNames} = subject ID) in a KMIP/KMS provider, so destroying that single key renders every ciphertext unreadable --- in the primary collection, across replica-set secondaries and sharded clusters, in Change Stream events consumed by downstream pipelines, in Atlas Search indexes (which embed the encrypted values), and inside continuous-backup snapshots and Atlas Online Archive tiers, without waiting for snapshot retention expiry. Trace the alternative --- row-level \texttt{deleteMany} plus downstream replay --- and its propagation burden through consumers, derived collections, and search re-indexing. Handle legal hold: keys under hold are quarantined (flagged in the KMS, never destroyed) until the hold is released, with every destroy/quarantine action written to the audit log for the compliance trail. \usecase{Design a HIPAA/PCI-DSS compliant database architecture for a healthcare provider, securing all patient records using Queryable Encryption with crypto-shredding as the erasure mechanism.}}
 \end{itemize}
+\resources{MongoDB CSFLE \& Queryable Encryption docs (\url{https://www.mongodb.com/docs/manual/core/queryable-encryption/}); Data Engineer Handbook (\url{https://github.com/DataExpert-io/data-engineer-handbook}).}
+\selfcheck{\begin{itemize}[label=-, itemsep=0pt, leftmargin=1.5em]
+    \item CSFLE vs. Queryable Encryption: what is the key difference?
+    \item Deterministic vs. random encryption: what is the query implication?
+    \item What is the relationship between a DEK and the KMS master key?
+    \item Which query shapes does QE currently support?
+    \item Why is losing the KMS master key catastrophic?
+\end{itemize}}
+\prodnote{Queryable Encryption adds storage overhead (encrypted indexes and metadata collections can grow collections 2--4x) and restricts query shapes on encrypted fields. Encrypt only fields that genuinely require it, test query patterns before enabling QE in production, and protect KMS master keys with strict IAM --- loss of the master key means unrecoverable data.}
+\prodnote{Naive \texttt{DELETE} is insufficient for GDPR erasure: the document survives in continuous-backup snapshots, PITR oplog windows, Online Archive Parquet tiers, and already-emitted Change Stream events sitting in downstream consumers and derived collections. A per-subject crypto-shredding key makes all of those copies unreadable the instant the key is destroyed; row-level deletes must instead be paired with a documented replay propagation plan, backup-retention expiry policy, and a legal-hold exception process --- and every erasure must land in the audit log.}
 
 \subsection*{Week 19: Network Security, PrivateLink \& Auditing}
+\par\noindent\textbf{Outcomes:} isolate Atlas traffic with PrivateLink and security groups, enforce TLS 1.3 with custom CAs, write scoped JSON audit filters, ship audit logs to a SIEM with rotation.
 \begin{itemize}[label=-]
     \dayitem{Monday}{Network Isolation: IP Access Lists, VPC Peering, and AWS/Azure PrivateLink.}
     \dayitem{Tuesday}{TLS/SSL Configuration: Enforcing TLS 1.3 and custom Certificate Authorities.}
@@ -257,8 +902,18 @@
     \dayitem{Thursday}{\project{Enable auditing on a MongoDB Enterprise deployment. Write a custom JSON audit filter to capture all read/write attempts on a sensitive \texttt{salaries} collection.}}
     \dayitem{Friday}{\usecase{Architect a zero-trust network perimeter for MongoDB Atlas using AWS PrivateLink, strict security groups, and real-time SIEM audit integration.}}
 \end{itemize}
+\resources{Atlas PrivateLink \& network security docs (\url{https://www.mongodb.com/docs/atlas/security-private-endpoint/}); MongoDB auditing docs (\url{https://www.mongodb.com/docs/manual/core/auditing/}).}
+\selfcheck{\begin{itemize}[label=-, itemsep=0pt, leftmargin=1.5em]
+    \item Why is PrivateLink preferred over IP access lists?
+    \item Why enforce TLS 1.3 with custom certificate authorities?
+    \item What do audit filters limit?
+    \item Why ship audit logs off-host to a SIEM?
+    \item Name the layers of a zero-trust Atlas perimeter.
+\end{itemize}}
+\prodnote{Audit logging at high verbosity generates significant I/O and log volume. Use tight audit filters (sensitive collections and DDL actions only), ship audit logs off-host to a SIEM with rotation, and treat audit gaps (agent restarts, disk-full events) as incidents with a written runbook.}
 
 \subsection*{Week 20: Governance, Archiving \& Lifecycle Management}
+\par\noindent\textbf{Outcomes:} configure Atlas Online Archive with partition-aligned date keys, run federated queries across live and archived data, explain PITR mechanics and retention, verify restores on a schedule.
 \begin{itemize}[label=-]
     \dayitem{Monday}{Atlas Online Archive: Cold data tiering to S3/Azure Blob as Parquet.}
     \dayitem{Tuesday}{Federated Database Instances: Querying live MongoDB collections alongside S3 Parquet archives seamlessly.}
@@ -266,8 +921,92 @@
     \dayitem{Thursday}{\project{Configure Atlas Online Archive on a time-series collection. Write a Federated Query seamlessly reading active Atlas data and archived S3 Parquet data.}}
     \dayitem{Friday}{\usecase{Design an enterprise data retention lifecycle automatically archiving 7-year-old financial logs to Cloud Storage while preserving queryability.}}
 \end{itemize}
+\resources{Atlas Online Archive docs (\url{https://www.mongodb.com/docs/atlas/online-archive/manage-online-archive/}); Apache Iceberg repo for open-table-format comparison (\url{https://github.com/apache/iceberg}).}
+\selfcheck{\begin{itemize}[label=-, itemsep=0pt, leftmargin=1.5em]
+    \item What does Atlas Online Archive do?
+    \item Why partition archives on the query date key?
+    \item What can an Atlas federated query read together?
+    \item What does PITR retention define?
+    \item Why must restores be tested regularly?
+\end{itemize}}
+\prodnote{Cost guardrails: Online Archive queries against cold Parquet are billed per GB scanned --- always partition archives on the date/partition key used by queries. Verify restores regularly: a backup or archive that has never been restored is not a recovery strategy.}
 
 \capstone{Milestone 5}{Hardened Enterprise Healthcare Platform. Build a zero-trust MongoDB security architecture. Implement SCRAM + x.509 authentication, deploy Queryable Encryption (QE) using AWS KMS for patient PII fields, lock down network boundaries using PrivateLink, configure custom audit logging for compliance, and set up Atlas Online Archive to tier old records to S3.}
+\rubric{\begin{itemize}[label=-, leftmargin=1.5em, itemsep=0pt]
+    \item Platform deploys end-to-end from a clean environment following the repo README.
+    \item Architecture diagram committed (draw.io/TikZ/PNG) showing security layers from network to field-level encryption.
+    \item At least 3 automated data-quality/security tests (unauthorized-access rejection, QE round-trip query, audit-log capture) with a failing-case demonstration.
+    \item Monitoring/alerting evidence: auth-failure and audit-event alerts (screenshot or exported config).
+    \item Monthly cost estimate including QE overhead and archive storage with 2 optimization decisions documented.
+    \item Security review: least-privilege roles, KMS key policy, no hardcoded secrets, PII/PHI handling documented.
+\end{itemize}}
+
+\subsection*{Milestone 5 Capstone: Reference Solution Sketch}
+\begin{itemize}[label=-, itemsep=0pt]
+    \item \textbf{Architecture:} PrivateLink-isolated Atlas cluster $\to$ x.509/SCRAM auth $\to$ least-privilege RBAC $\to$ Queryable Encryption (AWS KMS) on PII fields $\to$ audit trail to SIEM, with Online Archive for 7-year retention --- defense in depth, each layer independent.
+    \item Create the KMS master key with a deny-all-except-service IAM policy; generate one DEK per encrypted field with \texttt{keyAltNames}.
+    \item Enable QE on \texttt{patients.name} and \texttt{patients.ssn}; round-trip equality queries through the encrypted client.
+    \item Configure the audit filter to capture DDL plus all access to sensitive collections; ship logs to the SIEM.
+\begin{lstlisting}[language=Python]
+# Per-subject crypto-shredding: one DEK per patient; destroy to erase
+dek_id = client_encryption.create_data_key(
+    kms_provider="aws", master_key=MASTER_KEY,
+    key_alt_names=[f"patient:{patient_id}"])   # GDPR-ready
+
+def erase_subject(patient_id: str) -> None:
+    kv = db.get_collection("key_vault")
+    dek = kv.find_one({"keyAltNames": f"patient:{patient_id}"})
+    kv.delete_one({"_id": dek["_id"]})  # all copies, incl. backups, unreadable
+    audit.log("crypto_shred", subject=patient_id)
+\end{lstlisting}
+    \item \textbf{Pitfall:} QE metadata collections triple storage --- budget IOPS and test query shapes before enabling.
+    \item \textbf{Pitfall:} shared DEKs across subjects make per-subject erasure impossible --- key per subject from day one.
+    \item \textbf{Pitfall:} audit filters that are too broad drown the SIEM and fill disks --- scope to sensitive collections only.
+\end{itemize}
+
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}[
+    node distance=4mm and 6mm,
+    box/.style={draw, rounded corners, fill=blue!10, align=center, minimum height=8mm, inner sep=2mm, font=\small},
+    sidebox/.style={draw, rounded corners, fill=orange!15, align=center, minimum height=8mm, inner sep=2mm, font=\small},
+    arr/.style={-{Stealth}, thick}
+]
+\node[box] (net) {Network\\peering /\\PrivateLink};
+\node[box, right=of net] (auth) {Authentication\\(SCRAM, x.509,\\LDAP/OIDC)};
+\node[box, right=of auth] (roles) {Authorization\\(RBAC custom\\roles)};
+\node[box, right=of roles] (enc) {Encryption\\at rest (disk)\\\& in transit (TLS)};
+\node[box, right=of enc] (qe) {Encryption\\in use\\(CSFLE / QE)};
+\draw[arr] (net) -- (auth);
+\draw[arr] (auth) -- (roles);
+\draw[arr] (roles) -- (enc);
+\draw[arr] (enc) -- (qe);
+\node[sidebox, below=of roles] (audit) {Auditing +\\SIEM};
+\node[sidebox, below=of enc] (arch) {Online Archive\\(cold tier)};
+\draw[arr, dashed] (roles) -- (audit);
+\draw[arr, dashed] (enc) -- (arch);
+\end{tikzpicture}
+\caption{Milestone 5 reference architecture: layered security from network isolation through authentication, authorization, and encryption at rest, in transit, and in use.}
+\end{figure}
+
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}[
+    node distance=8mm and 18mm,
+    ent/.style={draw, rounded corners, fill=green!8, align=left, inner sep=2mm, font=\footnotesize},
+    arr/.style={-{Stealth}, thick},
+    lbl/.style={font=\scriptsize\itshape}
+]
+\node[ent] (patients) {\textbf{patients}\\ \_id: ObjectId\\ mrn: string\\ name: string (QE-encrypted)\\ ssn: string (QE-encrypted)\\ dob: date};
+\node[ent, right=of patients] (appts) {\textbf{appointments}\\ \_id: ObjectId\\ patient\_id: ref $\to$ patients\\ provider\_id: ref $\to$ providers\\ date: date\\ status: string};
+\node[ent, below=of patients] (providers) {\textbf{providers}\\ \_id: ObjectId\\ name: string\\ specialty: string\\ npi: string};
+\node[ent, right=of providers] (kv) {\textbf{key\_vault}\\ \_id: UUID (DEK)\\ keyMaterial: encrypted\\ keyAltNames: [string]};
+\draw[arr] (appts) -- node[lbl, above] {N:1 ref} (patients);
+\draw[arr] (appts) -- node[lbl, right] {N:1 ref} (providers);
+\draw[arr, dashed] (kv) -- node[lbl, above] {encrypts fields (KMS-wrapped)} (patients);
+\end{tikzpicture}
+\caption{Capstone data model: Hardened Healthcare Platform --- QE-encrypted PII fields in patients, referenced by appointments; DEKs held in the key vault collection.}
+\end{figure}
 
 \newpage
 % ==========================================
@@ -275,17 +1014,58 @@
 % ==========================================
 \section{Milestone 6: DataOps, Automation, Kubernetes \& Certification (Month 6)}
 \textit{Objective: Master Infrastructure as Code, Kubernetes Operator, Ops Manager, and DBA/Data Engineer Certification.}
+\par\noindent\textbf{Learning outcomes:} provision Atlas infrastructure with Terraform, operate MongoDB on Kubernetes via the Operator, execute PITR restore drills, pass the certification practice exam.
 
 \subsection*{Week 21: Infrastructure as Code (Terraform \& CloudFormation)}
+\par\noindent\textbf{Outcomes:} provision Atlas projects, clusters, users, and private endpoints with Terraform, automate index and \texttt{\$jsonSchema} migrations in CI/CD, execute zero-downtime expand-contract schema evolution.
 \begin{itemize}[label=-]
     \dayitem{Monday}{MongoDB Atlas Terraform Provider: Provisioning Clusters, Projects, and Users.}
     \dayitem{Tuesday}{Managing Database Access, Private Endpoints, and Search Indexes via Terraform.}
     \dayitem{Wednesday}{Automating Index Deployments using \texttt{mongosh} scripts in CI/CD pipelines.}
     \dayitem{Thursday}{\project{Write Terraform HCL scripts to provision an Atlas Sharded Cluster, configure VPC Peering, deploy database users, and automate index deployment.}}
-    \dayitem{Friday}{\usecase{Architect a multi-environment (Dev, Staging, Prod) GitOps infrastructure deployment pipeline managing MongoDB Atlas infrastructure using Terraform.}}
+\begin{lstlisting}
+resource "mongodbatlas_cluster" "analytics" {
+  project_id   = var.atlas_project_id
+  name         = "analytics-sharded"
+  cluster_type = "SHARDED"
+
+  replication_specs {
+    num_shards = 2
+    regions_config {
+      region_name     = "US_EAST_1"
+      electable_nodes = 3
+      priority        = 7
+      read_only_nodes = 0
+    }
+  }
+
+  provider_name               = "AWS"
+  provider_instance_size_name = "M30"
+  mongo_db_major_version      = "8.0"
+  backup_enabled              = true
+  pit_enabled                 = true
+
+  labels {
+    key   = "environment"
+    value = "production"
+  }
+}
+\end{lstlisting}
+    \dayitem{Friday}{Zero-Downtime Schema Evolution (expand--migrate--contract): \textbf{expand} --- deploy an application version writing the new optional field alongside the old one; \textbf{migrate} --- dual-write new writes and backfill existing documents with a batched aggregation pipeline (\texttt{\$set} + \texttt{\$merge}, throttled, idempotent, resumable); \textbf{switch reads} --- flip consumers to the new field behind a feature flag, with a backward-compatible view shim projecting both shapes for lagging consumers; \textbf{contract} --- only after zero lagging readers remain, enforce the field via \texttt{\$jsonSchema} (\texttt{validationAction} graduating \texttt{warn} $\to$ \texttt{error}), then \texttt{\$unset} the old field in a final batched pass. Sequence every step as a reviewed migration in the same CI/CD pipeline that deploys indexes (Wednesday), never as ad-hoc \texttt{mongosh} against production. \usecase{Architect a multi-environment (Dev, Staging, Prod) GitOps infrastructure deployment pipeline managing MongoDB Atlas infrastructure using Terraform, with expand--migrate--contract migrations gated per environment.}}
 \end{itemize}
+\resources{MongoDB Atlas Terraform provider registry (\url{https://registry.terraform.io/providers/mongodb/mongodbatlas/latest/docs}); Data Engineering Zoomcamp (\url{https://github.com/DataTalksClub/data-engineering-zoomcamp}).}
+\selfcheck{\begin{itemize}[label=-, itemsep=0pt, leftmargin=1.5em]
+    \item What resources does the Atlas Terraform provider manage?
+    \item Why store Terraform state remotely with locking?
+    \item Why run \texttt{terraform plan} in CI on every PR?
+    \item Where should Atlas API keys live?
+    \item Why bundle the Week 3 contract test into infra pipelines?
+\end{itemize}}
+\prodnote{IaC guardrails: store Terraform state remotely with locking, run \texttt{terraform plan} in CI on every PR, and never store Atlas API keys in code --- use CI secrets. Add the schema-drift contract test from Week 3 to the same pipeline so index, schema, and infrastructure changes deploy as one reviewed unit.}
+\prodnote{Failure story: a team renamed \texttt{total\_price} to \texttt{order\_total} and deployed the backfill and the application switch in the \emph{same} release. The old application version was still serving traffic during the rolling deploy, writing only \texttt{total\_price}; the revenue dashboard read the new field and silently dropped 40\% of orders for two hours until rollback. With expand--contract, the dashboard would have kept reading the shim view until every consumer had switched and the contract phase dropped the old field.}
 
 \subsection*{Week 22: MongoDB Kubernetes Operator (Enterprise/Community)}
+\par\noindent\textbf{Outcomes:} explain CRDs and operator reconciliation loops, deploy replica sets and sharded clusters as custom resources, execute rolling upgrades and TLS rotation on Kubernetes, contrast the Operator with Ops Manager.
 \begin{itemize}[label=-]
     \dayitem{Monday}{MongoDB Kubernetes Operator Architecture: Custom Resource Definitions (CRDs).}
     \dayitem{Tuesday}{Deploying Replica Sets and Sharded Clusters on Kubernetes via Custom Resources.}
@@ -293,17 +1073,36 @@
     \dayitem{Thursday}{\project{Deploy the MongoDB Community Kubernetes Operator on a local Minikube cluster. Provision a 3-node Replica Set, trigger a rolling version upgrade, and monitor recovery.}}
     \dayitem{Friday}{\usecase{Design a private cloud database-as-a-service (DBaaS) architecture leveraging the MongoDB Enterprise Kubernetes Operator and Ops Manager.}}
 \end{itemize}
+\resources{MongoDB Kubernetes Operator docs (\url{https://www.mongodb.com/docs/kubernetes-operator/}); Apache Airflow repo for complementary orchestration (\url{https://github.com/apache/airflow}).}
+\selfcheck{\begin{itemize}[label=-, itemsep=0pt, leftmargin=1.5em]
+    \item What is a Kubernetes CRD?
+    \item What does the MongoDB Kubernetes Operator automate?
+    \item How does the operator perform a rolling upgrade?
+    \item Why use Minikube for learning the operator?
+    \item Operator vs. Ops Manager: who does what?
+\end{itemize}}
 
 \subsection*{Week 23: Backup, Disaster Recovery \& Ops Manager / Cloud Manager}
+\par\noindent\textbf{Outcomes:} describe Ops Manager/Cloud Manager agent roles, execute a PITR restore drill against a measured RPO/RTO, configure Atlas alerts for lag, connections, and backup failures, write runbook entries per alert.
 \begin{itemize}[label=-]
     \dayitem{Monday}{Ops Manager / Cloud Manager Architecture: Monitoring, Backup, and Automation Agents.}
     \dayitem{Tuesday}{Continuous Backups and Point-In-Time Recovery (PITR) mechanics.}
-    \dayitem{Wednesday}{Performance Advisor \& Index Ranking engines in Cloud Manager.}
-    \dayitem{Thursday}{\project{Simulate data corruption on a test cluster. Execute a Point-In-Time Recovery (PITR) using Cloud Manager snapshots to restore the database to 1 minute before corruption.}}
+    \dayitem{Wednesday}{Atlas Observability: metrics dashboards, alert configurations (e.g., replication lag $>10$s, connection saturation, disk usage), and the Performance Advisor / Index Ranking engines.}
+    \dayitem{Thursday}{\project{Backup/PITR restore drill: enable Atlas Continuous Backup on a test cluster, snapshot document counts, then \emph{accidentally} drop a collection. Perform a point-in-time restore to 1 minute before the drop and verify restored document counts match the pre-drop snapshot. Then configure Atlas alerts: replication lag $>10$s and connections $>80\%$ of maximum.}}
     \dayitem{Friday}{\usecase{Architect a disaster recovery strategy with an RPO of $<1$ minute and RTO of $<15$ minutes for a multi-region enterprise database cluster.}}
 \end{itemize}
+\resources{Atlas monitoring \& alerts docs (\url{https://www.mongodb.com/docs/atlas/monitoring-alerts/}); Atlas backup \& PITR docs (\url{https://www.mongodb.com/docs/atlas/backup-restore-cluster/}).}
+\selfcheck{\begin{itemize}[label=-, itemsep=0pt, leftmargin=1.5em]
+    \item Define RPO and RTO.
+    \item How does PITR reconstruct any point in time?
+    \item Which two alert thresholds were configured this week?
+    \item What does the Atlas Performance Advisor do?
+    \item Why alert on backup job failures themselves?
+\end{itemize}}
+\prodnote{Day-2 operations: every alert needs a runbook entry (owner, triage steps, escalation). Test the PITR drill quarterly --- measure actual RTO against the stated objective --- and alert on backup job failures themselves, since a silently broken backup is the worst kind of surprise.}
 
 \subsection*{Week 24: MongoDB Certified DBA \& Data Engineer Readiness}
+\par\noindent\textbf{Outcomes:} map exam domains to the six milestones, score 75\%+ on a timed 60-question practice exam, triage incorrect answers to source domains, assemble the capstone portfolio for interviews.
 \begin{itemize}[label=-]
     \dayitem{Monday}{Exam Review: Storage Engine, Memory, and System Performance Domain (25\%).}
     \dayitem{Tuesday}{Exam Review: Replication, Consensus, and Sharding Mechanics Domain (30\%).}
@@ -311,8 +1110,423 @@
     \dayitem{Thursday}{\project{Take a full-length 60-question MongoDB Certified Data Engineer practice exam under timed conditions. Review incorrect responses and analyze edge cases.}}
     \dayitem{Friday}{Final Review and Certification Readiness Verification.}
 \end{itemize}
+\resources{MongoDB University certification catalog (\url{https://learn.mongodb.com/}); Data Engineering Zoomcamp (\url{https://github.com/DataTalksClub/data-engineering-zoomcamp}).}
+\selfcheck{\begin{itemize}[label=-, itemsep=0pt, leftmargin=1.5em]
+    \item Which exam domain carries the most weight?
+    \item What practice-exam score signals certification readiness?
+    \item What fraction of the readiness score comes from capstones?
+    \item What is a sound time-boxing strategy for 60 questions?
+    \item What should you do with every incorrect practice answer?
+\end{itemize}}
 
 \capstone{Milestone 6}{Production-Grade GitOps Data Platform Deployment. Build an automated database platform. Use Terraform to deploy an Atlas cluster, integrate the MongoDB Kubernetes Operator for local staging, deploy CI/CD pipelines for Index and Schema migrations, configure Continuous Backups with PITR, and complete a full-length DBA/Data Engineer practice evaluation.}
+\rubric{\begin{itemize}[label=-, leftmargin=1.5em, itemsep=0pt]
+    \item Full platform deploys from a clean environment following the repo README (Terraform + K8s manifests + CI pipeline).
+    \item Architecture diagram committed (draw.io/TikZ/PNG) showing the GitOps flow from commit to running Atlas/K8s cluster.
+    \item At least 3 automated data-quality tests in CI (schema-drift contract test, post-deploy connectivity check, restore-verification job) with a failing-case demonstration.
+    \item Monitoring/alerting evidence: Atlas alert policies (lag, connections, backup failures) exported as config or screenshot.
+    \item Monthly cost estimate across environments with 2 optimization decisions documented.
+    \item Security review: least-privilege CI service account, secrets in CI vault (no hardcoded keys), PII handling noted.
+\end{itemize}}
+
+\subsection*{Milestone 6 Capstone: Reference Solution Sketch}
+\begin{itemize}[label=-, itemsep=0pt]
+    \item \textbf{Architecture:} Git repo (HCL + K8s manifests) $\to$ CI/CD $\to$ Terraform Atlas provider for prod, MongoDB K8s Operator for staging --- one reviewed pipeline ships infrastructure, indexes, and schemas together.
+    \item Structure the repo as \texttt{infra/} (Terraform, remote state + locking), \texttt{migrations/} (numbered index/schema scripts), and \texttt{k8s/} (operator manifests).
+    \item CI stages: \texttt{terraform plan} on PR $\to$ contract tests $\to$ apply to staging (K8s operator) $\to$ smoke tests $\to$ manual gate $\to$ prod apply.
+    \item Enable Continuous Backup + PITR on prod; add a scheduled restore-verification job that restores to a scratch cluster nightly.
+\begin{lstlisting}
+# migrations/0007_expand_contract.js -- runs in CI, idempotent
+db.orders.updateMany(
+  { order_total: { $exists: false }, total_price: { $exists: true } },
+  [ { $set: { order_total: "$total_price" } } ] );      // backfill
+// contract phase (separate later migration, after readers switch):
+db.runCommand({ collMod: "orders", validator: { $jsonSchema: {
+  required: ["order_total"] } }, validationAction: "error" });
+db.orders.updateMany({}, [ { $unset: "total_price" } ] );
+\end{lstlisting}
+    \item \textbf{Pitfall:} applying Terraform to prod before staging passes hides provider bugs --- gate prod on staging smoke tests.
+    \item \textbf{Pitfall:} a one-shot full-table backfill saturates the primary --- batch, throttle, and make migrations resumable.
+    \item \textbf{Pitfall:} a restore-verification job that never runs means PITR is a hope, not a control --- alert on its failures.
+\end{itemize}
+
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}[
+    node distance=4mm and 7mm,
+    box/.style={draw, rounded corners, fill=blue!10, align=center, minimum height=8mm, inner sep=2mm, font=\small},
+    sidebox/.style={draw, rounded corners, fill=orange!15, align=center, minimum height=8mm, inner sep=2mm, font=\small},
+    arr/.style={-{Stealth}, thick}
+]
+\node[box] (git) {Git repo\\(HCL + YAML)};
+\node[box, right=of git] (cicd) {CI/CD\\pipeline};
+\node[box, right=of cicd] (tf) {Terraform\\(Atlas provider)};
+\node[box, right=of tf] (atlas) {MongoDB\\Atlas};
+\draw[arr] (git) -- (cicd);
+\draw[arr] (cicd) -- (tf);
+\draw[arr] (tf) -- (atlas);
+\node[sidebox, below=of cicd] (k8sop) {MongoDB K8s\\Operator};
+\node[sidebox, below=of tf] (k8s) {Kubernetes\\staging cluster};
+\node[sidebox, below=of atlas] (backup) {Continuous\\Backup + PITR};
+\draw[arr] (cicd) -- (k8sop);
+\draw[arr] (k8sop) -- (k8s);
+\draw[arr, dashed] (atlas) -- (backup);
+\end{tikzpicture}
+\caption{Milestone 6 reference architecture: GitOps flow from Git through CI/CD and Terraform into Atlas, with the Kubernetes Operator managing staging and Continuous Backup protecting production.}
+\end{figure}
+
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}[
+    node distance=8mm and 18mm,
+    ent/.style={draw, rounded corners, fill=green!8, align=left, inner sep=2mm, font=\footnotesize},
+    arr/.style={-{Stealth}, thick},
+    lbl/.style={font=\scriptsize\itshape}
+]
+\node[ent] (projects) {\textbf{projects}\\ \_id: ObjectId\\ name: string\\ org\_id: string\\ owners: [embedded]};
+\node[ent, right=of projects] (clusters) {\textbf{clusters}\\ \_id: ObjectId\\ project\_id: ref $\to$ projects\\ tier: string (M10/M30)\\ region: string\\ backup\_enabled: bool};
+\node[ent, below=of projects] (snaps) {\textbf{backup\_snapshots}\\ \_id: ObjectId\\ cluster\_id: ref $\to$ clusters\\ created\_at: date\\ pit\_window\_hours: int};
+\node[ent, right=of snaps] (alerts) {\textbf{alert\_policies}\\ \_id: ObjectId\\ project\_id: ref $\to$ projects\\ metric: string\\ threshold: number\\ notify: [embedded]};
+\draw[arr] (clusters) -- node[lbl, above] {N:1 ref} (projects);
+\draw[arr] (snaps) -- node[lbl, left] {N:1 ref} (clusters);
+\draw[arr] (alerts) -- node[lbl, above] {N:1 ref} (projects);
+\end{tikzpicture}
+\caption{Capstone data model: Production GitOps Platform --- Terraform-managed projects and clusters, with snapshot and alert-policy metadata tracked as documents.}
+\end{figure}
+
+\newpage
+% ==========================================
+% APPENDICES
+% ==========================================
+\section{Appendix A: Glossary}
+\begin{description}[leftmargin=4.5em, style=nextline, itemsep=0pt]
+    \item[WiredTiger] MongoDB's default storage engine providing document-level concurrency control, compression, journaling, and checkpoints.
+    \item[Checkpoint] A durable, consistent snapshot WiredTiger writes to disk every 60 seconds; journals cover the gaps between checkpoints.
+    \item[Oplog] The capped operations log on replica set primaries that secondaries tail to replicate writes idempotently.
+    \item[Replica Set] A group of mongod processes maintaining the same data set, providing automatic failover via Raft-like elections.
+    \item[Write Concern] The acknowledgment level requested for a write (\texttt{w:1}, \texttt{w:majority}, \texttt{j:true}), trading latency for durability.
+    \item[Read Concern] The consistency level of reads (\texttt{local}, \texttt{majority}, \texttt{linearizable}).
+    \item[Read Preference] Routing rule for read traffic (e.g. \texttt{nearest}, \texttt{secondaryPreferred}) across replica set members.
+    \item[Shard Key] The immutable-ish field(s) determining how documents distribute across shards; governs query targeting vs. scatter-gather.
+    \item[Chunk] A contiguous range of shard-key values; the unit of data movement between shards during balancing.
+    \item[Balancer] The background process that migrates chunks to keep shards evenly loaded; can be restricted to scheduled windows.
+    \item[CSRS] Config Server Replica Set; stores cluster metadata (chunk ranges, zones) consulted by \texttt{mongos}.
+    \item[mongos] The stateless query router for sharded clusters that targets queries using CSRS metadata.
+    \item[Zone Sharding] Pinning chunk ranges to specific shards to enforce data residency or hardware affinity.
+    \item[ESR Rule] Compound index field ordering guideline: Equality fields first, then Sort, then Range.
+    \item[Covered Query] A query served entirely from an index without fetching documents.
+    \item[Aggregation Pipeline] An ordered sequence of stages (\texttt{\$match}, \texttt{\$group}, \texttt{\$lookup}, ...) transforming documents server-side.
+    \item[\$facet] A stage running multiple independent sub-pipelines over the same input documents in one pass.
+    \item[Change Stream] A resumable, ordered stream of real-time data change events on a collection, database, or cluster.
+    \item[Resume Token] An opaque token identifying a position in a change stream, enabling restart without event loss.
+    \item[Atlas Search] Lucene-powered full-text search integrated into Atlas via the \texttt{\$search} stage.
+    \item[Atlas Vector Search] Approximate-nearest-neighbor (HNSW) vector index search via \texttt{\$vectorSearch}, used for RAG and recommendations.
+    \item[ASP] Atlas Stream Processing: managed continuous stream processing over Kafka/Change Streams sources with windowed aggregation.
+    \item[CSFLE] Client-Side Field Level Encryption; fields are encrypted by the driver before leaving the application.
+    \item[Queryable Encryption (QE)] MongoDB's in-use encryption allowing equality queries over encrypted fields without server-side decryption.
+    \item[PITR] Point-In-Time Recovery: restoring a cluster to any second within the continuous-backup retention window using oplog replay.
+    \item[Performance Advisor] Atlas feature that analyzes slow queries and recommends indexes.
+\end{description}
+
+\section{Appendix B: Assessment \& Grading Model}
+Each milestone capstone is graded on the following weighted rubric:
+
+\begin{center}
+\renewcommand{\arraystretch}{1.3}
+\begin{tabular}{@{} l c p{7.5cm} @{}}
+\toprule
+\textbf{Category} & \textbf{Weight} & \textbf{What is assessed} \\
+\midrule
+Correctness & 30\% & Pipeline/system produces correct results end-to-end from a clean checkout. \\
+Reliability \& tests & 20\% & Automated data-quality tests, failing-case demo, failover/restore drills. \\
+Security & 15\% & Least-privilege roles, secrets management, encryption, PII handling. \\
+Cost awareness & 15\% & Monthly cost estimate with documented optimization decisions. \\
+Documentation & 10\% & README quality, architecture diagram, runbook entries. \\
+Demo & 10\% & Live walkthrough: deploy, break, observe, and recover the system. \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{Readiness score:} the six capstone grades form 70\% of the final readiness score. The Week 24 timed practice exam contributes the remaining 30\%; a score of 75\%+ on the practice exam plus all capstone rubrics satisfied indicates certification readiness.
+
+\section{Appendix C: Interview Preparation}
+\begin{enumerate}[itemsep=0pt]
+    \item Walk me through what happens, byte by byte, when a document is written to MongoDB. \textit{(Week 1)}
+    \item When would you embed versus reference, and which anti-patterns have you seen in production? \textit{(Weeks 2--3)}
+    \item How do you migrate a large PostgreSQL database to MongoDB with zero downtime? \textit{(Week 4)}
+    \item Explain what can roll back during a primary failover and how write/read concerns prevent it. \textit{(Week 5)}
+    \item How do you choose a shard key, and how do you fix a bad one on a live 20M-document collection? \textit{(Weeks 6--7)}
+    \item How would you enforce GDPR data residency across a global cluster? \textit{(Week 8)}
+    \item A query is slow: walk me through your \texttt{explain()} methodology and how the ESR rule guides index design. \textit{(Weeks 9, 12)}
+    \item Replace five SQL JOINs with one aggregation pipeline --- which stages do you use and why? \textit{(Weeks 10--11)}
+    \item How do Change Streams and Atlas Stream Processing differ, and how do you make stream consumers idempotent? \textit{(Weeks 15--16)}
+    \item Design the security architecture for a HIPAA-compliant MongoDB platform, including encryption in use. \textit{(Weeks 17--19)}
+\end{enumerate}
+
+\section{Appendix D: Self-Check Answer Key}
+
+\textbf{Week 1:}
+\begin{enumerate}[itemsep=0pt]
+    \item 60 seconds by default.
+    \item Committed writes made since the last checkpoint.
+    \item \texttt{wiredTiger.cache} (eviction and dirty-bytes counters).
+    \item The OS page cache needs RAM for file I/O buffering.
+    \item Latency stalls during checkpoints; tune cache size and disk I/O.
+\end{enumerate}
+
+\textbf{Week 2:}
+\begin{enumerate}[itemsep=0pt]
+    \item The Attribute Pattern (array of key/value attribute documents).
+    \item Groups many measurements per document, slashing metadata overhead.
+    \item When the working set is bloated by rarely-read fields.
+    \item Derived values, precomputed at write time.
+    \item Type 1 overwrites; Type 2 keeps versioned history with valid\_from/valid\_to.
+\end{enumerate}
+
+\textbf{Week 3:}
+\begin{enumerate}[itemsep=0pt]
+    \item When the ``many'' side is few and read together with the parent.
+    \item Unbounded document growth hits the 16MB limit and degrades writes.
+    \item Breaking: renaming a required field; non-breaking: adding an optional field.
+    \item Logs violations but still accepts the write.
+    \item The producer team owns it; enforced at ingestion, in CI, and in the database.
+\end{enumerate}
+
+\textbf{Week 4:}
+\begin{enumerate}[itemsep=0pt]
+    \item Writing to both systems; risk of divergence on partial failure.
+    \item To capture changes that occurred during the bulk load.
+    \item That both systems return equivalent results for live queries.
+    \item Retries and replays must not duplicate or corrupt data.
+    \item Keeping the source live and replicating back until cutover.
+\end{enumerate}
+
+\textbf{Week 5:}
+\begin{enumerate}[itemsep=0pt]
+    \item The new primary may lack writes the old primary acknowledged.
+    \item Capped replication log; secondaries may re-apply operations.
+    \item They vote without holding data, weakening durability semantics.
+    \item Acknowledgment only after the journal write is durable.
+    \item \texttt{readConcern: "majority"}.
+\end{enumerate}
+
+\textbf{Week 6:}
+\begin{enumerate}[itemsep=0pt]
+    \item \texttt{mongos} routes queries; the CSRS stores chunk and zone metadata.
+    \item Hash spreads evenly but defeats range targeting; range is the opposite.
+    \item All new writes land on the single highest chunk's shard.
+    \item A contiguous shard-key range; split when exceeding max chunk size.
+    \item Chunks between shards; copy cost plus latency on the donor shard.
+\end{enumerate}
+
+\textbf{Week 7:}
+\begin{enumerate}[itemsep=0pt]
+    \item High cardinality, low frequency, non-monotonic rate of change.
+    \item Adding suffix fields to the existing shard key live.
+    \item Every shard must be queried and results merged by \texttt{mongos}.
+    \item Few chunks limit distribution and parallelism across shards.
+    \item One shard shows disproportionate ops/CPU versus its peers.
+\end{enumerate}
+
+\textbf{Week 8:}
+\begin{enumerate}[itemsep=0pt]
+    \item A range of shard-key values (chunks).
+    \item Zone-shard EU keys to EU shards; verify with chunk distribution.
+    \item Routes reads to the member with the lowest network latency.
+    \item Directing reads to members tagged by hardware or region.
+    \item Minimizes cross-region latency and egress cost.
+\end{enumerate}
+
+\textbf{Week 9:}
+\begin{enumerate}[itemsep=0pt]
+    \item Equality fields first, then Sort, then Range.
+    \item All returned fields come from the index; no document FETCH.
+    \item At most one array (multikey) field per compound index.
+    \item When queries consistently target a small filtered subset.
+    \item Avoids blocking writes and cache pressure on the primary.
+\end{enumerate}
+
+\textbf{Week 10:}
+\begin{enumerate}[itemsep=0pt]
+    \item Reduces documents flowing into expensive later stages.
+    \item Runs multiple independent sub-pipelines over the same input.
+    \item Recursive traversal of hierarchies (e.g. org charts).
+    \item Outputs one document per array element.
+    \item Stages may spill to disk beyond 100MB RAM; 10--100x slower.
+\end{enumerate}
+
+\textbf{Week 11:}
+\begin{enumerate}[itemsep=0pt]
+    \item Window functions: ranks, moving averages, cumulative sums.
+    \item The pipeline aborts unless \texttt{allowDiskUse} is set.
+    \item \texttt{\$rank} skips positions after ties; \texttt{\$denseRank} does not.
+    \item The rate of change between window boundary documents.
+    \item A range window of -30 days to current over a date field.
+\end{enumerate}
+
+\textbf{Week 12:}
+\begin{enumerate}[itemsep=0pt]
+    \item Index scan versus full collection scan.
+    \item Profiled slow operations with timing and plan details.
+    \item Unused indexes that waste RAM and write throughput.
+    \item Queued read/write operations; the server is saturated.
+    \item An in-memory sort because no index provides the order.
+\end{enumerate}
+
+\textbf{Week 13:}
+\begin{enumerate}[itemsep=0pt]
+    \item Apache Lucene, integrated per Atlas cluster.
+    \item \texttt{\$search} (or \texttt{\$searchMeta}).
+    \item \texttt{autocomplete}.
+    \item Tokenizes and normalizes text (stemming, casing, stopwords).
+    \item Substring/partial matching on short fields like SKUs.
+\end{enumerate}
+
+\textbf{Week 14:}
+\begin{enumerate}[itemsep=0pt]
+    \item A dense vector capturing the semantic meaning of content.
+    \item Approximate nearest-neighbor graph; sub-linear lookup time.
+    \item BM25 keyword (\texttt{\$search}) with vector (\texttt{\$vectorSearch}) results.
+    \item When magnitudes vary; direction carries the meaning.
+    \item Retrieves semantically similar documents to ground the LLM prompt.
+\end{enumerate}
+
+\textbf{Week 15:}
+\begin{enumerate}[itemsep=0pt]
+    \item Ever-growing state exhausts memory/disk, slows checkpoints, and causes restarts.
+    \item Stream-collection joins: enriching each event with current Atlas data.
+    \item Events outside the window/allowed lateness miss matches or must be dropped.
+    \item Replay re-emits, but upserts on the dedup key make re-processing effect-free.
+    \item The token is invalidated; the consumer must re-bootstrap from a fresh snapshot.
+\end{enumerate}
+
+\textbf{Week 16:}
+\begin{enumerate}[itemsep=0pt]
+    \item A position in the stream enabling restart without event loss.
+    \item Crashes then reprocess at most the un-checkpointed events.
+    \item Pushing curated analytics back into operational tools (CRM).
+    \item Matching records to the same entity across systems' keys.
+    \item Freshness and immediacy versus API rate limits and cost.
+\end{enumerate}
+
+\textbf{Week 17:}
+\begin{enumerate}[itemsep=0pt]
+    \item x.509; no passwords to rotate, certificate-based identity.
+    \item Built-in roles are too broad for least-privilege access.
+    \item Adds collection/action privileges to an existing role.
+    \item Only the exact actions on the exact collections needed.
+    \item Signals misconfigured roles or an active probing attack.
+\end{enumerate}
+
+\textbf{Week 18:}
+\begin{enumerate}[itemsep=0pt]
+    \item CSFLE encrypts before the query; QE allows equality queries on ciphertext.
+    \item Deterministic enables equality matches; random prevents them.
+    \item The master key wraps DEKs stored in the key vault collection.
+    \item Equality (plus range/prefix in newer versions) only.
+    \item All encrypted data becomes permanently unrecoverable.
+\end{enumerate}
+
+\textbf{Week 19:}
+\begin{enumerate}[itemsep=0pt]
+    \item Private endpoints avoid public IPs and broad allowlists.
+    \item Strong transport encryption with controlled trust chains.
+    \item Which actions and collections generate audit events, reducing volume.
+    \item Tamper evidence and correlation across systems.
+    \item PrivateLink, TLS, authentication, RBAC, auditing.
+\end{enumerate}
+
+\textbf{Week 20:}
+\begin{enumerate}[itemsep=0pt]
+    \item Tiers cold data to S3/Blob as queryable Parquet.
+    \item Per-GB-scanned billing; partition pruning keeps costs low.
+    \item Live Atlas collections alongside archived cloud storage.
+    \item The window within which any point in time is restorable.
+    \item An untested backup is not a recovery strategy.
+\end{enumerate}
+
+\textbf{Week 21:}
+\begin{enumerate}[itemsep=0pt]
+    \item Projects, clusters, users, private endpoints, search indexes.
+    \item Prevents concurrent applies from corrupting shared state.
+    \item Reviews infrastructure diffs before they touch production.
+    \item CI secret stores or vaults; never in code.
+    \item Schema, index, and infrastructure changes deploy as one reviewed unit.
+\end{enumerate}
+
+\textbf{Week 22:}
+\begin{enumerate}[itemsep=0pt]
+    \item A Custom Resource Definition extending the Kubernetes API.
+    \item Provisioning, TLS rotation, upgrades, and scaling of clusters.
+    \item Replaces members one at a time, preserving availability.
+    \item A free local cluster with the same operator semantics.
+    \item The Operator reconciles K8s state; Ops Manager monitors and backs up.
+\end{enumerate}
+
+\textbf{Week 23:}
+\begin{enumerate}[itemsep=0pt]
+    \item Maximum data-loss window versus maximum time to restore service.
+    \item Nearest snapshot plus oplog replay to the target second.
+    \item Replication lag $>10$s; connections $>80\%$ of maximum.
+    \item Analyzes slow queries and recommends indexes.
+    \item A silently broken backup defeats the entire DR plan.
+\end{enumerate}
+
+\textbf{Week 24:}
+\begin{enumerate}[itemsep=0pt]
+    \item Replication, Consensus, and Sharding Mechanics (30\%).
+    \item 75\%+ under timed conditions.
+    \item 70\%; the practice exam contributes 30\%.
+    \item About 1.5 minutes per question; flag and revisit hard ones.
+    \item Trace the misconception to a domain and re-study it.
+\end{enumerate}
+
+\section{Appendix E: Datasets \& Project Data}
+
+\subsection*{Public datasets}
+\begin{itemize}[label=-]
+    \item \textbf{MongoDB Atlas sample datasets} --- loadable free from the Atlas UI (``Load Sample Dataset''): \texttt{sample\_mflix} (movies/comments; Weeks 9--13 aggregation and search), \texttt{sample\_analytics} (customers/accounts/transactions; Milestone 3 analytics), and \texttt{sample\_supplies} (orders with embedded items; Milestones 1--2 modeling and sharding). See \url{https://www.mongodb.com/docs/atlas/sample-data/}.
+    \item \textbf{Olist Brazilian e-commerce dataset} (Kaggle: \url{https://www.kaggle.com/datasets/olistbr/brazilian-ecommerce}) --- 9 relational CSVs (~100k orders); ideal for the Milestone 1 relational-to-document migration capstone and the Milestone 4 recommendation engine.
+    \item \textbf{MongoDB open datasets} (\url{https://github.com/mongodb/docs-assets} and \url{https://github.com/neelabalan/mongodb-sample-dataset}) --- restaurants, airbnb, and other JSON corpora for indexing and aggregation practice.
+\end{itemize}
+
+\subsection*{Synthetic data generation}
+\begin{itemize}[label=-]
+    \item \textbf{mgeneratejs} (\url{https://github.com/rueckstiess/mgeneratejs}) --- template-driven document generation at volume (10M+ inserts in Week 1).
+    \item \textbf{Python Faker} --- realistic PII-style fields for capstone seed data.
+    \item \textbf{Expected volumes per milestone:} Milestone 1: $\sim$100k documents; Milestone 2: 20M documents (live shard-key refinement); Milestone 3: 100M documents; Milestones 4--6: 1--10M documents plus continuous Change Stream / Kafka event feeds.
+\end{itemize}
+
+\section{Appendix F: Portfolio \& Presentation Guide}
+
+\subsection*{Presenting each capstone on GitHub}
+Structure every capstone README as:
+\begin{enumerate}[itemsep=0pt]
+    \item \textbf{Problem statement} and architecture diagram first --- a reviewer should understand the system in 30 seconds.
+    \item \textbf{Setup instructions} that run end-to-end from a clean checkout (seed data scripts included).
+    \item \textbf{Screenshots/evidence}: dashboards, \texttt{explain()} plans, failover or PITR restore proof, alert configs.
+    \item \textbf{Cost estimate}: monthly Atlas footprint with the two optimization decisions you documented.
+    \item \textbf{Lessons learned} and known limitations --- this section is what senior interviewers read first.
+\end{enumerate}
+
+\subsection*{Resume bullet templates (two per milestone)}
+\begin{itemize}[label=-]
+    \item \textbf{M1:} ``Migrated a 15-table PostgreSQL schema to MongoDB using Relational Migrator with CDC, achieving zero-downtime cutover and a 5x query speedup.''
+    \item \textbf{M1:} ``Designed document models applying Attribute, Bucket, and Subset patterns, enforced with versioned \$jsonSchema data contracts in CI.''
+    \item \textbf{M2:} ``Deployed a 4-shard multi-region MongoDB cluster with zone sharding enforcing GDPR data residency across 3 regions.''
+    \item \textbf{M2:} ``Refined shard keys live on 20M documents, reducing scatter-gather analytical queries by 90\%.''
+    \item \textbf{M3:} ``Built aggregation pipelines (\$facet, \$setWindowFields, \$graphLookup) over 100M documents served by fully covered ESR-compliant indexes.''
+    \item \textbf{M3:} ``Eliminated disk spilling and collection scans via \texttt{explain()}-driven tuning and \$indexStats index pruning.''
+    \item \textbf{M4:} ``Implemented hybrid search combining Atlas Search (BM25) and Vector Search embeddings for a RAG recommendation engine.''
+    \item \textbf{M4:} ``Built an Atlas Stream Processing pipeline windowing Kafka events into real-time personalized recommendations.''
+    \item \textbf{M5:} ``Hardened a healthcare platform with Queryable Encryption via AWS KMS, x.509 auth, PrivateLink, and SIEM-integrated auditing.''
+    \item \textbf{M5:} ``Designed a 7-year data lifecycle with Atlas Online Archive tiering to Parquet while preserving federated queryability.''
+    \item \textbf{M6:} ``Automated multi-environment Atlas deployments with Terraform and GitOps CI/CD including schema-contract tests.''
+    \item \textbf{M6:} ``Operated MongoDB on Kubernetes via the Operator and validated DR with a quarterly PITR restore drill (RPO $<1$ minute).''
+\end{itemize}
+
+\subsection*{Talking about your projects in interviews}
+Lead with the problem and the scale (document counts, throughput, regions), then quantify outcomes (latency reduction, cost saved, failover time). Pick one hard trade-off per project --- shard key choice, write concern vs. latency, embedding vs. referencing --- and explain what you rejected and why. Be ready to whiteboard the architecture diagram from memory and to defend a failure scenario: region outage, rolled-back writes, or schema drift caught in CI.
 
 \newpage
 % ==========================================
@@ -340,11 +1554,11 @@
 \endlastfoot
 
 1 & WiredTiger Storage Engine & Cache \& Eviction Tuning Benchmark & $\square$ \\
-2 & Advanced Schema Patterns & Attribute \& Subset Pattern Refactoring & $\square$ \\
-3 & Modeling Relationships & JSON Schema Validation Implementation & $\square$ \\
+2 & Advanced Schema Patterns \& Analytics Modeling & Attribute \& Subset Pattern Refactoring + SCD2 History & $\square$ \\
+3 & Modeling Relationships \& Data Contracts & JSON Schema Validation Implementation & $\square$ \\
 4 & Relational to MongoDB Migration & \textbf{Cap 1: Relational Monolith Modernization} & $\square$ \\
 \midrule
-5 & Replica Set Internals & Network Partition \& Election Simulation & $\square$ \\
+5 & Replica Set Internals & Failover \& Election Simulation (\texttt{rs.stepDown}) & $\square$ \\
 6 & Sharding Mechanics & Hash-based Sharded Cluster Deployment & $\square$ \\
 7 & Cluster Balancing \& Tuning & Live Shard Key Refinement & $\square$ \\
 8 & Global Clusters \& Multi-Region & \textbf{Cap 2: Globally Distributed Sharded Cluster} & $\square$ \\
@@ -357,16 +1571,16 @@
 13 & Atlas Search (Lucene) & Custom Analyzer \& Autocomplete Search & $\square$ \\
 14 & Atlas Vector Search \& GenAI & RAG Backend with Embeddings \& Vector Index & $\square$ \\
 15 & Atlas Stream Processing & Kafka Windowed Streaming Pipeline & $\square$ \\
-16 & Change Streams \& Eventing & \textbf{Cap 4: Agentic E-Commerce Engine} & $\square$ \\
+16 & Change Streams, Eventing \& Reverse ETL & \textbf{Cap 4: Agentic E-Commerce Engine} & $\square$ \\
 \midrule
 17 & Authentication \& RBAC & SCRAM + x.509 Custom Role Setup & $\square$ \\
-18 & Encryption (CSFLE \& QE) & Queryable Encryption with AWS KMS & $\square$ \\
+18 & Encryption (CSFLE \& QE) + GDPR Erasure & Queryable Encryption with AWS KMS & $\square$ \\
 19 & Network Security \& Auditing & Custom Audit Filters \& Log Inspection & $\square$ \\
 20 & Online Archiving & \textbf{Cap 5: Hardened Healthcare Platform} & $\square$ \\
 \midrule
-21 & Infrastructure as Code & Atlas Terraform Provisioning Scripts & $\square$ \\
+21 & IaC \& Zero-Downtime Schema Evolution & Atlas Terraform Provisioning Scripts & $\square$ \\
 22 & MongoDB Kubernetes Operator & Minikube Operator Deployment \& Rolling Upgrade & $\square$ \\
-23 & Backup \& Disaster Recovery & Point-In-Time Recovery Simulation & $\square$ \\
+23 & Backup, Observability \& Disaster Recovery & Atlas PITR Restore Drill \& Alert Configuration & $\square$ \\
 24 & Certification Preparation & \textbf{Cap 6: Production GitOps Deployment} & $\square$ \\
 
 \end{longtable}
@@ -378,4 +1592,4 @@
     Best of luck on your 6-month journey to becoming a Master Data Engineer and Senior Architect in MongoDB!
 \end{center}
 
-\enddocument
+\end{document}
