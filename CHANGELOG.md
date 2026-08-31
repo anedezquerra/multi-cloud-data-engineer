@@ -25,3 +25,8 @@ All notable changes to this repository are documented here.
 ### Removed
 - Deleted the `new 32.txt`, `new 33.txt`, `new 34.txt` loose notes from the
   repo root and all six platform folders (content integrated into the books).
+
+### Added
+- New seventh platform: Databricks 24-week syllabus (`Databricks\main.tex`)
+  and full book (`Databricks\book\`, chapters 0–24 + appendices), integrated
+  into `build.ps1`.

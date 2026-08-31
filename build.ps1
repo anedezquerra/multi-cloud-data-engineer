@@ -3,7 +3,7 @@
     Build one or all Data Engineer platform books to PDF.
 
 .DESCRIPTION
-    Each platform folder (AWS, Azure, Fabric, GCP, MongoDB, Snowflake) contains a
+    Each platform folder (AWS, Azure, Fabric, GCP, MongoDB, Snowflake, Databricks) contains a
     modular LaTeX book under <Platform>\book\ whose master file is main.tex.
 
     MiKTeX's `latexmk` requires a Perl engine that is not installed on this machine,
@@ -29,14 +29,14 @@
 #>
 [CmdletBinding()]
 param(
-    [ValidateSet('AWS', 'Azure', 'Fabric', 'GCP', 'MongoDB', 'Snowflake', 'all')]
+    [ValidateSet('AWS', 'Azure', 'Fabric', 'GCP', 'MongoDB', 'Snowflake', 'Databricks', 'all')]
     [string]$Target = 'all',
 
     [switch]$Clean
 )
 
 $root = $PSScriptRoot
-$allBooks = 'AWS', 'Azure', 'Fabric', 'GCP', 'MongoDB', 'Snowflake'
+$allBooks = 'AWS', 'Azure', 'Fabric', 'GCP', 'MongoDB', 'Snowflake', 'Databricks'
 $targets = if ($Target -eq 'all') { $allBooks } else { @($Target) }
 
 if (-not (Get-Command pdflatex -ErrorAction SilentlyContinue)) {

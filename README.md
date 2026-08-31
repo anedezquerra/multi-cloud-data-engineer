@@ -10,6 +10,7 @@ LaTeX source for six self-study **"Master Data Engineer"** programs — one per 
 | GCP | `GCP\GCP Master Data Engineer 6-Month Syllabus.pdf` | `GCP\book\` |
 | MongoDB | `MongoDB\MongoDB Master Data Engineer 6-Month Syllabus.pdf` | `MongoDB\book\` |
 | Snowflake | `Snowflake\Snowflake Master Data Engineer 6-Month Syllabus.pdf` | `Snowflake\book\` |
+| Databricks | `Databricks\Databricks Master Data Engineer 6-Month Syllabus.pdf` | `Databricks\book\` |
 
 Each platform folder contains two deliverables:
 
@@ -33,8 +34,8 @@ xelatex main.tex   # second pass resolves TOC and hyperref links
 **Books** use `pdflatex` + `bibtex` + `makeindex`. The repo script builds one or all:
 
 ```powershell
-.\build.ps1 -Target AWS     # single book
-.\build.ps1                 # all six books
+.\build.ps1 -Target AWS     # single book (AWS, Azure, Fabric, GCP, MongoDB, Snowflake, Databricks)
+.\build.ps1                 # all seven books
 .\build.ps1 -Clean          # remove auxiliary files afterwards
 ```
 
