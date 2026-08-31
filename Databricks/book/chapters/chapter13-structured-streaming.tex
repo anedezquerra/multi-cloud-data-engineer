@@ -1,0 +1,325 @@
+\chapter{Structured Streaming Foundations}
+\index{Structured Streaming}\index{micro-batch}\index{streaming source}\index{streaming sink}%
+\index{output mode}\index{trigger}\index{availableNow}\index{checkpoint}\index{exactly-once}%
+\begin{objectives}
+\begin{itemize}
+    \item Explain the infinite-table model and the micro-batch execution engine beneath it.
+    \item Read from streaming sources (files, rate, Kafka preview) and write to Delta with checkpoints.
+    \item Choose output modes (append, update, complete) and triggers (processing time, availableNow, continuous) deliberately.
+    \item Operate streams: restart semantics, monitoring with listeners and metrics, and backpressure.
+    \item Prove a stream survives kill-and-restart without loss or duplication.
+    \item Design a sub-minute ingestion layer for a high-rate event source.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+Structured Streaming is Spark's \textbf{streaming engine}; the same model---micro-batches or
+operators over an unbounded log---exists on every platform.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{3.0cm}p{3.4cm}p{3.2cm}p{3.2cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{Databricks (Spark)} & \textbf{AWS} & \textbf{Azure / GCP / Fabric} \\
+\midrule
+Engine & Structured Streaming & Flink (Managed Service) / Lambda & Stream Analytics / Dataflow (Beam) / Eventstream+Activator \\
+Execution & Micro-batch (continuous optional) & True streaming (Flink) & Streaming / unified batch+stream (Beam) \\
+Exactly-once & Checkpoint + idempotent sink & Flink checkpoints + 2PC sinks & At-least-once + dedup / exactly-once (Dataflow) \\
+Replay & Source offsets in checkpoint & Kinesis iterators / Kafka offsets & Event Hubs checkpoints / Pub/Sub seek \\
+Batch unification & \texttt{availableNow} trigger & Flink batch mode & Dataflow's core thesis \\
+Monitoring & Stream metrics + listener & CloudWatch / Flink metrics & Azure Monitor / Dataflow UI / Fabric metrics \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+\textbf{Snowflake} approaches streaming with Snowpipe Streaming and dynamic tables (micro-batch
+by design); \textbf{MongoDB} with change streams feeding processors.
+\end{crosscloud}
+
+\section{Week 13 Roadmap and Mental Model}
+Part III processed data that had already arrived; Part IV processes data \emph{as} it arrives. Structured Streaming's achievement is making that feel like batch: the same DataFrame API, the same Catalyst optimizer, the same Delta sinks---over an input that never ends \cite{sparkStructuredStreaming}. Week 13 builds the execution model and the operational contract; Week 14 adds state and event time.
+
+The mental model: \textbf{the stream is a table that grows; every trigger runs a small batch over the new rows}. Your query is planned once and executed incrementally; results land in the sink; the checkpoint remembers where the source was read to and what intermediate state exists. Understand that loop---trigger, plan, process new rows, commit offsets and state---and every streaming behavior becomes predictable.
+
+\begin{definitionbox}
+\textbf{Structured Streaming} treats a stream as an unbounded table. A query over it runs as a sequence of \textbf{micro-batches}: each trigger reads new source data since the last committed offset, applies the incrementally-executed query, writes the sink, and commits progress (offsets + state) to the \textbf{checkpoint}.
+\end{definitionbox}
+
+\begin{keyterms}
+\textbf{Output mode}: what the sink receives---\texttt{append} (new rows only), \texttt{update} (changed rows), \texttt{complete} (whole result). \textbf{Trigger}: when micro-batches run---processing-time interval, \texttt{availableNow} (run once over backlog, then stop), or continuous. \textbf{Checkpoint}: the fault-tolerance state directory. \textbf{Backpressure}: bounding batch size so processing keeps up with input.
+\end{keyterms}
+
+\section{Monday: The Micro-Batch Model}
+\subsection{Sources, Incremental Execution, Sinks}
+A source (files via Auto Loader, Kafka, rate generator, Delta change feed) presents offsets; the engine reads a batch between the last committed offset and the current end; the query---planned once, including its stateful operators---processes incrementally; the sink (Delta in this program) commits transactionally. Because the sink write and the offset commit are coordinated through the checkpoint, a crash between them replays the batch---which is why sink idempotence (Chapter 2's MERGE, Delta's transactional replace) is the second half of exactly-once.
+
+\subsection{Micro-Batch versus Continuous}
+Micro-batch (the default) processes discrete chunks with seconds-to-minutes latency and full exactly-once support. \textbf{Continuous processing} runs long-lived operators for millisecond latency with at-least-once guarantees and a restricted operator set. The default answer in this program is micro-batch with a sane trigger; continuous is a deliberate, measured choice.
+
+\begin{notebox}
+Real-time does not mean continuous. Most ``real-time'' business requirements---dashboards refreshing every minute, alerts within a minute---are micro-batch requirements. Reserve continuous processing for measured sub-second mandates.
+\end{notebox}
+
+\section{Tuesday: Output Modes and Triggers}
+\subsection{Choosing the Output Mode}
+The mode is dictated by the query's semantics: a stateless filter \emph{appends}; an aggregation that keeps updating a key's value must \texttt{update} (or \texttt{complete}, rewriting the whole result---viable only for small results); aggregations over event time with watermarks append after the watermark closes the window (Chapter 14). Delta as a sink accepts append natively; update-style results use \texttt{foreachBatch} + MERGE (Chapter 16).
+
+\subsection{Choosing the Trigger}
+\texttt{processingTime="30 seconds"} for continuous low-latency flow; \texttt{availableNow=True} for scheduled, batch-priced streaming (process the backlog, stop, bill nothing until the next run---this is what makes Chapter 11's triggered ingestion economical); \texttt{Trigger.Once} for one-shot backfills. The trigger is a cost-latency dial you set per pipeline, per environment.
+
+\begin{lstlisting}[language=Python,caption={The streaming skeleton used across Part IV.},label={lst:ch13-skeleton}]
+stream = (spark.readStream.format("cloudFiles")
+    .option("cloudFiles.format", "json")
+    .option("cloudFiles.schemaLocation",
+            "/Volumes/de_training/bronze/_schemas/clicks")
+    .load("/Volumes/de_training/bronze/landing/clicks/"))
+
+query = (stream.writeStream
+    .format("delta")
+    .outputMode("append")
+    .option("checkpointLocation", "/Volumes/de_training/bronze/_ckpt/clicks")
+    .trigger(availableNow=True)            # or: processingTime="30 seconds"
+    .toTable("de_training.bronze.clicks"))
+
+query.awaitTermination()
+print(query.lastProgress)                  # input vs processing rate, offsets
+\end{lstlisting}
+
+\section{Wednesday: Checkpoints, Recovery, and Monitoring}
+\subsection{What the Checkpoint Holds}
+The checkpoint directory stores: source offsets (where to resume), state-store snapshots (for stateful operators, Chapter 14), and the query's metadata. Its rules, which this book treats as law: one checkpoint per query definition; never delete it casually (Chapter 11's pitfall); put it on governed storage; treat incompatible query changes as requiring a new checkpoint.
+
+\subsection{Monitoring a Stream}
+\texttt{query.lastProgress} and the streaming UI expose input rate, processing rate, batch duration, and offsets. \textbf{Falling behind} shows as input rate durably above processing rate; \textbf{unhealthy batches} show as rising duration. The two levers: more parallelism (partitions, executors) or smaller batches (\texttt{maxFilesPerTrigger}, \texttt{maxOffsetsPerTrigger}).
+
+\begin{pitfall}
+\textbf{Changing a stateful query in place.} Adding an aggregation key or changing window logic invalidates checkpointed state; the restart fails loudly (by design) or, worse with forced config, silently mis-aggregates. Version the query, new checkpoint, and a planned backfill---the same discipline as Chapter 11's checkpoint governance.
+\end{pitfall}
+
+\section{Thursday Hands-on Project: Kill It, Restart It, Prove It}
+Build a file-sourced streaming pipeline, run it under three triggers, then kill it mid-stream and prove---from counts, not hope---that nothing was lost or duplicated.
+\index{hands-on lab}\index{checkpoint!lab}\index{exactly-once!lab}
+
+\begin{lstlisting}[language=Python,caption={Week 13 lab: restart-safety proof.},label={lst:ch13-lab}]
+import uuid, time
+from pyspark.sql import functions as F
+
+# Producer: drop numbered JSON files into the landing path while streams run
+def drop_batch(n, start):
+    rows = [{"event_id": str(uuid.uuid4()), "seq": i,
+             "ts": time.time()} for i in range(start, start + n)]
+    (spark.createDataFrame(rows).write.mode("append")
+     .json("/Volumes/de_training/bronze/landing/clicks/"))
+
+drop_batch(500, 0)
+
+q = (spark.readStream.format("cloudFiles")
+     .option("cloudFiles.format", "json")
+     .option("cloudFiles.schemaLocation", "/Volumes/de_training/bronze/_schemas/clicks")
+     .load("/Volumes/de_training/bronze/landing/clicks/")
+     .writeStream.format("delta")
+     .option("checkpointLocation", "/Volumes/de_training/bronze/_ckpt/clicks")
+     .trigger(processingTime="5 seconds")
+     .toTable("de_training.bronze.clicks"))
+
+drop_batch(500, 500)          # more data while running
+q.stop()                      # the "crash" (mid-stream kill)
+drop_batch(500, 1000)         # data arriving while the stream is DOWN
+
+# Restart with the SAME checkpoint: must resume, not restart from zero
+q2 = (spark.readStream.format("cloudFiles")
+      .option("cloudFiles.format", "json")
+      .option("cloudFiles.schemaLocation", "/Volumes/de_training/bronze/_schemas/clicks")
+      .load("/Volumes/de_training/bronze/landing/clicks/")
+      .writeStream.format("delta")
+      .option("checkpointLocation", "/Volumes/de_training/bronze/_ckpt/clicks")
+      .trigger(availableNow=True)
+      .toTable("de_training.bronze.clicks"))
+
+n = spark.table("de_training.bronze.clicks").count()
+d = spark.table("de_training.bronze.clicks").dropDuplicates(["event_id"]).count()
+assert n == 1500 == d, f"expected 1500 unique, got n={n} d={d}"
+\end{lstlisting}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item The streaming pipeline with a governed checkpoint location.
+    \item The kill-and-restart log: counts before stop, during downtime arrivals, after restart.
+    \item The uniqueness assertion output proving 1500 rows, zero duplicates, zero loss.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item Restart from the same checkpoint resumes---it does not reprocess committed files.
+    \item Final table equals exactly the produced events; dedup count equals raw count.
+    \item \texttt{lastProgress} metrics (input rate, batch duration) captured for at least 5 batches.
+    \item Trigger comparison documented: processing-time vs.\ \texttt{availableNow} on the same backlog.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Add a \texttt{StreamingQueryListener} that logs batch metrics to a Delta table.
+    \item Force a schema-incompatible query change; capture the restart failure and document the new-checkpoint procedure.
+    \item Point the same source at a second sink with its own checkpoint; explain why that is safe while sharing a checkpoint is not.
+\end{itemize}
+
+\section{Friday Use Case: Sub-Minute Ingestion for Ad-Tech Events}
+An ad-tech platform receives 50k events/second from bidder fleets. Downstream dashboards must see data within one minute; finance reconciles hourly; the events feed both real-time pacing and nightly billing.
+\index{ad-tech}\index{streaming!design}
+
+\subsection{Requirements and Assumptions}
+Events arrive as JSON through a managed Kafka (3 partitions per topic is the current---wrong---configuration). Peak is 3x average. One minute p95 end-to-end latency. Nightly billing runs from the same Bronze table.
+
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[
+        box/.style={rectangle, rounded corners, draw=primary, thick, fill=primary!7, align=center, minimum width=2.9cm, minimum height=0.95cm, font=\small\bfseries},
+        store/.style={cylinder, draw=primary, shape border rotate=90, aspect=0.25, fill=primary!10, align=center, minimum width=2.3cm, minimum height=1.1cm, font=\small\bfseries},
+        flow/.style={-{Latex[length=2mm]}, draw=primary, thick}
+    ]
+        \node[box] (bidders) at (0,0) {Bidder fleet\\50k events/s};
+        \node[box] (kafka) at (3.6,0) {Kafka\\96 partitions};
+        \node[box] (stream) at (7.2,0) {Structured Streaming\\30-s micro-batches\\capped offsets};
+        \node[store] (bronze) at (11.2,0) {Bronze Delta\\(liquid clustered)};
+        \node[box] (rt) at (14.6,0.8) {Pacing dashboards\\(1-min refresh)};
+        \node[box] (bill) at (14.6,-0.8) {Nightly billing\\(batch, same table)};
+        \draw[flow] (bidders) -- (kafka);
+        \draw[flow] (kafka) -- (stream);
+        \draw[flow] (stream) -- (bronze);
+        \draw[flow] (bronze) -- (rt);
+        \draw[flow] (bronze) -- (bill);
+    \end{tikzpicture}%
+    }
+    \caption{Sub-minute ingestion: partition-scaled Kafka, capped micro-batches, one Bronze table serving both latencies.}
+    \label{fig:ch13-adtech}
+\end{figure}
+
+\subsection{Architecture Decisions}
+\textbf{Parallelism first.} 50k/s over 3 Kafka partitions cannot feed enough Spark tasks; the design scales to 96 partitions (peak headroom 3x) so each micro-batch parallelizes. \texttt{maxOffsetsPerTrigger} caps batch size so a peak burst stretches latency slightly instead of OOMing executors---backpressure by configuration, monitored by the input-vs-processing-rate metric.
+
+\textbf{One table, two consumers.} Bronze is liquid-clustered on \texttt{(event\_hour, campaign\_id)}; pacing dashboards read the last hour (a small, clustered slice); nightly billing scans by hour partition. Micro-batches at 30 seconds with coordinated predictive optimization keep file sizes healthy (Chapter 5's lesson, streaming edition).
+
+\begin{pitfall}
+\textbf{Measuring latency at the dashboard only.} End-to-end latency is producer-to-Bronze plus dashboard refresh. Instrument both: \texttt{lastProgress} batch lag for the stream, refresh timestamp for the dashboard. A ``slow pipeline'' was, in the real incident this mirrors, a dashboard refreshing every 5 minutes against a healthy 30-second stream.
+\end{pitfall}
+
+\subsection{Risks and Mitigations}
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{4.6cm}p{7.6cm}@{}}
+\toprule
+\textbf{Risk} & \textbf{Mitigation} \\
+\midrule
+Peak burst triples normal rate & Partition headroom and capped offsets; lag-based autoscaling review \\
+Retention gap truncates history & Replay drills sized to retention; \texttt{failOnDataLoss} policy documented \\
+Dashboard looks real-time but is stale & Freshness tile on every real-time dashboard \\
+Stream failure pages the wrong team & Ownership tags on checkpoints and jobs; alert routing tested \\
+Billing reads the same table mid-write & Delta snapshot isolation; documented writer slices \\
+\bottomrule
+\end{tabular}
+\caption{Week 13 scenario risks and mitigations.}
+\label{tab:ch13-risks}
+\end{table}
+
+\section{Design Decision Guide}
+\index{decision guide!Week 13}%
+Streaming's first decisions are semantic; the configuration follows from them.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.4cm}p{4.4cm}p{4.6cm}@{}}
+\toprule
+\textbf{Decision} & \textbf{Choose the first when} & \textbf{Choose the second when} \\
+\midrule
+Append vs.\ update output mode & Event facts, new rows only & Keyed results that evolve \\
+\texttt{availableNow} vs.\ processing-time & Minutes-freshness, cost-aware & Continuous low-latency flow \\
+Micro-batch vs.\ continuous & Nearly everything & Measured sub-second mandates \\
+New checkpoint vs.\ reuse & Query semantics changed & Never reuse across definitions \\
+Delta sink vs.\ external sink & Lakehouse consumers & Operational systems needing push \\
+\texttt{failOnDataLoss} true vs.\ false & Gaps must halt the pipeline & Retention gaps are tolerable and logged \\
+\bottomrule
+\end{tabular}
+\caption{Week 13 decision guide.}
+\label{tab:ch13-decisions}
+\end{table}
+
+Write the latency requirement down before choosing a trigger---``real-time'' unquantified becomes the most expensive setting by default. The checkpoint governance rules from the chapter override every convenience.
+
+\section{Operational Guidance for Week 13}
+\index{operational guidance!Week 13}%
+\subsection{Performance and Reliability}
+Alert on the two rates---input versus processing---and on batch-duration trend; a stream that takes 25 seconds per 30-second trigger today falls over at the next traffic step. Back up checkpoint directories with the same care as tables (they are the recovery state), and document the new-checkpoint procedure (query version bump + backfill plan) before you need it. Upgrade runtimes against a copy of the stream first: state-store formats evolve.
+
+\subsection{Security and Governance Checklist}
+\begin{itemize}
+    \item Checkpoints and schema locations in governed volumes, one per query, named in the runbook.
+    \item Source credentials (Kafka, cloud notifications) from secret scopes only.
+    \item Sink table writes restricted to the streaming service principal.
+    \item \texttt{failOnDataLoss} choice documented per stream with the retention window it assumes.
+\end{itemize}
+
+\subsection{Troubleshooting Playbook}
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.6cm}p{4.2cm}p{4.8cm}@{}}
+\toprule
+\textbf{Symptom} & \textbf{Likely cause} & \textbf{First action} \\
+\midrule
+Stream falls behind over hours & Parallelism or batch-size bound & Check rates in lastProgress; partitions, then cap, then executors \\
+Restart fails after code change & State schema incompatible with checkpoint & New checkpoint + planned backfill; never force the flag casually \\
+Duplicate rows after crash & Sink not idempotent for replays & MERGE/replace sink; verify checkpoint-sink pairing \\
+Batch 0 huge, then normal & Backlog on first start & Expected; cap with maxFiles/OffsetsPerTrigger \\
+\bottomrule
+\end{tabular}
+\caption{Week 13 troubleshooting quick reference.}
+\label{tab:ch13-trouble}
+\end{table}
+
+\section{Interview Q\&A}
+\subsection{Concepts and Trade-offs}
+\begin{enumerate}
+    \item \textbf{Q: Explain micro-batch execution to a backend engineer.}\\
+    A: The stream is an infinite table; each trigger runs a small incremental batch query over rows since the last committed offset, writes transactionally, and commits offsets to the checkpoint. Latency is the trigger interval plus batch time.
+    \item \textbf{Q: What exactly does the checkpoint make safe?}\\
+    A: Restart position (offsets), stateful-operator state, and query metadata. Combined with an idempotent/transactional sink, you get exactly-once; without the sink half you get at-least-once with duplicates.
+    \item \textbf{Q: Append versus update output mode?}\\
+    A: Append for event facts; update for keyed results that change over time (and then only to sinks that accept updates, or via \texttt{foreachBatch} MERGE into Delta); complete rewrites the whole result---small dimension-style outputs only.
+    \item \textbf{Q: When is \texttt{availableNow} the right trigger?}\\
+    A: Whenever the freshness requirement is minutes-to-hours: you get streaming sources with batch economics---process the backlog, stop, pay nothing until the next schedule.
+    \item \textbf{Q: A stream keeps up off-peak but falls behind at peak. Options?}\\
+    A: Check batch duration composition first: add source partitions (parallelism), cap batch size (backpressure), increase executors, or remove an accidental wide transformation. Scale the bottleneck, not the whole pipeline.
+    \item \textbf{Q: How does Structured Streaming differ from ``running a batch job every minute''?}\\
+    A: The checkpointed offsets, incremental state, and exactly-once composition---a cron batch re-reads, re-processes, and re-writes; the stream processes each record once and remembers it did.
+    \item \textbf{Q: What metric would you graph on a stream's dashboard first?}\\
+    A: Input rate versus processing rate per batch---it is the earliest, cleanest leading indicator of every streaming failure mode.
+    \item \textbf{Q: What is the smallest safe streaming change process?}\\
+    A: Copy the query, new checkpoint, replay into a recovery table, reconcile, then cut over. The query-under-test never shares state with the one in production.
+\end{enumerate}
+
+\section{Further Reading}
+The Structured Streaming Programming Guide is the reference \cite{sparkStructuredStreaming}; the Kafka integration guide previews Chapter 15 \cite{sparkKafkaIntegration}. Delta-as-sink semantics are covered in the Delta documentation \cite{deltaLakeDocs,databricksDelta}, and Auto Loader (Chapter 11) is the file source used throughout \cite{databricksAutoLoader}.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item Structured Streaming is incremental batch over an unbounded table---same API, same optimizer, same sinks.
+    \item Exactly-once = checkpoint (offsets + state) plus an idempotent sink; neither half suffices alone.
+    \item Output mode follows query semantics; trigger choice is a cost-latency dial.
+    \item One checkpoint per query; governed locations; new checkpoint for incompatible changes.
+    \item Monitor input rate versus processing rate; fix parallelism and batch size before hardware.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Why does exactly-once require cooperation between checkpoint and sink?
+    \item \textbf{(Conceptual)} Which output mode can a grouped aggregation use with a Delta sink, and why is \texttt{complete} usually wrong at scale?
+    \item \textbf{(Hands-on)} Complete the Thursday lab, including the 1500-row uniqueness proof.
+    \item \textbf{(Hands-on)} Add \texttt{maxFilesPerTrigger} and observe the latency/throughput trade-off over a synthetic burst.
+    \item \textbf{(Hands-on)} Write the listener-based metrics table and chart batch duration over 20 batches.
+    \item \textbf{(Design)} Size Kafka partitions and trigger interval for the Friday scenario at 3x peak; show the arithmetic.
+    \item \textbf{(Operations)} Write the alert rule for ``processing rate $<$ 80\% of input rate for 10 minutes.''
+    \item \textbf{(Architecture)} When would you choose DLT streaming tables (Chapter 10) over this hand-built stream? What changes operationally?
+\end{enumerate}

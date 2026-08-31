@@ -1,0 +1,327 @@
+\chapter{Databricks SQL and SQL Warehouses}
+\index{Databricks SQL}\index{SQL warehouse}\index{serverless SQL}\index{Photon}%
+\index{materialized view}\index{result cache}\index{query profile}\index{system tables}%
+\begin{objectives}
+\begin{itemize}
+    \item Explain SQL warehouse architecture: serverless, pro, and classic types, and how Photon accelerates queries.
+    \item Write warehouse-grade SQL against Unity Catalog tables, including time travel and window functions.
+    \item Choose between materialized views, streaming tables, and scheduled Gold tables for derived data.
+    \item Size warehouses with min/max clusters, auto-stop, and channel selection; read the query profile.
+    \item Attribute cost with \texttt{system.billing.usage} and warehouse monitoring.
+    \item Design a warehouse topology that isolates BI bursts from engineering backfills.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+Databricks SQL is the platform's \textbf{warehouse-serving layer}; each cloud fields a serverless
+SQL engine with the same promises and different mechanics.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{3.0cm}p{3.4cm}p{3.2cm}p{3.2cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{Databricks} & \textbf{AWS} & \textbf{Azure / GCP / Fabric} \\
+\midrule
+SQL compute & SQL warehouse (serverless/pro/classic) & Redshift Serverless / Athena & Synapse serverless / BigQuery / Fabric Warehouse \\
+Engine & Photon (vectorized) & Redshift engine / Trino & Synapse / Dremel / Fabric engine \\
+Autoscale & Multi-cluster load balancing & Concurrency scaling / per-query & Autoscale / slots / capacity smoothing \\
+Idle behavior & Auto-stop, serverless scale-to-zero & Pause / per-query billing & Auto-pause / per-slot / capacity \\
+Derived tables & Materialized views, streaming tables & Redshift MVs / Athena CTAS & Synapse MVs / BigQuery MVs \\
+Cost visibility & \texttt{system.billing.usage} & CUR + CloudWatch & Cost Management / billing export / Capacity Metrics \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+\textbf{Snowflake} is the closest conceptual peer---virtual warehouses with per-second billing and
+result caching---but Databricks SQL queries the \emph{same} Delta tables your pipelines write,
+with no copy into a proprietary store.
+\end{crosscloud}
+
+\section{Week 6 Roadmap and Mental Model}
+The first five chapters built and optimized tables; Week 6 serves them. Databricks SQL (DBSQL) is the warehouse surface: SQL editors, SQL warehouses, query federation, and the serving layer beneath AI/BI (Chapter 7). The engineering questions are operational: which warehouse type, what size, how does it scale, what does it cost, and how do you know a query is slow for a fixable reason \cite{databricksSQL,databricksSQLWarehouses}.
+
+The mental model: \textbf{a SQL warehouse is a load-balanced fleet of query clusters over your Delta tables}. You submit SQL; the warehouse compiles it (Photon), pulls data from cloud storage through the cache, scales clusters between its min/max bounds under concurrency, and records everything in system tables. There is no data movement into the warehouse---the storage is the lake you already govern.
+
+\begin{definitionbox}
+\textbf{A SQL warehouse} is SQL-optimized compute for Databricks SQL: a managed set of clusters with a size (2X-Small to 4X-Large), a min/max cluster range, an auto-stop timer, and a type (serverless, pro, classic) controlling startup speed, features, and price.
+\end{definitionbox}
+
+\begin{keyterms}
+\textbf{Photon}: the vectorized execution engine. \textbf{Serverless warehouse}: instant-start, fast-autoscaling compute in Databricks' account. \textbf{Query profile}: the per-operator execution breakdown with rows, bytes, and time. \textbf{Result cache}: reuse of a query's results when query and data are unchanged. \textbf{Materialized view}: a managed, incrementally refreshed precomputed result.
+\end{keyterms}
+
+\section{Monday: Warehouse Types and Photon}
+\subsection{Serverless, Pro, Classic}
+\textbf{Serverless} warehouses start in seconds, scale aggressively, run in Databricks' cloud account, and support the newest features (including predictive optimization integration and AI functions). \textbf{Pro} adds classic-cloud control with fast start. \textbf{Classic} trades startup latency for the most configuration control and lowest DBU rate. Default to serverless for BI; drop to pro/classic when networking or custom initialization requires the data plane.
+
+\subsection{Photon Under the Hood}
+Photon re-implements Spark's execution hot path in vectorized native code: columnar batches, SIMD instructions, cache-aware operators \cite{databricksPhoton}. The practical consequences: scans, joins, and aggregations over Delta are dramatically faster than vanilla Spark SQL, and the speedup grows with data scanned---which is why Chapter 5's layout work multiplies this chapter's engine.
+
+\begin{notebox}
+You do not ``enable Photon'' on a SQL warehouse---it is the engine. On classic compute you choose a Photon-enabled runtime; on serverless it is always on.
+\end{notebox}
+
+\section{Tuesday: Warehouse SQL and the Query Profile}
+\subsection{Analytical SQL on the Lakehouse}
+Databricks SQL speaks Spark SQL against the three-level namespace, with time travel, window functions, and \texttt{QUALIFY}:
+
+\begin{lstlisting}[language=SQL,caption={Warehouse-grade analytical SQL patterns.},label={lst:ch6-sql}]
+-- Top products per region this quarter
+SELECT region, product_id, SUM(net_amount) AS revenue
+FROM de_training.gold.fact_orders
+WHERE order_date >= DATE '2026-07-01'
+GROUP BY region, product_id
+QUALIFY ROW_NUMBER() OVER (PARTITION BY region ORDER BY revenue DESC) <= 10;
+
+-- Point-in-time question against history (Chapter 2 pays off here)
+SELECT COUNT(*) FROM de_training.gold.fact_orders
+TIMESTAMP AS OF '2026-08-01T00:00:00Z';
+\end{lstlisting}
+
+\subsection{Reading the Query Profile}
+Every query has a profile (Query History $\rightarrow$ query $\rightarrow$ profile): a graph of operators with rows, bytes, peak memory, and duration. The diagnostic skill from Chapter 4 transfers directly: look for the operator holding the time---a scan reading more bytes than expected (layout problem, Chapter 5), a spill (memory), or an exchange skewing (join strategy).
+
+\section{Wednesday: Materialized Views, Caching, and Cost Attribution}
+\subsection{Materialized Views versus Scheduled Gold}
+A DBSQL \textbf{materialized view} is a managed precomputed result with incremental refresh where possible; a \textbf{streaming table} maintains a continuously appended aggregation \cite{databricksSQL}. The decision rule: use a materialized view when consumers query a stable derived shape and freshness tolerance is minutes-to-hours; keep a scheduled Gold table when the derivation is complex business logic that belongs in your pipeline repo with tests (Chapter 3's discipline).
+
+\begin{lstlisting}[language=SQL,caption={A materialized view over the Gold star schema.},label={lst:ch6-mv}]
+CREATE MATERIALIZED VIEW de_training.gold.mv_daily_revenue
+AS SELECT order_date, region, SUM(net_amount) AS revenue, COUNT(*) AS orders
+FROM de_training.gold.fact_orders
+GROUP BY order_date, region;
+\end{lstlisting}
+
+\subsection{Scaling and Cost}
+Concurrency scales by clusters: a 2X-Small warehouse with max 10 clusters absorbs a 9 a.m.\ dashboard burst by adding clusters, then scales back. Auto-stop kills idle spend. Attribution comes from system tables:
+
+\begin{lstlisting}[language=SQL,caption={Warehouse cost attribution from system tables.},label={lst:ch6-cost}]
+SELECT w.warehouse_name,
+       ROUND(SUM(u.usage_quantity), 2) AS dbus,
+       COUNT(DISTINCT u.usage_date) AS active_days
+FROM system.billing.usage u
+JOIN system.warehouses w USING (warehouse_id)
+WHERE u.usage_date >= current_date() - 30
+  AND u.sku_name LIKE '%SQL%'
+GROUP BY w.warehouse_name
+ORDER BY dbus DESC;
+\end{lstlisting}
+
+\begin{pitfall}
+\textbf{One giant warehouse for everything.} A single maxed-out warehouse mixes the CEO's dashboard with a backfill scan and makes both unpredictable. Split by workload class (executive BI, ad-hoc, engineering), set per-warehouse max clusters, and let each have its own auto-stop.
+\end{pitfall}
+
+\section{Thursday Hands-on Project: Serve the Gold Star Schema}
+Put the Month 1 Gold schema behind a serverless SQL warehouse, add a materialized view, capture query profiles, and attribute cost.
+\index{hands-on lab}\index{SQL warehouse!lab}\index{query profile!lab}
+
+\begin{lstlisting}[language=SQL,caption={Week 6 lab: warehouse setup, MV, and measurement.},label={lst:ch6-lab}]
+-- 1. Create warehouse (UI or API): type=serverless, size=2X-Small,
+--    min=1, max=4, auto-stop=10 min, channel=Current.
+
+-- 2. Baseline the daily-revenue query directly on the fact table
+SELECT order_date, region, SUM(net_amount) AS revenue
+FROM de_training.gold.fact_orders
+GROUP BY order_date, region;              -- capture the profile
+
+-- 3. Materialized view, then re-run the same question against it
+CREATE MATERIALIZED VIEW de_training.gold.mv_daily_revenue AS
+SELECT order_date, region, SUM(net_amount) AS revenue, COUNT(*) AS orders
+FROM de_training.gold.fact_orders
+GROUP BY order_date, region;
+
+SELECT * FROM de_training.gold.mv_daily_revenue
+WHERE order_date >= '2026-08-01';         -- capture the faster profile
+
+-- 4. Cost: what did today's work cost?
+SELECT sku_name, ROUND(SUM(usage_quantity),2) AS dbus
+FROM system.billing.usage
+WHERE usage_date = current_date()
+GROUP BY sku_name;
+\end{lstlisting}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item A running serverless warehouse with documented size, scaling bounds, and auto-stop.
+    \item Two captured query profiles (fact scan vs.\ MV) with an explanation of the difference.
+    \item The day's DBU attribution query output.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item The MV returns results identical to the direct aggregate (reconciliation).
+    \item The warehouse auto-stops within its timer; evidence from the warehouse events tab.
+    \item Scaling bounds are justified in one paragraph (expected concurrency, SLA).
+    \item The query-profile analysis names the dominant operator in the slow plan.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Create a second warehouse for ``engineering'' and prove workload isolation during a simulated burst.
+    \item Compare classic vs.\ serverless startup latency with timestamps.
+    \item Build the weekly per-warehouse cost report as a saved query with a schedule.
+\end{itemize}
+
+\section{Friday Use Case: 500 Analysts, One 9 A.M. Burst, Zero Contention}
+A company's 500 analysts open dashboards at 9 a.m.; simultaneously, data engineers run month-end backfills against the same Gold tables. Complaints: dashboards queue, backfills time out, and last month someone ``fixed'' it by doubling warehouse size---and the bill.
+\index{capacity planning}\index{workload isolation}
+
+\subsection{Requirements and Assumptions}
+Dashboards must load in under 10 seconds at p95; backfills may take hours but must finish by month-end close. Gold tables are liquid-clustered (Chapter 5). Budget grows slower than headcount.
+
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[
+        wh/.style={rectangle, rounded corners, draw=primary, thick, fill=primary!7, align=center, minimum width=3.4cm, minimum height=1.1cm, font=\small\bfseries},
+        load/.style={rectangle, rounded corners, draw=codegray, thick, fill=white, align=center, minimum width=3.0cm, minimum height=0.85cm, font=\scriptsize\bfseries},
+        store/.style={cylinder, draw=primary, shape border rotate=90, aspect=0.25, fill=primary!10, align=center, minimum width=2.4cm, minimum height=1.2cm, font=\small\bfseries},
+        flow/.style={-{Latex[length=2mm]}, draw=primary, thick}
+    ]
+        \node[load] (bi) at (0,1.4) {500 analysts\\9 a.m. burst};
+        \node[load] (adhoc) at (0,0) {ad-hoc\\analysts};
+        \node[load] (eng) at (0,-1.4) {engineering\\backfills};
+        \node[wh] (whbi) at (4.6,1.4) {WH-executive\\serverless 2XS\\min 2 / max 10};
+        \node[wh] (whadhoc) at (4.6,0) {WH-adhoc\\serverless XS\\min 1 / max 3};
+        \node[wh] (wheng) at (4.6,-1.4) {WH-engineering\\pro Small\\min 1 / max 2};
+        \node[store] (gold) at (9.6,0) {Gold Delta\\(liquid clustered)};
+        \draw[flow] (bi) -- (whbi);
+        \draw[flow] (adhoc) -- (whadhoc);
+        \draw[flow] (eng) -- (wheng);
+        \draw[flow] (whbi) -- (gold);
+        \draw[flow] (whadhoc) -- (gold);
+        \draw[flow] (wheng) -- (gold);
+    \end{tikzpicture}%
+    }
+    \caption{Workload-class warehouse topology over one governed Gold layer: isolation without data copies.}
+    \label{fig:ch6-warehouse-topology}
+\end{figure}
+
+\subsection{Architecture Decisions}
+\textbf{Three warehouses, three classes.} Executive BI (serverless, aggressive scaling, tight auto-stop), ad-hoc (small, cheap, forgiving), engineering (pro, sized for scans, auto-stop generous). The shared Delta storage means isolation costs no copies; the burst is absorbed by max-clusters scaling, not by an oversized idle floor.
+
+\textbf{Query hygiene.} Dashboards query the materialized view, not the raw fact; the backfill writes at off-peak with its own warehouse; a saved monitoring query (profiles + billing) reviews p95 weekly. The doubling-the-size incident becomes a scaling-bounds conversation backed by queue-time metrics.
+
+\begin{pitfall}
+\textbf{Reading the queue as a sizing problem.} Queued queries at 9 a.m.\ with idle clusters mean the \emph{max clusters} bound is the constraint, not size; a bigger single cluster would not have helped and would have billed more. Queue time, running time, and cluster count are three different metrics---read all three before changing anything.
+\end{pitfall}
+
+\subsection{Risks and Mitigations}
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{4.6cm}p{7.6cm}@{}}
+\toprule
+\textbf{Risk} & \textbf{Mitigation} \\
+\midrule
+Burst budget spikes with headcount & Max-clusters caps per warehouse; monthly chargeback review \\
+A heavy query starves the executive warehouse & Workload classes isolated; per-user query limits \\
+Stale MV presented as fresh & Staleness alert; refresh timestamp rendered on the dashboard \\
+Warehouse sprawl across teams & Inventory with owners; unused warehouses auto-flagged \\
+Classic warehouses forgotten running & Auto-stop enforced by policy; weekly idle audit \\
+\bottomrule
+\end{tabular}
+\caption{Week 6 scenario risks and mitigations.}
+\label{tab:ch6-risks}
+\end{table}
+
+\section{Design Decision Guide}
+\index{decision guide!Week 6}%
+Warehouse decisions are workload-shape decisions; name the workload class first.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.4cm}p{4.4cm}p{4.6cm}@{}}
+\toprule
+\textbf{Decision} & \textbf{Choose the first when} & \textbf{Choose the second when} \\
+\midrule
+Serverless vs.\ classic warehouse & BI and bursty SQL; zero-ops valued & Custom networking or lowest-rate steady load \\
+Materialized view vs.\ scheduled Gold & Stable derived shape, tolerance for managed refresh & Complex tested business logic \\
+One warehouse vs.\ per-class warehouses & Tiny teams, light concurrency & Mixed latency classes or chargeback needs \\
+Size up vs.\ scale out & Individual queries are slow & Concurrency (queueing) is the problem \\
+Result cache reliance vs.\ MV & Ad-hoc repeated questions & Shared, governed derived numbers \\
+Photon confidence vs.\ measurement & Always measure & --- \\
+\bottomrule
+\end{tabular}
+\caption{Week 6 decision guide.}
+\label{tab:ch6-decisions}
+\end{table}
+
+The recurring trap is treating warehouse size as the only knob. Bounds, classes, caching, and derived tables usually matter more---and all four are cheaper than a bigger T-shirt size.
+
+\section{Operational Guidance for Week 6}
+\index{operational guidance!Week 6}%
+\subsection{Performance and Reliability}
+Review warehouse telemetry weekly: queue time (concurrency bound), median/p95 run time (query health), and cluster count over the day (scaling shape). Auto-stop settings are audited against reality---a warehouse ``stopped at night'' that shows 2 a.m.\ activity is running something nobody scheduled. Materialized-view refresh status is monitored like any pipeline; a silently stale MV is a certified number quietly rotting.
+
+\subsection{Security and Governance Checklist}
+\begin{itemize}
+    \item Dashboards and scheduled queries publish under a least-privilege service identity.
+    \item Warehouse access granted per workload class; engineers do not run backfills on the executive warehouse.
+    \item Every warehouse has a documented owner, size rationale, and auto-stop value.
+    \item Monthly cost attribution per warehouse is reviewed and tagged to a domain.
+\end{itemize}
+
+\subsection{Troubleshooting Playbook}
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.6cm}p{4.2cm}p{4.8cm}@{}}
+\toprule
+\textbf{Symptom} & \textbf{Likely cause} & \textbf{First action} \\
+\midrule
+Queries queue at peak & Max-clusters bound reached & Read queue vs.\ run time; raise max for the burst window \\
+First dashboard load slow & Cold warehouse (auto-stop) & Serverless type or a scheduled early-morning warm query \\
+MV returns stale rows & Refresh not scheduled/failed & Check refresh history; alert on staleness \\
+Same query fast then slow & Result cache invalidated by new commits & Expected; cache hits only when data and text are unchanged \\
+\bottomrule
+\end{tabular}
+\caption{Week 6 troubleshooting quick reference.}
+\label{tab:ch6-trouble}
+\end{table}
+
+\section{Interview Q\&A}
+\subsection{Concepts and Trade-offs}
+\begin{enumerate}
+    \item \textbf{Q: Why is Databricks SQL different from connecting a BI tool to Spark?}\\
+    A: Photon-vectorized execution, warehouse-level caching and scaling, governance integration, and per-query profiles---an analytical serving layer, not a general cluster with a SQL cell.
+    \item \textbf{Q: Serverless warehouse: what do you give up?}\\
+    A: Data-plane networking options and some custom init control; you gain instant start, fast autoscaling, and no cluster management. For BI, the trade is almost always right.
+    \item \textbf{Q: Materialized view or a scheduled Gold table?}\\
+    A: MV for stable derived shapes with freshness tolerance and simple logic; scheduled Gold when the derivation is versioned business logic that needs tests, review, and pipeline discipline.
+    \item \textbf{Q: How do you find who spent what on SQL last month?}\\
+    A: \texttt{system.billing.usage} joined to \texttt{system.warehouses}, broken out by SKU and day; add \texttt{system.access.audit} for per-user query attribution.
+    \item \textbf{Q: A dashboard is slow only at 9 a.m. Diagnose.}\\
+    A: Queue time at the concurrency bound: raise max clusters for the burst window, move the dashboard to the MV, and check that the warehouse is serverless so scale-up is seconds, not minutes.
+    \item \textbf{Q: When is a classic warehouse still the right answer?}\\
+    A: Custom networking/init requirements, the strictest per-DBU price on steady loads, or features gated to the classic tier---decided from requirements, not habit.
+    \item \textbf{Q: What does the query profile tell you that the UI duration does not?}\\
+    A: \emph{Where} the time went: which operator scanned how many bytes and spilled what. Duration says slow; the profile says why.
+    \item \textbf{Q: How do you prove a warehouse right-sizing saved money?}\\
+    A: Same workload, measured weeks, \texttt{system.billing.usage} deltas per SKU---the cost chapter of the tuning report, with queue time held constant so the saving is not just slower service.
+\end{enumerate}
+
+\section{Further Reading}
+The Databricks SQL \cite{databricksSQL} and SQL warehouse \cite{databricksSQLWarehouses} documentation cover types, sizing, and monitoring; Photon is explained in \cite{databricksPhoton}. System-table billing and warehouse monitoring are documented in \cite{databricksSystemTables}. For the engine fundamentals, revisit Spark SQL tuning \cite{sparkSQLTuning}.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item A SQL warehouse is a scalable query fleet over governed Delta tables---no copies, no separate store.
+    \item Serverless is the BI default; pro/classic serve networking and control edge cases.
+    \item Materialized views answer repeated derived questions; complex business logic still belongs in tested pipelines.
+    \item Queue time, run time, and cluster count are different metrics---size nothing before reading all three.
+    \item Cost attribution is a system-table query away; make it a weekly habit.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Contrast a SQL warehouse with an all-purpose cluster for a BI workload: three differences.
+    \item \textbf{(Conceptual)} Why does the result cache make some dashboard refreshes free, and when does it miss?
+    \item \textbf{(Hands-on)} Complete the Thursday lab, including both query profiles.
+    \item \textbf{(Hands-on)} Build the three-warehouse topology from the Friday case and measure a simulated burst (20 concurrent queries) against each.
+    \item \textbf{(Hands-on)} Write and schedule the weekly warehouse cost report; include a week-over-week delta column.
+    \item \textbf{(Design)} Choose warehouse type/size/bounds for: executive dashboards, a data-science team, and a dbt-style transformation workload. Justify each.
+    \item \textbf{(Operations)} Write the alert rule for ``warehouse queue time $>$ 60 s for 10 minutes.''
+    \item \textbf{(Architecture)} When would you put a materialized view in a DLT pipeline instead of DBSQL (preview of Chapter 10)?
+\end{enumerate}

@@ -1,0 +1,318 @@
+\chapter{Delta Live Tables: Declarative Pipelines}
+\index{Delta Live Tables}\index{declarative pipelines}\index{streaming table}\index{materialized view!DLT}%
+\index{expectations}\index{data quality}\index{event log}\index{triggered pipeline}\index{continuous pipeline}%
+\begin{objectives}
+\begin{itemize}
+    \item Explain DLT's declarative model: datasets, dependencies, and the automatically built DAG.
+    \item Author streaming tables and materialized views in Python and SQL.
+    \item Enforce data quality with expectations: warn, drop, and fail semantics.
+    \item Operate pipelines: development versus production mode, triggered versus continuous, full refresh, and schema evolution.
+    \item Query the DLT event log for quality metrics, lineage, and operational history.
+    \item Decide deliberately between DLT and hand-written Spark plus Workflows.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+DLT is Databricks' \textbf{declarative pipeline} layer; the pattern---define datasets and quality,
+let the platform handle execution---has analogs everywhere.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{3.0cm}p{3.4cm}p{3.2cm}p{3.2cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{Databricks (DLT)} & \textbf{AWS} & \textbf{Azure / GCP / Fabric} \\
+\midrule
+Declarative pipelines & DLT (Lakeflow Declarative Pipelines) & Glue workflows + DQ rules & ADF/Fabric pipelines + gates / Dataform \\
+Quality rules & Expectations (warn/drop/fail) & Glue Data Quality (Deequ) & Great Expectations / dbt tests \\
+Streaming dataset & Streaming table & Kinesis $\rightarrow$ Glue streaming & Eventstream / Dataflow / Fabric streams \\
+Batch dataset & Materialized view & Redshift MV / Athena CTAS & BigQuery MV / Fabric MV \\
+Ops telemetry & Event log (Delta table) & CloudWatch + Glue job metrics & ADF monitoring / Dataflow metrics \\
+Lineage & Automatic, into UC & Glue lineage (partial) & Purview / Dataplex \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+\textbf{Snowflake}'s analog is Dynamic Tables with \texttt{EXPECT} clauses emerging; dbt
+(cross-platform) shares the declarative-DAG philosophy with SQL models and tests.
+\end{crosscloud}
+
+\section{Week 10 Roadmap and Mental Model}
+Chapter 9 squeezed performance out of hand-written Spark. Week 10 asks the architectural question: which pipelines should be hand-written at all? Delta Live Tables (DLT---being rebranded Lakeflow Declarative Pipelines) inverts control: you declare \emph{datasets} (streaming tables, materialized views) and their \emph{quality rules}; the framework builds the DAG, chooses batch or streaming execution, retries, checkpoints, and records every quality metric \cite{databricksDLT}.
+
+The mental model: \textbf{DLT is a compiler from intent to pipeline}. Your code is a graph of dataset definitions; the runtime infers dependencies from table references, plans the execution order, and operates the result---including the parts hand-written pipelines get wrong under pressure: consistent checkpoints, quality telemetry, and lineage into Unity Catalog.
+
+\begin{definitionbox}
+\textbf{Delta Live Tables} is Databricks' declarative ETL framework. A \textbf{streaming table} ingests each source record exactly once (append processing); a \textbf{materialized view} maintains a query result, refreshed incrementally where possible. \textbf{Expectations} are per-dataset quality rules with warn, drop, or fail semantics.
+\end{definitionbox}
+
+\begin{keyterms}
+\textbf{Expectation}: \texttt{@dlt.expect}, \texttt{expect\_or\_drop}, \texttt{expect\_or\_fail}. \textbf{Event log}: the per-pipeline Delta table of runs, quality metrics, and lineage. \textbf{Development mode}: fast-iterating pipeline mode that reuses compute and skips retries. \textbf{Full refresh}: rebuilding datasets from scratch. \textbf{Trigger}: available-now (triggered) versus continuous processing.
+\end{keyterms}
+
+\section{Monday: Datasets and the Declarative DAG}
+\subsection{Streaming Tables and Materialized Views}
+A streaming table wraps a streaming read---the append-only facts of your system (Auto Loader output, Kafka, CDC feeds). A materialized view wraps a query---DLT tracks its inputs and refreshes it incrementally when the plan allows. Dependencies are inferred: referencing \texttt{LIVE} names (or the table names) wires the DAG automatically.
+
+\begin{lstlisting}[language=Python,caption={A three-dataset DLT pipeline in Python.},label={lst:ch10-pipeline}]
+import dlt
+from pyspark.sql import functions as F
+
+@dlt.table(comment="Raw orders, exactly-once from the landing volume")
+def bronze_orders():
+    return (spark.readStream.format("cloudFiles")
+            .option("cloudFiles.format", "csv")
+            .option("header", True)
+            .load("/Volumes/de_training/bronze/landing/olist/orders/"))
+
+@dlt.table(comment="Typed, deduplicated orders")
+def silver_orders():
+    return (dlt.read_stream("bronze_orders")
+            .withColumn("order_ts", F.to_timestamp("order_purchase_timestamp"))
+            .withColumn("total_amount", F.col("payment_value").cast("decimal(12,2)"))
+            .dropDuplicates(["order_id"]))
+
+@dlt.table(comment="Daily revenue by region")
+def gold_daily_revenue():
+    return (dlt.read("silver_orders")
+            .groupBy(F.to_date("order_ts").alias("order_date"), "region")
+            .agg(F.sum("total_amount").alias("revenue")))
+\end{lstlisting}
+
+\subsection{Development versus Production Mode}
+Development mode attaches to a long-lived cluster, skips retries, and reuses compute between runs---fast iteration. Production mode isolates each run, retries on failure, and terminates compute---operational safety. Develop in dev mode; deploy in production mode; never let a demo in dev mode stand in for a production run.
+
+\section{Tuesday: Expectations---Quality as Code}
+\subsection{Warn, Drop, Fail}
+Expectations attach quality rules to datasets \cite{databricksDLTExpectations}: \texttt{expect} records violations (warn), \texttt{expect\_or\_drop} removes offending rows, \texttt{expect\_or\_fail} stops the update. All three emit metrics to the event log, so ``how much bad data did we see this week'' is a SQL query, not an investigation.
+
+\begin{lstlisting}[language=Python,caption={The three expectation severities, deliberately assigned.},label={lst:ch10-expectations}]
+@dlt.table
+@dlt.expect("reasonable_amount", "total_amount < 1_000_000")   -- warn: log it
+@dlt.expect_or_drop("valid_key", "order_id IS NOT NULL")       -- drop: unusable
+@dlt.expect_or_fail("pii_gate", "customer_email IS NOT NULL")  -- fail: stop the line
+def silver_orders_validated():
+    return dlt.read_stream("bronze_orders")  # ... typed transform as above
+\end{lstlisting}
+
+\begin{pitfall}
+\textbf{Everything is \texttt{expect}.} Warn-only expectations produce metrics nobody acts on---aspirational quality control. The discipline: every rule gets a severity decision on purpose. Keys and PII fail; business-plausibility rules warn with an owner; everything in between drops with quarantine visibility.
+\end{pitfall}
+
+\section{Wednesday: Operating Pipelines}
+\subsection{Triggered versus Continuous}
+A \textbf{triggered} pipeline processes available data and stops---batch economics for streaming sources. \textbf{Continuous} stays up for second-level latency at continuous cost. Most pipelines in this program are triggered on a schedule; Chapter 16 covers when continuous earns its DBUs.
+
+\subsection{Full Refresh and Schema Evolution}
+Incrementalization has limits: a logic change to a materialized view may require a \textbf{full refresh} (rebuild from source). Schema evolution of sources is handled per dataset (DLT tracks and adapts, or fails with a clear error depending on configuration). The operational habit: know per dataset whether tomorrow's change deploys cleanly or needs a refresh---and budget the refresh window.
+
+\subsection{The Event Log}
+Every pipeline publishes an event log (a Delta table in the pipeline's storage): run lifecycle, per-dataset quality metrics, lineage edges, and errors.
+
+\begin{lstlisting}[language=SQL,caption={Quality metrics from the event log.},label={lst:ch10-eventlog}]
+SELECT timestamp, details:flow_progress.data_quality.expectations
+FROM event_log(TABLE(de_training.silver.silver_orders_validated))
+WHERE event_type = 'flow_progress'
+ORDER BY timestamp DESC
+LIMIT 20;
+\end{lstlisting}
+
+\section{Thursday Hands-on Project: The Medallion as DLT}
+Rebuild the Month 1 Bronze$\rightarrow$Silver$\rightarrow$Gold flow as one DLT pipeline with expectations, inject a poison record, and read the quality evidence from the event log.
+\index{hands-on lab}\index{expectations!lab}
+
+\begin{lstlisting}[language=Python,caption={Week 10 lab core: pipeline with poison-record drill.},label={lst:ch10-lab}]
+# Pipeline notebook (selected datasets shown)
+@dlt.table
+@dlt.expect_or_drop("valid_order", "order_id IS NOT NULL")
+@dlt.expect_or_fail("non_negative", "total_amount >= 0")
+def silver_orders():
+    return (dlt.read_stream("bronze_orders")
+            .withColumn("total_amount", F.col("payment_value").cast("decimal(12,2)"))
+            .dropDuplicates(["order_id"]))
+
+# The drill: append one CSV with a NULL order_id and one negative amount.
+# Expected: NULL-key row dropped (counted), negative amount fails the update.
+# Then: fix the poison file, re-run, and confirm the pipeline recovers.
+\end{lstlisting}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item The DLT pipeline (Python or SQL) reproducing the medallion flow with expectations on Silver.
+    \item Event-log queries showing the dropped NULL-key record and the failed negative-amount update.
+    \item A recovery note: what the pipeline did, what you fixed, how the re-run converged.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item The poisoned NULL-key row is dropped and \emph{counted} in quality metrics---not silently absent.
+    \item The \texttt{expect\_or\_fail} violation stops the update; Gold is untouched by the failed run.
+    \item After fixing the source, one triggered run converges Silver and Gold to the correct state with no manual table surgery.
+    \item The pipeline runs in production mode with a schedule, not only interactively.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Add a quarantine \emph{dataset} capturing dropped rows with reasons, mirroring Chapter 3's pattern.
+    \item Convert \texttt{gold\_daily\_revenue} to a materialized view and document when it refreshes incrementally vs.\ fully.
+    \item Deploy the pipeline twice (dev/prod targets) from one definition---a preview of Chapter 23.
+\end{itemize}
+
+\section{Friday Use Case: DLT or Hand-Written---Drawing the Line}
+A logistics company asks you to classify three pipeline candidates: (1) 200-table nightly CDC replication, (2) a fraud feature pipeline with exotic stateful logic, (3) a compliance reporting flow with strict audit requirements.
+\index{DLT!adoption}\index{architecture decision}
+
+\subsection{Requirements and Assumptions}
+The team knows Spark well and DLT not at all. The fraud pipeline uses \texttt{flatMapGroupsWithState} with custom timers. The compliance flow needs immutability evidence and sign-off gates.
+
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[
+        cand/.style={rectangle, rounded corners, draw=primary, thick, fill=primary!7, align=center, minimum width=3.6cm, minimum height=1.0cm, font=\small\bfseries},
+        verdict/.style={rectangle, rounded corners, draw=codegreen!60!black, thick, fill=green!8, align=center, minimum width=3.2cm, minimum height=0.9cm, font=\scriptsize\bfseries},
+        why/.style={rectangle, rounded corners, draw=codegray, thick, fill=white, align=center, minimum width=3.6cm, minimum height=0.75cm, font=\scriptsize},
+        flow/.style={-{Latex[length=2mm]}, draw=primary, thick}
+    ]
+        \node[cand] (cdc) at (0,0) {200-table CDC\\replication};
+        \node[cand] (fraud) at (4.8,0) {Fraud features\\stateful logic};
+        \node[cand] (comp) at (9.6,0) {Compliance\\reporting};
+        \node[verdict] (v1) at (0,-1.5) {DLT + AUTO CDC};
+        \node[verdict] (v2) at (4.8,-1.5) {Hand-written\\Spark + Workflows};
+        \node[verdict] (v3) at (9.6,-1.5) {DLT + expectations\\+ event-log audit};
+        \node[why] (w1) at (0,-2.8) {declared schemas,\\built-in SCD, scale};
+        \node[why] (w2) at (4.8,-2.8) {custom state API\\outside DLT's model};
+        \node[why] (w3) at (9.6,-2.8) {quality evidence is\\the deliverable};
+        \draw[flow] (cdc) -- (v1); \draw[flow] (fraud) -- (v2); \draw[flow] (comp) -- (v3);
+        \draw[flow, dashed] (v1) -- (w1); \draw[flow, dashed] (v2) -- (w2); \draw[flow, dashed] (v3) -- (w3);
+    \end{tikzpicture}%
+    }
+    \caption{The adoption boundary: DLT where declaration wins, hand-written Spark where control wins.}
+    \label{fig:ch10-boundary}
+\end{figure}
+
+\subsection{Architecture Decisions}
+\textbf{CDC replication: DLT.} Two hundred tables of key-based upserts with SCD handling is exactly what \texttt{AUTO CDC} and expectations commoditize (Chapter 11 details the CDC mechanics). \textbf{Fraud features: hand-written.} Arbitrary stateful operators, custom timers, and side-effecting sinks live outside DLT's dataset model; forcing them in costs more than the DAG automation saves. \textbf{Compliance: DLT.} The event log plus expectations \emph{is} the audit evidence the requirement asks for.
+
+\begin{pitfall}
+\textbf{All-or-nothing adoption.} The platforms compose: a Workflows job (Chapter 12) can run a DLT pipeline task \emph{and} a hand-written Spark task. The boundary belongs inside the estate, per pipeline---not around it.
+\end{pitfall}
+
+\subsection{Risks and Mitigations}
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{4.6cm}p{7.6cm}@{}}
+\toprule
+\textbf{Risk} & \textbf{Mitigation} \\
+\midrule
+Expectation drops quietly shrink a dataset & Drop-rate trend alert per dataset from the event log \\
+Dev-mode pipeline promoted untested & Prod-mode deploy only via the bundle pipeline \\
+Full refresh blows the weekend window & Refresh cost measured; calendar holds the slot \\
+Framework upgrade changes behavior & Channel pinned; upgrade tested in dev target first \\
+DLT hides logic from reviewers & Pipeline source is code in Git, reviewed like any change \\
+\bottomrule
+\end{tabular}
+\caption{Week 10 scenario risks and mitigations.}
+\label{tab:ch10-risks}
+\end{table}
+
+\section{Design Decision Guide}
+\index{decision guide!Week 10}%
+DLT decisions are about who operates the pipeline: you, or the framework.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.4cm}p{4.4cm}p{4.6cm}@{}}
+\toprule
+\textbf{Decision} & \textbf{Choose the first when} & \textbf{Choose the second when} \\
+\midrule
+DLT vs.\ hand-written Spark + Workflows & Standard ETL with quality rules & Exotic stateful logic or side effects \\
+Streaming table vs.\ materialized view & Append-only facts, exactly-once ingest & Derived query results over inputs \\
+\texttt{expect\_or\_drop} vs.\ \texttt{expect\_or\_fail} & Row is expendable, pipeline must continue & Bad data invalidates the whole batch \\
+Triggered vs.\ continuous & Minutes-freshness, cost-sensitive & Measured sub-minute mandate \\
+Development vs.\ production mode & Iterating & Anything scheduled or shared \\
+Full refresh vs.\ incremental & Logic change invalidates stored state & Schema-compatible evolution \\
+\bottomrule
+\end{tabular}
+\caption{Week 10 decision guide.}
+\label{tab:ch10-decisions}
+\end{table}
+
+When torn, ask who will debug this at 03:00 and what evidence they will need. DLT's event log is often the deciding vote---operability is a feature of the platform, not of your diligence.
+
+\section{Operational Guidance for Week 10}
+\index{operational guidance!Week 10}%
+\subsection{Performance and Reliability}
+Track per-dataset processing time and quality metrics from the event log as first-class telemetry---the pipeline that degrades announces itself there weeks before users notice. Budget and calendar the full refreshes: know which logic changes force them and how long they take at current volume. Pin the pipeline channel deliberately and test upgrades in dev mode; a channel auto-upgrade before a demo is a rite of passage you can skip.
+
+\subsection{Security and Governance Checklist}
+\begin{itemize}
+    \item Pipelines run as a service principal in production mode, never as a person.
+    \item Expectation severities reviewed per rule: fail for keys/PII, drop with quarantine, warn with an owner.
+    \item Event-log retention covers your audit window; export quality metrics for compliance.
+    \item Pipeline target schemas are UC-governed like any table---declarative does not mean ungoverned.
+\end{itemize}
+
+\subsection{Troubleshooting Playbook}
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.6cm}p{4.2cm}p{4.8cm}@{}}
+\toprule
+\textbf{Symptom} & \textbf{Likely cause} & \textbf{First action} \\
+\midrule
+Update fails on schema change & Source evolution incompatible with dataset & Read the error's dataset; evolve or full-refresh \\
+Expectation storm after source change & Upstream contract broke & Event log quality trend; pause downstream publish \\
+Pipeline ``stuck'' starting & Cluster quota or dev-mode reuse confusion & Check compute events; verify mode and policy \\
+MV refreshed fully (slow) & Change invalidated incremental plan & Expected on logic change; schedule the window \\
+\bottomrule
+\end{tabular}
+\caption{Week 10 troubleshooting quick reference.}
+\label{tab:ch10-trouble}
+\end{table}
+
+\section{Interview Q\&A}
+\subsection{Concepts and Trade-offs}
+\begin{enumerate}
+    \item \textbf{Q: What does DLT actually do that a notebook chain does not?}\\
+    A: Dependency inference and DAG construction, execution-mode management (batch/streaming per dataset), checkpointing, retries, per-dataset quality metrics, an event log, and UC lineage---the operational layer you would otherwise hand-build.
+    \item \textbf{Q: Streaming table versus materialized view?}\\
+    A: A streaming table appends each source record exactly once (facts); a materialized view maintains a query result over its inputs (derived state). Streaming tables answer ``what arrived''; MVs answer ``what is true.''
+    \item \textbf{Q: \texttt{expect\_or\_drop} versus \texttt{expect\_or\_fail}?}\\
+    A: Drop when the row is expendable and the pipeline must continue (with quarantine visibility); fail when bad data invalidates the whole batch---keys, PII gates---and continuing would corrupt consumers.
+    \item \textbf{Q: When does a DLT change require a full refresh?}\\
+    A: When the change invalidates incremental state---logic changes to a materialized view whose stored results encode the old logic. Know it per dataset before you deploy.
+    \item \textbf{Q: Why query the event log instead of trusting the UI?}\\
+    A: The UI shows the last run; the event log is the durable, queryable record---trend analysis, audit evidence, and alerting all read it as a table.
+    \item \textbf{Q: What telemetry would you lose by leaving DLT?}\\
+    A: Per-dataset quality metrics, the event log's run history, and automatic lineage---you would rebuild all three before your first audit.
+    \item \textbf{Q: How do expectations interact with schema evolution?}\\
+    A: Expectations evaluate the row as it arrives at the dataset; a schema change that renames a column makes the expectation reference fail loudly---which is the point: quality rules pin the contract.
+    \item \textbf{Q: Can DLT and plain Spark coexist in one pipeline estate?}\\
+    A: That is the normal end state: DLT owns the standard flows, hand-written Spark owns the exotic ones, and Workflows orchestrates both as task types in the same jobs.
+\end{enumerate}
+
+\section{Further Reading}
+The DLT documentation is the reference \cite{databricksDLT}; expectations and the event log are detailed in \cite{databricksDLTExpectations}. Auto Loader (the streaming source used throughout) is covered in \cite{databricksAutoLoader}, and the medallion rationale in \cite{databricksMedallion}. dbt practitioners should map the concepts across: datasets $\sim$ models, expectations $\sim$ tests, event log $\sim$ run results.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item DLT compiles declared datasets and quality rules into an operated pipeline---DAG, checkpoints, retries, metrics, lineage included.
+    \item Streaming tables capture facts exactly once; materialized views maintain derived truth.
+    \item Every expectation gets a deliberate severity: warn, drop (visible), or fail (protect downstream).
+    \item The event log is your quality evidence base---query it, alert on it, audit with it.
+    \item The DLT boundary is per pipeline: declaration wins for standard ETL; hand-written Spark wins for exotic control.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Explain the difference between DLT's DAG inference and Airflow-style explicit dependencies; name one risk of each.
+    \item \textbf{(Conceptual)} Why does \texttt{expect\_or\_fail} on a PII column protect \emph{downstream} tables, not just the dataset itself?
+    \item \textbf{(Hands-on)} Complete the Thursday lab, including the poison drill and event-log queries.
+    \item \textbf{(Hands-on)} Rewrite one dataset in SQL (DLT SQL) and compare readability with the Python version.
+    \item \textbf{(Hands-on)} Trend this week's quality metrics from the event log and chart the drop rate per day.
+    \item \textbf{(Design)} Classify five of your current (or hypothetical) pipelines on the DLT boundary; defend each call in one sentence.
+    \item \textbf{(Operations)} Write the runbook for ``pipeline failed on \texttt{expect\_or\_fail} at 03:00'': diagnosis, fix, re-run, evidence.
+    \item \textbf{(Architecture)} When would you graduate this pipeline's scheduling from the DLT trigger to a Workflows job (Chapter 12)?
+\end{enumerate}

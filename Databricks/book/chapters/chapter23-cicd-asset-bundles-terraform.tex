@@ -1,0 +1,399 @@
+\chapter{CI/CD with Databricks Asset Bundles, Terraform, and Cost Optimization}
+\index{Asset Bundles}\index{databricks.yml}\index{Terraform}\index{CI/CD}\index{GitHub Actions}%
+\index{infrastructure as code}\index{dev staging prod}\index{cost optimization}\index{system.billing.usage}%
+\begin{objectives}
+\begin{itemize}
+    \item Define jobs, pipelines, and compute as code with Databricks Asset Bundles.
+    \item Structure bundle targets (dev/staging/prod) with variables and mode constraints.
+    \item Provision workspace resources with the Terraform Databricks provider and remote state.
+    \item Build a GitHub Actions pipeline: PR validation, staging gate, prod promotion.
+    \item Produce per-domain chargeback from \texttt{system.billing.usage} and act on it.
+    \item Design a delivery and FinOps operating model for a multi-team platform.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+Asset Bundles are Databricks' \textbf{native IaC}; Terraform is the cross-cloud constant; the
+CI/CD pattern is identical everywhere.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{3.0cm}p{3.4cm}p{3.2cm}p{3.2cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{Databricks} & \textbf{AWS} & \textbf{Azure / GCP / Fabric} \\
+\midrule
+Native IaC & Asset Bundles (\texttt{databricks.yml}) & CloudFormation / CDK & Bicep / Deployment Manager / Fabric Git + Terraform \\
+Cross-platform IaC & Terraform provider & Terraform & Terraform \\
+Validate-before-deploy & \texttt{bundle validate} & cfn-lint / CDK synth & \texttt{terraform plan} / what-if \\
+CI auth & Service principal + OAuth M2M & OIDC $\rightarrow$ IAM role & OIDC $\rightarrow$ workload identity \\
+State & Terraform remote state & S3 + DynamoDB lock & Storage account / GCS backend \\
+Cost telemetry & \texttt{system.billing.usage} & CUR 2.0 & Cost Management / billing export / Capacity Metrics \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+\textbf{Snowflake}'s story is Terraform-first plus database-change tools (schemachange, dbt);
+the lesson that transfers everywhere: \emph{the merge is the deploy, and the pipeline is the only
+writer to prod}.
+\end{crosscloud}
+
+\section{Week 23 Roadmap and Mental Model}
+Twenty-two weeks of platform skills converge on the delivery question: how does a change travel from a laptop to production \emph{safely}? Week 23's answer is infrastructure as code (Asset Bundles for Databricks resources, Terraform for the workspace perimeter) behind a CI/CD pipeline with a staging gate---plus the FinOps loop that keeps the whole estate affordable \cite{databricksAssetBundles,terraformDatabricks}.
+
+The mental model: \textbf{production is a build artifact}. Nobody clicks in prod; a merge to \texttt{main} triggers validation, staging deployment, tests, and---only then---prod deployment. The bundle is the unit of deployment; the target is the environment; the pipeline is the policy.
+
+\begin{definitionbox}
+\textbf{A Databricks Asset Bundle} is a versioned declaration (\texttt{databricks.yml} plus resource files) of jobs, pipelines, and other workspace objects, deployed to named \textbf{targets} (dev/staging/prod) with variable substitution, deployment state tracking, and \texttt{validate}/\texttt{deploy}/\texttt{run} lifecycle commands.
+\end{definitionbox}
+
+\begin{keyterms}
+\textbf{Target}: a named deployment environment with its own workspace, variables, and mode. \textbf{Mode}: \texttt{development} (prefixed, paused schedules) or \texttt{production} (unpaused, locked). \textbf{Variable}: a bundle input substituted per target. \textbf{Remote state}: Terraform's shared, locked state backend. \textbf{Chargeback}: attributing platform cost to domains from billing system tables.
+\end{keyterms}
+
+\section{Monday: Asset Bundles}
+\subsection{Anatomy}
+A bundle declares resources (jobs, pipelines, dashboards, models) and targets; \texttt{databricks bundle validate} checks the declaration against the workspace schema before anything deploys; \texttt{bundle deploy} syncs code and applies resources; \texttt{bundle run} executes a resource in a target \cite{databricksAssetBundles}.
+
+\begin{lstlisting}[language=json,caption={The course bundle: one job, one pipeline, three targets.},label={lst:ch23-bundle}]
+bundle:
+  name: governed-platform
+
+variables:
+  catalog: {default: de_training}
+
+targets:
+  dev:
+    mode: development        # prefixed names, paused schedules
+    default: true
+    workspace: {host: https://dev-ws.azuredatabricks.net}
+  staging:
+    mode: production
+    workspace: {host: https://stg-ws.azuredatabricks.net}
+    variables: {catalog: de_staging}
+  prod:
+    mode: production
+    workspace: {host: https://prd-ws.azuredatabricks.net}
+    variables: {catalog: de_prod}
+    run_as: {service_principal_name: sp-etl-prod}
+
+resources:
+  pipelines:
+    medallion:
+      name: medallion-${bundle.target}
+      catalog: ${var.catalog}
+      libraries:
+        - notebook: {path: ../src/pipelines/medallion.py}
+  jobs:
+    nightly_elt:
+      name: nightly-elt-${bundle.target}
+      tasks:
+        - task_key: pipeline
+          pipeline_task: {pipeline_id: ${resources.pipelines.medallion.id}}
+        - task_key: quality_gate
+          depends_on: [{task_key: pipeline}]
+          notebook_task: {notebook_path: ../src/quality_gate}
+\end{lstlisting}
+
+\subsection{Targets and Modes}
+Development mode prefixes resource names and pauses schedules so ten engineers' dev deployments coexist without collisions; production mode unpins schedules and enforces \texttt{run\_as}. The discipline that prevents the classic incident: \emph{prod is deployed only by CI}, from the pinned merge commit, after staging passes.
+
+\begin{pitfall}
+\textbf{Deploying prod from a laptop.} Local prod deploys bypass the staging gate, the audit trail, and the pinned commit. Remove human deploy rights to prod targets; CI's service principal holds them. The exception path (break-glass deploy) is documented, credentialed separately, and alarmed.
+\end{pitfall}
+
+\section{Tuesday: Terraform for the Workspace Perimeter}
+\subsection{What Terraform Owns versus What Bundles Own}
+The split this book uses: \textbf{Terraform} provisions the slow-moving perimeter---workspaces, service principals, groups, metastore bindings, cluster policies, secret scopes; \textbf{bundles} deploy the fast-moving application---jobs, pipelines, dashboards. Both are code; both go through the same review; neither is clicked in production \cite{terraformDatabricks}.
+
+\begin{lstlisting}[language=json,caption={Terraform perimeter for the prod target.},label={lst:ch23-terraform}]
+terraform {
+  backend "azurerm" {                     # remote, locked state
+    resource_group_name  = "rg-de-terraform"
+    storage_account_name = "stdetfstate"
+    container_name       = "tfstate"
+    key                  = "databricks-prod.tfstate"
+  }
+  required_providers {
+    databricks = { source = "databricks/databricks" }
+  }
+}
+
+provider "databricks" { host = var.workspace_host }
+
+resource "databricks_service_principal" "etl_prod" {
+  display_name = "sp-etl-prod"
+}
+
+resource "databricks_cluster_policy" "training" {
+  name       = "de-training-policy"
+  definition = jsonencode({
+    autotermination_minutes = { type = "fixed", value = 30 }
+    num_workers             = { type = "range", maxValue = 4 }
+  })
+}
+
+resource "databricks_grants" "gold_readers" {
+  schema = "de_prod.gold"
+  grant { principal  = "analysts"
+          privileges = ["USE_SCHEMA", "SELECT"] }
+}
+\end{lstlisting}
+
+\subsection{State Discipline}
+Terraform state is the record of what exists: remote (never a laptop file), locked (no concurrent applies), and access-controlled (it describes your security estate). A lost or forked state file is how ``Terraform wants to delete the metastore binding'' happens.
+
+\section{Wednesday: The Pipeline and the FinOps Loop}
+\subsection{GitHub Actions Shape}
+\begin{lstlisting}[language=json,caption={CI/CD: validate on PR, deploy to staging on merge, gate prod.},label={lst:ch23-actions}]
+name: platform-cicd
+on:
+  pull_request: {branches: [main]}
+  push: {branches: [main]}
+env:
+  DATABRICKS_CLIENT_ID: ${{ vars.SP_CLIENT_ID }}
+  DATABRICKS_CLIENT_SECRET: ${{ secrets.SP_CLIENT_SECRET }}
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: databricks/setup-cli@main
+      - run: databricks bundle validate -t staging
+  deploy_staging:
+    needs: validate
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: databricks/setup-cli@main
+      - run: |
+          databricks bundle deploy -t staging
+          databricks bundle run nightly_elt -t staging
+          python tests/smoke_staging.py        # contract + row-count checks
+  deploy_prod:
+    needs: deploy_staging
+    environment: production                    # requires reviewer approval
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: databricks/setup-cli@main
+      - run: databricks bundle deploy -t prod
+\end{lstlisting}
+
+\subsection{FinOps from System Tables}
+Weekly cost practice: \texttt{system.billing.usage} by SKU and tag, per-domain chargeback, and the two-optimization rule (every monthly review implements at least two cost changes: auto-termination enforcement, serverless conversion, trigger-cadence rightsizing, storage lifecycle) \cite{databricksSystemTables}.
+
+\begin{lstlisting}[language=SQL,caption={Per-domain monthly chargeback.},label={lst:ch23-chargeback}]
+SELECT custom_tags.domain,
+       sku_name,
+       ROUND(SUM(usage_quantity), 1) AS dbus,
+       ROUND(SUM(usage_quantity * list_price), 0) AS est_usd
+FROM system.billing.usage
+JOIN system.billing.list_prices USING (sku_name, cloud, price_start_time)
+WHERE usage_date >= date_trunc('month', current_date()) - INTERVAL 1 MONTH
+GROUP BY custom_tags.domain, sku_name
+ORDER BY est_usd DESC;
+\end{lstlisting}
+
+\section{Thursday Hands-on Project: Bundle, Pipeline, and the Cost Report}
+Convert the Week 12 job into a bundle with dev/prod targets, drive it from GitHub Actions through a staging gate, provision the perimeter with Terraform, and ship the weekly DBU report.
+\index{hands-on lab}\index{Asset Bundles!lab}\index{CI/CD!lab}
+
+\begin{lstlisting}[language=PowerShell,caption={Week 23 lab: from hand-built job to gated deployment.},label={lst:ch23-lab}]
+# 1. Scaffold and validate
+databricks bundle init   # or author databricks.yml per lst:ch23-bundle
+databricks bundle validate -t dev
+databricks bundle deploy  -t dev
+databricks bundle run nightly_elt -t dev
+
+# 2. Terraform the perimeter (lst:ch23-terraform)
+terraform init; terraform plan -out=tfplan; terraform apply tfplan
+
+# 3. Wire .github/workflows/platform-cicd.yml (lst:ch23-actions);
+#    PR -> validate; merge -> staging deploy + smoke; approval -> prod.
+
+# 4. The Friday habit, automated:
+databricks bundle run weekly_cost_report -t prod
+\end{lstlisting}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item The bundle with dev/staging/prod targets and variables; validation output.
+    \item The Terraform configuration with remote, locked state.
+    \item The Actions run history: PR validation, staging gate, approved prod deploy.
+    \item The chargeback report with two implemented optimizations.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item A clean clone deploys the platform to dev with two commands (\texttt{terraform apply}, \texttt{bundle deploy}).
+    \item A deliberately broken bundle fails \texttt{validate} in the PR and never reaches staging.
+    \item Prod deploys only via the approved environment; the audit trail shows it.
+    \item The cost report attributes $\geq$95\% of DBUs to a domain tag.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Add the lineage impact check from Chapter 22 as a PR comment step.
+    \item Add bundle tests (notebook unit tests) that run in the staging job.
+    \item Implement the break-glass prod deploy path with its own alarm.
+\end{itemize}
+
+\section{Friday Use Case: Thirty Pipelines, Three Environments, Monthly Accountability}
+A platform team ships 30 pipelines for five business domains across dev/staging/prod, with a per-domain monthly budget and a release-train cadence. Design the delivery and FinOps operating model.
+\index{operating model}\index{FinOps}\index{release train}
+
+\subsection{Requirements and Assumptions}
+Domains ship weekly on the train; urgent fixes ride a documented hotfix path. Finance expects per-domain monthly variance explanations. Two production incidents last quarter were untracked manual changes.
+
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[
+        box/.style={rectangle, rounded corners, draw=primary, thick, fill=primary!7, align=center, minimum width=2.6cm, minimum height=0.95cm, font=\small\bfseries},
+        gate/.style={rectangle, rounded corners, draw=orange!80!black, thick, fill=orange!10, align=center, minimum width=2.4cm, minimum height=0.85cm, font=\scriptsize\bfseries},
+        flow/.style={-{Latex[length=2mm]}, draw=primary, thick}
+    ]
+        \node[box] (pr) at (0,0) {PR\\validate +\\lineage check};
+        \node[box] (stg) at (3.6,0) {Staging\\deploy +\\smoke tests};
+        \node[gate] (gate) at (7.2,0) {Approval\\(release\\manager)};
+        \node[box] (prod) at (10.4,0) {Prod deploy\\(CI only)};
+        \node[box] (fin) at (13.6,0) {FinOps\\chargeback +\\variance};
+        \draw[flow] (pr) -- (stg);
+        \draw[flow] (stg) -- (gate);
+        \draw[flow] (gate) -- (prod);
+        \draw[flow] (prod) -- (fin);
+    \end{tikzpicture}%
+    }
+    \caption{The release train: every change rides the same validated, gated track; cost closes the loop monthly.}
+    \label{fig:ch23-train}
+\end{figure}
+
+\subsection{Architecture Decisions}
+\textbf{One track, no exceptions.} Every resource change rides PR $\rightarrow$ staging $\rightarrow$ approval $\rightarrow$ prod; the hotfix path is the same track with an expedited approval, so the audit trail survives the emergency. The two manual-change incidents become impossible by removing human prod-deploy rights and alarming on drift (a scheduled job compares deployed state to the bundle registry).
+
+\textbf{Cost as a domain conversation.} Chargeback lands monthly per domain from \cref{lst:ch23-chargeback}; variance $>$15\% requires a note; the two-optimization rule keeps the estate's unit cost falling even as volume grows. Domains see their DBU dashboard---cost awareness without central nagging.
+
+\begin{pitfall}
+\textbf{The untracked manual fix.} Every ``quick fix in the UI'' forks production from the code. Detect it (drift job), reverse it (the bundle redeploys over it), and fix the loop time that tempted it---if the train takes two hours, hotfixes will always look faster, and they always cost more than they save.
+\end{pitfall}
+
+\subsection{Risks and Mitigations}
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{4.6cm}p{7.6cm}@{}}
+\toprule
+\textbf{Risk} & \textbf{Mitigation} \\
+\midrule
+Manual prod change under pressure & Humans lack prod deploy rights; drift job alarms on divergence \\
+Staging no longer predicts prod & Scheduled staging refresh; parity checks in the pipeline \\
+Terraform state corrupted or locked & Remote versioned backend; documented force-unlock procedure \\
+Chargeback tags missing on new compute & Tag enforcement in cluster policy, not in documentation \\
+Approval becomes rubber-stamping & Two-reviewer rule for schema or grant changes \\
+\bottomrule
+\end{tabular}
+\caption{Week 23 scenario risks and mitigations.}
+\label{tab:ch23-risks}
+\end{table}
+
+\section{Design Decision Guide}
+\index{decision guide!Week 23}%
+Delivery decisions are policy made executable; optimize for the audit trail surviving the emergency.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.4cm}p{4.4cm}p{4.6cm}@{}}
+\toprule
+\textbf{Decision} & \textbf{Choose the first when} & \textbf{Choose the second when} \\
+\midrule
+Bundles vs.\ Terraform & Application resources (jobs, pipelines) & Perimeter (workspaces, principals, policies) \\
+Staging gate vs.\ direct prod & Anything user-facing or scheduled & Dev-only sandboxes \\
+Service principal in CI vs.\ PAT & Always the principal & Never a personal token in CI \\
+Hotfix via pipeline vs.\ manual fix & Always the pipeline, expedited & Never manual---drift is the incident \\
+Chargeback vs.\ showback & Budgets have owners & Early-stage awareness building \\
+Weekly train vs.\ continuous release & Team coordination matters & Mature trunk-based teams \\
+\bottomrule
+\end{tabular}
+\caption{Week 23 decision guide.}
+\label{tab:ch23-decisions}
+\end{table}
+
+The two-command redeploy (Terraform apply, bundle deploy) is the health metric of the whole delivery system: when it stops being true, the estate is drifting from its code.
+
+\section{Operational Guidance for Week 23}
+\index{operational guidance!Week 23}%
+\subsection{Performance and Reliability}
+Measure the delivery system itself: deploy frequency, PR-to-prod lead time, validation failure rate, and staging-to-prod divergence time. A staging environment that drifts from prod (data volume, configuration) stops predicting prod---refresh it on a schedule. The drift-detection job (deployed state versus bundle registry) runs daily; any diff is either an untracked change or a failed deploy, and both are incidents-lite.
+
+\subsection{Security and Governance Checklist}
+\begin{itemize}
+    \item CI service principal holds deploy rights; humans hold approval rights---separate duties.
+    \item Terraform state backend access-controlled and versioned.
+    \item Bundle variables containing environment secrets resolved from CI secret stores.
+    \item Prod targets locked to pipeline deployment; break-glass path alarmed.
+\end{itemize}
+
+\subsection{Troubleshooting Playbook}
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.6cm}p{4.2cm}p{4.8cm}@{}}
+\toprule
+\textbf{Symptom} & \textbf{Likely cause} & \textbf{First action} \\
+\midrule
+Validate passes, deploy fails & Permission gap on the target workspace & Deploy as the CI principal; compare grants per target \\
+Staging green, prod red & Environment/config drift & Diff target variables and workspace configuration \\
+Terraform state locked & Aborted apply left the lock & Force-unlock by lock ID after confirming no live apply \\
+Bundle variable missing in one target & Variable declared without default & Add per-target overrides or a safe default \\
+\bottomrule
+\end{tabular}
+\caption{Week 23 troubleshooting quick reference.}
+\label{tab:ch23-trouble}
+\end{table}
+
+\section{Interview Q\&A}
+\subsection{Concepts and Trade-offs}
+\begin{enumerate}
+    \item \textbf{Q: Asset Bundles versus Terraform---what goes where?}\\
+    A: Terraform for the slow perimeter (workspaces, principals, policies, metastores); bundles for the fast application layer (jobs, pipelines, dashboards) with per-target variables and modes. Both in Git, both through the same review.
+    \item \textbf{Q: What does \texttt{bundle validate} actually catch?}\\
+    A: Schema errors, missing variables, bad resource references, and permission problems---before any cloud change. It is the compile step for your platform.
+    \item \textbf{Q: Why remote, locked Terraform state?}\\
+    A: State is the record of what exists. Local state forks under team/CI use; a forked state is how plans propose recreating---or deleting---your production estate.
+    \item \textbf{Q: How do you keep humans out of prod without slowing hotfixes?}\\
+    A: The same pipeline with an expedited approval gate: the hotfix is a PR with a faster review SLA, not a different process. Audit and staging evidence survive the emergency.
+    \item \textbf{Q: Where does chargeback data come from, and what breaks it?}\\
+    A: \texttt{system.billing.usage} plus tags (cluster policy-enforced, bundle-injected). Untagged compute breaks attribution---which is why tag enforcement lives in policy, not in a wiki.
+    \item \textbf{Q: What is the first signal your delivery process is failing?}\\
+    A: Drift between deployed state and the bundle registry---caught by the drift job. Manual changes are not a people problem; they are a missing-guardrail problem.
+    \item \textbf{Q: How do you attribute a cost spike to a change?}\\
+    A: Join the billing spike window to the deployment history: bundle deploys and Terraform applies are logged, so the cost curve diffs against the release curve.
+    \item \textbf{Q: How do you convince a team to stop deploying by hand?}\\
+    A: Make the pipeline faster than the manual path and prove it once: a two-command redeploy and a five-minute PR-to-staging loop. Teams abandon manual deploys when the governed path is also the easiest one.
+\end{enumerate}
+
+\section{Further Reading}
+Asset Bundles are documented in \cite{databricksAssetBundles}; the Terraform provider in \cite{terraformDatabricks}; billing system tables in \cite{databricksSystemTables}. The jobs being deployed come from Chapter 12 \cite{databricksWorkflows}; the service principals CI runs as come from Chapter 21 \cite{databricksSecurity}.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item Production is a build artifact: bundles + Terraform in Git, deployed by CI, gated by staging.
+    \item Targets and modes make dev collisions and prod schedules structurally impossible to confuse.
+    \item Terraform state is remote, locked, and access-controlled---it describes your security estate.
+    \item Hotfixes ride the same track faster, never a different track.
+    \item FinOps is a monthly loop with per-domain chargeback and two implemented optimizations---enforced by tags in policy.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Why does development mode prefix resource names, and what breaks without it?
+    \item \textbf{(Conceptual)} Explain the two-command clean-clone redeploy and what each command owns.
+    \item \textbf{(Hands-on)} Complete the Thursday lab, including the deliberately-broken PR.
+    \item \textbf{(Hands-on)} Add a drift-detection job comparing deployed jobs against the bundle registry.
+    \item \textbf{(Hands-on)} Build the per-domain DBU dashboard and write this month's variance note.
+    \item \textbf{(Design)} Write the hotfix runbook (SLA, approvers, evidence) for the Friday scenario.
+    \item \textbf{(Operations)} Draft the incident review template for ``prod changed outside the pipeline.''
+    \item \textbf{(Architecture)} When would you introduce dbt into this delivery model, and which bundle resources would it displace?
+\end{enumerate}

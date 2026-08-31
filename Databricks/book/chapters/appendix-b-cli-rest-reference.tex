@@ -1,0 +1,210 @@
+\chapter{CLI, SDK, and API Quick Reference}
+\index{Databricks CLI}\index{REST API}\index{quick reference}\index{SQL!reference}\index{PySpark!reference}%
+This appendix collects the commands, endpoints, and idioms the book's labs use repeatedly, in
+one lookup-friendly place. It is a reference, not a tutorial: each section points back to the
+chapter that teaches the concept.
+
+\section{Databricks CLI Essentials}
+\index{Databricks CLI!essentials}%
+\begin{lstlisting}[language=bash,caption={Databricks CLI commands used across the labs.},label={lst:appendixb-cli}]
+databricks auth login --host https://<workspace>.azuredatabricks.net  # OAuth (Ch. 0)
+databricks auth profiles                      # list configured profiles
+databricks current-user me                    # confirm identity
+
+# Workspace and clusters (Ch. 1)
+databricks workspace list /
+databricks clusters list --output json
+databricks clusters create --json @cluster.json
+
+# Jobs and pipelines (Ch. 12)
+databricks jobs list
+databricks jobs run-now <job-id>
+databricks jobs submit --json @run.json
+databricks runs repair --run-id <run-id>      # repair failed tasks only
+
+# Unity Catalog (Ch. 8, 22)
+databricks catalogs list
+databricks schemas create bronze --catalog de_training
+databricks volumes create de_training bronze landing MANAGED
+databricks grants get schema de_training.gold
+
+# Secrets (Ch. 21)
+databricks secrets create-scope kv-lab
+databricks secrets put-secret kv-lab kafka-password --string-value '<from-vault>'
+
+# Asset Bundles (Ch. 23)
+databricks bundle validate -t dev
+databricks bundle deploy -t staging
+databricks bundle run nightly_elt -t prod
+\end{lstlisting}
+
+\section{Databricks SDK for Python}
+\index{databricks-sdk-py}%
+The SDK mirrors the REST API and powers automation scripts throughout the book
+(Chapters~1, 12, 23):
+
+\begin{lstlisting}[language=Python,caption={SDK essentials.},label={lst:appendixb-sdk}]
+from databricks.sdk import WorkspaceClient
+
+w = WorkspaceClient()  # reads DATABRICKS_HOST / profile from env
+
+me = w.current_user.me()
+print(me.user_name)
+
+# Submit a one-off job run (Ch. 1 smoke test)
+from databricks.sdk.service.jobs import SubmitTask, NotebookTask
+run = w.jobs.submit(run_name="ch0-smoke", tasks=[
+    SubmitTask(task_key="smoke",
+               notebook_task=NotebookTask(notebook_path="/Repos/<you>/course/src/smoke"),
+               new_cluster={"spark_version": "15.4.x-scala2.12",
+                            "num_workers": 1,
+                            "node_type_id": "Standard_DS3_v2"})
+]).result()
+
+# List catalog tables (Ch. 8)
+for t in w.tables.list(catalog_name="de_training", schema_name="gold"):
+    print(t.full_name)
+\end{lstlisting}
+
+\section{REST API}
+\index{REST API!Databricks}%
+The REST API is the operations plane beneath Week~23's CI/CD. Pattern: acquire a token
+(OAuth preferred), call the API, poll long-running operations.
+
+\begin{lstlisting}[language=bash,caption={REST API essentials (token redacted).},label={lst:appendixb-rest}]
+# List jobs
+curl -H "Authorization: Bearer ******" `
+    https://<workspace>.azuredatabricks.net/api/2.1/jobs/list
+
+# Trigger a job run
+curl -X POST -H "Authorization: Bearer ******" `
+    -H "Content-Type: application/json" `
+    -d '{"job_id": 12345}' `
+    https://<workspace>.azuredatabricks.net/api/2.1/jobs/run-now
+
+# Execute SQL on a warehouse
+curl -X POST -H "Authorization: Bearer ******" `
+    -H "Content-Type: application/json" `
+    -d '{"statement":"SELECT COUNT(*) FROM de_training.gold.fact_orders","warehouse_id":"<id>"}' `
+    https://<workspace>.azuredatabricks.net/api/2.0/sql/statements
+\end{lstlisting}
+
+\begin{pitfall}
+The REST API authenticates as \emph{someone}: use a service principal with least-privilege
+grants, an OAuth or vaulted secret, and a rotation date. Tokens pasted into scripts reproduce
+Chapter~21's token-in-notebook failure at the platform layer.
+\end{pitfall}
+
+\section{Spark SQL and Delta Quick Reference}
+\index{SQL!quick reference}\index{Delta Lake!quick reference}%
+\begin{lstlisting}[language=SQL,caption={SQL idioms used across Chapters 2--8.},label={lst:appendixb-sql}]
+-- Three-level namespace (Ch. 1, 8)
+SELECT * FROM de_training.silver.orders LIMIT 10;
+
+-- History and time travel (Ch. 2)
+DESCRIBE HISTORY de_training.silver.orders;
+SELECT COUNT(*) FROM de_training.silver.orders VERSION AS OF 12;
+RESTORE TABLE de_training.silver.orders TO VERSION AS OF 11;
+
+-- Maintenance (Ch. 5)
+OPTIMIZE de_training.silver.orders ZORDER BY (customer_id, order_date);
+ALTER TABLE de_training.gold.fact_orders CLUSTER BY (order_date, region);
+VACUUM de_training.silver.orders RETAIN 168 HOURS;
+
+-- Governance (Ch. 8, 22)
+GRANT SELECT ON SCHEMA de_training.gold TO `analysts`;
+CREATE OR REPLACE VIEW de_training.gold.v_customer_masked AS
+SELECT customer_id,
+       CASE WHEN is_member('pii_readers') THEN email
+            ELSE sha2(email, 256) END AS email
+FROM de_training.gold.dim_customer;
+
+-- Cost introspection (Ch. 6, 23)
+SELECT sku_name, SUM(usage_quantity) AS dbus
+FROM system.billing.usage
+WHERE usage_date >= current_date() - 30
+GROUP BY sku_name ORDER BY dbus DESC;
+\end{lstlisting}
+
+\section{PySpark and Streaming Quick Reference}
+\index{PySpark!quick reference}\index{Structured Streaming!quick reference}%
+\begin{lstlisting}[language=Python,caption={PySpark/Streaming idioms used throughout.},label={lst:appendixb-pyspark}]
+# Read a managed table; stamp lineage columns (Ch. 3)
+df = (spark.read.table("de_training.bronze.orders")
+      .withColumn("_ingested_at", F.current_timestamp()))
+
+# Idempotent partition-scoped write (Ch. 9, 12, 20)
+(df.write.format("delta").mode("overwrite")
+   .option("replaceWhere", "as_of_date = '2026-07-31'")
+   .saveAsTable("de_training.gold.features_daily"))
+
+# Schema evolution (Ch. 2, 11): default enforcement rejects; opt in deliberately
+(df.write.format("delta").mode("append")
+   .option("mergeSchema", "true")
+   .saveAsTable("de_training.silver.orders"))
+
+# Auto Loader (Ch. 11)
+stream = (spark.readStream.format("cloudFiles")
+    .option("cloudFiles.format", "csv")
+    .option("cloudFiles.schemaLocation",
+            "/Volumes/de_training/bronze/_schemas/orders")
+    .load("/Volumes/de_training/bronze/landing/orders"))
+
+# Checkpointed streaming sink (Ch. 13)
+(stream.writeStream.format("delta")
+    .option("checkpointLocation", "/Volumes/de_training/bronze/_ckpt/orders")
+    .trigger(availableNow=True)
+    .toTable("de_training.bronze.orders_stream"))
+
+# Watermark + dedup (Ch. 14)
+deduped = (df.withWatermark("event_ts", "10 minutes")
+             .dropDuplicates(["event_id"]))
+
+# Registered model as UDF (Ch. 17, 20)
+predict = mlflow.pyfunc.spark_udf(
+    spark, "models:/ml.churn_model@champion", result_type="double")
+\end{lstlisting}
+
+\section{Asset Bundle Skeleton}
+\index{Asset Bundles!quick reference}%
+\begin{lstlisting}[language=json,caption={Minimal databricks.yml with dev/prod targets (Ch. 23).},label={lst:appendixb-bundle}]
+bundle:
+  name: governed-platform
+
+variables:
+  catalog:
+    default: de_training
+
+targets:
+  dev:
+    mode: development
+    default: true
+    workspace:
+      host: https://<dev-workspace>.azuredatabricks.net
+  prod:
+    mode: production
+    workspace:
+      host: https://<prod-workspace>.azuredatabricks.net
+
+resources:
+  jobs:
+    nightly_elt:
+      name: nightly-elt-${bundle.target}
+      tasks:
+        - task_key: pipeline
+          pipeline_task:
+            pipeline_id: ${resources.pipelines.medallion.id}
+  pipelines:
+    medallion:
+      name: medallion-${bundle.target}
+      catalog: ${var.catalog}
+      libraries:
+        - notebook:
+            path: ../src/medallion_pipeline.py
+\end{lstlisting}
+
+\begin{tipbox}
+Keep this appendix open during capstones. Every idiom here appears in at least one chapter's
+validation checklist; when an acceptance criterion says ``idempotent'' or ``dedup,'' these are the
+exact patterns it refers to.
+\end{tipbox}

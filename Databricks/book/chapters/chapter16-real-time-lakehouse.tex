@@ -1,0 +1,424 @@
+\chapter{Real-Time Lakehouse Architectures}
+\index{real-time lakehouse}\index{streaming medallion}\index{foreachBatch}\index{stream-static join}%
+\index{stream-stream join}\index{latency budget}\index{continuous vs triggered}%
+\begin{objectives}
+\begin{itemize}
+    \item Design a streaming medallion architecture: Bronze append streams, Silver dedup and joins, Gold incremental aggregates.
+    \item Use \texttt{foreachBatch} to apply MERGE-based sinks within exactly-once semantics.
+    \item Implement stream-static and stream-stream joins with correct watermarks on both sides.
+    \item Serve real-time Gold to AI/BI dashboards with explicit freshness indicators.
+    \item Model latency and cost trade-offs between continuous, micro-batch, and triggered processing.
+    \item Reconcile streaming and batch views of the same business truth.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+The real-time lakehouse---streams landing in governed tables that also serve batch---is the
+converged endpoint every platform is building toward.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{3.0cm}p{3.4cm}p{3.2cm}p{3.2cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{Databricks} & \textbf{AWS} & \textbf{Azure / GCP / Fabric} \\
+\midrule
+Stream-to-table & Structured Streaming $\rightarrow$ Delta & Flink $\rightarrow$ Iceberg/S3 Tables & Eventstream $\rightarrow$ Eventhouse / Dataflow $\rightarrow$ BigQuery \\
+Upsert sink & \texttt{foreachBatch} + MERGE & Flink upsert writers & BigQuery MERGE / KQL update policies \\
+Real-time serving & Gold streaming tables + AI/BI & Kinesis Analytics $\rightarrow$ QuickSight & KQL + Real-Time Dashboards / BigQuery BI Engine \\
+Batch+stream one table & Delta (both writers) & Iceberg (Flink + batch) & BigQuery streaming + batch / OneLake \\
+Reconciliation & Batch recompute vs stream & Lambda/Kappa variants & Same pattern \\
+Latency floor & Seconds (micro-batch) & Sub-second (Flink) & Sub-second (KQL) / seconds (Dataflow) \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+\textbf{Snowflake}'s version is Snowpipe Streaming into tables queried by the same engine as
+batch---the same architectural promise with a fully managed engine and no stream topology to
+design.
+\end{crosscloud}
+
+\section{Week 16 Roadmap and Mental Model}
+Part IV's previous chapters built streaming \emph{mechanics}. Week 16 assembles them into \emph{architecture}: a lakehouse where streams and batches write the same governed tables, real-time aggregates serve live dashboards, and a batch path reconciles the streaming view against business truth. This is the chapter where the medallion (Part I) and streaming (Part IV) become one system \cite{sparkStructuredStreaming,databricksDelta}.
+
+The mental model: \textbf{streaming is a latency tier of the lakehouse, not a separate estate}. Bronze streaming tables capture events; Silver applies the same dedup/quality rules as batch, continuously; Gold maintains incremental aggregates. The batch path is not legacy---it is the reconciliation and reprocessing tier that keeps the stream honest.
+
+\begin{definitionbox}
+\textbf{A real-time lakehouse} is a medallion architecture whose layers are maintained continuously by streaming pipelines, with batch processing retained for backfill, reconciliation, and heavy reprocessing---one governed storage layer (Delta) serving both latency tiers.
+\end{definitionbox}
+
+\begin{keyterms}
+\textbf{\texttt{foreachBatch}}: the escape hatch running arbitrary batch logic (MERGE, fan-out) per micro-batch with checkpointed exactly-once. \textbf{Stream-static join}: enriching a stream against a slowly changing table. \textbf{Stream-stream join}: joining two streams with watermarks on both. \textbf{Latency budget}: the end-to-end freshness requirement decomposed per stage. \textbf{Reconciliation}: the batch proof that streaming Gold matches source truth.
+\end{keyterms}
+
+\section{Monday: The Streaming Medallion}
+\subsection{Layer by Layer}
+\textbf{Bronze}: the append stream from Kafka/Auto Loader---exactly-once facts, liquid-clustered for the serving queries. \textbf{Silver}: dedup (watermarked), typing, expectations (DLT streams carry them), and stream-static enrichment against dimensions. \textbf{Gold}: incremental aggregates---windowed revenue, running counts---served directly to dashboards. The batch pipeline still exists: it recomputes Gold nightly from Bronze as the reconciliation of record.
+
+\subsection{One Table, Two Writers}
+Delta's optimistic concurrency lets a stream and a batch job write the same table---\emph{if} they write disjoint slices (stream owns recent data; batch owns restatements) or coordinate through keys. The practical pattern: streams write live partitions; nightly batch rewrites the same logical window with reconciled values in a \texttt{replaceWhere} scoped overwrite. Conflicts are commit-time failures you design away by slice discipline, not luck.
+
+\begin{pitfall}
+\textbf{Stream and batch both upserting the same keys.} Two writers MERGE-ing the same keyspace will serialize against each other, fail commits under contention, and produce ordering-dependent state. Partition the responsibility: stream owns now, batch owns then; or make the batch the only writer and the stream a staging feed.
+\end{pitfall}
+
+\section{Tuesday: foreachBatch and Streaming Joins}
+\subsection{foreachBatch: The Correct Escape Hatch}
+Streaming DataFrames cannot MERGE directly. \texttt{foreachBatch} hands each micro-batch to a function as a \emph{batch} DataFrame---where MERGE, multiple sinks, and side effects are legal---while the checkpoint still guarantees the batch is processed exactly once:
+
+\begin{lstlisting}[language=Python,caption={foreachBatch MERGE sink: idempotent upserts from a stream.},label={lst:ch16-foreachbatch}]
+def upsert_to_silver(batch_df, batch_id):
+    batch_df.createOrReplaceTempView(f"batch_{batch_id}")
+    spark.sql(f"""
+        MERGE INTO de_training.silver.orders_rt AS t
+        USING batch_{batch_id} AS s
+        ON t.order_id = s.order_id
+        WHEN MATCHED AND s.event_ts > t.event_ts THEN UPDATE SET *
+        WHEN NOT MATCHED THEN INSERT *
+    """)
+
+(stream.writeStream
+    .foreachBatch(upsert_to_silver)
+    .option("checkpointLocation", "/Volumes/de_training/silver/_ckpt/orders_rt")
+    .trigger(processingTime="30 seconds")
+    .start())
+\end{lstlisting}
+
+\subsection{Streaming Joins}
+\textbf{Stream-static} (events $\times$ dimension): the static side is snapshotted per batch---broadcast it when small, and know that dimension changes apply to \emph{new} micro-batches only. \textbf{Stream-stream}: both sides arrive over time; the join needs watermarks on both sides plus an event-time join constraint (\texttt{A.ts BETWEEN B.ts - INTERVAL 5 MINUTES AND B.ts}), which tells the engine when join state can be evicted. Unbounded stream-stream joins without watermarks are unbounded state.
+
+\section{Wednesday: Serving and the Latency/Cost Model}
+\subsection{Real-Time Gold to Dashboards}
+Gold streaming tables serve AI/BI dashboards refreshing at decision cadence (Chapter 7): every minute for operations, not every second because the platform allows it. Add a freshness tile---\texttt{max(event\_ts)} and last-write timestamp---so a stale pipeline is visible on the same dashboard that depends on it.
+
+\subsection{The Latency/Cost Dial}
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.4cm}p{3.6cm}p{3.4cm}p{2.6cm}@{}}
+\toprule
+\textbf{Mode} & \textbf{Latency} & \textbf{Cost profile} & \textbf{Use when} \\
+\midrule
+Continuous stream & Sub-second to seconds & Always-on compute & Measured sub-minute mandates \\
+Micro-batch (30 s) & $\sim$30--60 s & High but tunable & Operational dashboards \\
+Triggered hourly & Minutes-hours & Pay per run & Finance-grade freshness \\
+Nightly batch & Hours & Cheapest & Reconciliation, history \\
+\bottomrule
+\end{tabular}
+\caption{The latency/cost dial: four settings, four price points.}
+\label{tab:ch16-latency}
+\end{table}
+
+\section{Thursday Hands-on Project: The Real-Time Orders Pipeline}
+Build the full streaming medallion for orders: Kafka $\rightarrow$ Bronze $\rightarrow$ Silver deduped MERGE $\rightarrow$ Gold 5-minute revenue $\rightarrow$ a live AI/BI dashboard with a freshness tile.
+\index{hands-on lab}\index{real-time lakehouse!lab}
+
+\begin{lstlisting}[language=Python,caption={Week 16 lab: the streaming Gold aggregation.},label={lst:ch16-lab}]
+from pyspark.sql import functions as F
+
+silver = spark.readStream.table("de_training.silver.orders_rt")
+
+gold5m = (silver
+    .withWatermark("event_ts", "10 minutes")
+    .groupBy(F.window("event_ts", "5 minutes"), "region")
+    .agg(F.sum("amount").alias("revenue"),
+         F.countDistinct("order_id").alias("orders")))
+
+def publish_gold(batch_df, batch_id):
+    batch_df.createOrReplaceTempView("g")
+    spark.sql("""
+        MERGE INTO de_training.gold.revenue_5m AS t
+        USING g AS s
+        ON t.window_start = s.window.start AND t.region = s.region
+        WHEN MATCHED THEN UPDATE SET *
+        WHEN NOT MATCHED THEN INSERT *
+    """)
+
+(gold5m.writeStream.foreachBatch(publish_gold)
+    .outputMode("update")
+    .option("checkpointLocation", "/Volumes/de_training/gold/_ckpt/revenue_5m")
+    .trigger(processingTime="1 minute")
+    .start())
+
+# Dashboard dataset (AI/BI):
+#   SELECT *, current_timestamp() AS refreshed_at
+#   FROM de_training.gold.revenue_5m
+#   ORDER BY window_start DESC LIMIT 288   -- one day of 5-min bars
+\end{lstlisting}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item The three streaming queries (Bronze, Silver MERGE, Gold aggregate) with governed checkpoints.
+    \item The AI/BI dashboard with 5-minute revenue bars and a freshness tile.
+    \item A nightly batch reconciliation query comparing streaming Gold against a Bronze recompute.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item A Kafka replay produces zero duplicate Silver rows and zero duplicate Gold updates.
+    \item The dashboard shows data no older than two trigger intervals under normal load.
+    \item The reconciliation query agrees within documented tolerance (late-drop policy stated).
+    \item Cost per day of the continuous pipeline is computed from \texttt{system.billing.usage} and compared against a triggered alternative.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Add a stream-stream join (orders $\times$ payments, 5-minute constraint) with correct watermarks.
+    \item Convert Gold to a DLT streaming pipeline and compare operational surface with the hand-built version.
+    \item Implement the freshness alert: page when \texttt{max(window\_start)} falls 3 intervals behind.
+\end{itemize}
+
+\section{Friday Use Case: Ten Thousand Vehicles, One Dispatch Screen}
+A logistics fleet streams 10k GPS/telemetry events per second from vehicles. Dispatch needs a sub-minute live map; routing optimization retrains nightly on full history; the finance team bills customers from the same events.
+\index{logistics}\index{IoT}\index{streaming!architecture}
+
+\subsection{Requirements and Assumptions}
+Events carry \texttt{vehicle\_id}, position, speed, and timestamps. Dispatch decisions expire in 60 seconds. Billing must reconcile to the source of record (the event log) to the event. Overnight, batch recomputes daily Gold from Bronze.
+
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[
+        box/.style={rectangle, rounded corners, draw=primary, thick, fill=primary!7, align=center, minimum width=2.9cm, minimum height=0.95cm, font=\small\bfseries},
+        store/.style={cylinder, draw=primary, shape border rotate=90, aspect=0.25, fill=primary!10, align=center, minimum width=2.2cm, minimum height=1.05cm, font=\small\bfseries},
+        flow/.style={-{Latex[length=2mm]}, draw=primary, thick}
+    ]
+        \node[box] (fleet) at (0,0) {Fleet telemetry\\10k events/s};
+        \node[box] (kafka) at (3.4,0) {Kafka\\by vehicle\_id};
+        \node[store] (bronze) at (6.8,0) {Bronze\\(append)};
+        \node[box] (silver) at (10.2,0.9) {Silver stream\\dedup + enrich};
+        \node[box] (gold) at (13.6,0.9) {Gold 1-min\\positions/status};
+        \node[box] (batch) at (10.2,-0.9) {Nightly batch\\reconcile + retrain};
+        \node[box] (dash) at (16.4,0.9) {Dispatch\\dashboard};
+        \node[store] (bill) at (16.4,-0.9) {Billing Gold\\(reconciled)};
+        \draw[flow] (fleet) -- (kafka);
+        \draw[flow] (kafka) -- (bronze);
+        \draw[flow] (bronze) -- (silver);
+        \draw[flow] (silver) -- (gold);
+        \draw[flow] (gold) -- (dash);
+        \draw[flow] (bronze) -- (batch);
+        \draw[flow] (batch) -- (bill);
+    \end{tikzpicture}%
+    }
+    \caption{Fleet lakehouse: one Bronze log feeding a real-time dispatch tier and a reconciled nightly tier.}
+    \label{fig:ch16-fleet}
+\end{figure}
+
+\subsection{Architecture Decisions}
+\textbf{Two tiers, one truth.} The dispatch tier optimizes for freshness: 30-second micro-batches, update-mode aggregates into \texttt{gold.vehicle\_status}, a 1-minute dashboard. The billing tier optimizes for correctness: nightly batch recompute from Bronze with exact dedup and windowing---its Gold is the invoice source. The streaming Gold is explicitly labeled operational; the batch Gold is financial. They agree because they share Bronze, dedup keys, and window definitions---and a daily diff job proves it.
+
+\textbf{Capacity and cost.} Kafka partitioned by \texttt{vehicle\_id} (ordering per vehicle, parallelism for scale); the dispatch stream is the only always-on compute; everything else is triggered. The cost model (\cref{tab:ch16-latency}) is reviewed monthly against the measured freshness dispatch actually uses.
+
+\begin{pitfall}
+\textbf{Billing from the streaming tier.} Operational aggregates tolerate late-drop and at-least-once edge cases that invoices may not. The batch reconciliation tier is not optional overhead---it is what makes the real-time tier safe to move fast.
+\end{pitfall}
+
+\subsection{Risks and Mitigations}
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{4.6cm}p{7.6cm}@{}}
+\toprule
+\textbf{Risk} & \textbf{Mitigation} \\
+\midrule
+Stream/batch divergence normalized & Daily reconciliation diff trended and alerted, not eyeballed \\
+Dispatch screen drives a wrong hold & Operational tier labeled; safety actions read the reconciled tier \\
+foreachBatch grows slower with load & Per-batch duration alert; merge-condition data skipping verified \\
+Continuous trigger left on after a demo & Trigger config in code review; weekend cost alert \\
+Late events rewrite financial windows & Billing reads only the batch-reconciled Gold tier \\
+\bottomrule
+\end{tabular}
+\caption{Week 16 scenario risks and mitigations.}
+\label{tab:ch16-risks}
+\end{table}
+
+\section{Design Decision Guide}
+\index{decision guide!Week 16}%
+Real-time lakehouse decisions are about which tier answers which question.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.4cm}p{4.4cm}p{4.6cm}@{}}
+\toprule
+\textbf{Decision} & \textbf{Choose the first when} & \textbf{Choose the second when} \\
+\midrule
+\texttt{foreachBatch} MERGE vs.\ streaming table & Custom upsert logic, multi-sink & Standard append/aggregate flows \\
+Stream-static vs.\ pre-joined enrichment & Dimension changes matter going forward & Point-in-time correctness is required \\
+Continuous vs.\ triggered & Sub-minute mandate with budget & Minutes-freshness at batch cost \\
+Operational vs.\ financial Gold tier & Fast approximate answers & Reconciled, invoice-grade numbers \\
+Kappa vs.\ Lambda (batch shadow) & Team can own one codebase and accept drift & Financial/audit truth must recompute \\
+Stream-stream vs.\ stream-static join & Both sides arrive over time & One side is reference data \\
+\bottomrule
+\end{tabular}
+\caption{Week 16 decision guide.}
+\label{tab:ch16-decisions}
+\end{table}
+
+The tiering question settles most rows: if the answer drives money or safety, the batch-reconciled tier owns it; if it drives a dashboard someone glances at, the streaming tier does.
+
+\section{Operational Guidance for Week 16}
+\index{operational guidance!Week 16}%
+\subsection{Performance and Reliability}
+The nightly reconciliation between streaming Gold and batch truth is the tier's license to operate: automate it, trend the diff, and alert on drift beyond tolerance. Review trigger cadence monthly against the freshness the business actually consumes---latency nobody looks at is spend nobody needs. Keep the \texttt{foreachBatch} function lean; per-batch overhead (connections, catalog calls) multiplies by trigger frequency.
+
+\subsection{Security and Governance Checklist}
+\begin{itemize}
+    \item Dashboard publish identity scoped to the Gold serving views.
+    \item Streaming checkpoints and reconciliation tables classified with their source data.
+    \item The operational/financial Gold split documented---consumers know which tier answers which question.
+    \item Freshness alerting covers every real-time dashboard (no silent staleness).
+\end{itemize}
+
+\subsection{Troubleshooting Playbook}
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.6cm}p{4.2cm}p{4.8cm}@{}}
+\toprule
+\textbf{Symptom} & \textbf{Likely cause} & \textbf{First action} \\
+\midrule
+Stream and batch disagree & Late-drop policy or dedup mismatch & Diff on shared keys; reconcile watermark policies \\
+foreachBatch batches slow & Per-batch MERGE on degraded layout & Optimize the target; check merge-condition skipping \\
+MERGE commit conflicts & Batch and stream writing same keyspace & Enforce slice discipline (stream=now, batch=then) \\
+Dashboard fresh but wrong & Aggregate logic drift between tiers & Single-source the window definitions \\
+\bottomrule
+\end{tabular}
+\caption{Week 16 troubleshooting quick reference.}
+\label{tab:ch16-trouble}
+\end{table}
+
+\section{Interview Q\&A}
+\subsection{Concepts and Trade-offs}
+\begin{enumerate}
+    \item \textbf{Q: Why does the stream need a batch shadow at all?}\\
+    A: Streams trade exactness for latency: watermarks drop late data, edge cases duplicate, windows close early. The nightly batch from Bronze is the reconciled truth; the stream is the fast approximation that must provably agree with it.
+    \item \textbf{Q: Why \texttt{foreachBatch} instead of a native MERGE sink?}\\
+    A: Streaming DataFrames do not support MERGE directly; \texttt{foreachBatch} exposes each micro-batch as a batch DataFrame---where MERGE is legal---while the checkpoint preserves exactly-once across the hand-off.
+    \item \textbf{Q: Stream-stream join: what makes it safe?}\\
+    A: Watermarks on \emph{both} sides plus an event-time interval constraint, so join state is bounded and evictable; without them the join state is unbounded memory.
+    \item \textbf{Q: When is continuous processing justified over 30-second micro-batches?}\\
+    A: When the measured business cost of 30 seconds of staleness exceeds the DBU premium---rare outside market-making, real-time bidding, and safety systems. Most ``real-time'' requirements are micro-batch requirements.
+    \item \textbf{Q: How do you keep the dashboard honest?}\\
+    A: A freshness tile showing \texttt{max(event\_ts)} and last-write time, plus an alert when lag exceeds the budget---the dashboard that monitors its own pipeline.
+    \item \textbf{Q: Why not query the streaming Silver directly for billing?}\\
+    A: Because streams encode lateness and replay policy; billing needs the reconciled batch computation over immutable Bronze. Fast and correct are different tiers by design.
+    \item \textbf{Q: What is the cost question to ask before any continuous trigger?}\\
+    A: ``What does one minute of staleness cost the business?'' If the answer is unmeasurable, the continuous premium is unpayable-by-logic---choose triggered.
+    \item \textbf{Q: What is the migration path from a nightly batch estate to this architecture?}\\
+    A: Incremental: Auto Loader replaces file polling, \texttt{availableNow} streams replace cron reads, and only consumers with measured freshness needs graduate to micro-batch triggers. The batch tier remains the reconciler throughout.
+\end{enumerate}
+
+\section{Further Reading}
+The Structured Streaming guide covers \texttt{foreachBatch} and streaming joins \cite{sparkStructuredStreaming}; Delta's streaming integration is in \cite{databricksDelta}; Kafka source options in \cite{sparkKafkaIntegration}. The medallion rationale this chapter streams into is \cite{databricksMedallion}, and the optimization chapter (5) explains why the streaming Bronze needs clustering and predictive optimization.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item The real-time lakehouse is one medallion estate with two latency tiers---not a separate streaming stack.
+    \item \texttt{foreachBatch} + MERGE is the exactly-once upsert sink; dedup keys make replays safe.
+    \item Stream-stream joins require watermarks and interval constraints on both sides.
+    \item Latency is a priced dial: continuous, micro-batch, triggered, batch---choose per consumer.
+    \item The batch reconciliation tier is what licenses the streaming tier to move fast.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Explain why two writers to one Delta table are safe when their slices are disjoint.
+    \item \textbf{(Conceptual)} Why does update output mode pair naturally with \texttt{foreachBatch} MERGE?
+    \item \textbf{(Hands-on)} Complete the Thursday lab, including the reconciliation query and its tolerance statement.
+    \item \textbf{(Hands-on)} Add the freshness tile and the lag alert; force a stream stoppage and capture the alert.
+    \item \textbf{(Hands-on)} Run the cost comparison: one day continuous vs.\ hourly triggered on the same pipeline.
+    \item \textbf{(Design)} Write the watermark and join-constraint spec for a payments-joins-orders stream-stream join.
+    \item \textbf{(Operations)} Draft the incident runbook for ``dispatch dashboard 10 minutes stale.''
+    \item \textbf{(Architecture)} Redesign the Friday scenario as Kappa (no batch tier). What breaks? What must you add to compensate?
+\end{enumerate}
+
+\section{Milestone 4 Capstone: The Real-Time Fraud Telemetry Platform}\label{sec:ch16-capstone}
+\index{Milestone 4 capstone}\index{capstone project!Part IV}\index{fraud detection!capstone}
+
+\begin{capstonebox}
+\textbf{Mission.} Close Part IV with a production-shaped streaming system: synthetic card transactions from Kafka into a Bronze stream, deduplicated watermarked Silver, a stateful impossible-travel rule, Gold 5-minute aggregates on a live dashboard, and a replay drill proving exactly-once with zero duplicate alerts.
+
+\textbf{Estimated time.} 8--10 hours.
+
+\textbf{What you'll practice.}
+\begin{itemize}
+    \item Kafka production with unique event IDs and keyed partitioning.
+    \item Watermarked dedup before rule evaluation---the replay-safety ordering.
+    \item \texttt{foreachBatch} MERGE sinks and stateful per-card logic.
+    \item Live dashboards with freshness telemetry and a measured latency budget.
+\end{itemize}
+\end{capstonebox}
+
+\subsection*{Scenario}
+Meridian Bank's card fraud team currently reviews alerts batched hourly. You are delivering the real-time platform: flag a card used in two cities within 10 minutes, alert within 30 seconds of the second event, and give analysts a live windowed view---with zero tolerance for duplicate alerts under replays.
+
+\subsection*{Requirements}
+\begin{itemize}
+    \item Seeded Kafka producer (6 partitions, keyed by \texttt{card\_id}), $\geq$100k events including planted impossible-travel cases and a replayable ID space.
+    \item Bronze append stream with governed checkpoint; Silver dedup with a 10-minute watermark.
+    \item Impossible-travel detection (stateful per-card or windowed \texttt{countDistinct(city)} $\geq$ 2) feeding a keyed alert sink.
+    \item Gold \texttt{revenue\_5m}-style aggregates + AI/BI dashboard with freshness tile.
+    \item Replay drill: full topic replay produces zero duplicate alerts and zero duplicate Silver rows.
+    \item Cost report: continuous vs.\ triggered comparison with the chosen trigger justified.
+\end{itemize}
+
+\subsection*{Reference Architecture}
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[
+        box/.style={rectangle, rounded corners, draw=primary, thick, fill=primary!7, align=center, minimum width=2.7cm, minimum height=0.95cm, font=\small\bfseries},
+        gate/.style={rectangle, rounded corners, draw=orange!80!black, thick, fill=orange!10, align=center, minimum width=2.6cm, minimum height=0.9cm, font=\scriptsize\bfseries},
+        flow/.style={-{Latex[length=2mm]}, draw=primary, thick}
+    ]
+        \node[box] (kafka) at (0,0) {Kafka\\card txns};
+        \node[box] (bronze) at (3.2,0) {Bronze\\append};
+        \node[box] (silver) at (6.4,0) {Silver\\dedup + wm};
+        \node[gate] (rule) at (9.6,0.9) {Impossible-\\travel rule};
+        \node[box] (gold) at (9.6,-0.9) {Gold 5-min\\aggregates};
+        \node[box] (alert) at (12.8,0.9) {Alert sink\\(keyed, idempotent)};
+        \node[box] (dash) at (12.8,-0.9) {AI/BI +\\freshness tile};
+        \draw[flow] (kafka) -- (bronze);
+        \draw[flow] (bronze) -- (silver);
+        \draw[flow] (silver) -- (rule);
+        \draw[flow] (silver) -- (gold);
+        \draw[flow] (rule) -- (alert);
+        \draw[flow] (gold) -- (dash);
+    \end{tikzpicture}%
+    }
+    \caption{Milestone 4 reference architecture: dedup-before-rules fraud telemetry.}
+    \label{fig:ch16-capstone-arch}
+\end{figure}
+
+\subsection*{Implementation Steps}
+\begin{enumerate}
+    \item Producer with \texttt{uuid5}-deterministic event IDs; plant the fraud cases.
+    \item Bronze stream (capped trigger, governed checkpoint).
+    \item Silver: watermark, \texttt{dropDuplicates}, \texttt{foreachBatch} MERGE.
+    \item Rule stream in update mode; alert sink keyed by \texttt{event\_id}.
+    \item Gold aggregates + dashboard + freshness tile.
+    \item Replay drill and cost report; finalize the README per the portfolio guide.
+\end{enumerate}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item All pipeline code, producer, and dashboard export in Git.
+    \item Replay-drill evidence: alert count before and after replay identical.
+    \item Latency measurement (event time to alert) at p50/p95.
+    \item Cost report with trigger decision.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item Zero duplicate alerts on full replay; zero duplicate Silver rows.
+    \item The planted fraud case alerts within the latency budget.
+    \item Late events within the watermark are included; beyond it, counted and dropped.
+    \item Credentials in secret scopes; checkpoints in governed volumes.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Reimplement the rule with \texttt{applyInPandasWithState} and compare code clarity and state metrics.
+    \item Add the nightly batch reconciliation tier and the daily diff job.
+    \item Failover drill: new checkpoint from \texttt{earliest} into a recovery estate with reconciliation.
+\end{itemize}

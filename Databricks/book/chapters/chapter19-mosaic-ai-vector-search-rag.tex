@@ -1,0 +1,348 @@
+\chapter{Mosaic AI, Vector Search, and Generative AI (RAG)}
+\index{Mosaic AI}\index{Vector Search}\index{RAG}\index{embeddings}\index{chunking}%
+\index{Foundation Model APIs}\index{Delta-sync index}\index{MLflow evaluation}\index{GenAI governance}%
+\begin{objectives}
+\begin{itemize}
+    \item Explain the GenAI building blocks on Databricks: Foundation Model APIs, embeddings, and serving endpoints.
+    \item Build a chunking pipeline from documents into a governed Delta table.
+    \item Create and query Mosaic AI Vector Search indexes, choosing managed versus Delta-sync.
+    \item Assemble a retrieval-augmented generation (RAG) chain with prompt templates and metadata filters.
+    \item Evaluate RAG quality with MLflow metrics instead of eyeballing.
+    \item Design a governed, cost-bounded GenAI application.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+RAG is the \textbf{dominant GenAI production pattern}; every cloud packages the same four
+parts---embed, index, retrieve, generate.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{3.0cm}p{3.4cm}p{3.2cm}p{3.2cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{Databricks} & \textbf{AWS} & \textbf{Azure / GCP / Fabric} \\
+\midrule
+Foundation models & Foundation Model APIs (pay-per-token or provisioned) & Bedrock & Azure OpenAI / Vertex AI / Fabric AI \\
+Embeddings & Hosted embedding endpoints & Bedrock Titan Embeddings & Azure OpenAI embeddings / Vertex embeddings \\
+Vector index & Mosaic AI Vector Search & OpenSearch / Kendra / pgvector on RDS & AI Search / Vertex Vector Search / OneLake + AI \\
+RAG orchestration & LangChain/LlamaIndex + MLflow & Bedrock Knowledge Bases & Azure AI RAG pattern / Vertex RAG Engine \\
+Evaluation & MLflow evaluate (LLM judges) & Bedrock evaluations & Azure AI eval / Vertex eval \\
+Governance & UC over chunks + audit of endpoints & IAM + Bedrock guardrails & Entra + content filters / Vertex safety \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+\textbf{MongoDB Atlas Vector Search} and \textbf{Snowflake Cortex} implement the same pattern
+against their own data planes---the architecture you learn here ports everywhere.
+\end{crosscloud}
+
+\section{Week 19 Roadmap and Mental Model}
+Weeks 17--18 productionized classical ML. Week 19 adds the GenAI workload your data platform will be asked to serve: retrieval-augmented generation over the organization's documents. The data engineering content is substantial: documents are ingested, chunked, embedded, indexed, freshness-managed, and governed---a pipeline problem before it is a prompt problem \cite{databricksMosaicAI,databricksVectorSearch}.
+
+The mental model: \textbf{RAG is a search problem feeding a generation step}. The model's quality is bounded by retrieval quality; retrieval quality is bounded by chunking and embedding choices; everything is bounded by the freshness and governance of the source Delta table. Engineers who treat the vector index as a derived, rebuildable projection of governed data ship systems they can debug; those who treat it as the source of truth ship mysteries.
+
+\begin{definitionbox}
+\textbf{Retrieval-augmented generation (RAG)} answers questions by (1) embedding the question, (2) retrieving the most similar document chunks from a vector index, (3) assembling a prompt with that context, and (4) generating an answer from a foundation model. \textbf{Mosaic AI Vector Search} is Databricks' managed vector index over Delta tables.
+\end{definitionbox}
+
+\begin{keyterms}
+\textbf{Embedding}: a dense vector encoding of text. \textbf{Chunk}: a document slice sized for retrieval. \textbf{Managed index}: embeddings computed and maintained by Vector Search. \textbf{Delta-sync index}: index synced from a Delta table (your pipeline computes embeddings or uses a managed embedding model). \textbf{Foundation Model API}: pay-per-token hosted model endpoints. \textbf{MLflow evaluation}: metric-based LLM output scoring, including LLM-as-judge.
+\end{keyterms}
+
+\section{Monday: Foundation Models and the Serving Surface}
+\subsection{The Building Blocks}
+Mosaic AI exposes hosted models (Llama-family, and partner models) behind \textbf{Foundation Model APIs}: pay-per-token for variable load, provisioned throughput for latency/throughput guarantees. Embedding models run the same way. Everything is an endpoint---which means authentication, rate limits, cost per call, and inference logging are the integration surface, and Chapter 20's serving discipline applies to LLMs exactly as to sklearn \cite{databricksModelServing}.
+
+\subsection{Cost and Latency Arithmetic}
+GenAI economics are per-token: a RAG answer costs embedding tokens + retrieved context tokens + generated tokens. The cost ceiling from the Friday scenario is an engineering constraint: chunk count per answer ($k$), context length, and model choice are the dials. Record token usage per request from day one; ``the LLM bill'' is otherwise the least explainable line item you will ever defend.
+
+\begin{pitfall}
+\textbf{Provisioned throughput for a demo.} Pay-per-token scales to zero; provisioned throughput bills around the clock. Match the endpoint mode to the load shape: provisioned when measured p95 latency demands it under real traffic---not when a demo felt slow once.
+\end{pitfall}
+
+\section{Tuesday: Vector Search}
+\subsection{From Documents to an Index}
+The pipeline: documents $\rightarrow$ chunks (with source metadata) $\rightarrow$ embeddings $\rightarrow$ index. On Databricks, chunks live in a Delta table (governed, versioned, lineage-tracked); a \textbf{Delta-sync index} keeps the index synchronized with that table---updates flow automatically \cite{databricksVectorSearch}.
+
+\begin{lstlisting}[language=Python,caption={Chunking into Delta and creating a Delta-sync index.},label={lst:ch19-chunks}]
+from pyspark.sql import functions as F
+
+docs = spark.read.text("/Volumes/de_training/bronze/docs/", wholetext=True)
+
+def chunk(text, size=800, overlap=100):
+    return [text[i:i+size] for i in range(0, len(text), size - overlap)]
+
+chunks = (docs
+    .withColumn("path", F.col("path"))
+    .withColumn("chunk_arr", F.udf(chunk, "array<string>")(F.col("value")))
+    .select("path", F.posexplode("chunk_arr").alias("chunk_id", "chunk_text"))
+    .withColumn("id", F.md5(F.concat("path", F.col("chunk_id").cast("string")))))
+
+(chunks.write.format("delta").mode("overwrite")
+   .saveAsTable("de_training.rag.doc_chunks"))   # enable Change Data Feed
+
+# Vector Search endpoint + Delta-sync index (UI, SDK, or API):
+#   source: de_training.rag.doc_chunks, primary key: id,
+#   embedding source column: chunk_text (managed embedding model),
+#   metadata columns: path  -> filters like path LIKE '%runbook%'
+\end{lstlisting}
+
+\subsection{Querying with Filters}
+Similarity search returns top-$k$ chunks; \textbf{metadata filters} scope retrieval (e.g., only current-runbook chunks, only the caller's department). Filters are where governance enters retrieval: the filter is the row-level security of GenAI.
+
+\begin{lstlisting}[language=Python,caption={Similarity search with a governance filter.},label={lst:ch19-query}]
+from databricks.vector_search.client import VectorSearchClient
+
+vs = VectorSearchClient()
+index = vs.get_index(index_name="de_training.rag.doc_chunks_idx")
+results = index.similarity_search(
+    query_text="how do I repair a failed pipeline run?",
+    columns=["chunk_text", "path"],
+    filters={"path LIKE": "%runbook%"},
+    num_results=5)
+\end{lstlisting}
+
+\section{Wednesday: The RAG Chain and Evaluation}
+\subsection{Assembling the Chain}
+Retrieve (top-$k$ with filters) $\rightarrow$ assemble prompt (instructions + context + question) $\rightarrow$ generate via a Foundation Model endpoint $\rightarrow$ log everything. LangChain or plain Python both work; the discipline is in logging: question, retrieved chunk IDs, prompt, answer, tokens, latency---per request.
+
+\begin{lstlisting}[language=Python,caption={A minimal, fully-logged RAG chain.},label={lst:ch19-rag}]
+import mlflow
+
+def answer(question: str) -> dict:
+    hits = index.similarity_search(query_text=question, num_results=5,
+                                   columns=["chunk_text", "path"])
+    context = "\n\n".join(r[0] for r in hits["result"]["data_array"])
+    prompt = (f"Answer using ONLY this context; cite sources.\n\n"
+              f"CONTEXT:\n{context}\n\nQUESTION: {question}")
+    resp = client.serving_endpoints.query(  # Foundation Model endpoint
+        name="databricks-meta-llama-3-3-70b-instruct",
+        messages=[{"role": "user", "content": prompt}])
+    out = {"question": question, "answer": resp.choices[0].message.content,
+           "sources": [r[1] for r in hits["result"]["data_array"]]}
+    mlflow.log_table(out, "rag_responses.json")   # evidence, per eval run
+    return out
+\end{lstlisting}
+
+\subsection{Evaluation as a Pipeline Stage}
+Eyeballing three answers is a demo; a logged metric set is engineering. \texttt{mlflow.evaluate} with LLM-judged metrics (faithfulness, relevance) over a fixed question set turns prompt/index changes into measurable deltas---and gates them.
+
+\begin{pitfall}
+\textbf{No golden set, no progress.} Without a fixed evaluation set (10--100 questions with known-good sources), every prompt tweak is vibes. Build the golden set first; it is the unit test suite of the whole RAG system.
+\end{pitfall}
+
+\section{Thursday Hands-on Project: The Program's Own RAG Assistant}
+Build a RAG assistant over this program's documentation: chunk, index (Delta-sync), retrieve, generate, and evaluate 10 golden questions with MLflow.
+\index{hands-on lab}\index{RAG!lab}\index{Vector Search!lab}
+
+\begin{lstlisting}[language=Python,caption={Week 19 lab: evaluation harness.},label={lst:ch19-lab}]
+import mlflow
+import pandas as pd
+
+golden = pd.DataFrame([
+    {"question": "How do I repair a failed workflow run?",
+     "expected_source": "week12_runbook.md"},
+    {"question": "What retention must VACUUM respect?",
+     "expected_source": "week02_delta.md"},
+    # ... 10 total, with known-good source documents
+])
+
+results = []
+for _, row in golden.iterrows():
+    out = answer(row.question)
+    results.append({**row.to_dict(), **out})
+
+eval_df = pd.DataFrame(results)
+with mlflow.start_run(run_name="rag_eval_v1"):
+    metrics = mlflow.evaluate(
+        data=eval_df, predictions="answer",
+        model_type="question-answering")     # LLM-judged quality metrics
+    mlflow.log_metric("source_hit_rate",
+        (eval_df.apply(lambda r: r.expected_source in str(r.sources), axis=1)
+               .mean()))
+\end{lstlisting}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item The chunking pipeline writing \texttt{rag.doc\_chunks} with source metadata.
+    \item A Delta-sync Vector Search index and the retrieval function with filters.
+    \item The evaluation run: 10 golden questions, logged metrics, one diagnosed failure.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item Every answer carries its source list; the source-hit rate is computed and logged.
+    \item One retrieval failure is fixed by chunking or metadata-filter changes---with before/after metrics.
+    \item A document update flows to the index via Delta-sync without manual re-indexing.
+    \item Token usage per question is logged; the per-answer cost is computed.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Compare chunk sizes (400/800/1200) on the golden set; report the retrieval-quality trade-off.
+    \item Add a PII redaction step before embedding and prove a planted PII string never reaches the index.
+    \item Deploy the chain behind a serving endpoint with an inference table (preview of Chapter 20).
+\end{itemize}
+
+\section{Friday Use Case: The Support Copilot with a Cost Ceiling}
+A SaaS company wants a support copilot over 2M help-center articles: answers within 3 seconds, sources cited, PII never exposed, monthly cost capped at a fixed budget.
+\index{RAG!production}\index{cost ceiling}\index{support copilot}
+
+\subsection{Requirements and Assumptions}
+Articles update hourly; support agents are the users; wrong answers with confident tone are worse than ``I don't know''; the cost ceiling is hard.
+
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[
+        box/.style={rectangle, rounded corners, draw=primary, thick, fill=primary!7, align=center, minimum width=2.8cm, minimum height=0.95cm, font=\small\bfseries},
+        gate/.style={rectangle, rounded corners, draw=red!60!black, thick, fill=red!5, align=center, minimum width=2.6cm, minimum height=0.85cm, font=\scriptsize\bfseries},
+        flow/.style={-{Latex[length=2mm]}, draw=primary, thick}
+    ]
+        \node[box] (cms) at (0,0.8) {Help-center CMS\\(hourly sync)};
+        \node[box] (chunk) at (3.6,0.8) {Chunk pipeline\\+ PII redaction};
+        \node[box] (idx) at (7.2,0.8) {Delta-sync\\Vector Search};
+        \node[box] (rag) at (10.8,0.8) {RAG endpoint\\($k$=4, capped ctx)};
+        \node[box] (agent) at (14.2,0.8) {Agent console\\cited answers};
+        \node[gate] (eval) at (7.2,-1.1) {Golden-set eval gate\\(weekly, CI)};
+        \node[gate] (cost) at (10.8,-1.1) {Token budget monitor\\(per-day cap)};
+        \draw[flow] (cms) -- (chunk);
+        \draw[flow] (chunk) -- (idx);
+        \draw[flow] (idx) -- (rag);
+        \draw[flow] (rag) -- (agent);
+        \draw[flow, dashed] (eval) -- (idx);
+        \draw[flow, dashed] (cost) -- (rag);
+    \end{tikzpicture}%
+    }
+    \caption{Governed copilot: redaction before indexing, evaluation gating changes, token budgets bounding cost.}
+    \label{fig:ch19-copilot}
+\end{figure}
+
+\subsection{Architecture Decisions}
+\textbf{Freshness and safety by construction.} The hourly CMS sync lands in the chunks table; Delta-sync keeps the index fresh; PII redaction runs \emph{before} embedding so PII can never be retrieved. Answers must cite sources; retrieval-failure (low similarity scores) returns a scripted ``not in the help center'' rather than a confabulated answer.
+
+\textbf{The cost ceiling as an engineering constraint.} $k=4$ chunks, context trimmed to a token cap, the smaller foundation model for drafts with the larger one reserved for low-confidence escalations, and a daily token budget monitor fed by the inference table. The golden-set eval runs weekly in CI (Chapter 23): a prompt or index change that regresses faithfulness does not ship.
+
+\begin{pitfall}
+\textbf{Letting the model answer without retrieval evidence.} If no chunk clears the similarity threshold, the correct output is abstention. A model answering from parametric knowledge in a support context invents plausible policy---the most expensive sentence your platform will ever publish.
+\end{pitfall}
+
+\subsection{Risks and Mitigations}
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{4.6cm}p{7.6cm}@{}}
+\toprule
+\textbf{Risk} & \textbf{Mitigation} \\
+\midrule
+PII reaches the vector index & Redaction before embedding; planted-PII eval test \\
+Stale index serves retired policy & Delta-sync lag alert; abstention on old-document citations \\
+Token budget breached mid-month & Per-day caps with degradation to the smaller model \\
+Prompt change regresses quality & Golden-set gate in CI blocks the deploy \\
+Confabulated answers reach agents & Similarity-threshold abstention with scripted fallback \\
+\bottomrule
+\end{tabular}
+\caption{Week 19 scenario risks and mitigations.}
+\label{tab:ch19-risks}
+\end{table}
+
+\section{Design Decision Guide}
+\index{decision guide!Week 19}%
+GenAI decisions are measured against the golden set and the token budget---both first.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.4cm}p{4.4cm}p{4.6cm}@{}}
+\toprule
+\textbf{Decision} & \textbf{Choose the first when} & \textbf{Choose the second when} \\
+\midrule
+Small vs.\ large chunks & Precise fact lookup & Context-heavy synthesis questions \\
+Delta-sync vs.\ managed index & Chunks live in Delta and change & External pipelines produce embeddings \\
+Small $k$ vs.\ large $k$ & Cost/precision focus & Recall-critical questions \\
+Pay-per-token vs.\ provisioned & Variable or demo traffic & Measured p95 latency mandates \\
+RAG vs.\ fine-tuning & Knowledge changes, citations required & Style/format/behavior adaptation \\
+Abstain vs.\ best-effort answer & Accuracy-critical domains & Brainstorming aids \\
+\bottomrule
+\end{tabular}
+\caption{Week 19 decision guide.}
+\label{tab:ch19-decisions}
+\end{table}
+
+Two invariants: the chunks table is the governed source of truth, and the eval gate decides what ships. Everything else---models, chunkers, prompts---is interchangeable behind those two.
+
+\section{Operational Guidance for Week 19}
+\index{operational guidance!Week 19}%
+\subsection{Performance and Reliability}
+Index freshness is the RAG system's uptime: monitor Delta-sync lag and alert when the index trails the chunks table. Run the golden-set evaluation on every prompt/model/index change---in CI once Week 23 lands---and block regressions. Track token usage per request with a daily budget alert; the cost curve is the first place a misbehaving loop or oversized context shows up.
+
+\subsection{Security and Governance Checklist}
+\begin{itemize}
+    \item PII redaction runs before embedding; a planted-PII test in the eval set proves it.
+    \item Metadata filters enforce the caller's data scope at retrieval time.
+    \item Serving endpoints ACL'd; inference logging enabled for audit.
+    \item Source documents' UC classification governs what may enter the chunks table.
+\end{itemize}
+
+\subsection{Troubleshooting Playbook}
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.6cm}p{4.2cm}p{4.8cm}@{}}
+\toprule
+\textbf{Symptom} & \textbf{Likely cause} & \textbf{First action} \\
+\midrule
+Answers cite wrong documents & Chunking or metadata-filter gap & Inspect retrieved chunks for golden questions; retune \\
+Index stale after doc update & Change Data Feed off / sync failure & Verify CDF on the chunks table; check index sync status \\
+Token cost spiked & Context too large or retry loop & Inspect per-request token logs; cap context and retries \\
+Confident wrong answers & Retrieval abstention missing & Add similarity threshold with scripted fallback \\
+\bottomrule
+\end{tabular}
+\caption{Week 19 troubleshooting quick reference.}
+\label{tab:ch19-trouble}
+\end{table}
+
+\section{Interview Q\&A}
+\subsection{Concepts and Trade-offs}
+\begin{enumerate}
+    \item \textbf{Q: Why keep chunks in Delta if the vector index is what serves queries?}\\
+    A: Delta is the governed, versioned, rebuildable source of truth; the index is a derived projection. When embeddings models change or a bad sync corrupts the index, you rebuild from the table---and lineage/audit cover the content.
+    \item \textbf{Q: Managed versus Delta-sync index?}\\
+    A: Delta-sync when your chunks live in Delta and freshness matters---the index follows the table automatically. Managed (direct vector writes) when a non-Databricks pipeline produces embeddings.
+    \item \textbf{Q: How does chunk size affect quality?}\\
+    A: Small chunks retrieve precisely but lose context; large chunks carry context but dilute similarity. The golden set answers it empirically---there is no universal size.
+    \item \textbf{Q: How do you evaluate a RAG system?}\\
+    A: Fixed golden set; retrieval metrics (source-hit rate) and generation metrics (LLM-judged faithfulness/relevance) logged per run; changes gated on the metrics in CI.
+    \item \textbf{Q: Where does governance enter a GenAI pipeline?}\\
+    A: At every stage: UC grants on the chunks table, PII redaction before embedding, metadata filters as retrieval-time row security, endpoint access control, and inference logging for audit.
+    \item \textbf{Q: Why not fine-tune instead of RAG for the copilot?}\\
+    A: Fine-tuning changes behavior, not knowledge: it cannot cite, it goes stale with the content, and it costs orders of magnitude more per update. RAG keeps knowledge in governed data where freshness and revocation exist.
+    \item \textbf{Q: What is the RAG system's rollback story?}\\
+    A: The chunks table is versioned Delta; the index is rebuildable from it; prompts and models are versioned artifacts behind the eval gate. Every layer rolls back independently.
+    \item \textbf{Q: How do you onboard a new document corpus into the assistant?}\\
+    A: Land it in the governed volume, classify it, chunk it through the same pipeline, and let Delta-sync update the index---new content is a data operation, not a model operation.
+\end{enumerate}
+
+\section{Further Reading}
+The Mosaic AI documentation covers the GenAI surface \cite{databricksMosaicAI}; Vector Search specifics are in \cite{databricksVectorSearch}; model serving in \cite{databricksModelServing}; MLflow evaluation in \cite{mlflowDocs}. The Unity Catalog governance of the chunks table reuses Chapter 8 \cite{databricksUnityCatalog}.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item RAG is a search problem feeding a generation step---retrieval quality bounds everything.
+    \item Chunks live in governed Delta; the vector index is a derived, rebuildable projection.
+    \item The golden evaluation set is the unit-test suite of the whole system; build it first.
+    \item GenAI cost is per-token arithmetic: $k$, context length, and model choice are the dials; log usage per request.
+    \item Abstention beats confabulation: no retrieval evidence, no answer.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Explain why embedding must happen \emph{after} PII redaction, not before with filtered retrieval.
+    \item \textbf{(Conceptual)} What does a Delta-sync index guarantee about freshness, and what does it not guarantee?
+    \item \textbf{(Hands-on)} Complete the Thursday lab including the diagnosed retrieval failure.
+    \item \textbf{(Hands-on)} Run the chunk-size comparison and report the retrieval-quality/cost trade-off.
+    \item \textbf{(Hands-on)} Add abstention on low similarity scores; add a golden question that requires it.
+    \item \textbf{(Design)} Design the two-model cost strategy (draft vs.\ escalate) with the routing rule.
+    \item \textbf{(Operations)} Write the daily token-budget alert and the action it triggers.
+    \item \textbf{(Architecture)} When would you fine-tune instead of RAG? Give a workload where each wins.
+\end{enumerate}

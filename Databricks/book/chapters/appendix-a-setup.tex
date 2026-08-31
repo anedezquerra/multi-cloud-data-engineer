@@ -1,0 +1,137 @@
+\chapter{Environment Setup and Sample Data}
+\index{setup}\index{Databricks trial}\index{tools!installation}\index{sample data}\index{workspace conventions}%
+This appendix is the standing setup reference for every lab in the book. Complete it once
+before Chapter~0 and return whenever a lab assumes a tool, a connection, or a dataset that
+your machine or workspace does not yet have. Everything here targets Windows with PowerShell,
+matching the environment used throughout the program.
+
+\section{Accounts and Workspace}
+\index{Databricks trial!setup}%
+\begin{itemize}
+    \item \textbf{Trial or Community Edition.} Create a free trial workspace from the Databricks
+    portal \cite{databricksTrial}, or use Databricks Community Edition for the no-cost path. The
+    trial credits cover every lab in the book; they expire, so they are unsuitable for anything
+    with an SLA. If your employer provides a workspace, request a dedicated catalog for labs.
+    \item \textbf{Unity Catalog metastore.} Most trial workspaces are Unity Catalog-enabled. Verify
+    you can create a catalog before Chapter~2; otherwise fall back to the \texttt{hive\_metastore}
+    for the early chapters and revisit governance labs when a metastore is available
+    \cite{databricksUnityCatalog}.
+    \item \textbf{Cloud account guardrails.} A classic (non-serverless) workspace bills cloud VMs to
+    your cloud account: set a cloud budget alert before Week~1's first cluster.
+\end{itemize}
+
+\section{Local Tooling}
+\index{VS Code}\index{Databricks CLI}\index{Git!installation}%
+Install once, in this order:
+
+\begin{enumerate}
+    \item \textbf{Python 3.x} --- used by the SDK scripts, the Week~15 Kafka producer, and synthetic
+    data generation. Verify with \texttt{python --version}.
+    \item \textbf{Git} --- required from Chapter~0 onward; Week~23 depends on it. Verify with
+    \texttt{git --version}.
+    \item \textbf{VS Code} --- with the Python extension and the Databricks extension; the editor for
+    bundle work and local development.
+    \item \textbf{Databricks CLI v0.200+} --- the command plane for workspace, jobs, bundles, and
+    secrets operations (Appendix~B).
+    \item \textbf{Python packages} --- \texttt{databricks-sdk} (Chapter~1), \texttt{databricks-cli},
+    \texttt{faker} (Chapters~13, 15, 24), \texttt{mlflow} and \texttt{scikit-learn}
+    (Chapters~17--20), \texttt{confluent-kafka} (Chapter~15).
+    \item \textbf{Docker Desktop} (optional) --- the cleanest way to run the local Kafka broker for
+    the Chapter~15 lab.
+    \item \textbf{Terraform} (Chapter~23) --- for the infrastructure-as-code labs.
+\end{enumerate}
+
+\begin{lstlisting}[language=bash,caption={One-time tool verification (PowerShell).},label={lst:appendixa-verify}]
+python --version
+git --version
+databricks --version
+databricks auth login --host https://<your-workspace>.azuredatabricks.net
+databricks current-user me
+pip install databricks-sdk faker mlflow scikit-learn confluent-kafka
+\end{lstlisting}
+
+\section{Repository and Credential Conventions}
+\index{credentials!conventions}%
+Clone or create the course repository with the standard layout---\texttt{data/}, \texttt{src/},
+\texttt{tests/}, \texttt{bundles/}, \texttt{docs/}---and observe three credential rules from day one:
+
+\begin{itemize}
+    \item Secrets live in environment variables (\texttt{DATABRICKS\_HOST},
+    \texttt{DATABRICKS\_TOKEN}) or Databricks secret scopes---never in notebooks, bundle YAML, or Git.
+    \item Prefer OAuth (\texttt{databricks auth login}) over personal access tokens; where a token is
+    unavoidable, set an expiry and store it outside the repository.
+    \item Enable secret scanning on the course repository before Week~23's CI/CD makes every
+    committed file a deployment artifact.
+    \item Commit generator scripts, never generated data; the datasets below are reproducible by design.
+\end{itemize}
+
+\section{Workspace Naming Conventions}
+\index{workspace!naming}%
+Labs reference objects by predictable names: catalog \texttt{de\_training} with schemas
+\texttt{bronze}, \texttt{silver}, \texttt{gold}; volume \texttt{de\_training.bronze.landing};
+clusters \texttt{de-weekNN-cluster}; jobs \texttt{de-weekNN-<purpose>}; bundle targets
+\texttt{dev}, \texttt{staging}, \texttt{prod}. Consistency matters because runbooks, alerts,
+and the acceptance checklists all reference these names.
+
+\section{Sample Datasets}
+\index{sample data!NYC Taxi}\index{sample data!Olist}\index{faker}%
+The book's labs and capstones standardize on three data sources:
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.2cm}p{4.6cm}p{5.8cm}@{}}
+\toprule
+\textbf{Dataset} & \textbf{Used in} & \textbf{Notes} \\
+\midrule
+NYC Taxi (TLC trip records) & Parts I--II (Chapters 2, 4--6) & Available in-workspace under \texttt{/databricks-datasets/nyctaxi/} and as \texttt{samples.nyctaxi}; 1--5M rows suffice for capstones \cite{nycTaxiRegistry} \\
+Olist Brazilian e-commerce & Parts I and III (Chapters 3, 10--12) & $\sim$100k orders across 9 related CSVs: orders, items, customers, products, payments, reviews \cite{olistDataset} \\
+Synthetic streams (\texttt{faker}) & Parts IV--VI (Chapters 13--16, 21--24) & Card transactions, IoT telemetry, PII-style CRM rows; seed generators for reproducibility \cite{fakerPython} \\
+\bottomrule
+\end{tabular}
+\caption{Standard datasets and where they are used.}
+\label{tab:appendixa-datasets}
+\end{table}
+
+Volume guidance: Part~I medallion work at 1--10M rows; the Part~II optimization benchmark at
+$\sim$50M rows; Part~III re-ingests the nine Olist tables daily; Part~IV streams at 5--20k events
+per minute during demos; Part~V scores $\sim$100k rows per batch.
+
+\begin{lstlisting}[language=Python,caption={Seeded synthetic transaction generator (commit the script, not the data).},label={lst:appendixa-faker}]
+from faker import Faker
+import csv
+
+fake = Faker()
+Faker.seed(42)  # reproducible
+
+with open("data/synthetic_transactions.csv", "w", newline="") as f:
+    w = csv.writer(f)
+    w.writerow(["event_id", "card_id", "city", "amount", "event_ts"])
+    for i in range(100_000):
+        w.writerow([f"E{i:07d}", f"C{fake.random_int(1, 5000):05d}",
+                    fake.city(), round(fake.random.uniform(1, 500), 2),
+                    fake.date_time_this_year().isoformat()])
+\end{lstlisting}
+
+\section{Troubleshooting Checklist}
+\index{troubleshooting!setup}%
+\begin{itemize}
+    \item \textbf{CLI cannot authenticate}: re-run \texttt{databricks auth login}; confirm the host
+    has no trailing slash and the profile name matches \texttt{DEFAULT} or \texttt{-p <profile>}.
+    \item \textbf{Cluster start fails on quota}: request vCPU quota in the cloud account, or switch
+    the lab to serverless compute where available.
+    \item \textbf{Table not found from SQL}: confirm the three-level name
+    (\texttt{catalog.schema.table}) and that your principal has \texttt{USE CATALOG/SCHEMA} and
+    \texttt{SELECT} (Chapter~8).
+    \item \textbf{Auto Loader finds no files}: the checkpoint remembers processed files; drop new
+    files \emph{after} the checkpoint was created, or use a fresh checkpoint for a deliberate
+    re-ingest (Chapter~11).
+    \item \textbf{Bill grew overnight}: check \texttt{system.billing.usage} by SKU; an unterminated
+    all-purpose cluster is the usual cause (Chapter~1's cluster policy prevents this).
+\end{itemize}
+
+\begin{tipbox}
+When a lab fails, reproduce the failure at the smallest possible scope---one row, one file, one
+minute of telemetry---before investigating the estate. Every chapter's validation checklist is
+written to support exactly that reduction.
+\end{tipbox}

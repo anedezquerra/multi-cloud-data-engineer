@@ -1,0 +1,413 @@
+\chapter{Apache Spark on Databricks}
+\index{Apache Spark}\index{driver}\index{executor}\index{DAG}\index{lazy evaluation}%
+\index{Catalyst}\index{shuffle}\index{partition}\index{Spark UI}\index{caching}%
+\begin{objectives}
+\begin{itemize}
+    \item Explain Spark's driver/executor architecture, DAG scheduler, and lazy evaluation.
+    \item Distinguish narrow and wide transformations and predict when a shuffle occurs.
+    \item Read the Spark UI and \texttt{explain} plans to locate expensive stages, skew, and spills.
+    \item Control partitioning deliberately with \texttt{repartition}, \texttt{coalesce}, and shuffle settings.
+    \item Use caching judiciously and recognize when it hurts.
+    \item Diagnose a regressed nightly job and write an evidence-based tuning plan.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+Spark on Databricks is the \textbf{reference implementation} of managed Spark; the engine is the
+same everywhere, but the operational wrapper differs.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{3.0cm}p{3.4cm}p{3.2cm}p{3.2cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{Databricks} & \textbf{AWS} & \textbf{Azure / GCP} \\
+\midrule
+Managed Spark & Databricks Runtime (Photon) & Glue / EMR / EMR Serverless & Synapse Spark / Fabric / Dataproc \\
+Cluster manager & Built-in (no YARN to run) & YARN / EMR managed & Synapse / Dataproc managed \\
+GPU/vectorized engine & Photon & EMR runtime (partial) & Fabric native engine \\
+Autoscaling & Autoscaling clusters + serverless & EMR managed scaling & Autoscale pools / Dataproc autoscaling \\
+UI and diagnostics & Spark UI + Ganglia + query profile & Spark UI on EMR & Spark UI / Fabric monitoring \\
+Default table format & Delta & Iceberg/Hudi/Delta by config & Delta (Fabric) / BigQuery tables \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+\textbf{Snowflake} plays this role with Snowpark (DataFrame API on its engine); \textbf{MongoDB}
+integrates via the Spark Connector. Skills from this chapter transfer to every managed-Spark
+offering almost unchanged.
+\end{crosscloud}
+
+\section{Week 4 Roadmap and Mental Model}
+Databricks exists because of Spark, and Spark skills are the single highest-leverage engineering skill on the platform \cite{zaharia2012spark,chambersZaharia}. Week 4 builds the execution mental model: driver, executors, DAG, stages, tasks---and the habits of reading plans and the UI before touching configuration.
+
+The mental model: \textbf{Spark is a lazy, distributed compiler for dataflow}. You describe transformations on logical datasets; nothing runs until an action forces it; Catalyst compiles your description into an optimized physical plan; the scheduler splits that plan into stages at shuffle boundaries; each stage runs as parallel tasks over partitions. Every performance conversation in this book is a conversation about one of those steps.
+
+\begin{definitionbox}
+\textbf{Apache Spark} is a distributed data-processing engine: a driver program plans work as a DAG of transformations over partitioned data, and executors run that work as parallel tasks. \textbf{Lazy evaluation} means transformations build a plan; only actions (count, write, collect) execute it.
+\end{definitionbox}
+
+\begin{keyterms}
+\textbf{Partition}: a chunk of data processed by one task. \textbf{Shuffle}: the all-to-all data movement between stages required by wide transformations. \textbf{Skew}: one partition holding disproportionately many records. \textbf{Spill}: writing intermediate data to disk when memory is exhausted. \textbf{Photon}: Databricks' vectorized execution engine for SQL/DataFrame workloads.
+\end{keyterms}
+
+\section{Monday: Architecture and Lazy Evaluation}
+\subsection{Driver, Executors, DAG, Stages, Tasks}
+The \textbf{driver} hosts your SparkSession, builds the logical plan, optimizes it through Catalyst, and coordinates execution. \textbf{Executors} are JVM (plus Photon native) processes on cluster workers that run tasks and hold cached data. The physical plan splits into \textbf{stages} at shuffle boundaries; each stage launches one \textbf{task} per partition. Cluster sizing is arithmetic on these nouns: tasks per stage $=$ partitions; parallel tasks $\le$ total executor cores.
+
+\subsection{Lazy Evaluation and Catalyst}
+Because transformations are lazy, Catalyst sees the whole pipeline before running anything: it pushes filters to the scan, prunes columns, constant-folds expressions, and reorders joins by statistics. This is why writing \texttt{filter} before \texttt{select} rarely matters---and why an early \texttt{collect()} or \texttt{count()} ``for debugging'' can silently destroy the optimization by forcing intermediate execution \cite{sparkDocs}.
+
+\begin{lstlisting}[language=Python,caption={Reading the plan before running the job.},label={lst:ch4-explain}]
+df = (spark.read.table("de_training.silver.orders")
+      .filter(F.col("order_status") == "delivered")
+      .groupBy("customer_state")
+      .agg(F.sum("total_amount").alias("revenue")))
+
+df.explain(True)   # logical, analyzed, optimized, and physical plans
+# Look for: Exchange hashpartitioning (the shuffle), and whether the
+# filter appears in the scan (pushdown) or as a separate Filter node.
+\end{lstlisting}
+
+\section{Tuesday: Transformations, Actions, and the Shuffle}
+\subsection{Narrow versus Wide}
+\textbf{Narrow} transformations (\texttt{select}, \texttt{filter}, \texttt{withColumn}) map partition-in to partition-out with no data movement. \textbf{Wide} transformations (\texttt{groupBy}, \texttt{join}, \texttt{distinct}, \texttt{repartition}) require a \textbf{shuffle}: every executor sends slices of its data to every other executor. Shuffles dominate job cost: network, serialization, disk spill, and the barrier between stages.
+
+\begin{pitfall}
+\textbf{The accidental wide transformation.} \texttt{dropDuplicates()} with no columns, \texttt{orderBy} (global sort), and \texttt{join} on a non-partitioned key all shuffle. In a notebook it costs seconds; on 2 TB it costs hours. Run \texttt{explain} and count the \texttt{Exchange} nodes before you run the job.
+\end{pitfall}
+
+\subsection{Partitions and the 200 Default}
+After a shuffle, Spark produces \texttt{spark.sql.shuffle.partitions} partitions---default 200. For 2 GB of shuffled data that is 200 tiny tasks of overhead; for 2 TB it is 200 gigantic tasks that spill. Adaptive Query Execution (AQE, on by default in Databricks Runtime) coalesces small partitions and splits skewed ones at runtime from actual statistics \cite{sparkSQLTuning}. Manual tuning still matters when AQE's assumptions do not fit---Chapter 9 goes deep.
+
+\section{Wednesday: The Spark UI, Caching, and Partitioning}
+\subsection{Reading the Spark UI}
+The Spark UI (Compute $\rightarrow$ cluster $\rightarrow$ Spark UI, or per-query in the notebook) is the evidence source: the \textbf{Jobs/Stages} tabs show task time distributions and shuffle read/write; the \textbf{SQL} tab shows the physical plan with per-node row counts and durations; the \textbf{Executors} tab shows memory pressure and GC. The diagnostic habit: find the slowest stage, look at its task summary---a long tail (max task time $\gg$ median) means skew; heavy shuffle read means a wide transformation to question.
+
+\subsection{Caching Deliberately}
+\texttt{cache()} pins a DataFrame's computed partitions in memory (and disk) for reuse. Cache when a DataFrame is read repeatedly by downstream branches of your job. Do not cache data scanned once, data larger than executor memory (it spills or evicts, costing more than recompute), or data you then transform anyway---cache the \emph{result} of the expensive transformation.
+
+\begin{tipbox}
+In notebooks, always \texttt{unpersist()} training caches at the end of a session on a shared cluster---your cached 50 GB is your teammate's out-of-memory error.
+\end{tipbox}
+
+\subsection{Repartition versus Coalesce}
+\texttt{repartition(n)} shuffles into exactly $n$ partitions (can increase or decrease); \texttt{coalesce(n)} only decreases, merging partitions without a full shuffle. Use \texttt{repartition} to fix skew or parallelism; \texttt{coalesce} before writing to reduce output file count---the small-file problem you will meet formally in Chapter 5.
+
+\section{Thursday Hands-on Project: Find the Shuffle, Fix the Skew}
+Using 10M NYC Taxi rows \cite{nycTaxiRegistry}, build an aggregation with a deliberately skewed key, find the evidence in the Spark UI, and fix it.
+\index{hands-on lab}\index{skew!lab}\index{Spark UI!lab}
+
+\begin{lstlisting}[language=Python,caption={Week 4 lab: induce, observe, and fix skew.},label={lst:ch4-lab}]
+from pyspark.sql import functions as F
+
+trips = spark.read.table("samples.nyctaxi.trips")
+
+# 1. Deliberate skew: 80% of rows share one key
+skewed = trips.withColumn(
+    "hot_key",
+    F.when(F.rand(seed=42) < 0.8, F.lit("HOT")).otherwise(F.col("payment_type")))
+
+agg = (skewed.groupBy("hot_key")
+       .agg(F.sum("fare_amount").alias("revenue"),
+            F.count("*").alias("trips")))
+agg.write.mode("overwrite").saveAsTable("de_training.silver.week04_skewed")
+
+# 2. Evidence: Spark UI > SQL tab > the Exchange + HashAggregate nodes;
+#    Stages tab: one task processes ~80% of shuffle rows (max >> median).
+
+# 3a. Fix with salting: spread the hot key across N buckets
+salted = (skewed.withColumn("salt", (F.rand(seed=1) * 16).cast("int"))
+          .withColumn("salted_key", F.concat_ws("_", "hot_key", "salt")))
+partial = (salted.groupBy("salted_key")
+           .agg(F.sum("fare_amount").alias("revenue"),
+                F.count("*").alias("trips")))
+final = (partial.withColumn("hot_key", F.split("salted_key", "_").getItem(0))
+         .groupBy("hot_key")
+         .agg(F.sum("revenue").alias("revenue"), F.sum("trips").alias("trips")))
+final.write.mode("overwrite").saveAsTable("de_training.silver.week04_salted")
+
+# 3b. Or let AQE try first:
+spark.conf.set("spark.sql.adaptive.skewJoin.enabled", "true")
+\end{lstlisting}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item Spark UI screenshots (or exported metrics) of the skewed stage: task summary with max $\gg$ median.
+    \item The salted (or repartitioned) run's stage summary for comparison.
+    \item A results table: job duration, shuffle read, max task time---before and after.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item You identify the exact stage and node causing skew from UI evidence, not guesswork.
+    \item The fix measurably reduces max task time while producing identical results (row-for-row reconciliation between skewed and salted outputs).
+    \item One experiment deliberately disables AQE to show its effect, then re-enables it.
+    \item The cluster used is terminated at lab end.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Repeat with a skewed \emph{join} and compare salting vs.\ broadcast vs.\ AQE skew handling.
+    \item Measure the effect of \texttt{spark.sql.shuffle.partitions} at 50, 200, and 2000 on the same job.
+    \item Rewrite the aggregation in Spark SQL and compare physical plans with the DataFrame version.
+\end{itemize}
+
+\section{Friday Use Case: The Nightly Job That Grew from 40 Minutes to 6 Hours}
+A partner's nightly PySpark job processed 200 GB in 40 minutes last year; at 2 TB it now misses its 6 a.m.\ SLA by three hours. No code changed. You are asked for a tuning plan.
+\index{performance tuning}\index{regression}
+
+\subsection{Requirements and Assumptions}
+The job reads partitioned Parquet, joins against a slowly growing dimension table, aggregates, and writes a daily Gold partition. Cluster size has not changed. You have Spark UI access to recent runs.
+
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[
+        stepnode/.style={rectangle, rounded corners, draw=primary, thick, fill=primary!7, align=center, minimum width=3.1cm, minimum height=0.95cm, font=\small\bfseries},
+        ev/.style={rectangle, rounded corners, draw=codegreen!60!black, thick, fill=green!7, align=center, minimum width=3.1cm, minimum height=0.85cm, font=\scriptsize},
+        flow/.style={-{Latex[length=2mm]}, draw=primary, thick}
+    ]
+        \node[stepnode] (slow) at (0,0) {Slowest stage\\(SQL tab)};
+        \node[stepnode] (tasks) at (4.2,0) {Task summary\\(Stages tab)};
+        \node[stepnode] (plan) at (8.4,0) {Physical plan\\(\texttt{explain})};
+        \node[stepnode] (fix) at (12.6,0) {Targeted fix\\+ A/B run};
+        \node[ev] (e1) at (0,-1.6) {per-node rows + time};
+        \node[ev] (e2) at (4.2,-1.6) {max vs median task};
+        \node[ev] (e3) at (8.4,-1.6) {shuffle nodes, join type};
+        \node[ev] (e4) at (12.6,-1.6) {duration + shuffle delta};
+        \draw[flow] (slow) -- (tasks);
+        \draw[flow] (tasks) -- (plan);
+        \draw[flow] (plan) -- (fix);
+        \draw[flow, dashed] (slow) -- (e1);
+        \draw[flow, dashed] (tasks) -- (e2);
+        \draw[flow, dashed] (plan) -- (e3);
+        \draw[flow, dashed] (fix) -- (e4);
+    \end{tikzpicture}%
+    }
+    \caption{The evidence-driven tuning loop: locate, attribute, hypothesize, measure.}
+    \label{fig:ch4-tuning-loop}
+\end{figure}
+
+\subsection{Architecture Decisions}
+\textbf{Diagnose before configuring.} The expected finding: the dimension table crossed the broadcast threshold as it grew, flipping a broadcast hash join to a sort-merge join with a full shuffle---or a new skewed key arrived with a data change. The evidence table: stage durations over the regression window, join type in the plan, task-time tails.
+
+\textbf{The fix menu, in order.} (1) Re-enable broadcast for the dimension (\texttt{broadcast()} hint) if it still fits memory; (2) fix shuffle partition count for the new volume; (3) salt the skewed key; (4) right-size the cluster only after the plan is sane. Scaling hardware against a bad plan multiplies cost, not speed.
+
+\begin{pitfall}
+\textbf{``Just add workers.''} If the plan has a 200-partition shuffle over 2 TB or a skewed sort-merge join, more executors change nothing but the bill. Plans first, hardware second---and re-baseline after every fix so gains are attributable.
+\end{pitfall}
+
+\subsection{Risks and Mitigations}
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{4.6cm}p{7.6cm}@{}}
+\toprule
+\textbf{Risk} & \textbf{Mitigation} \\
+\midrule
+Tuning fix regresses next month silently & Weekly duration trend with a config-change log \\
+Skew returns with a new tenant & Skew metric (max/median task time) alerted per run \\
+``Optimized'' job breaks correctness & Row-for-row reconciliation gate in every tuning change \\
+Spark UI evidence lost with the cluster & Metrics exported before job clusters terminate \\
+Dimension outgrows the broadcast hint & Size assertion in the job; alert before the flip \\
+\bottomrule
+\end{tabular}
+\caption{Week 4 scenario risks and mitigations.}
+\label{tab:ch4-risks}
+\end{table}
+
+\section{Design Decision Guide}
+\index{decision guide!Week 4}%
+Spark decisions are measurement-backed by habit; the defaults below hold until the UI says otherwise.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.4cm}p{4.4cm}p{4.6cm}@{}}
+\toprule
+\textbf{Decision} & \textbf{Choose the first when} & \textbf{Choose the second when} \\
+\midrule
+\texttt{repartition} vs.\ \texttt{coalesce} & Increasing parallelism or fixing distribution & Only reducing output partitions \\
+Cache vs.\ recompute & A DataFrame feeds multiple actions & Single-pass pipelines \\
+Broadcast vs.\ sort-merge join & One side provably fits in memory & Both sides are large \\
+Trust AQE vs.\ manual tuning & Typical workloads & Known extreme skew or stale statistics \\
+DataFrame API vs.\ RDD & Everything in this book & Exotic partition-level control \\
+More partitions vs.\ bigger executors & Tasks spill or are too coarse & Scheduling overhead dominates \\
+\bottomrule
+\end{tabular}
+\caption{Week 4 decision guide.}
+\label{tab:ch4-decisions}
+\end{table}
+
+Every row has the same footnote: measure first. The decision guide narrows the hypothesis space; the Spark UI picks the row.
+
+\section{Operational Guidance for Week 4}
+\index{operational guidance!Week 4}%
+\subsection{Performance and Reliability}
+Adopt the evidence-retention habit early: for every production Spark job, the Spark UI metrics (stage durations, shuffle volumes, task summaries) of the last N runs should be exported or screenshotted before clusters terminate---job clusters delete their UI history with the VMs. Track p50 duration per job weekly; a 20\% week-over-week regression with no config change is a data-shape change and deserves the same investigation as a failure.
+
+\subsection{Security and Governance Checklist}
+\begin{itemize}
+    \item Shared all-purpose clusters run with table access control via Unity Catalog only (no legacy workspace ACLs mixed in).
+    \item Init scripts and uploaded libraries come from reviewed sources---they execute as the cluster's identity.
+    \item Notebook outputs that may contain PII rows are cleared before screenshots into tickets.
+    \item Caches on shared clusters are unpersisted at session end.
+\end{itemize}
+
+\subsection{Troubleshooting Playbook}
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.6cm}p{4.2cm}p{4.8cm}@{}}
+\toprule
+\textbf{Symptom} & \textbf{Likely cause} & \textbf{First action} \\
+\midrule
+Driver out of memory & \texttt{collect()}/\texttt{toPandas()} at scale & Find the driver-side pull; replace with sampled or aggregated read \\
+One task takes hours & Skewed key in a wide transformation & Task-summary tail in the UI; salt or AQE skew handling \\
+Tasks spill to disk & Partition too large / memory pressure & Raise shuffle partitions or executor memory; check caching competition \\
+First run slow, then fast & Cold metadata/cache & Warm-up is normal; benchmark with medians, not single runs \\
+\bottomrule
+\end{tabular}
+\caption{Week 4 troubleshooting quick reference.}
+\label{tab:ch4-trouble}
+\end{table}
+
+\section{Interview Q\&A}
+\subsection{Concepts and Trade-offs}
+\begin{enumerate}
+    \item \textbf{Q: Walk me through what happens when I call \texttt{df.write.saveAsTable()}.}\\
+    A: The driver runs Catalyst on the accumulated logical plan, produces a physical plan, splits it into stages at shuffles, schedules one task per partition per stage, executors run tasks and write files, and the final commit makes the table version visible.
+    \item \textbf{Q: Why is the shuffle the usual suspect?}\\
+    A: It is the only operation requiring all-to-all data movement---network, serialization, disk spill---plus a barrier that prevents pipelining. Most big-job pathologies (skew, spill, tiny tasks) are shuffle pathologies.
+    \item \textbf{Q: What does AQE give you, and when do you override it?}\\
+    A: Runtime re-optimization: coalescing small shuffle partitions, converting sort-merge to broadcast joins, splitting skewed partitions---from actual statistics. Override when its thresholds misfit: known-skewed keys, or a broadcast it declined that you can prove fits.
+    \item \textbf{Q: When do you cache?}\\
+    A: When one computed DataFrame feeds multiple downstream actions and its recompute is expensive. Never for single-scan pipelines; always unpersist on shared clusters.
+    \item \textbf{Q: \texttt{repartition} or \texttt{coalesce} before writing 5,000 small files?}\\
+    A: \texttt{coalesce} if reducing from an already-parallel stage (no full shuffle); \texttt{repartition} if you also need to change the distribution. Then let Chapter 5's \texttt{OPTIMIZE} handle the rest.
+    \item \textbf{Q: What is the driver doing while executors run tasks?}\\
+    A: Tracking task completion, serving the UI, planning the next stage---and holding anything you \texttt{collect()}ed, which is why driver OOMs are usually self-inflicted.
+    \item \textbf{Q: Does Photon change anything about tuning method?}\\
+    A: The engine is faster per core, but the method is identical: read the plan and UI, fix joins/shuffles/skew first, and measure. Photon lowers the ceiling after the plan is sane, not before.
+    \item \textbf{Q: How do you size a cluster for a brand-new job?}\\
+    A: Estimate shuffle volume, pick partitions for $\sim$100--200 MB each, give executors enough memory for the largest task plus spill headroom, then let the first three runs' UI metrics correct your estimate. Sizing is iterated, not derived.
+\end{enumerate}
+
+\section{Further Reading}
+Start with the RDD paper for the execution model's origins \cite{zaharia2012spark} and \textit{Spark: The Definitive Guide} for a practitioner tour \cite{chambersZaharia}. The Spark documentation covers the DataFrame API \cite{sparkDocs} and the performance-tuning guide covers AQE, join strategy, and shuffle configuration \cite{sparkSQLTuning}. The Photon page explains Databricks' vectorized execution layer \cite{databricksPhoton}.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item Spark compiles lazy transformations into stages of parallel tasks; shuffles split stages and dominate cost.
+    \item \texttt{explain} and the Spark UI are the evidence sources---diagnose from them, not from intuition.
+    \item Skew shows as a task-time tail; salting, repartitioning, or AQE skew handling are the fixes.
+    \item Cache only reused, expensive-to-recompute DataFrames; unpersist on shared clusters.
+    \item Tune the plan before the hardware: a bad join strategy scales costs, not throughput.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Define narrow and wide transformations and give two examples of each.
+    \item \textbf{(Conceptual)} Why does an early \texttt{count()} in a notebook break Catalyst's whole-pipeline optimization?
+    \item \textbf{(Hands-on)} Complete the Thursday lab; capture both stage summaries and the reconciliation check.
+    \item \textbf{(Hands-on)} Find the \texttt{Exchange} nodes in three different queries and explain what data movement each represents.
+    \item \textbf{(Hands-on)} Measure a cached vs.\ uncached two-branch pipeline; report when caching won and by how much.
+    \item \textbf{(Design)} Write the investigation report for the Friday scenario as if delivering it to the partner: evidence, hypothesis, fix, expected SLA.
+    \item \textbf{(Design)} Choose shuffle partition counts for 5 GB, 500 GB, and 5 TB shuffles; justify each.
+    \item \textbf{(Architecture)} When would you move this job from an all-purpose cluster to a job cluster or serverless? Quantify the trade-off.
+\end{enumerate}
+
+\section{Milestone 1 Capstone: The Retail Medallion Lakehouse}\label{sec:ch4-capstone}
+\index{Milestone 1 capstone}\index{capstone project!Part I}\index{medallion architecture!capstone}\index{RESTORE!capstone}
+
+\begin{capstonebox}
+\textbf{Mission.} Close Part I by building the retail medallion lakehouse end to end: land the Olist dataset into Bronze via a Unity Catalog volume with ingestion metadata, cleanse into Silver with quarantine and reconciliation, publish a Gold star schema, and prove operability with a corruption-and-\texttt{RESTORE} recovery drill.
+
+\textbf{Estimated time.} 6--8 hours, plus optional cost-modeling and security-review time.
+
+\textbf{What you'll practice.}
+\begin{itemize}
+    \item Volume-based raw landing with \texttt{\_ingested\_at}/\texttt{\_source\_file} metadata.
+    \item Parameterized PySpark notebooks per layer (no code edits between runs).
+    \item Idempotent Silver upserts and reconciled, quarantined rejects.
+    \item Gold dimensional modeling and a measured Spark aggregation.
+    \item Time-travel forensics and \texttt{RESTORE} recovery with history evidence.
+\end{itemize}
+\end{capstonebox}
+
+\subsection*{Scenario}
+Contoso Retail's analytics team receives nine CSV extracts nightly from the Olist-style order system. Today, analysts clean data in spreadsheets; every restatement is a manual crisis. You are building the lakehouse foundation that makes data trustworthy, reprocessable, and recoverable.
+
+\subsection*{Requirements}
+\begin{itemize}
+    \item Catalog \texttt{de\_training} with \texttt{bronze}, \texttt{silver}, \texttt{gold} schemas and volume \texttt{de\_training.bronze.landing}.
+    \item Bronze tables for all nine CSVs, append-only, with lineage metadata.
+    \item Silver tables typed, deduplicated on business keys, with a quarantine table per source and a reconciliation assertion per transition.
+    \item Gold \texttt{fact\_orders}, \texttt{dim\_customer}, \texttt{dim\_product}, \texttt{dim\_date}; a revenue-by-state aggregation measured in the Spark UI.
+    \item A documented drill: corrupt a Silver table, find the last good version in history, \texttt{RESTORE}, verify counts.
+    \item README with architecture diagram, setup commands, cost estimate (DBUs + storage), and lessons learned.
+\end{itemize}
+
+\subsection*{Reference Architecture}
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[
+        src/.style={rectangle, rounded corners, draw=codegray, thick, fill=white, align=center, minimum width=2.6cm, minimum height=0.95cm, font=\small\bfseries},
+        lake/.style={cylinder, shape border rotate=90, aspect=0.25, draw=primary, thick, fill=backcolour, align=center, minimum width=2.6cm, minimum height=1.25cm, font=\small},
+        proc/.style={rectangle, rounded corners, draw=primary, thick, fill=primary!7, align=center, minimum width=3.0cm, minimum height=1.0cm, font=\small\bfseries},
+        gate/.style={rectangle, rounded corners, draw=orange!80!black, thick, fill=orange!10, align=center, minimum width=2.6cm, minimum height=0.85cm, font=\scriptsize\bfseries}
+    ]
+        \node[src] (csvs) at (0,0) {9 CSV extracts\\(UC volume)};
+        \node[lake, fill=brown!12] (bronze) at (3.8,0) {Bronze\\append-only};
+        \node[proc] (silvernb) at (7.6,0) {Silver notebooks\\type + dedup};
+        \node[lake, fill=gray!15] (silver) at (11.4,0) {Silver Delta\\keyed MERGE};
+        \node[proc] (goldnb) at (15.2,0) {Gold notebooks\\star schema};
+        \node[lake, fill=yellow!18] (gold) at (18.6,0) {Gold Delta\\facts + dims};
+        \node[gate] (quar) at (7.6,-1.9) {quarantine\\+ reconciliation};
+        \node[gate] (drill) at (11.4,1.9) {corrupt $\rightarrow$ RESTORE\\drill evidence};
+        \draw[arrow] (csvs) -- (bronze);
+        \draw[arrow] (bronze) -- (silvernb);
+        \draw[arrow] (silvernb) -- (silver);
+        \draw[arrow] (silver) -- (goldnb);
+        \draw[arrow] (goldnb) -- (gold);
+        \draw[arrow, dashed] (silvernb) -- (quar);
+        \draw[arrow, dashed] (drill) -- (silver);
+    \end{tikzpicture}%
+    }
+    \caption{Milestone 1 reference architecture: medallion lakehouse with quality gates and recovery drill.}
+    \label{fig:ch4-capstone-arch}
+\end{figure}
+
+\subsection*{Implementation Steps}
+\begin{enumerate}
+    \item Create the catalog, schemas, and volume; upload the nine Olist CSVs.
+    \item Write \texttt{bronze\_ingest.py}: parameter-driven landing of any CSV with metadata columns.
+    \item Write \texttt{silver\_transform.py}: typing, dedup, quarantine, keyed \texttt{MERGE}; assert reconciliation.
+    \item Write \texttt{gold\_publish.py}: star schema build; measure the revenue aggregation in the Spark UI and record stage metrics.
+    \item Run the recovery drill and capture \texttt{DESCRIBE HISTORY} before/after \texttt{RESTORE}.
+    \item Write the README per the portfolio guide; estimate cost from \texttt{system.billing.usage}.
+\end{enumerate}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item Git repository with the three notebooks, README, and architecture diagram.
+    \item Reconciliation output proving accepted + rejected = input for every table.
+    \item Recovery-drill evidence: history entries and matching pre/post row counts.
+    \item Cost estimate with two documented optimization decisions.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item Clean-clone re-run of all three layers completes with zero manual edits and zero row-count drift.
+    \item A poisoned file demonstrably lands in quarantine while reconciliation still balances.
+    \item The recovery drill restores the exact pre-corruption count, evidenced by history.
+    \item No hardcoded credentials anywhere; the cluster used is policy-bound and terminated.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Wrap the three notebooks as a multi-task Workflow job (preview of Chapter 12).
+    \item Add a Gold data-quality test suite (uniqueness, referential integrity) as a separate notebook.
+    \item Rebuild Gold from Bronze in a parallel schema and cut over with a view swap, per Chapter 3's restatement pattern.
+\end{itemize}

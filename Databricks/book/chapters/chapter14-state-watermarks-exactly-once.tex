@@ -1,0 +1,322 @@
+\chapter{State Management, Watermarks, and Exactly-Once Semantics}
+\index{stateful streaming}\index{watermark}\index{event time}\index{windows}\index{session window}%
+\index{dropDuplicates}\index{RocksDB state store}\index{exactly-once}\index{late data}%
+\begin{objectives}
+\begin{itemize}
+    \item Distinguish event time from processing time and choose windows: tumbling, sliding, session.
+    \item Configure watermarks to bound lateness and state size.
+    \item Implement stateful deduplication and aggregations without unbounded state.
+    \item Select and operate the RocksDB state store for large state.
+    \item Compose checkpoint + idempotent sink into an end-to-end exactly-once argument.
+    \item Design a late-tolerant, replay-safe fraud stream.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+Event-time state management is \textbf{the} hard part of streaming on every platform; the
+vocabulary transfers directly.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{3.0cm}p{3.4cm}p{3.2cm}p{3.2cm}@{}}
+\toprule
+\textbf{Concept} & \textbf{Databricks (Spark)} & \textbf{AWS (Flink)} & \textbf{Azure / GCP / Fabric} \\
+\midrule
+Event-time windows & \texttt{window()}, session windows & Tumbling/sliding/session windows & ASA windows / Beam windows / KQL \texttt{bin()} \\
+Lateness control & \texttt{withWatermark} & Watermarks + allowed lateness & ASA late-arrival policy / Beam watermarks \\
+Dedup & \texttt{dropDuplicates} + watermark & Keyed state + TTL & \texttt{arg\_max} (KQL) / Beam state \\
+Custom state & \texttt{flatMapGroupsWithState} & Keyed process functions & Beam stateful DoFns \\
+State backend & HDFS-compatible / RocksDB & RocksDB / heap & Managed / Beam state \\
+State TTL & Watermark-driven eviction & State TTL config & TTL / watermark-driven \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+The deepest contrast is philosophical: Spark and Flink make you \emph{design} state (TTLs,
+backends, watermarks); managed engines (Dataflow, KQL) hide more of it---and give you less to
+tune when it breaks.
+\end{crosscloud}
+
+\section{Week 14 Roadmap and Mental Model}
+Week 13's streams were stateless filters and appends. The interesting questions---``revenue per 5-minute window,'' ``have we seen this event before,'' ``sessions per user''---are \textbf{stateful}: the answer for new data depends on remembered old data. Week 14 is about remembering the right things for the right amount of time, and no more \cite{sparkStructuredStreaming}.
+
+The mental model: \textbf{watermark = state budget}. A watermark declares ``events later than $t - w$ are too late to matter.'' That one declaration lets the engine close windows, emit results, and---critically---\emph{delete} the state for closed keys. Without it, every stateful query is a slow-motion memory leak; with it, state size is bounded by the watermark horizon times the arrival rate.
+
+\begin{definitionbox}
+\textbf{Event time} is when the event happened (a timestamp in the data); \textbf{processing time} is when the engine sees it. A \textbf{watermark} is a moving threshold on event time: events older than \texttt{max(event\_time) - delay} are dropped, and state older than that horizon is evicted.
+\end{definitionbox}
+
+\begin{keyterms}
+\textbf{Tumbling window}: fixed, non-overlapping intervals. \textbf{Sliding window}: fixed length, overlapping by slide. \textbf{Session window}: activity-gap-bounded, dynamic length. \textbf{State store}: where operator state lives---default in-memory + write-ahead, or RocksDB for large state. \textbf{Exactly-once}: checkpoint + idempotent sink + deterministic state.
+\end{keyterms}
+
+\section{Monday: Event Time and Windows}
+\subsection{Why Event Time}
+Processing-time windows answer ``what did we see between 10:00 and 10:05?'' Event-time windows answer ``what happened between 10:00 and 10:05?''---the question every business stakeholder is actually asking. The difference materializes the moment data is late, replayed, or reprocessed: processing-time answers change; event-time answers are stable \cite{sparkStructuredStreaming}.
+
+\subsection{Window Types}
+\begin{lstlisting}[language=SQL,caption={The three window shapes over the same stream.},label={lst:ch14-windows}]
+-- Tumbling: each event in exactly one 5-minute bucket
+SELECT window(event_ts, '5 minutes') w, COUNT(*) FROM clicks GROUP BY w;
+
+-- Sliding: 10-minute windows computed every 2 minutes (each event in 5 windows)
+SELECT window(event_ts, '10 minutes', '2 minutes') w, COUNT(*) FROM clicks GROUP BY w;
+
+-- Session: window closes after 10 minutes of inactivity per user
+SELECT session_window(event_ts, '10 minutes') s, user_id, COUNT(*)
+FROM clicks GROUP BY user_id, s;
+\end{lstlisting}
+
+\begin{pitfall}
+\textbf{Sliding-window multiplication surprise.} A 10-minute window with a 2-minute slide emits every event into five windows. Dashboards summing across windows then report 5x revenue. Slide deliberately, and document the overlap wherever the result is consumed.
+\end{pitfall}
+
+\section{Tuesday: Watermarks}
+\subsection{The Contract}
+\texttt{withWatermark("event\_ts", "10 minutes")} tells the engine: track the maximum event time seen; events arriving with \texttt{event\_ts} older than $max - 10$ minutes are dropped; window state older than the horizon may be evicted. In append mode, a window's result is emitted only when the watermark passes its end---latency is the watermark delay; in update mode, partial results emit continuously and finalize at the watermark.
+
+\subsection{Choosing the Delay}
+The watermark delay is a business decision wearing technical clothes: how late does real data arrive (measure the p99 lateness of your sources), and what is the cost of dropping later data versus waiting longer? Set it from measured lateness plus margin; monitor dropped-late-event counts; alert when they rise---your sources changed, not your logic.
+
+\begin{tipbox}
+Measure lateness empirically before setting the watermark: \texttt{SELECT percentile\_approx(processing\_ts - event\_ts, 0.99)} over a representative day. The number you guess in a design doc is wrong; the p99 you measured is a spec.
+\end{tipbox}
+
+\section{Wednesday: Stateful Operators and the State Store}
+\subsection{Deduplication and Aggregations}
+\texttt{dropDuplicates(["event\_id"])} keeps per-key state of seen IDs---\emph{with a watermark}, state for IDs older than the horizon is evicted; without one, it grows forever. Windowed aggregations behave the same way. The pattern that keeps every stateful pipeline in this book safe: \textbf{watermark first, then the stateful operator}.
+
+\subsection{Arbitrary State and RocksDB}
+\texttt{flatMapGroupsWithState} (Scala) and \texttt{applyInPandasWithState} (Python) give full control: per-key state with explicit timers---the tool for sessionization, pattern detection, and the fraud rule in the capstone. When state outgrows executor memory (high key cardinality $\times$ long watermark), switch the state store to \textbf{RocksDB}: state spills to local disk/SSD with changelog checkpointing, at some latency cost per batch \cite{databricksRocksDB}.
+
+\begin{lstlisting}[language=Python,caption={Watermark-first dedup feeding a windowed aggregation.},label={lst:ch14-dedup}]
+from pyspark.sql import functions as F
+
+clean = (events
+    .withWatermark("event_ts", "10 minutes")       # state budget FIRST
+    .dropDuplicates(["event_id"]))                 # then the stateful op
+
+windowed = (clean
+    .groupBy(F.window("event_ts", "5 minutes"), "card_id")
+    .agg(F.count("*").alias("txns"),
+         F.countDistinct("city").alias("cities"),
+         F.sum("amount").alias("total")))
+\end{lstlisting}
+
+\section{Thursday Hands-on Project: Late, Duplicated, and Out of Order}
+Build a windowed aggregation over synthetic IoT events, inject late and duplicate records, and prove the watermark and dedup behave exactly as configured; then compare the default and RocksDB state stores.
+\index{hands-on lab}\index{watermark!lab}\index{RocksDB!lab}
+
+\begin{lstlisting}[language=Python,caption={Week 14 lab: lateness, duplication, and state backends.},label={lst:ch14-lab}]
+from pyspark.sql import functions as F
+
+events = (spark.readStream.format("rate")
+          .option("rowsPerSecond", 100).load()
+          .withColumn("event_id", F.expr("uuid()"))
+          .withColumn("device_id", (F.rand(1) * 50).cast("int"))
+          .withColumn("event_ts",
+              # inject jitter: some events arrive up to 15 min "late"
+              F.col("timestamp") -
+              F.expr("INTERVAL 1 SECOND") * (F.rand(2) * 900).cast("int")))
+
+agg = (events
+       .withWatermark("event_ts", "10 minutes")
+       .dropDuplicates(["event_id"])
+       .groupBy(F.window("event_ts", "5 minutes"), "device_id")
+       .agg(F.count("*").alias("readings")))
+
+q = (agg.writeStream.format("delta")
+     .outputMode("append")
+     .option("checkpointLocation", "/Volumes/de_training/silver/_ckpt/iot_windows")
+     .trigger(processingTime="30 seconds")
+     .toTable("de_training.silver.iot_windows"))
+
+# Observe: rows with jitter <= 10 min land in their EVENT-TIME window;
+# rows later than 10 min are dropped (count them via a listener metric).
+# RocksDB variant:
+spark.conf.set("spark.sql.streaming.stateStore.providerClass",
+               "com.databricks.sql.streaming.state.RocksDBStateStoreProvider")
+\end{lstlisting}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item The watermarked, deduplicated window pipeline writing to Delta.
+    \item Evidence that in-watermark late events land in the correct event-time window and beyond-watermark events are dropped.
+    \item A state-store comparison: operator state size and batch duration, default vs.\ RocksDB.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item A replayed batch produces zero duplicate output rows.
+    \item Dropped-late-event counts are measured (listener or metric), not assumed.
+    \item State size is bounded and demonstrably stops growing after keys age past the watermark.
+    \item The RocksDB trade-off (larger state headroom, slower per-batch) is quantified in one paragraph.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Implement a session-window variant and compare event-count semantics with tumbling.
+    \item Build the same aggregation in update mode and MERGE results into a serving table via \texttt{foreachBatch}.
+    \item Inject a source burst that doubles state size and chart the state-store behavior under load.
+\end{itemize}
+
+\section{Friday Use Case: Fifteen Minutes of Lateness, Thirty Seconds of Patience}
+A card network's fraud stream must tolerate up to 15 minutes of late events (intermittent regional links), deduplicate replays exactly, and still emit alerts within 30 seconds of event time for on-time data.
+\index{fraud detection}\index{lateness}\index{streaming!design}
+
+\subsection{Requirements and Assumptions}
+95\% of events arrive within 5 seconds; p99.9 lateness is 14 minutes. Replays occur on link flaps. Alerts drive automated card holds---a duplicate alert is a customer-facing incident; a missed 20-minute-late event is acceptable.
+
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[
+        box/.style={rectangle, rounded corners, draw=primary, thick, fill=primary!7, align=center, minimum width=3.0cm, minimum height=0.95cm, font=\small\bfseries},
+        gate/.style={rectangle, rounded corners, draw=orange!80!black, thick, fill=orange!10, align=center, minimum width=2.9cm, minimum height=0.9cm, font=\scriptsize\bfseries},
+        flow/.style={-{Latex[length=2mm]}, draw=primary, thick}
+    ]
+        \node[box] (src) at (0,0) {Card events\\(Kafka)};
+        \node[gate] (wm) at (3.8,0) {Watermark 15 min\\dropDuplicates};
+        \node[box] (fast) at (7.6,0.9) {Alert path\\update mode\\$\le$30 s};
+        \node[box] (win) at (7.6,-0.9) {Windowed Gold\\append, closes\\at watermark};
+        \node[box] (dash) at (11.6,0.9) {Pager / dashboard};
+        \node[box] (lake) at (11.6,-0.9) {Gold Delta\\serving};
+        \draw[flow] (src) -- (wm);
+        \draw[flow] (wm) -- (fast);
+        \draw[flow] (wm) -- (win);
+        \draw[flow] (fast) -- (dash);
+        \draw[flow] (win) -- (lake);
+    \end{tikzpicture}%
+    }
+    \caption{Split-brain lateness design: fast alerts in update mode, settled windows in append mode, one watermark over both.}
+    \label{fig:ch14-fraud}
+\end{figure}
+
+\subsection{Architecture Decisions}
+\textbf{One watermark, two consumers.} The 15-minute watermark (measured p99.9 + margin) bounds dedup and window state. The alert path runs in \emph{update} mode off the deduplicated stream---on-time events alert in seconds, without waiting for windows to close. The Gold path runs in append mode: settled, exactly-once windowed aggregates for analysts and model features.
+
+\textbf{Replay safety.} Deduplication is keyed on the network's unique \texttt{event\_id} \emph{before} any rule evaluation---replay after a link flap re-sees the IDs, drops them, and emits zero duplicate alerts. The alert sink writes with the event ID as its key, making even the last hop idempotent.
+
+\begin{pitfall}
+\textbf{One mode for both paths.} Append mode delays alerts until windows close (15+ minutes late---useless for fraud); update mode into Gold forces you to manage changing aggregates by hand. The split---update for alerts, append for settled analytics---is the design, not a compromise.
+\end{pitfall}
+
+\subsection{Risks and Mitigations}
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{4.6cm}p{7.6cm}@{}}
+\toprule
+\textbf{Risk} & \textbf{Mitigation} \\
+\midrule
+Fraud alert duplicates page customers & Dedup before rules; keyed idempotent alert sink \\
+Watermark drops legitimate late regions & Lateness measured per region; per-source watermarks if needed \\
+State store grows past memory silently & State-size alert; RocksDB migration runbook ready \\
+Replay storm after a link outage & Capped triggers; replay into recovery table first \\
+Window definition changes mid-quarter & Versioned query definitions; new checkpoint with backfill plan \\
+\bottomrule
+\end{tabular}
+\caption{Week 14 scenario risks and mitigations.}
+\label{tab:ch14-risks}
+\end{table}
+
+\section{Design Decision Guide}
+\index{decision guide!Week 14}%
+Stateful-streaming decisions trade memory, lateness, and correctness; write the budget down.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.4cm}p{4.4cm}p{4.6cm}@{}}
+\toprule
+\textbf{Decision} & \textbf{Choose the first when} & \textbf{Choose the second when} \\
+\midrule
+Tight vs.\ wide watermark & Freshness matters, sources are punctual & Late data is common and valuable \\
+\texttt{dropDuplicates} vs.\ windowed dedup & Global event-ID uniqueness & Per-window duplicates suffice \\
+RocksDB vs.\ default state store & State exceeds comfortable memory & Small state; lowest latency per batch \\
+Update vs.\ append mode & Alerts must not wait for window close & Settled aggregates for analytics \\
+Session vs.\ tumbling windows & Activity bursts define the unit & Calendar defines the unit \\
+Event time vs.\ processing time & Business truth, replay safety & Pure operational telemetry \\
+\bottomrule
+\end{tabular}
+\caption{Week 14 decision guide.}
+\label{tab:ch14-decisions}
+\end{table}
+
+The watermark row is the one you will revisit most: set it from measured lateness, monitor the drops, and treat changes as business decisions with an owner, not config tweaks.
+
+\section{Operational Guidance for Week 14}
+\index{operational guidance!Week 14}%
+\subsection{Performance and Reliability}
+Monitor state size per operator (memory metrics in the streaming UI) with a growth alert; unbounded growth means a missing watermark, not a slow leak. Track dropped-late-event counts as a business metric---when it rises, a source got slower, and the watermark conversation belongs with the data owner. Review watermark values quarterly against measured p99 lateness; sources drift.
+
+\subsection{Security and Governance Checklist}
+\begin{itemize}
+    \item State and checkpoints (which contain actual row data) classified like the tables they feed.
+    \item Watermark/dedup keys documented; they are the replay-safety contract.
+    \item RocksDB changelog checkpoints land on governed storage.
+    \item Late-drop policy (what lateness is acceptable) written down and owned by the business.
+\end{itemize}
+
+\subsection{Troubleshooting Playbook}
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.6cm}p{4.2cm}p{4.8cm}@{}}
+\toprule
+\textbf{Symptom} & \textbf{Likely cause} & \textbf{First action} \\
+\midrule
+State grows without bound & Stateful op without watermark & Add watermark; plan a state-reset deployment \\
+Late events missing from results & Watermark tighter than real lateness & Measure p99 lateness; widen with a data-owner sign-off \\
+Batches slow with large state & Default state store spilling & Move to RocksDB; verify changelog checkpointing \\
+Session windows never close & Gap longer than activity bursts & Check the gap value against measured inter-event times \\
+\bottomrule
+\end{tabular}
+\caption{Week 14 troubleshooting quick reference.}
+\label{tab:ch14-trouble}
+\end{table}
+
+\section{Interview Q\&A}
+\subsection{Concepts and Trade-offs}
+\begin{enumerate}
+    \item \textbf{Q: What does a watermark actually do?}\\
+    A: Two things: defines the lateness horizon after which events are dropped, and authorizes the engine to evict state older than the horizon---turning unbounded memory into a bounded budget.
+    \item \textbf{Q: Why is \texttt{dropDuplicates} dangerous without a watermark?}\\
+    A: Deduplication must remember every key it has ever seen; without eviction, state grows until the executors die. The watermark defines how long ``seen'' must be remembered.
+    \item \textbf{Q: Event time versus processing time---who cares?}\\
+    A: Anyone who replays data or has late arrivals. Event-time results are stable under reprocessing; processing-time results change with the clock. Billing, fraud, and SLAs are event-time questions.
+    \item \textbf{Q: When do you move to the RocksDB state store?}\\
+    A: When state size (keys $\times$ per-key state $\times$ watermark horizon) exceeds comfortable executor memory: RocksDB spills to disk with changelog checkpoints, trading per-batch latency for headroom.
+    \item \textbf{Q: Argue exactly-once for this pipeline, end to end.}\\
+    A: Source offsets checkpointed per batch; state deterministically derived from input and checkpointed; sink writes idempotent (keyed MERGE or Delta replace). A crash replays a batch into a sink that ignores replays---observable result: exactly-once.
+    \item \textbf{Q: A stakeholder wants ``no late data dropped, ever.'' Response?}\\
+    A: Then state is unbounded and windows never close---the honest design is a long watermark plus a batch reconciliation path for the long tail, which is what Chapter 16's two-tier pattern provides.
+    \item \textbf{Q: How do you size the watermark for a source you have never measured?}\\
+    A: You do not---you measure first with a passive stream and a lateness histogram, then set the delay from p99 plus margin. Guessing is how silent data loss gets configured.
+    \item \textbf{Q: How do you test a watermark change before deploying it?}\\
+    A: Replay a representative day (including its lateness profile) into a scratch table with both watermark values and diff the window outputs---the comparison is the deployment review.
+\end{enumerate}
+
+\section{Further Reading}
+The Structured Streaming guide's windowing and watermarking sections are the reference \cite{sparkStructuredStreaming}; the RocksDB state store is covered in \cite{databricksRocksDB}. For the exactly-once composition with Delta sinks, revisit \cite{databricksDelta}; for the Kafka offset side, \cite{sparkKafkaIntegration} (Chapter 15 expands it).
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item Event time is the business's clock; processing time is the machine's---build windows on the former.
+    \item A watermark is a state budget: it bounds memory and defines ``too late.''
+    \item Watermark first, then the stateful operator---every time, no exceptions.
+    \item RocksDB buys state headroom at per-batch latency; measure before and after.
+    \item Exactly-once is a three-part composition: checkpointed offsets, deterministic state, idempotent sink.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Explain why a sliding window with a 2-minute slide over 10-minute windows inflates a naive total by 5x.
+    \item \textbf{(Conceptual)} Why must ``allowed lateness'' be finite for any stateful stream?
+    \item \textbf{(Hands-on)} Complete the Thursday lab with both state stores; capture the comparison.
+    \item \textbf{(Hands-on)} Measure your source's lateness distribution (p50/p99/p99.9) and set the watermark from the measurement.
+    \item \textbf{(Hands-on)} Implement the update-mode alert path from the Friday scenario with a keyed MERGE sink.
+    \item \textbf{(Design)} Choose window types for: hourly revenue, 5-minute error-rate alerting, user session duration. Justify each.
+    \item \textbf{(Operations)} Write the alert rule for ``dropped-late-event count $>$ 0.1\% of volume.''
+    \item \textbf{(Architecture)} When would session windows break the append-mode output contract, and what mode do you use then?
+\end{enumerate}

@@ -1,0 +1,304 @@
+\chapter{AI/BI Dashboards and Genie}
+\index{AI/BI}\index{dashboards}\index{Genie}\index{natural-language analytics}%
+\index{semantic model}\index{certified dataset}\index{self-service BI}%
+\begin{objectives}
+\begin{itemize}
+    \item Build AI/BI dashboards with curated datasets, parameters, and cross-filters over governed Gold data.
+    \item Configure a Genie space with instructions, example queries, and trusted assets that yield correct SQL.
+    \item Curate a semantic layer: certified views, named measures, and documented dimensions.
+    \item Publish and schedule dashboards with governed credentials.
+    \item Diagnose and fix wrong Genie answers with instructions rather than data hacks.
+    \item Design a self-service analytics layer where certified and exploratory analytics coexist safely.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+AI/BI is Databricks' \textbf{native BI layer}; Genie is its natural-language front end. Every
+platform now pairs BI with an LLM assistant.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{3.0cm}p{3.4cm}p{3.2cm}p{3.2cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{Databricks} & \textbf{AWS} & \textbf{Azure / GCP / Fabric} \\
+\midrule
+BI surface & AI/BI dashboards & QuickSight & Power BI / Looker / Power BI (Fabric) \\
+NL analytics & Genie spaces & Amazon Q in QuickSight & Copilot (Power BI) / Gemini (Looker) \\
+Semantic steering & Genie instructions + certified tables & Q topics & Semantic model + Copilot prep / LookML \\
+Compute behind BI & SQL warehouse & SPICE / direct query & Import / DirectQuery / Direct Lake \\
+Scheduling/sharing & Dashboard subscriptions & Scheduled emails & Subscriptions / Looker schedules \\
+Governance link & Unity Catalog lineage to tiles & Q/QuickSight permissions & Purview / Looker permissions \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+The differentiator to articulate in interviews: AI/BI reads the governed Delta tables in place and
+inherits Unity Catalog lineage, so a dashboard tile traces back to the pipeline that produced it.
+\end{crosscloud}
+
+\section{Week 7 Roadmap and Mental Model}
+Weeks 1--6 built governed, performant Gold data. Week 7 makes it \emph{consumable}: dashboards for the known questions and Genie for the unknown ones. The engineering content is not chart placement---it is the semantic discipline that makes self-service safe: certified datasets, named measures, and instructions that encode business definitions so that ``revenue'' means one thing everywhere \cite{databricksDashboards,databricksGenie}.
+
+The mental model: \textbf{a dashboard is a cached contract; Genie is a compiler}. Dashboards execute your SQL on a schedule and render the results---trust comes from the SQL being right and the source being certified. Genie compiles natural language into SQL at question time---trust comes from the space being scoped to clean Gold tables with instructions that teach it your vocabulary. Both fail the same way: confidently, when pointed at ungoverned data.
+
+\begin{definitionbox}
+\textbf{An AI/BI dashboard} is a Databricks-native BI artifact: a set of datasets (SQL against governed tables) feeding visualizations with parameters and cross-filters, published on a schedule. \textbf{A Genie space} is a curated natural-language analytics surface: selected tables plus instructions, example queries, and trusted assets that steer generated SQL.
+\end{definitionbox}
+
+\begin{keyterms}
+\textbf{Certified table/view}: a Gold asset marked as the governed source for a metric. \textbf{Instruction}: Genie steering text---definitions, join rules, filters. \textbf{Trusted asset}: a pre-verified query Genie can use as an authoritative answer. \textbf{Parameter}: a dashboard input bound across datasets. \textbf{Cross-filter}: a selection in one visualization filtering the others.
+\end{keyterms}
+
+\section{Monday: AI/BI Dashboards}
+\subsection{Datasets and Visualizations}
+A dashboard's \textbf{datasets} are SQL queries (or table references) executed on a SQL warehouse; \textbf{visualizations} render them; \textbf{parameters} thread user input through every dataset. Author datasets against Gold views---never Bronze---and prefer views that already encode the business grain so the dataset SQL stays thin and reviewable.
+
+\begin{lstlisting}[language=SQL,caption={A parameterized dashboard dataset over a certified view.},label={lst:ch7-dataset}]
+SELECT order_date, region, category,
+       SUM(net_amount) AS revenue,
+       COUNT(DISTINCT order_id) AS orders
+FROM de_training.gold.v_sales_certified      -- certified, governed
+WHERE order_date BETWEEN :start_date AND :end_date
+  AND region IN (:regions)
+GROUP BY order_date, region, category;
+\end{lstlisting}
+
+\subsection{Parameters, Cross-Filters, and Publishing}
+Parameters make one dashboard serve many slices (dates, regions, channels). Publishing snapshots the dashboard on a schedule with the publisher's warehouse and credentials; subscribers receive rendered output. The governance consequence: \emph{whoever publishes shares their access}---publish with a service identity whose Gold read rights are exactly what subscribers should see (Chapter 8 makes this enforceable).
+
+\section{Tuesday: Genie Spaces}
+\subsection{What Genie Needs to Succeed}
+Genie answers questions by generating SQL over the tables you give it, steered by natural-language context \cite{databricksGenie}. The inputs, in order of leverage: (1) few, clean, well-named Gold tables with documented columns; (2) \textbf{instructions} defining business terms (``revenue excludes cancelled orders''), join paths, and default filters; (3) \textbf{example queries} pairing questions with verified SQL; (4) \textbf{trusted assets} for the exact certified answers.
+
+\begin{pitfall}
+\textbf{Genie over Bronze.} Pointed at raw tables, Genie produces fluent, plausible, wrong SQL: unparsed dates, pre-dedup counts, business terms guessed from column names. Genie amplifies your data quality---it does not create it. Scope spaces to certified Gold only.
+\end{pitfall}
+
+\subsection{Debugging a Wrong Answer}
+The Genie workflow when an answer is wrong: inspect the generated SQL, identify the semantic gap (wrong join? wrong filter? wrong measure?), then fix it \emph{in the space}---an instruction, an example query, or a trusted asset---never by editing data to match the answer. Each fix generalizes: a good instruction repairs a whole class of future questions.
+
+\section{Wednesday: The Semantic Layer}
+\subsection{Certified Views and Named Measures}
+Between Gold tables and consumers sits a thin, deliberate semantic layer: views that rename columns to business language, encode the certified metric definitions, and hide operational columns. The goal is that every tool---dashboards, Genie, notebooks, external BI---computes ``revenue'' identically because they all read the same view.
+
+\begin{lstlisting}[language=SQL,caption={A certified semantic view with named measures.},label={lst:ch7-certified}]
+CREATE OR REPLACE VIEW de_training.gold.v_sales_certified AS
+SELECT  o.order_date,
+        c.region,
+        p.category,
+        o.net_amount,                       -- certified: net of cancels/refunds
+        o.order_id
+FROM    de_training.gold.fact_orders o
+JOIN    de_training.gold.dim_customer c USING (customer_id)
+JOIN    de_training.gold.dim_product  p USING (product_id)
+WHERE   o.order_status NOT IN ('cancelled', 'refunded');
+\end{lstlisting}
+
+\begin{tipbox}
+Certification is a process, not a flag: a view becomes certified when finance reconciles it to the source system, an owner is named, and changes go through review. Then mark it---and grant broadly.
+\end{tipbox}
+
+\section{Thursday Hands-on Project: Executive Dashboard and Genie Space}
+Build a three-page executive dashboard on the certified Gold view, then a Genie space that correctly answers five business questions---including one it initially gets wrong.
+\index{hands-on lab}\index{Genie!lab}\index{dashboard!lab}
+
+\begin{lstlisting}[language=SQL,caption={Week 7 lab assets: certified view plus the dashboard's core datasets.},label={lst:ch7-lab}]
+-- 0. Certified semantic view (from Wednesday)
+CREATE OR REPLACE VIEW de_training.gold.v_sales_certified AS
+SELECT o.order_date, c.region, p.category, o.net_amount, o.order_id
+FROM de_training.gold.fact_orders o
+JOIN de_training.gold.dim_customer c USING (customer_id)
+JOIN de_training.gold.dim_product  p USING (product_id)
+WHERE o.order_status NOT IN ('cancelled','refunded');
+
+-- Dataset A: revenue trend      Dataset B: revenue by region
+-- Dataset C: top categories     (all parameterized on :start_date/:end_date)
+
+-- Genie space over de_training.gold (certified tables only) with instructions:
+--  - "Revenue" = SUM(net_amount) from v_sales_certified, excluding cancels.
+--  - "Last quarter" means the most recent completed calendar quarter.
+--  - Join customer to orders via customer_id only.
+-- Trusted asset: verified SQL for "revenue by state last quarter".
+\end{lstlisting}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item A published three-page dashboard (trend, geography, category) with date and region parameters.
+    \item A Genie space over Gold with instructions, two example queries, and one trusted asset.
+    \item A short log: five test questions, the one wrong answer, its generated SQL, and the instruction that fixed it.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item Every dashboard dataset reads certified Gold views---no Bronze or ad-hoc tables.
+    \item ``Revenue by state last quarter'' in Genie matches the dashboard's certified number exactly.
+    \item The wrong-answer fix is an instruction or trusted asset, not a data change, and generalizes (a second phrasing of the same question now works).
+    \item The published dashboard runs on a service identity with Gold-only read access.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Add a cross-filter from the region map to the trend page.
+    \item Measure Genie's first-try accuracy on 10 questions before and after instructions.
+    \item Schedule a Monday 7 a.m.\ subscription of the executive page to a distribution list.
+\end{itemize}
+
+\section{Friday Use Case: Certified Numbers and Curious Users}
+A retailer's finance team requires that any number leaving the analytics platform be certified and reconciled; meanwhile 300 business users want to ask Genie ad-hoc questions. Both must coexist without a shadow-Excel economy.
+\index{self-service}\index{certification}\index{finance}
+
+\subsection{Requirements and Assumptions}
+Certified metrics change quarterly at most. Business questions are 80\% recurring themes, 20\% novel. Finance audits quarterly and currently distrusts anything not from their own extracts.
+
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[
+        box/.style={rectangle, rounded corners, draw=primary, thick, fill=primary!6, align=center, minimum width=3.2cm, minimum height=1.0cm, font=\small\bfseries},
+        cert/.style={rectangle, rounded corners, draw=codegreen!60!black, thick, fill=green!8, align=center, minimum width=3.0cm, minimum height=0.9cm, font=\small\bfseries},
+        flow/.style={-{Latex[length=2mm]}, draw=primary, thick}
+    ]
+        \node[box] (gold) at (0,0) {Gold tables\\(facts, dims)};
+        \node[cert] (views) at (4.6,0) {Certified views\\named measures};
+        \node[box] (dash) at (9.2,1.3) {AI/BI dashboards\\(finance)};
+        \node[box] (genie) at (9.2,-1.3) {Genie space\\(business users)};
+        \node[box, draw=red!60!black, fill=red!5] (audit) at (13.6,0) {Lineage + audit\\quarterly review};
+        \draw[flow] (gold) -- (views);
+        \draw[flow] (views) -- (dash);
+        \draw[flow] (views) -- (genie);
+        \draw[flow, dashed] (dash) -- (audit);
+        \draw[flow, dashed] (genie) -- (audit);
+    \end{tikzpicture}%
+    }
+    \caption{One semantic layer feeding both certified dashboards and exploratory Genie, with lineage into the audit review.}
+    \label{fig:ch7-selfservice}
+\end{figure}
+
+\subsection{Architecture Decisions}
+\textbf{One semantic layer, two doors.} Both dashboards and Genie read the same certified views, so a number cannot diverge between the CFO's dashboard and a manager's Genie question. Genie's space is scoped to certified tables; its instructions encode the finance-approved definitions; trusted assets hold the board-level answers verbatim.
+
+\textbf{Trust mechanics.} Every certified view carries an owner and a reconciliation record (finance signs quarterly). Dashboard tiles inherit Unity Catalog lineage, so an auditor can click from a number to the view to the pipeline. Ad-hoc exploration happens in a separate ``explore'' Genie space over non-certified Gold, clearly labeled---curiosity is allowed, export to finance decks is not.
+
+\begin{pitfall}
+\textbf{Certifying the dashboard instead of the data.} A ``certified dashboard'' over uncertified tables certifies nothing durable---the next pipeline change silently alters it. Certify the view, let any tool read it, and audit at the view layer.
+\end{pitfall}
+
+\subsection{Risks and Mitigations}
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{4.6cm}p{7.6cm}@{}}
+\toprule
+\textbf{Risk} & \textbf{Mitigation} \\
+\midrule
+Genie confidently wrong on a metric & Golden question set re-run on every instruction change \\
+Two ``revenue'' definitions circulate & One certified view; all tools read it; lineage proves it \\
+Dashboard subscribers see too much & Publish under a least-privilege service identity \\
+Explore space leaks into finance decks & Explicit labeling, separate space, export guardrails \\
+Instruction debt accumulates unreviewed & Quarterly Genie space review with accuracy trend \\
+\bottomrule
+\end{tabular}
+\caption{Week 7 scenario risks and mitigations.}
+\label{tab:ch7-risks}
+\end{table}
+
+\section{Design Decision Guide}
+\index{decision guide!Week 7}%
+Self-service analytics succeeds or fails on semantic decisions, not chart choices.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.4cm}p{4.4cm}p{4.6cm}@{}}
+\toprule
+\textbf{Decision} & \textbf{Choose the first when} & \textbf{Choose the second when} \\
+\midrule
+Dashboard vs.\ Genie & Known recurring questions & Exploratory, phrased-in-the-moment questions \\
+Certified view vs.\ ad-hoc dataset & Any number that leaves the room & Analyst's own scratch exploration \\
+Instruction vs.\ trusted asset & A class of questions needs steering & One exact recurring question needs a fixed answer \\
+Service identity vs.\ publisher identity & Anything with subscribers & Personal draft dashboards only \\
+AI/BI vs.\ external BI tool & Governance colocation wins & Organizational BI standard mandates it \\
+Refresh cadence: decision vs.\ maximum & Always decision cadence & Never the platform maximum by default \\
+\bottomrule
+\end{tabular}
+\caption{Week 7 decision guide.}
+\label{tab:ch7-decisions}
+\end{table}
+
+The unifying principle: one semantic layer, many doors. Every row above is a way of keeping the certified definition between the data and the decision-maker.
+
+\section{Operational Guidance for Week 7}
+\index{operational guidance!Week 7}%
+\subsection{Performance and Reliability}
+Track dashboard refresh duration and failure rate per dashboard; a tile that silently serves yesterday's data erodes trust faster than an honest error. For Genie, maintain the golden question set and re-run it after every instruction change---instruction edits are code changes with regression risk. Version the certified views (change control with reconciliation sign-off) because every tool downstream inherits their definitions.
+
+\subsection{Security and Governance Checklist}
+\begin{itemize}
+    \item Genie spaces scoped to certified Gold only; explore spaces clearly labeled.
+    \item Dashboard publication identity has exactly the access subscribers should inherit.
+    \item Subscriptions reviewed quarterly---recipient lists drift as roles change.
+    \item Certified-view changes require reconciliation evidence before merge.
+\end{itemize}
+
+\subsection{Troubleshooting Playbook}
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.6cm}p{4.2cm}p{4.8cm}@{}}
+\toprule
+\textbf{Symptom} & \textbf{Likely cause} & \textbf{First action} \\
+\midrule
+Genie answers with wrong metric & Missing/ambiguous instruction & Inspect generated SQL; add instruction or trusted asset \\
+Dashboard serves stale data & Refresh schedule or warehouse cold & Check refresh log and warehouse event history \\
+Parameter not filtering & Dataset SQL missing the parameter binding & Rebind the parameter in the dataset, not the visual \\
+Subscription not received & Publish identity lost access & Republish under the service identity; check delivery log \\
+\bottomrule
+\end{tabular}
+\caption{Week 7 troubleshooting quick reference.}
+\label{tab:ch7-trouble}
+\end{table}
+
+\section{Interview Q\&A}
+\subsection{Concepts and Trade-offs}
+\begin{enumerate}
+    \item \textbf{Q: Why not just give analysts Power BI against Gold?}\\
+    A: You can---the point of AI/BI is colocation with governance: lineage to the tile, no extract pipelines, and one semantic layer shared with Genie. External BI is a valid choice when the organization's standard demands it; the certified views remain the contract either way.
+    \item \textbf{Q: How do you stop Genie from hallucinating metrics?}\\
+    A: Scope to certified tables, encode definitions as instructions, provide example queries and trusted assets, and measure first-try accuracy on a fixed question set before rolling out.
+    \item \textbf{Q: Dashboard performance is poor. Where do you look?}\\
+    A: Dataset SQL (is it scanning the fact table instead of an MV or the certified view?), warehouse sizing/queueing (Chapter 6), and table layout (Chapter 5)---in that order.
+    \item \textbf{Q: Who should a published dashboard run as?}\\
+    A: A service identity whose data access equals what subscribers may see; publishing as a privileged user silently escalates every subscriber's effective access.
+    \item \textbf{Q: How do you handle a metric definition change?}\\
+    A: Change the certified view under review, re-reconcile with finance, bump the Genie instructions in the same change---one definition, one place, every tool updates together.
+    \item \textbf{Q: What is the first thing you check when a certified number changes unexpectedly?}\\
+    A: The view's lineage and the pipeline history---certified numbers change because upstream changed, and lineage turns ``who touched this'' into a query.
+    \item \textbf{Q: Can Genie replace a semantic layer?}\\
+    A: No---instructions steer generation, they do not enforce definitions. The certified views are the semantics; Genie is one of several doors onto them.
+    \item \textbf{Q: How many Genie spaces should a domain have?}\\
+    A: Few: one certified space per domain plus one explore space. Every additional space forks the instructions and example set---and the definitions they encode.
+\end{enumerate}
+
+\section{Further Reading}
+The AI/BI dashboards \cite{databricksDashboards} and Genie \cite{databricksGenie} documentation are the product references. Revisit SQL warehouses for the compute underneath \cite{databricksSQLWarehouses} and Unity Catalog for the certification and lineage mechanics \cite{databricksUnityCatalog,databricksLineage}.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item Dashboards are cached contracts; Genie is a compiler---both inherit the quality of the data and semantics you give them.
+    \item Certified views with named measures are the single source of metric truth for every tool.
+    \item Fix wrong Genie answers with instructions and trusted assets---never by editing data.
+    \item Published dashboards run as the publisher; publish with a least-privilege service identity.
+    \item Self-service and certification coexist when both doors open onto the same semantic layer.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Explain to finance why a Genie answer and a dashboard tile can be trusted to agree.
+    \item \textbf{(Conceptual)} List three instruction types that steer Genie and give an example of each.
+    \item \textbf{(Hands-on)} Complete the Thursday lab, including the wrong-answer fix log.
+    \item \textbf{(Hands-on)} Add a second Genie space over uncertified Gold labeled ``explore only'' and document the guardrail difference.
+    \item \textbf{(Hands-on)} Trace one dashboard tile's lineage to its source tables in the catalog explorer; capture it.
+    \item \textbf{(Design)} Write the certification checklist (owner, reconciliation, review cadence) for a new certified view.
+    \item \textbf{(Operations)} A certified view must change schema. Write the change plan covering dashboards, Genie, and downstream notebooks.
+    \item \textbf{(Architecture)} When would you move a heavy dashboard dataset into a materialized view (Chapter 6) rather than tuning the SQL? Quantify.
+\end{enumerate}

@@ -1,0 +1,347 @@
+\chapter{The Medallion Architecture: Bronze, Silver, and Gold}
+\index{medallion architecture}\index{Bronze layer}\index{Silver layer}\index{Gold layer}%
+\index{data quality}\index{quarantine}\index{star schema}\index{idempotency}\index{Unity Catalog!naming}%
+\begin{objectives}
+\begin{itemize}
+    \item Justify the Bronze/Silver/Gold layering and articulate the cost of skipping a layer.
+    \item Design Bronze tables as append-only, self-describing evidence with ingestion metadata.
+    \item Build Silver cleansing, conformance, deduplication, and quarantine patterns.
+    \item Publish Gold dimensional models (facts, dimensions) for SQL, BI, and ML consumers.
+    \item Make every layer transition idempotent and reconcilable by row count.
+    \item Name catalogs, schemas, and tables for a multi-team Unity Catalog estate.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+The medallion is a \textbf{design pattern}, not a Databricks product---every platform expresses the
+same progressive refinement with its own primitives.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{2.6cm}p{3.4cm}p{3.4cm}p{3.0cm}@{}}
+\toprule
+\textbf{Layer} & \textbf{Databricks} & \textbf{AWS / Azure / GCP lake} & \textbf{Snowflake / Fabric} \\
+\midrule
+Bronze (raw) & \texttt{bronze} schema, Delta & \texttt{raw/} prefix (S3/ADLS/GCS) & RAW schema / Bronze Lakehouse \\
+Silver (validated) & \texttt{silver} schema, Delta & \texttt{validated/} prefix & STAGING schema / Silver Lakehouse \\
+Gold (curated) & \texttt{gold} star schema & \texttt{curated/} prefix & ANALYTICS schema / Gold Lakehouse \\
+Quality gate & Expectations, constraints, quarantine & Glue DQ rules & Great Expectations / pipeline gates \\
+Access boundary & UC grants per schema & Lake Formation per zone & Role grants / workspace roles \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+The pattern predates the name: staging/core/mart schemas in classical warehouses are the same idea
+with relational storage. What Delta adds is cheap reprocessing---Bronze can be kept forever and
+Silver rebuilt at will.
+\end{crosscloud}
+
+\section{Week 3 Roadmap and Mental Model}
+Week 2 gave you a trustworthy table format; Week 3 organizes many tables into a trustworthy \emph{system}. The medallion architecture is the standard answer to a recurring failure: pipelines that transform raw data directly into reports, so that every bug fix requires either corrupting the report layer or re-pulling from the source \cite{databricksMedallion}.
+
+The mental model: \textbf{each layer has one job and one audience}. Bronze answers ``what exactly did we receive?'' for engineers. Silver answers ``what is the clean, current truth?'' for pipelines. Gold answers ``what does the business measure?'' for analysts and models. A row may restate many times in Gold, but it lands in Bronze exactly once.
+
+\begin{definitionbox}
+\textbf{The medallion architecture} is a lakehouse design pattern that progressively refines data through Bronze (raw, append-only), Silver (validated, conformed, deduplicated), and Gold (business-level, dimensional, consumable) layers, with quality gates and reconciliation at each transition.
+\end{definitionbox}
+
+\begin{keyterms}
+\textbf{Quarantine}: a table holding rejected rows with rejection reasons. \textbf{Conformance}: aligning schemas, units, and reference data across sources. \textbf{Reconciliation}: the arithmetic proof that no rows were lost between layers. \textbf{Idempotent transition}: re-running a layer's pipeline yields the same layer state. \textbf{Star schema}: Gold's fact-plus-dimensions shape.
+\end{keyterms}
+
+\section{Monday: Why Layers, and the Cost of Skipping Them}
+\subsection{Progressive Refinement}
+Each transition does exactly one class of work. Bronze $\rightarrow$ Silver: parsing, typing, validation, deduplication. Silver $\rightarrow$ Gold: business logic, conformance across domains, dimensional modeling. Mixing classes---business logic in Silver, typing in Gold---creates pipelines that cannot be rerun, debugged, or audited independently.
+
+\subsection{Idempotent Reprocessing}
+The layering pays off on the bad day: a Silver bug is fixed by reprocessing Silver from Bronze; a Gold business-rule change is fixed by rebuilding Gold from Silver. Neither touches the source. This only works if transitions are idempotent---key-based \texttt{MERGE} or partition-scoped \texttt{replaceWhere}---and if Bronze retains everything needed to rebuild.
+
+\begin{pitfall}
+\textbf{Transforming in place.} Updating Bronze rows during cleansing destroys the evidence layer. Bronze is write-once; corrections and reinterpretations belong to downstream layers. If storage cost tempts you to mutate Bronze, remember what you are trading: the ability to ever rebuild.
+\end{pitfall}
+
+\section{Tuesday: Bronze---The Evidence Layer}
+\subsection{Append-Only Raw Capture}
+Bronze tables store what arrived, as it arrived, plus metadata your future self will need: \texttt{\_ingested\_at}, \texttt{\_source\_file}, \texttt{\_source\_system}, and a pipeline run identifier. Types stay permissive (strings are common) because Bronze's job is capture, not judgment.
+
+\begin{lstlisting}[language=Python,caption={Bronze landing with ingestion metadata.},label={lst:ch3-bronze}]
+from pyspark.sql import functions as F
+
+raw = (spark.read.option("header", True)
+       .csv("/Volumes/de_training/bronze/landing/olist/orders/"))
+
+bronze = (raw
+    .withColumn("_ingested_at", F.current_timestamp())
+    .withColumn("_source_file", F.input_file_name())
+    .withColumn("_source_system", F.lit("olist"))
+    .withColumn("_run_id", F.lit(spark.conf.get("spark.databricks.job.id", "manual"))))
+
+(bronze.write.format("delta").mode("append")
+   .saveAsTable("de_training.bronze.orders"))
+\end{lstlisting}
+
+\subsection{Schema-on-Read Trade-offs}
+Keeping Bronze loosely typed means a malformed column never blocks ingestion---the failure surfaces in Silver where it can be quarantined and explained. The trade-off is discipline: Silver must parse defensively, and someone must own watching the quarantine.
+
+\section{Wednesday: Silver Conformance and the Gold Star Schema}
+\subsection{Silver: Validation, Dedup, Quarantine}
+Silver is where data earns trust: typed columns, enforced constraints, deduplicated business keys, and a quarantine table catching what fails with a reason attached.
+
+\begin{lstlisting}[language=Python,caption={Silver cleansing with quarantine accounting.},label={lst:ch3-silver}]
+bronze = spark.read.table("de_training.bronze.orders")
+
+typed = (bronze
+    .withColumn("order_ts", F.to_timestamp("order_purchase_timestamp"))
+    .withColumn("total_amount", F.col("payment_value").cast("decimal(12,2)")))
+
+valid = typed.where("order_id IS NOT NULL AND total_amount >= 0")
+rejected = (typed.where("order_id IS NULL OR total_amount < 0")
+                 .withColumn("_reject_reason", F.lit("null key or negative amount")))
+
+# Idempotent upsert into Silver; rejected rows are never dropped silently
+(valid.write.format("delta").mode("append").saveAsTable("staging.orders_valid"))
+spark.sql("""MERGE INTO de_training.silver.orders t
+             USING staging.orders_valid s ON t.order_id = s.order_id
+             WHEN NOT MATCHED THEN INSERT *""")
+(rejected.write.format("delta").mode("append")
+   .saveAsTable("de_training.silver.orders_quarantine"))
+\end{lstlisting}
+
+\subsection{Reconciliation}
+Every transition publishes its arithmetic: \texttt{bronze\_in = silver\_accepted + quarantined}. A one-line assertion in the pipeline (and later, a DLT expectation or a Workflow gate) turns silent row loss into a loud failure.
+
+\subsection{Gold: The Dimensional Contract}
+Gold is modeled for consumption: \texttt{fact\_orders} (measures, foreign keys) surrounded by \texttt{dim\_customer}, \texttt{dim\_product}, \texttt{dim\_date}. Facts are narrow and additive; dimensions are conformed and slowly changing where history matters. Gold is the only layer analysts should query by default---Chapter 8 enforces that with grants.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{2.2cm}p{4.2cm}p{3.2cm}p{3.4cm}@{}}
+\toprule
+\textbf{Layer} & \textbf{Question answered} & \textbf{Audience} & \textbf{Write pattern} \\
+\midrule
+Bronze & What did we receive? & Engineers & Append-only \\
+Silver & What is clean truth? & Pipelines & Keyed MERGE / replaceWhere \\
+Gold & What do we measure? & Analysts, ML & Scheduled rebuild / merge \\
+Quarantine & What failed and why? & Data stewards & Append-only \\
+\bottomrule
+\end{tabular}
+\caption{One job, one audience, one write pattern per layer.}
+\label{tab:ch3-layers}
+\end{table}
+
+\section{Thursday Hands-on Project: The Olist Medallion}
+Build the three-layer flow for the Olist e-commerce dataset \cite{olistDataset}: land nine raw CSVs into Bronze, cleanse into Silver with quarantine, publish a Gold star schema, and reconcile every transition.
+\index{hands-on lab}\index{medallion architecture!lab}\index{quarantine!lab}
+
+\begin{lstlisting}[language=Python,caption={Gold star schema build with reconciliation.},label={lst:ch3-gold}]
+from pyspark.sql import functions as F
+
+orders = spark.read.table("de_training.silver.orders")
+items  = spark.read.table("de_training.silver.order_items")
+cust   = spark.read.table("de_training.silver.customers")
+
+dim_customer = cust.select("customer_id", "customer_unique_id",
+                           "customer_city", "customer_state")
+dim_customer.write.format("delta").mode("overwrite") \
+    .saveAsTable("de_training.gold.dim_customer")
+
+fact_orders = (orders.join(items, "order_id")
+    .groupBy("order_id", "customer_id", F.to_date("order_ts").alias("order_date"))
+    .agg(F.sum("price").alias("net_amount"),
+         F.count("order_item_id").alias("line_count")))
+fact_orders.write.format("delta").mode("overwrite") \
+    .saveAsTable("de_training.gold.fact_orders")
+
+# Reconciliation: Gold facts must equal Silver order count
+silver_n = spark.table("de_training.silver.orders").count()
+gold_n   = spark.table("de_training.gold.fact_orders").count()
+assert silver_n == gold_n, f"reconciliation failed: {silver_n} != {gold_n}"
+\end{lstlisting}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item Bronze tables for all nine Olist CSVs with ingestion metadata columns.
+    \item Silver tables with typed schemas, deduplicated keys, and populated quarantine tables.
+    \item Gold \texttt{fact\_orders}, \texttt{dim\_customer}, \texttt{dim\_product}, \texttt{dim\_date}.
+    \item A reconciliation notebook asserting accepted + rejected = input for every table.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item Full re-run from a clean clone changes zero Silver/Gold row counts (idempotence proof).
+    \item At least one deliberately poisoned CSV lands in quarantine with a reason, and reconciliation still balances.
+    \item Gold aggregates (total revenue) match a direct Bronze computation within rounding.
+    \item Lineage columns (\texttt{\_source\_file}, \texttt{\_ingested\_at}) trace a Gold row to its raw file.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Add \texttt{dim\_date} generated from the calendar range of the facts.
+    \item Parameterize the Silver notebook by \texttt{processing\_date} and prove a single-day re-run.
+    \item Convert one Silver transition to \texttt{replaceWhere} partition overwrite and explain when it beats MERGE.
+\end{itemize}
+
+\section{Friday Use Case: Two Years of Reprocessing Without Double-Counting}
+A retail chain changes its revenue recognition rule: cancelled-then-refunded orders must now net against the month of the original sale. Two years of Gold must be rebuilt. The CFO's constraint: at no point may the revenue number double-count, and the old numbers must remain queryable for the restatement filing.
+\index{reprocessing}\index{restatement}\index{retail}
+
+\subsection{Requirements and Assumptions}
+Bronze retains all raw extracts (append-only). Gold serves dashboards that finance reads daily. The restatement window is one weekend. Fifty downstream reports reference \texttt{gold.fact\_orders} by name.
+
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[
+        layer/.style={cylinder, draw=primary, shape border rotate=90, aspect=0.25, fill=primary!8, align=center, minimum width=2.6cm, minimum height=1.3cm, font=\small\bfseries},
+        proc/.style={rectangle, rounded corners, draw=primary, thick, fill=primary!7, align=center, minimum width=2.8cm, minimum height=0.95cm, font=\small\bfseries},
+        dec/.style={rectangle, rounded corners, draw=orange!80!black, thick, fill=orange!10, align=center, minimum width=3.0cm, minimum height=0.85cm, font=\scriptsize\bfseries},
+        flow/.style={-{Latex[length=2mm]}, draw=primary, thick}
+    ]
+        \node[layer, fill=brown!12] (bronze) at (0,0) {Bronze\\(untouched)};
+        \node[proc] (silver) at (4.0,0) {Silver rebuild\\(rule v1 $\rightarrow$ v2)};
+        \node[layer, fill=gray!15] (silvert) at (8.0,0) {Silver\\tables};
+        \node[proc] (goldnew) at (12.0,0.9) {Gold v2 build\\(new schema)};
+        \node[layer, fill=yellow!18] (goldt) at (15.6,0.9) {gold\_v2};
+        \node[dec] (swap) at (12.0,-1.2) {View swap\\gold.fact $\rightarrow$ v2};
+        \node[layer, fill=yellow!8] (goldold) at (15.6,-1.2) {gold (v1)\\retained};
+        \draw[flow] (bronze) -- (silver);
+        \draw[flow] (silver) -- (silvert);
+        \draw[flow] (silvert) -- (goldnew);
+        \draw[flow] (goldnew) -- (goldt);
+        \draw[flow] (goldt) -- (swap);
+        \draw[flow] (goldold) -- (swap);
+    \end{tikzpicture}%
+    }
+    \caption{Zero-double-count restatement: rebuild into parallel tables, then swap via view or catalog rename in one auditable step.}
+    \label{fig:ch3-restatement}
+\end{figure}
+
+\subsection{Architecture Decisions}
+\textbf{Parallel build, atomic swap.} Silver and Gold v2 build alongside v1 from immutable Bronze. Reconciliation gates the cutover: v2 totals are compared against v1 with an expected-delta report derived from the rule change. Cutover is a view re-point (\texttt{CREATE OR REPLACE VIEW gold.fact\_orders AS SELECT * FROM gold\_v2.fact\_orders})---one commit, one history entry, instantly reversible.
+
+\textbf{Evidence.} The old tables persist under \texttt{gold\_v1\_archive} for the filing; \texttt{DESCRIBE HISTORY} plus the reconciliation report form the restatement evidence pack.
+
+\begin{pitfall}
+\textbf{Backfilling in place during business hours.} Rewriting \texttt{gold.fact\_orders} while dashboards read it produces mixed-rule numbers---the worst outcome: not wrong enough to notice, not right enough to file. Parallel build plus atomic swap exists precisely for this scenario.
+\end{pitfall}
+
+\subsection{Risks and Mitigations}
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{4.6cm}p{7.6cm}@{}}
+\toprule
+\textbf{Risk} & \textbf{Mitigation} \\
+\midrule
+Restatement weekend overruns & Parallel v2 build rehearsed; cutover is one reversible view swap \\
+Quarantine becomes a write-only graveyard & Weekly steward review with per-reason trends \\
+Gold consumers query Silver directly & Grants make Gold the only readable layer for analysts \\
+Bronze storage cost questioned & Documented reprocessing value; lifecycle rules on raw volumes \\
+Reconciliation tolerances gamed & Assertions are arithmetic on counts, not thresholds people choose \\
+\bottomrule
+\end{tabular}
+\caption{Week 3 scenario risks and mitigations.}
+\label{tab:ch3-risks}
+\end{table}
+
+\section{Design Decision Guide}
+\index{decision guide!Week 3}%
+Medallion design is mostly discipline decisions made once per pipeline.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.4cm}p{4.4cm}p{4.6cm}@{}}
+\toprule
+\textbf{Decision} & \textbf{Choose the first when} & \textbf{Choose the second when} \\
+\midrule
+Keyed MERGE vs.\ \texttt{replaceWhere} & Records arrive as changes & A partition is restated wholesale \\
+Quarantine vs.\ fail-fast & Bad rows are routine & Bad rows invalidate the batch \\
+Star schema vs.\ wide Gold table & Many consumers and facts share dimensions & One consumer, one fixed question \\
+Three layers vs.\ two & Reprocessing or multiple consumers exist & Truly single-use, disposable data \\
+View swap vs.\ in-place backfill & Consumers must never see mixed state & The table is internal and rebuildable \\
+Strict types in Bronze vs.\ strings & The source contract is enforced upstream & Sources drift and evidence matters more \\
+\bottomrule
+\end{tabular}
+\caption{Week 3 decision guide.}
+\label{tab:ch3-decisions}
+\end{table}
+
+The pattern across the table: choose the option that keeps the transition idempotent and the evidence preserved. Both compound; both are invisible until the day they save you.
+
+\section{Operational Guidance for Week 3}
+\index{operational guidance!Week 3}%
+\subsection{Performance and Reliability}
+The reconciliation ledger is the layer's heartbeat: every transition appends its arithmetic (input, accepted, quarantined) and a daily report trends it---a rising quarantine rate is a source-schema change announcing itself before anyone calls. Reprocessing drills are scheduled, not aspirational: once a month, rebuild one Silver table from Bronze in a scratch schema and diff it. Gold rebuild cost should be measured and documented so restatement requests come with a known price.
+
+\subsection{Security and Governance Checklist}
+\begin{itemize}
+    \item Layer grants match the audience model: pipelines write Bronze, engineers write Silver, analysts read Gold.
+    \item Quarantine tables inherit the source's PII classification---rejected rows still contain PII.
+    \item Bronze retention set from the reprocessing objective, not storage cost alone.
+    \item Lineage metadata columns (\texttt{\_source\_file}, \texttt{\_ingested\_at}) populated on every Bronze write.
+\end{itemize}
+
+\subsection{Troubleshooting Playbook}
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.6cm}p{4.2cm}p{4.8cm}@{}}
+\toprule
+\textbf{Symptom} & \textbf{Likely cause} & \textbf{First action} \\
+\midrule
+Reconciliation mismatch & Duplicate keys fanning out a join & Dedup check on both sides; inspect the MERGE condition \\
+MERGE ``multiple matches'' error & Duplicate business keys in the source batch & Dedup source on the key before merging \\
+Rerun doubled Gold counts & Non-idempotent write (blind append) & Convert to keyed MERGE or \texttt{replaceWhere} \\
+Source file arrived late & Upstream SLA slip & Re-run the partition-scoped transition for that date \\
+\bottomrule
+\end{tabular}
+\caption{Week 3 troubleshooting quick reference.}
+\label{tab:ch3-trouble}
+\end{table}
+
+\section{Interview Q\&A}
+\subsection{Concepts and Trade-offs}
+\begin{enumerate}
+    \item \textbf{Q: Why keep Bronze forever when storage costs money?}\\
+    A: Bronze is the only layer that can answer ``what did the source actually say'' and the only input for rebuilding after logic changes. Its cost is small next to re-acquisition or restatement failure.
+    \item \textbf{Q: When is two layers (skip Silver) acceptable?}\\
+    A: Almost never for shared data. A single-source, single-consumer pipeline may collapse layers, but the moment a second consumer or a reprocessing need appears, you rebuild Silver under pressure.
+    \item \textbf{Q: How do you prove a transition lost no rows?}\\
+    A: Reconciliation arithmetic per run: input count equals accepted plus quarantined, asserted in the pipeline and logged to a run ledger.
+    \item \textbf{Q: MERGE or \texttt{replaceWhere} for Silver?}\\
+    A: MERGE for keyed upserts arriving as changes; \texttt{replaceWhere} for full partition restatements (daily snapshots). Both are idempotent; mixing them per table is not.
+    \item \textbf{Q: Why a star schema in Gold rather than one wide table?}\\
+    A: Shared conformed dimensions let many facts join consistently, selective scans stay cheap, and BI tools model relationships natively. Wide tables duplicate dimension logic into every fact.
+    \item \textbf{Q: Who owns the quarantine table?}\\
+    A: A named steward with a review cadence. Quarantine without an owner is where data goes to be forgotten; with one, it is your earliest upstream-quality signal.
+    \item \textbf{Q: Why does the medallion make streaming easier later?}\\
+    A: Each layer transition already has idempotent, keyed write semantics---the exact properties Structured Streaming sinks require. A well-built batch medallion becomes a streaming medallion by changing triggers, not contracts.
+    \item \textbf{Q: Where do source-system reference tables (country codes, calendars) live?}\\
+    A: As governed Gold dimensions with an owner and a refresh contract---they are conformed shared assets, and treating them as casual lookups is how three definitions of ``fiscal month'' happen.
+\end{enumerate}
+
+\section{Further Reading}
+The Databricks medallion guide is the canonical reference \cite{databricksMedallion}; pair it with the Delta Lake documentation for the write patterns (\texttt{MERGE}, \texttt{replaceWhere}) that make layers idempotent \cite{deltaLakeDocs,databricksDelta}. The lakehouse paper explains why this layering displaced the two-tier lake-plus-warehouse architecture \cite{armbrust2021lakehouse}. The Olist dataset page documents the nine source tables used in the lab \cite{olistDataset}.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item Bronze is evidence, Silver is truth, Gold is measurement---one job and one audience per layer.
+    \item Every transition is idempotent (keyed MERGE or partition overwrite) and reconciled by arithmetic.
+    \item Quarantine tables turn silent data loss into visible, explainable rejections.
+    \item Reprocessing is a first-class design requirement: build v2 in parallel, gate on reconciliation, swap atomically.
+    \item Catalog/schema naming (\texttt{catalog.bronze|silver|gold.table}) is governance infrastructure, not cosmetics.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} A stakeholder proposes skipping Silver ``for speed.'' Write the three-question checklist you would ask before agreeing.
+    \item \textbf{(Conceptual)} Why is append-only Bronze incompatible with GDPR-style erasure, and what pattern resolves it (hint: Chapter 22 revisits this)?
+    \item \textbf{(Hands-on)} Complete the Thursday lab, including one poisoned file, and capture the reconciliation output.
+    \item \textbf{(Hands-on)} Add \texttt{dim\_seller} to the Gold model and extend the reconciliation to cover it.
+    \item \textbf{(Design)} Design the medallion layout for a second source system (inventory) sharing the same Gold dimensions.
+    \item \textbf{(Design)} Write the cutover runbook for the Friday scenario, including the rollback step.
+    \item \textbf{(Governance)} Which layers should analysts be able to read by default, and how would you enforce it (preview of Chapter 8)?
+    \item \textbf{(Architecture)} At what data volume would you move the Silver transition from batch MERGE to a streaming design (preview of Part IV)? Justify with numbers.
+\end{enumerate}

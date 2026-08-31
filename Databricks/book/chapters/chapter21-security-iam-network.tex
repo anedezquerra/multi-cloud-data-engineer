@@ -1,0 +1,310 @@
+\chapter{Security, IAM, SCIM, and Network Isolation}
+\index{security}\index{IAM}\index{SCIM}\index{service principal}\index{secret scope}%
+\index{private connectivity}\index{IP access list}\index{single sign-on}\index{least privilege}%
+\begin{objectives}
+\begin{itemize}
+    \item Design identity architecture: account console versus workspace, SSO, and SCIM provisioning.
+    \item Operate service principals and OAuth machine-to-machine credentials for automation.
+    \item Manage secrets with Databricks-backed and Key Vault-backed secret scopes.
+    \item Apply network controls: private connectivity, IP access lists, and storage firewalls.
+    \item Enforce personal access token policy and audit authentication events.
+    \item Design time-boxed contractor access and production job identity.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+Identity and network isolation are \textbf{cloud-native disciplines} with a Databricks
+control-plane twist.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{3.0cm}p{3.4cm}p{3.2cm}p{3.2cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{Databricks} & \textbf{AWS} & \textbf{Azure / GCP} \\
+\midrule
+Workforce identity & SSO + SCIM from IdP & IAM Identity Center & Entra ID / Cloud Identity \\
+Machine identity & Service principal + OAuth M2M & IAM role & Managed identity / service account \\
+Long-lived secret & PAT (policy-controlled) & Access keys & Client secrets / SA keys \\
+Secrets store & Secret scopes (DB- or vault-backed) & Secrets Manager & Key Vault / Secret Manager \\
+Private link & Private connectivity to control plane + storage & PrivateLink + VPC endpoints & Private Link / Private Service Connect \\
+Perimeter control & IP access lists & Security groups, SCPs & NSGs, firewall rules / VPC SC \\
+Audit & system.access.audit + auth logs & CloudTrail & Activity Log / Cloud Audit Logs \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+\textbf{Snowflake} mirrors this with SSO/SCIM, network policies, and Tri-Secret/CMK options;
+\textbf{MongoDB Atlas} with federated auth, private endpoints, and IP access lists---the same
+checklist, different console.
+\end{crosscloud}
+
+\section{Week 21 Roadmap and Mental Model}
+Part VI hardens everything Parts I--V built. Week 21 covers the perimeter and the principals: who (and what) can reach the platform, and what they can do once inside. The recurring failure this week prevents: production pipelines running as a person, secrets in notebooks, and a network posture that assumes the SaaS control plane is ``handled'' \cite{databricksSecurity}.
+
+The mental model: \textbf{identity first, network second, secrets always}. Identity decides who acts (users via SSO, automation via service principals); network decides from where (private connectivity, IP lists); secrets decide with what credentials (scoped, vaulted, rotated). Auditors and attackers both start from these three lists.
+
+\begin{definitionbox}
+\textbf{A service principal} is a non-human identity for automation, granted least-privilege access and authenticated via OAuth M2M or a managed token. \textbf{SCIM} is the provisioning protocol that syncs users and groups from your identity provider into the Databricks account, automating joiner/mover/leaver hygiene.
+\end{definitionbox}
+
+\begin{keyterms}
+\textbf{SSO}: single sign-on via SAML/OIDC from the IdP. \textbf{Secret scope}: a named, ACL-controlled secrets namespace; Databricks-backed or backed by Azure Key Vault / AWS Secrets Manager. \textbf{IP access list}: allow/deny network ranges for workspace access. \textbf{Private connectivity}: private endpoints between your network, the control plane, and storage. \textbf{PAT policy}: workspace rules on token creation, lifetime, and scope.
+\end{keyterms}
+
+\section{Monday: Identity Architecture}
+\subsection{Account versus Workspace}
+The \textbf{account console} governs identity (users, groups, service principals), metastores, and budgets across workspaces; the \textbf{workspace} governs objects and grants within it. SSO binds the account to your IdP (Entra ID, Okta, Google); users then reach workspaces by entitlement. The discipline: identity changes happen at the account, from the IdP---never as one-off local users.
+
+\subsection{SCIM Provisioning}
+SCIM keeps Databricks group membership a projection of IdP groups: a new analyst appears in \texttt{analysts} on day one; a leaver loses access at HR offboarding, not at the quarterly review \cite{databricksSCIM}. Design the IdP group tree first (business unit $\times$ role $\times$ environment), then map it---the Chapter 8 access matrix becomes self-maintaining.
+
+\begin{pitfall}
+\textbf{Local users beside SCIM.} One hand-created user bypasses the whole leaver process. Policy: account-level user creation is IdP-only; audits diff workspace membership against SCIM-synced groups monthly.
+\end{pitfall}
+
+\section{Tuesday: Service Principals, OAuth, and Secrets}
+\subsection{Machine Identity}
+Production jobs, CI pipelines, and the RAG endpoint all authenticate as service principals: least-privilege grants (exactly the Chapter 8 matrix), OAuth M2M credentials with short-lived tokens, and an owner recorded per principal. The rule is absolute: \textbf{no production workload runs as a person}---people leave, rotate, and get phished; principals are scoped, owned, and auditable.
+
+\subsection{Secret Scopes}
+Notebooks read credentials at runtime via \texttt{dbutils.secrets.get(scope, key)}; the value never reaches code, logs (Databricks redacts scope-read values in output), or Git \cite{databricksSecretScopes}. Databricks-backed scopes are simple; Key Vault/AWS-backed scopes put rotation and policy in your cloud vault---choose the vault-backed scope when rotation SLAs and cross-service sharing matter.
+
+\begin{lstlisting}[language=Python,caption={The only acceptable way a notebook touches a credential.},label={lst:ch21-secrets}]
+# The secret lives in the vault-backed scope; the notebook reads a handle.
+kafka_password = dbutils.secrets.get(scope="kv-prod", key="kafka-password")
+# Databricks redacts this value if printed; it never exists in source control.
+\end{lstlisting}
+
+\section{Wednesday: Network Isolation}
+\subsection{Private Connectivity and Perimeter Controls}
+The network posture has three surfaces \cite{databricksSecurity}: (1) \textbf{user-to-control-plane}---IP access lists and conditional access at the IdP; (2) \textbf{control-plane-to-data-plane}---private connectivity so orchestration traffic avoids the public internet; (3) \textbf{cluster-to-storage/data-sources}---private endpoints and storage firewall rules so data-plane traffic stays on the cloud backbone. Classic compute runs in your VNet/VPC (or a Databricks-managed one), so your existing egress controls apply to clusters.
+
+\subsection{What IP Lists Do Not Do}
+An IP access list is a perimeter, not authentication: it stops the coffee-shop login, not the phished token replayed from the office VPN. Defense in depth means the list plus SSO with MFA plus short-lived tokens plus audit alerts---each layer catching what the others miss.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.4cm}p{4.6cm}p{4.8cm}@{}}
+\toprule
+\textbf{Control} & \textbf{Stops} & \textbf{Does not stop} \\
+\midrule
+SSO + MFA & Password-only compromise & Token theft after login \\
+SCIM & Orphaned leaver access & Privilege creep within synced groups \\
+IP access lists & Off-network access & Stolen credentials from allowed networks \\
+Secret scopes & Secrets in code/logs & Over-broad scope ACLs \\
+Private connectivity & Public-internet data exposure & Misconfigured endpoints/DNS \\
+\bottomrule
+\end{tabular}
+\caption{Each control has a known blind spot; the posture is the combination.}
+\label{tab:ch21-controls}
+\end{table}
+
+\section{Thursday Hands-on Project: Harden a Lab Workspace}
+Provision a service principal, scope its grants, move a notebook off a hardcoded PAT, add an IP access list, and prove the blocked path is blocked.
+\index{hands-on lab}\index{service principal!lab}\index{secret scope!lab}
+
+\begin{lstlisting}[language=PowerShell,caption={Week 21 lab: principal, scope, and perimeter.},label={lst:ch21-lab}]
+# 1. Service principal with a least-privilege grant set
+databricks service-principals create --display-name sp-etl-lab
+#    -> grant per Chapter 8: MODIFY on bronze/silver/gold, nothing else
+
+# 2. Secret scope + secret
+databricks secrets create-scope kv-lab
+databricks secrets put-secret kv-lab kafka-password --string-value '<from-vault>'
+
+# 3. Convert the notebook: delete the PAT literal, replace with
+#    dbutils.secrets.get("kv-lab", "kafka-password")  (see lst:ch21-secrets)
+
+# 4. IP access list: allow the office range only
+databricks ip-access-lists create --label office --list-type ALLOW `
+    --ip-addresses '["203.0.113.0/24"]'
+
+# 5. Negative test: from an off-list network (phone hotspot),
+#    databricks current-user me  -> must be denied; capture the 403.
+\end{lstlisting}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item The service principal with its grant list (and the one-line justification per grant).
+    \item The converted notebook running without any literal credential.
+    \item The IP access list with the denied-request evidence.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item The principal cannot read outside its schemas (negative test captured).
+    \item A repository secret scan comes back clean; the old PAT is revoked.
+    \item The blocked-network test fails closed (deny), with the audit event found in system tables.
+    \item The lab runs as the service principal end to end, proving person-independence.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Migrate the scope to Key Vault-backed and document the rotation procedure.
+    \item Set the workspace PAT policy (max lifetime, admin-only creation) and show a violating token request denied.
+    \item Write the monthly SCIM-vs-workspace membership diff script.
+\end{itemize}
+
+\section{Friday Use Case: Contractors, Service Principals, and No Public Internet}
+A platform team must onboard 15 contractors for a 90-day engagement, run all production jobs as non-human identities, and move all data-plane traffic off the public internet---without slowing the two dozen engineers already onboard.
+\index{contractor access}\index{zero trust}
+
+\subsection{Requirements and Assumptions}
+Contractors need Silver read and Gold read/write in one domain, nothing else, auto-expiring at day 90. Production spans 40 jobs. The security team requires private connectivity evidence for the next audit.
+
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[
+        idp/.style={rectangle, rounded corners, draw=codegreen!60!black, thick, fill=green!7, align=center, minimum width=3.0cm, minimum height=0.9cm, font=\small\bfseries},
+        ws/.style={rectangle, rounded corners, draw=primary, thick, fill=primary!6, align=center, minimum width=3.2cm, minimum height=1.0cm, font=\small\bfseries},
+        net/.style={rectangle, rounded corners, draw=red!60!black, thick, fill=red!5, align=center, minimum width=3.0cm, minimum height=0.9cm, font=\scriptsize\bfseries},
+        flow/.style={-{Latex[length=2mm]}, draw=primary, thick}
+    ]
+        \node[idp] (idp) at (0,0.8) {IdP: SSO + SCIM\\(contractor group,\\90-day expiry)};
+        \node[ws] (ws) at (4.8,0.8) {Workspace\\UC grants to groups\\SP-run jobs};
+        \node[net] (iplist) at (9.6,0.8) {IP access list\\+ private link};
+        \node[net] (fw) at (9.6,-1.0) {Storage firewall\\+ private endpoints};
+        \node[ws] (data) at (4.8,-1.0) {Data plane\\(your VNet)};
+        \node[idp] (audit) at (0,-1.0) {Audit:\\access + auth logs};
+        \draw[flow] (idp) -- (ws);
+        \draw[flow] (ws) -- (iplist);
+        \draw[flow] (ws) -- (data);
+        \draw[flow] (data) -- (fw);
+        \draw[flow, dashed] (iplist) -- (audit);
+        \draw[flow, dashed] (fw) -- (audit);
+    \end{tikzpicture}%
+    }
+    \caption{Zero-public-internet posture: IdP-driven identity, group-scoped grants, private data paths, continuous audit.}
+    \label{fig:ch21-zerotrust}
+\end{figure}
+
+\subsection{Architecture Decisions}
+\textbf{Contractor lifecycle as IdP configuration.} A \texttt{contractors-engagement-7} IdP group with a 90-day membership expiry; SCIM syncs it; UC grants target the group at the domain's schemas. Offboarding is the expiry firing---evidenced by the membership diff script---not a ticket someone remembers.
+
+\textbf{Private data plane.} Private endpoints for storage, storage firewall rules denying public access, private connectivity for control-plane traffic, and IP access lists on the workspace. The audit evidence is the negative test (public path denied) plus the endpoint inventory---asserted configurations are not evidence.
+
+\begin{pitfall}
+\textbf{Granting contractors to shared groups.} ``Just add them to \texttt{data-engineers} for now'' defeats expiry (the group outlives the engagement) and scope (the group sees all domains). One group per engagement with per-domain grants is five minutes of IdP work and zero cleanup risk.
+\end{pitfall}
+
+\subsection{Risks and Mitigations}
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{4.6cm}p{7.6cm}@{}}
+\toprule
+\textbf{Risk} & \textbf{Mitigation} \\
+\midrule
+Contractor access outlives the engagement & IdP group expiry; membership diff evidences the exit \\
+Service-principal secret leaks & Vault rotation runbook; audit baselines catch volume anomalies \\
+Private path bypassed by a new route & Quarterly negative tests; config drift detection \\
+SCIM outage strands new joiners & Documented manual-override with 48-hour auto-expiry \\
+IP list blocks a legitimate office move & Change window with staged allow-list; break-glass procedure \\
+\bottomrule
+\end{tabular}
+\caption{Week 21 scenario risks and mitigations.}
+\label{tab:ch21-risks}
+\end{table}
+
+\section{Design Decision Guide}
+\index{decision guide!Week 21}%
+Security decisions layer; none of these controls is sufficient alone.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.4cm}p{4.4cm}p{4.6cm}@{}}
+\toprule
+\textbf{Decision} & \textbf{Choose the first when} & \textbf{Choose the second when} \\
+\midrule
+Service principal vs.\ PAT & Any automated workload & Short-lived personal CLI use only \\
+OAuth M2M vs.\ long-lived token & CI/CD and scheduled jobs & Legacy tooling that cannot OAuth \\
+Vault-backed vs.\ Databricks-backed scope & Rotation SLAs, cross-service secrets & Platform-local simplicity \\
+IP access list vs.\ private connectivity & User perimeter filtering & Data-plane traffic privacy \\
+SCIM groups vs.\ manual membership & Any shared workspace & Never manual at scale \\
+Group expiry vs.\ ticket-based offboarding & Time-boxed engagements & Permanent staff via IdP lifecycle \\
+\bottomrule
+\end{tabular}
+\caption{Week 21 decision guide.}
+\label{tab:ch21-decisions}
+\end{table}
+
+The layering table from Wednesday (\cref{tab:ch21-controls}) is the check: for each row here, ask which blind spot remains and which other control covers it.
+
+\section{Operational Guidance for Week 21}
+\index{operational guidance!Week 21}%
+\subsection{Performance and Reliability}
+Security operations run on cadence: monthly SCIM-membership diffs, quarterly access reviews with negative tests, and immediate alerts on authentication anomalies (new-country logins, PAT creation bursts). Keep the break-glass path drilled and documented---a lockout discovered during an incident is a design flaw, not bad luck. Token and secret rotation is scheduled work with a runbook, verified by a post-rotation smoke test.
+
+\subsection{Security and Governance Checklist}
+\begin{itemize}
+    \item Quarterly diff of workspace membership against SCIM-synced groups.
+    \item PAT inventory with expiries; policy caps enforced at the workspace.
+    \item Service principal secrets rotated on schedule with owner sign-off.
+    \item IP access lists and private endpoints re-validated after any network change.
+\end{itemize}
+
+\subsection{Troubleshooting Playbook}
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.6cm}p{4.2cm}p{4.8cm}@{}}
+\toprule
+\textbf{Symptom} & \textbf{Likely cause} & \textbf{First action} \\
+\midrule
+SCIM group not appearing & Provisioning scope/filter misconfigured & Check the IdP provisioning log first \\
+\texttt{dbutils.secrets.get} denied & Principal missing scope ACL & Grant READ on the scope to the run-as identity \\
+Legitimate user locked out & IP access list too narrow & Break-glass admin; add the range; review the change \\
+CI fails auth after rotation & SP secret rotated without CI update & Update the vault entry CI reads; never the code \\
+\bottomrule
+\end{tabular}
+\caption{Week 21 troubleshooting quick reference.}
+\label{tab:ch21-trouble}
+\end{table}
+
+\section{Interview Q\&A}
+\subsection{Concepts and Trade-offs}
+\begin{enumerate}
+    \item \textbf{Q: Why must production jobs run as service principals?}\\
+    A: Person-run jobs break when the person leaves, inherit the person's full access (not least-privilege), and blur accountability. Principals are scoped, owned, rotated, and auditable.
+    \item \textbf{Q: What does SCIM actually automate?}\\
+    A: Joiner/mover/leaver synchronization: group membership in Databricks tracks the IdP, so access appears and disappears with HR state---no orphaned accounts, no provisioning tickets.
+    \item \textbf{Q: Databricks-backed versus vault-backed secret scope?}\\
+    A: Vault-backed when rotation SLAs, cross-service sharing, or existing vault governance matter; Databricks-backed for simplicity when platform-local secrets suffice.
+    \item \textbf{Q: Is an IP access list sufficient network security?}\\
+    A: No---it is a perimeter filter. Stolen credentials from an allowed network pass it. Layer it with SSO/MFA, short-lived tokens, private connectivity, and audit alerts (\cref{tab:ch21-controls}).
+    \item \textbf{Q: How do you prove least privilege for a service principal?}\\
+    A: The grant list with per-grant justification, negative tests for excluded access, and an audit sample showing actual use matches granted scope.
+    \item \textbf{Q: A manager asks for ``temporary admin'' for a contractor. Response?}\\
+    A: Time-boxed group membership for the needed scope, expiring automatically---admin is never the temporary answer to a scoped need.
+    \item \textbf{Q: How do you security-test your own platform?}\\
+    A: Negative tests as code: principals attempt what they must not do, on a schedule, with failures logged as pass/fail evidence. Security that is only reviewed, not tested, is a rumor.
+    \item \textbf{Q: Which single control gives the most risk reduction per hour?}\\
+    A: Running production workloads as least-privilege service principals. It caps blast radius, survives personnel change, and makes every automated action attributable.
+\end{enumerate}
+
+\section{Further Reading}
+The Databricks security and compliance documentation is the reference \cite{databricksSecurity}; SCIM provisioning is covered in \cite{databricksSCIM}; secrets in \cite{databricksSecretScopes}; audit via system tables in \cite{databricksSystemTables}. The identity-to-grants mapping builds directly on Chapter 8 \cite{databricksUnityCatalog}.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item Identity at the account, from the IdP: SSO for people, SCIM for lifecycle, service principals for machines.
+    \item No production workload runs as a person; no secret lives in code---scopes and OAuth M2M make both avoidable.
+    \item Every network control has a known blind spot; the posture is the layered combination plus audit.
+    \item Time-boxed access is IdP configuration (group expiry), not a calendar reminder.
+    \item Security evidence is negative tests and audit queries, not asserted configuration.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Map a joiner/mover/leaver event to the exact SCIM/UC changes each should cause.
+    \item \textbf{(Conceptual)} Why is PAT policy a governance control rather than a convenience setting?
+    \item \textbf{(Hands-on)} Complete the Thursday lab, including the fail-closed network test.
+    \item \textbf{(Hands-on)} Convert a second notebook to OAuth M2M via environment variables; document the credential lifetime change.
+    \item \textbf{(Hands-on)} Run the membership diff and the authentication audit query for your lab workspace.
+    \item \textbf{(Design)} Write the contractor group design (naming, grants, expiry) for the Friday scenario.
+    \item \textbf{(Operations)} Draft the incident runbook for ``service principal secret leaked.''
+    \item \textbf{(Architecture)} What changes in this design on serverless-only compute, where there is no customer VNet? What do you gain and lose?
+\end{enumerate}

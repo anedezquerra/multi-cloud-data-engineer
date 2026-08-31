@@ -1,0 +1,318 @@
+\chapter{Unity Catalog Deep Dive: Lineage, Audit, and Delta Sharing}
+\index{Unity Catalog!lineage}\index{column lineage}\index{system.access.audit}\index{Delta Sharing}%
+\index{clean rooms}\index{data classification}\index{impact analysis}\index{share revocation}%
+\begin{objectives}
+\begin{itemize}
+    \item Capture and query table- and column-level lineage for impact analysis and debugging.
+    \item Build an audit practice on \texttt{system.access.audit}: sensitive-access alerts and compliance reporting.
+    \item Share live data with Delta Sharing---open protocol and Databricks-to-Databricks---with revocation tested.
+    \item Apply data classification (tags) and use classification-driven policy.
+    \item Trace a Gold metric to its Bronze sources and enumerate every downstream consumer.
+    \item Design consortium data sharing with auditability and revocation.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+Lineage, audit, and sharing are the \textbf{accountability layer}; each platform implements them
+at different depths.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{3.0cm}p{3.4cm}p{3.2cm}p{3.2cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{Databricks (UC)} & \textbf{AWS} & \textbf{Azure / GCP / Fabric} \\
+\midrule
+Lineage & Automatic table + column lineage & Glue lineage (partial) / SageMaker & Purview / Dataplex / Fabric lineage \\
+Audit log & \texttt{system.access.audit} & CloudTrail + Lake Formation & Activity Log / Cloud Audit Logs \\
+Secure sharing & Delta Sharing (open protocol) & Redshift sharing / S3 Access Grants & Azure Data Share / BigQuery Analytics Hub / OneLake shortcuts \\
+Cross-org compute & Clean rooms & Clean Rooms (AWS) & Azure confidential clean rooms \\
+Classification & Tags + discovery (PII) & Macie & Purview scans / DLP \\
+Recipient without account & Yes (open protocol) & No (needs AWS entity) & Varies / BigQuery subscriber \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+\textbf{Snowflake} shares via listings and reader accounts (its own clean-room story); Delta
+Sharing's distinction is the \emph{open} protocol---recipients consume with pandas, Spark, or
+Power BI without any Databricks account.
+\end{crosscloud}
+
+\section{Week 22 Roadmap and Mental Model}
+Chapter 8 built the grants; Week 22 builds the \emph{evidence}: lineage that shows how data flows, audit that shows who touched it, and sharing that extends the governance boundary past your own organization. This is the week the platform starts answering its own hard questions \cite{databricksLineage,databricksSystemTables}.
+
+The mental model: \textbf{governance is a query workload}. Lineage is system tables you join; audit is an event log you alert on; sharing is a grant with a network protocol. Treating them as data---queryable, testable, alertable---is what separates a governed platform from a documented one.
+
+\begin{definitionbox}
+\textbf{Delta Sharing} is an open protocol for sharing live tables and volumes: the provider publishes a \textbf{share}; recipients query it through short-lived, pre-signed access without holding storage credentials or copying data. Revocation ends access centrally. \textbf{Column-level lineage} records which source columns produced which target columns across notebooks, jobs, and dashboards.
+\end{definitionbox}
+
+\begin{keyterms}
+\textbf{Share}: a named set of shared objects. \textbf{Recipient}: the consuming principal (Databricks or open-protocol). \textbf{Clean room}: a governed multi-party compute environment. \textbf{Impact analysis}: enumerating downstream consumers of an object before changing it. \textbf{Classification tag}: a UC tag marking sensitivity (e.g.\ \texttt{pii=true}) that policy and audit reference.
+\end{keyterms}
+
+\section{Monday: Lineage}
+\subsection{What Gets Captured}
+UC captures lineage automatically for reads/writes through Databricks compute: table-to-table, column-to-column, and into notebooks, jobs, dashboards, and registered models. The queries that change how you work: \emph{upstream} (what produced \texttt{gold.fact\_orders.total\_amount}?---the debugging question) and \emph{downstream} (what breaks if I change \texttt{silver.orders.order\_ts}?---the impact question) \cite{databricksLineage}.
+
+\begin{lstlisting}[language=SQL,caption={Column-level impact analysis before a breaking change.},label={lst:ch22-lineage}]
+-- Everything downstream of silver.orders.order_ts:
+SELECT DISTINCT target_table_full_name, target_column_name
+FROM system.access.column_lineage
+WHERE source_table_full_name = 'de_training.silver.orders'
+  AND source_column_name = 'order_ts';
+
+-- And the full provenance of a Gold metric:
+SELECT DISTINCT source_table_full_name, source_column_name
+FROM system.access.column_lineage
+WHERE target_table_full_name = 'de_training.gold.fact_orders'
+  AND target_column_name = 'total_amount';
+\end{lstlisting}
+
+\begin{tipbox}
+Run the downstream query from a pre-merge check in CI (Chapter 23): a PR that changes a column with downstream consumers gets an automatic comment listing them. Impact analysis that requires remembering to run it will not be run.
+\end{tipbox}
+
+\section{Tuesday: The Audit Practice}
+\subsection{system.access.audit as an Alerting Source}
+The audit table records authentication, grants, reads, writes, and administrative actions with user, object, and timestamp \cite{databricksSystemTables}. The practice, in ascending maturity: (1) ad-hoc answers (``who read \texttt{dim\_customer} last Tuesday?''); (2) scheduled reports (weekly access review per PII-tagged table); (3) alerts (any PII read by a non-approved group pages compliance); (4) baselines (anomaly: this service principal suddenly reads 40x its normal volume).
+
+\begin{lstlisting}[language=SQL,caption={The PII access alert query.},label={lst:ch22-audit-alert}]
+SELECT event_time, user_identity.email AS actor, request_params
+FROM system.access.audit
+WHERE action_name IN ('getTable','commandText')
+  AND request_params.full_name_arg = 'de_training.gold.dim_customer'
+  AND user_identity.email NOT IN
+      (SELECT member FROM de_training.governance.approved_pii_readers)
+  AND event_date >= current_date() - 1;
+-- Scheduled every 15 minutes; non-empty result pages the steward.
+\end{lstlisting}
+
+\subsection{Classification-Driven Policy}
+Tag sensitive objects (\texttt{pii=true}, \texttt{domain=finance}) so policy references the classification, not the table list: the alert above generalizes to ``any table tagged \texttt{pii},'' and new tables inherit scrutiny the day they are tagged. Classification without policy is decoration; policy without classification is a spreadsheet that rots.
+
+\section{Wednesday: Delta Sharing and Clean Rooms}
+\subsection{Sharing Without Copies}
+The provider creates a share, adds tables (or partitions of them), and adds recipients. Databricks-to-Databricks recipients see the share in their own catalog; open-protocol recipients get a credential file and query via pandas/Spark/Power BI connectors \cite{databricksDeltaSharing}. The provider's storage credentials never cross the boundary; access is short-lived and revocable; every read is auditable on the provider side.
+
+\begin{lstlisting}[language=SQL,caption={Create, populate, grant, and---critically---revoke a share.},label={lst:ch22-sharing}]
+CREATE SHARE supply_chain_orders;
+ALTER SHARE supply_chain_orders
+  ADD TABLE de_training.gold.fact_orders_shared;
+GRANT SELECT ON SHARE supply_chain_orders TO RECIPIENT acme_logistics;
+
+-- The revocation drill (the part everyone skips):
+REVOKE SELECT ON SHARE supply_chain_orders FROM RECIPIENT acme_logistics;
+-- Verify: the recipient's next read fails. Capture both sides as evidence.
+\end{lstlisting}
+
+\subsection{Clean Rooms}
+When parties must compute \emph{together} (match lists, joint aggregates) without either seeing the other's raw rows, a clean room provides the governed, audited meeting point---notebooks run against both parties' shared assets with outputs constrained by the room's rules.
+
+\begin{pitfall}
+\textbf{Sharing the whole schema.} Shares should contain the curated, agreed artifacts---not the schema they came from. One over-broad \texttt{ADD TABLE} is a data-sharing incident waiting for its audit. Share narrow, document the agreement, and test revocation before the first consumer connects.
+\end{pitfall}
+
+\section{Thursday Hands-on Project: Trace, Alert, Share, Revoke}
+Build the lineage trace for a Gold column, wire the PII audit alert, and execute a full share-revoke cycle with an external recipient.
+\index{hands-on lab}\index{Delta Sharing!lab}\index{lineage!lab}
+
+\begin{lstlisting}[language=Python,caption={Week 22 lab: the recipient-side check (open protocol).},label={lst:ch22-lab}]
+# Recipient environment (separate machine/env, no Databricks account):
+import delta_sharing
+import pandas as pd
+
+profile = "acme_profile.share"      # the credential file you were sent
+client = delta_sharing.SharingClient(profile)
+print([t.name for t in client.list_all_tables()])
+
+df = delta_sharing.load_as_pandas(
+    f"{profile}#supply_chain_orders.de_training.fact_orders_shared")
+print(len(df))
+
+# After revocation, the same call raises an authorization error.
+# Capture the before/after outputs: that pair IS the revocation evidence.
+\end{lstlisting}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item The column-lineage trace from \texttt{gold.fact\_orders.total\_amount} to Bronze, plus the downstream consumer list.
+    \item The PII alert query scheduled, with one planted violation captured.
+    \item The share lifecycle evidence: grant, recipient read, revoke, recipient denial.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item The lineage report includes at least one dashboard and one model as downstream consumers.
+    \item The alert fires on the planted read and stays quiet on approved reads (both evidenced).
+    \item Revocation demonstrably ends the recipient's access.
+    \item The shared object set is the curated view---not the base table---with the agreement documented.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Add the CI pre-merge impact check using the column-lineage query.
+    \item Classify all Gold tables with sensitivity tags and generalize the alert to tag-driven coverage.
+    \item Share a volume (files) instead of a table and document the difference in recipient experience.
+\end{itemize}
+
+\section{Friday Use Case: The Supply-Chain Consortium}
+Five companies exchange curated datasets---forecasts, inventory positions, shipment events---with three requirements: no cross-company credentials, complete auditability, and provable revocation when a member leaves.
+\index{data consortium}\index{Delta Sharing!design}
+
+\subsection{Requirements and Assumptions}
+Members run mixed platforms (two Databricks, one Snowflake, one pure-Python analytics shop, one Power BI shop). Data agreements are bilateral; leaving the consortium is contractual with a 30-day wind-down.
+
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[
+        member/.style={rectangle, rounded corners, draw=primary, thick, fill=primary!6, align=center, minimum width=2.8cm, minimum height=0.95cm, font=\small\bfseries},
+        share/.style={rectangle, rounded corners, draw=codegreen!60!black, thick, fill=green!8, align=center, minimum width=2.6cm, minimum height=0.85cm, font=\scriptsize\bfseries},
+        audit/.style={rectangle, rounded corners, draw=red!60!black, thick, fill=red!5, align=center, minimum width=3.0cm, minimum height=0.85cm, font=\scriptsize\bfseries},
+        flow/.style={-{Latex[length=2mm]}, draw=primary, thick}
+    ]
+        \node[member] (a) at (0,0) {Member A\\(Databricks)};
+        \node[share] (sa) at (3.8,0) {Share:\\forecasts\_a};
+        \node[member] (b) at (7.6,0.8) {Member B\\(Snowflake)};
+        \node[member] (c) at (7.6,-0.8) {Member C\\(Python)};
+        \node[member] (d) at (11.4,0) {Member D\\(Power BI)};
+        \node[audit] (aud) at (3.8,-1.8) {Provider-side audit:\\every read logged,\\revocation tested};
+        \draw[flow] (a) -- (sa);
+        \draw[flow] (sa) -- (b);
+        \draw[flow] (sa) -- (c);
+        \draw[flow] (sa) -- (d);
+        \draw[flow, dashed] (sa) -- (aud);
+    \end{tikzpicture}%
+    }
+    \caption{Consortium sharing: open-protocol shares serve every member platform; the provider keeps credentials, audit, and the revocation switch.}
+    \label{fig:ch22-consortium}
+\end{figure}
+
+\subsection{Architecture Decisions}
+\textbf{Open protocol as the equalizer.} Because Delta Sharing is an open protocol, Member B consumes via its Delta Sharing connector, Member C via the Python client, Member D via Power BI---no member needs a Databricks account or the provider's storage credentials. Each bilateral agreement is a separate share (never a shared share), so obligations, schemas, and revocation are per-agreement by construction.
+
+\textbf{The exit drill.} Wind-down is: revoke the member's share grants (access ends immediately, evidenced), retain the audit history per the agreement, and archive the share definition. The quarterly consortium review includes a live revocation test on a canary share---the same drill from the lab, run where it matters.
+
+\begin{pitfall}
+\textbf{Emailing extracts ``because sharing is hard to set up.''} An emailed CSV is unauditable, unrevocable, and instantly stale---precisely the three requirements. The share setup is one afternoon; the first leaked extract is a contract breach.
+\end{pitfall}
+
+\subsection{Risks and Mitigations}
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{4.6cm}p{7.6cm}@{}}
+\toprule
+\textbf{Risk} & \textbf{Mitigation} \\
+\midrule
+Share contents drift past the agreement & Share objects are curated views; schema changes reviewed \\
+Revocation assumed but untested & Quarterly revocation drill on a canary share \\
+Lineage trusted where coverage ends & Coverage report lists objects written outside UC-aware compute \\
+Audit alerts ignored after false alarms & Precision reviewed monthly; alerts route to a rotation \\
+Member disputes a read claim & Provider-side audit rows are the shared evidence standard \\
+\bottomrule
+\end{tabular}
+\caption{Week 22 scenario risks and mitigations.}
+\label{tab:ch22-risks}
+\end{table}
+
+\section{Design Decision Guide}
+\index{decision guide!Week 22}%
+Sharing and audit decisions define who can prove what, afterward.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.4cm}p{4.4cm}p{4.6cm}@{}}
+\toprule
+\textbf{Decision} & \textbf{Choose the first when} & \textbf{Choose the second when} \\
+\midrule
+Databricks-to-Databricks vs.\ open protocol & Both sides run Databricks & Any non-Databricks recipient \\
+Share vs.\ extract/copy & Live, revocable, auditable access & Never for governed data \\
+Clean room vs.\ bilateral shares & Joint computation without raw exposure & One-directional curated delivery \\
+Tag-driven vs.\ table-list policy & Estates that grow & Tiny fixed estates \\
+Audit alert vs.\ scheduled report & Actionable, rare events & Trend and compliance review \\
+Per-agreement share vs.\ one big share & Always per agreement & Never bundle obligations \\
+\bottomrule
+\end{tabular}
+\caption{Week 22 decision guide.}
+\label{tab:ch22-decisions}
+\end{table}
+
+The discipline that makes this week stick: every shared artifact can answer, on demand, four questions---who consumes it, under which agreement, when was revocation last tested, and what did they read last quarter.
+
+\section{Operational Guidance for Week 22}
+\index{operational guidance!Week 22}%
+\subsection{Performance and Reliability}
+Lineage and audit pipelines are platform services with their own SLOs: lineage freshness (time from write to visible edge), audit-query latency, and alert precision. Tune the PII alert quarterly---false positives train people to ignore the real event. Inventory shares monthly: every share has an owner, an agreement reference, and a last-revocation-test date.
+
+\subsection{Security and Governance Checklist}
+\begin{itemize}
+    \item Shares contain curated artifacts only; scope reviewed per agreement.
+    \item Revocation tests scheduled quarterly per share, evidenced on both sides.
+    \item Classification-tag coverage tracked as a metric (percent of tables tagged).
+    \item Audit-alert recipients are a group with an on-call rotation, not a person.
+\end{itemize}
+
+\subsection{Troubleshooting Playbook}
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.6cm}p{4.2cm}p{4.8cm}@{}}
+\toprule
+\textbf{Symptom} & \textbf{Likely cause} & \textbf{First action} \\
+\midrule
+Lineage gap for a table & Written outside Databricks compute & Register the external writer; document the gap \\
+PII alert floods & Over-broad table set or rule & Tune to tag-driven scope; baseline normal access \\
+Recipient cannot read share & Credential file expired / share not granted & Re-issue the activation; verify GRANT on the share \\
+Audit query slow & Scanning months of events unpartitioned & Filter by event\_date first; aggregate to a summary table \\
+\bottomrule
+\end{tabular}
+\caption{Week 22 troubleshooting quick reference.}
+\label{tab:ch22-trouble}
+\end{table}
+
+\section{Interview Q\&A}
+\subsection{Concepts and Trade-offs}
+\begin{enumerate}
+    \item \textbf{Q: What does column-level lineage change operationally?}\\
+    A: Impact analysis becomes a query: every downstream consumer of a column is enumerable before you change it, and every metric is traceable to sources after something looks wrong. Debugging and change review both accelerate.
+    \item \textbf{Q: How would you alert on PII access?}\\
+    A: Scheduled query over \texttt{system.access.audit} joined to the classification tags and the approved-reader list; non-approved access pages the steward. Tag-driven, so new PII tables are covered on classification day.
+    \item \textbf{Q: Why does Delta Sharing not share storage credentials?}\\
+    A: Recipients get short-lived, pre-signed access per request through the sharing server; the provider's storage account is never exposed, and revocation is a provider-side grant change with immediate effect.
+    \item \textbf{Q: Open-protocol versus Databricks-to-Databricks sharing?}\\
+    A: D2D is zero-credential and fully governed on both sides (UC end to end); open protocol reaches any platform with a credential file. Use D2D when both sides are Databricks; open protocol for everyone else.
+    \item \textbf{Q: What makes a consortium exit provable?}\\
+    A: The revocation drill: grant, read, revoke, failed read---all four logged. ``We believe access ended'' is not evidence; the recipient's denied request is.
+    \item \textbf{Q: How does lineage change schema-change review?}\\
+    A: The review starts from the consumer list, not the table: every downstream table, dashboard, and model is enumerated, so ``is this safe'' has a concrete answer.
+    \item \textbf{Q: What is the clean-room decision rule?}\\
+    A: When parties must compute jointly without exposing raw rows---match rates, joint aggregates. If one party could just receive a curated table, a share suffices; clean rooms are for mutual privacy.
+    \item \textbf{Q: How do you handle a data subject erasure request in a lakehouse?}\\
+    A: Targeted deletes through the layers with deletion vectors, a provenance query to find every copy, and \texttt{VACUUM} timing understood---erasure is a pipeline with evidence, not a one-off script.
+\end{enumerate}
+
+\section{Further Reading}
+Lineage is documented in \cite{databricksLineage}, system-table audit in \cite{databricksSystemTables}, and Delta Sharing in \cite{databricksDeltaSharing}. The grant model these build on is Chapter 8 \cite{databricksUnityCatalog}; the identity layer underneath is Chapter 21 \cite{databricksSecurity}.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item Lineage and audit are system tables: governance questions are queries, and policy is a scheduled job.
+    \item Impact analysis belongs in CI; a column change should enumerate its consumers before merge.
+    \item Classification tags make policy cover new data on day one; untagged policy rots.
+    \item Delta Sharing extends governance past your organization---with no copies, no shared credentials, and provable revocation.
+    \item Test revocation before the first consumer connects; drill it quarterly after.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Why is lineage capture ``free'' in UC but historically a separate product elsewhere?
+    \item \textbf{(Conceptual)} What is the difference between auditing access and auditing usage patterns, and which catches exfiltration?
+    \item \textbf{(Hands-on)} Complete the Thursday lab, including the open-protocol recipient test.
+    \item \textbf{(Hands-on)} Build the weekly PII-access review report and the per-domain access summary.
+    \item \textbf{(Hands-on)} Write the CI pre-merge lineage check for one repository.
+    \item \textbf{(Design)} Design the share taxonomy (naming, per-agreement isolation, schema contracts) for the Friday scenario.
+    \item \textbf{(Operations)} Write the member-exit runbook with the evidence checklist.
+    \item \textbf{(Architecture)} When would a clean room beat bilateral shares? Give a concrete consortium computation that requires it.
+\end{enumerate}

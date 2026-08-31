@@ -1,0 +1,306 @@
+\chapter{Getting Started: Your Databricks Workspace and Environment}
+\index{Databricks workspace}\index{free trial}\index{Community Edition}\index{personal access token}\index{OAuth}%
+\index{Databricks CLI}\index{databricks-sdk-py}\index{DBU}\index{auto-termination}\index{catalog}\index{naming conventions}%
+\lstdefinelanguage{PowerShell}{
+    morekeywords={Set-Variable,Write-Output,New-Item,Remove-Item,Get-Content,Set-Content,ConvertTo-Json,Out-File,if,else,foreach,where,return},
+    sensitive=false,
+    morecomment=[l]{\#},
+    morestring=[b]',
+    morestring=[b]"
+}
+
+\begin{objectives}
+\begin{itemize}
+    \item Create a Databricks workspace, distinguish the free trial from Community Edition and an organizational workspace, and identify the inputs required during sign-up.
+    \item Secure the workspace by avoiding shared admin use, understanding personal access token (PAT) policy, and preferring OAuth for daily work.
+    \item Install and validate the Databricks CLI and \texttt{databricks-sdk-py} on Windows PowerShell, and compare token configuration with OAuth profiles.
+    \item Configure CLI profiles, the workspace host, and VS Code so examples in later chapters can run reproducibly.
+    \item Establish cost guardrails with cluster policies, auto-termination, serverless compute, and billing alerts.
+    \item Apply the catalog, schema, and naming conventions used throughout this book.
+    \item Verify the environment with the CLI and a short notebook create, run, and cleanup workflow.
+\end{itemize}
+\end{objectives}
+
+\begin{keyterms}
+\textbf{Workspace}: the top-level Databricks environment where notebooks, clusters, jobs, and data objects live. \textbf{Control plane}: Databricks-managed services (web UI, jobs scheduler, cluster manager). \textbf{Data plane}: compute and storage in your cloud account. \textbf{DBU}: Databricks Unit, the per-second compute billing unit. \textbf{CLI profile}: a named set of host and credential configuration for the Databricks CLI.
+\end{keyterms}
+
+\section{Why Chapter 0 Exists}
+Before creating Delta tables, pipelines, streams, or serving endpoints, you need a safe sandbox. This chapter builds that sandbox deliberately: workspace, identity, command-line tooling, compute guardrails, naming rules, and a tiny verification exercise. The goal is not to become a workspace administrator in one sitting. The goal is to remove the avoidable problems that derail hands-on learning: working with a personal admin identity every day, forgetting auto-termination, losing track of CLI profiles, creating objects without naming conventions, or discovering charges after a lab was supposed to be cleaned up.
+
+This book assumes a Windows workstation and PowerShell. Most Databricks commands are the same on macOS, Linux, and Windows Terminal, but file paths, environment variables, quoting, and here-documents differ. Where the shell matters, listings use native PowerShell conventions.
+
+\begin{notebox}
+The examples in this chapter use a personal trial workspace or an organization-approved sandbox. Do not run training commands in a production workspace unless your employer has explicitly approved the workspace, compute policy, budget, and cleanup process.
+\end{notebox}
+
+\section{Creating a Workspace}
+\subsection{What You Need Before Sign-up}
+To start a Databricks trial, prepare a work or personal email address and---for a full trial on your own cloud account---access to an AWS, Azure, or GCP subscription where the workspace's data plane will run. Databricks also offers express and Community Edition paths that require no cloud account at all \cite{databricksTrial}. Choose deliberately:
+
+\begin{itemize}
+    \item \textbf{Full trial (own cloud account)}: complete feature set including classic clusters, Unity Catalog with your own storage, and VNet/VPC options. Compute VMs bill to your cloud account; Databricks bills DBUs against trial credits.
+    \item \textbf{Express / serverless trial}: no cloud account required; serverless compute only. Covers most of this book's SQL, pipeline, and ML labs.
+    \item \textbf{Community Edition}: a permanently free, limited workspace. Sufficient for Delta Lake, Spark, and MLflow fundamentals; not sufficient for Unity Catalog, SQL warehouses, or workflows at production scale.
+\end{itemize}
+
+\begin{definitionbox}
+\textbf{The Databricks free trial} is a credit grant, not an unlimited free account. Trial credits cover DBU consumption; on the full trial, the underlying cloud infrastructure (VMs, storage, egress) bills to your own cloud account from the first minute a classic cluster runs.
+\end{definitionbox}
+
+\subsection{Understanding the Cost Model}
+Databricks cost has two components: \textbf{DBUs} (the platform's compute unit, billed per second, with different rates per workload type---all-purpose, jobs, SQL, serverless) and \textbf{cloud infrastructure} (the VMs, disks, and egress in your cloud account, billed by the cloud provider). A stopped cluster bills neither; an idle all-purpose cluster bills both until auto-termination fires.
+
+\begin{pitfall}
+\textbf{Assuming the trial means no bill.} Trial credits absorb DBUs, but cloud VM hours from forgotten classic clusters, storage of intermediate tables, and cross-region egress still bill to your cloud account. Chapter 23 builds the habit of reading \texttt{system.billing.usage} weekly.
+\end{pitfall}
+
+\section{Securing the Workspace}
+\subsection{Identity Basics}
+The account you create with is an administrator. For daily learning work this is acceptable in a trial, but build the production habit early: administrators administer; engineers engineer. When your trial allows, create a second user or a service principal for pipeline work, and keep admin actions (user management, metastore binding, network configuration) distinct from data work.
+
+\subsection{Personal Access Tokens versus OAuth}
+A personal access token (PAT) is a long-lived credential tied to your user. OAuth issues short-lived tokens negotiated by the CLI. The rules of thumb:
+
+\begin{itemize}
+    \item \textbf{Interactive local work}: use OAuth via \texttt{databricks auth login}; the CLI refreshes tokens for you.
+    \item \textbf{Automation}: use a service principal with OAuth machine-to-machine credentials, not a person's PAT.
+    \item \textbf{If a PAT is unavoidable} (some Community Edition flows): set the shortest expiry allowed, store it in an environment variable or secret manager, and never commit it.
+\end{itemize}
+
+\begin{tipbox}
+Check your workspace's PAT policy early. Many organizations disable PATs entirely or cap their lifetime; learning the OAuth path first saves a painful re-authentication surprise in Week 23's CI/CD lab.
+\end{tipbox}
+
+\section{Installing and Configuring the Tooling}
+\subsection{The Databricks CLI}
+The Databricks CLI (v0.200 and later) is the command plane for workspace objects, clusters, jobs, pipelines, secrets, and Asset Bundles \cite{databricksCLI}. Install it with the native installer or via package managers, then authenticate:
+
+\begin{lstlisting}[language=PowerShell,caption={Installing and authenticating the Databricks CLI on Windows.},label={lst:ch0-cli-setup}]
+# Verify Python and Git first
+python --version
+git --version
+
+# CLI check (install from https://docs.databricks.com/dev-tools/cli/ if missing)
+databricks --version
+
+# OAuth login; stores a profile in ~/.databrickscfg
+databricks auth login --host https://<your-workspace>.azuredatabricks.net
+
+# Who am I? The first real verification
+databricks current-user me
+
+# Can I see the workspace?
+databricks workspace list /
+\end{lstlisting}
+
+\subsection{The Python SDK}
+The \texttt{databricks-sdk-py} package mirrors the REST API and powers the automation scripts in Chapters 1, 12, and 23 \cite{databricksSDK}:
+
+\begin{lstlisting}[language=Python,caption={SDK installation check and identity call.},label={lst:ch0-sdk-check}]
+# pip install databricks-sdk
+from databricks.sdk import WorkspaceClient
+
+w = WorkspaceClient()  # reads the DEFAULT CLI profile or env vars
+me = w.current_user.me()
+print(f"Authenticated as {me.user_name} on {w.config.host}")
+\end{lstlisting}
+
+\subsection{Environment Variables and Profiles}
+The CLI and SDK resolve credentials in a documented order: explicit flags, environment variables (\texttt{DATABRICKS\_HOST}, \texttt{DATABRICKS\_TOKEN}, or OAuth client fields), then the \texttt{\textasciitilde/.databrickscfg} profile. On PowerShell, set session variables like this:
+
+\begin{lstlisting}[language=PowerShell,caption={Session-scoped credential environment variables.},label={lst:ch0-env-vars}]
+$env:DATABRICKS_HOST = 'https://<your-workspace>.azuredatabricks.net'
+# Only if you must use a token; prefer OAuth profiles:
+$env:DATABRICKS_TOKEN = '<from-your-secret-manager>'
+\end{lstlisting}
+
+\section{Cost Guardrails to Stay Within Credits}
+\subsection{Auto-Termination and Cluster Policies}
+Every classic cluster you create should have auto-termination set to 30 minutes or less. Better: enforce it. A \textbf{cluster policy} can fix \texttt{autotermination\_minutes}, cap worker counts, and restrict node types, so a forgotten cluster cannot bill beyond the policy's bounds \cite{databricksCompute}.
+
+\subsection{Serverless First Where Possible}
+Serverless compute (notebooks, DLT, SQL warehouses) starts fast, bills per second, and idles to zero. For most labs in this book, serverless or the smallest job cluster is the economical choice; large all-purpose clusters are for the tuning chapters where you need to observe the behavior.
+
+\subsection{Budget Alerts and the Billing Tables}
+Set a budget alert in your cloud account on day one. Once Unity Catalog system tables are enabled, \texttt{system.billing.usage} gives you per-SKU DBU consumption to correlate with cloud VM cost \cite{databricksSystemTables}:
+
+\begin{lstlisting}[language=SQL,caption={Weekly DBU consumption by SKU---run it every Friday.},label={lst:ch0-billing}]
+SELECT sku_name, ROUND(SUM(usage_quantity), 2) AS dbus
+FROM system.billing.usage
+WHERE usage_date >= current_date() - 7
+GROUP BY sku_name
+ORDER BY dbus DESC;
+\end{lstlisting}
+
+\begin{pitfall}
+\textbf{The weekend cluster.} The single most common first-month bill shock is an all-purpose cluster left running from Friday to Monday. Auto-termination plus a policy cap makes this a non-event; without them it is a three-figure lesson.
+\end{pitfall}
+
+\section{Naming Conventions}
+Labs reference objects by predictable names. The course catalog is \texttt{de\_training} with schemas \texttt{bronze}, \texttt{silver}, and \texttt{gold}; raw files land in the volume \texttt{de\_training.bronze.landing}. Clusters are \texttt{de-weekNN-cluster}, jobs \texttt{de-weekNN-<purpose>}, and bundle targets \texttt{dev}, \texttt{staging}, \texttt{prod}. Consistency matters because runbooks, alerts, and acceptance checklists all reference these names.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.4cm}p{4.4cm}p{5.4cm}@{}}
+\toprule
+\textbf{Object} & \textbf{Convention} & \textbf{Example} \\
+\midrule
+Catalog & \texttt{de\_training} (labs), \texttt{de\_prod} (capstone 6) & \texttt{de\_training} \\
+Schemas & medallion layers & \texttt{bronze}, \texttt{silver}, \texttt{gold} \\
+Volume & purpose-named under bronze & \texttt{de\_training.bronze.landing} \\
+Tables & layer-qualified business name & \texttt{de\_training.silver.orders} \\
+Clusters & week-scoped & \texttt{de-week04-cluster} \\
+Jobs & week-scoped with purpose & \texttt{de-week12-nightly-elt} \\
+\bottomrule
+\end{tabular}
+\caption{Naming conventions used across all labs and capstones.}
+\label{tab:ch0-naming}
+\end{table}
+
+\section{Verification: Hello World}
+Close the chapter by proving the loop end to end: CLI identity, a notebook run, a Delta table, and cleanup.
+
+\begin{lstlisting}[language=PowerShell,caption={End-to-end smoke test: CLI identity plus a first table.},label={lst:ch0-smoke}]
+# 1. Identity
+databricks current-user me
+
+# 2. Create the course catalog and schemas (requires UC create rights)
+databricks schemas create bronze --catalog de_training
+databricks schemas create silver --catalog de_training
+databricks schemas create gold   --catalog de_training
+
+# 3. In a notebook (or the SQL editor), create and read back a table:
+#    CREATE OR REPLACE TABLE de_training.bronze.hello AS
+#    SELECT 'hello lakehouse' AS message, current_timestamp() AS created_at;
+#    SELECT * FROM de_training.bronze.hello;
+\end{lstlisting}
+
+\begin{lstlisting}[language=Python,caption={SDK smoke test: submit a notebook run programmatically.},label={lst:ch0-sdk-smoke}]
+from databricks.sdk import WorkspaceClient
+from databricks.sdk.service.jobs import SubmitTask, NotebookTask
+
+w = WorkspaceClient()
+run = w.jobs.submit(
+    run_name="ch0-smoke-test",
+    tasks=[SubmitTask(
+        task_key="smoke",
+        notebook_task=NotebookTask(
+            notebook_path="/Workspace/Users/<you>/ch0_smoke"),
+    )],
+)
+print(run.result().state.state_message)  # expect: success
+\end{lstlisting}
+
+If all three steps succeed, your identity, CLI, SDK, catalog, and compute path all work, and every subsequent chapter's labs can run as written.
+
+\section{Design Decision Guide}
+\index{decision guide!Chapter 0}%
+Setup decisions echo for six months; the defaults below are the ones this book assumes.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.4cm}p{4.4cm}p{4.6cm}@{}}
+\toprule
+\textbf{Decision} & \textbf{Choose the first when} & \textbf{Choose the second when} \\
+\midrule
+Trial vs.\ Community Edition & You want the full platform surface & Zero-cost fundamentals only \\
+Own cloud account vs.\ serverless trial & Classic clusters, VNet, your storage & No cloud account available \\
+OAuth profile vs.\ PAT & Always for local work & Only where OAuth is unavailable \\
+Policy-bound vs.\ free clusters & Any shared or lasting workspace & Disposable personal sandboxes \\
+Serverless-first vs.\ classic-first & Most labs & Tuning chapters that need the knobs \\
+\bottomrule
+\end{tabular}
+\caption{Chapter 0 decision guide.}
+\label{tab:ch0-decisions}
+\end{table}
+
+If a later chapter's lab behaves differently than expected, the cause is usually one of these five choices made differently. Check them first.
+
+\section{Operational Guidance for the Whole Program}
+\index{operational guidance!Chapter 0}%
+\subsection{Performance and Reliability}
+From Chapter 0 onward, treat the lab estate like a small production platform: clusters auto-terminate, budgets alert, and the Friday cost review runs weekly. The smoke test (identity, notebook run, first table) is your regression test after any environment change---a CLI upgrade, a new profile, a new workspace. Keep the setup reproducible: everything in this chapter should be re-executable from the repository README by a stranger.
+
+\subsection{Security and Governance Checklist}
+\begin{itemize}
+    \item Credentials live in OAuth profiles, environment variables, or secret scopes---never in files.
+    \item The training catalog (\texttt{de\_training}) is separate from any real data.
+    \item Secret scanning is enabled on the course repository before the first push.
+    \item Cloud budget alerts exist before the first classic cluster is created.
+\end{itemize}
+
+\section{Further Reading}
+Start with the Databricks documentation portal for workspace and compute concepts \cite{databricksDocs,databricksWorkspace,databricksCompute}. Review the CLI \cite{databricksCLI} and Python SDK \cite{databricksSDK} references, and the trial/Community Edition options \cite{databricksTrial}. For the architecture this book builds toward, read the lakehouse paper \cite{armbrust2021lakehouse} early; it frames every storage and governance decision in Parts I and II.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item A Databricks workspace plus deliberate tooling (CLI profile, SDK, VS Code) is the sandbox every later lab assumes.
+    \item Cost on Databricks is DBUs plus cloud infrastructure; auto-termination, cluster policies, and serverless-first habits keep trial credits intact.
+    \item OAuth profiles beat long-lived tokens; production automation belongs to service principals, not people.
+    \item Consistent catalog/schema/naming conventions turn six months of labs into a navigable, reviewable portfolio.
+    \item The smoke test (identity, notebook run, first table) proves the full loop before Week 1 begins.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Explain the control plane / data plane split and name one object that lives in each.
+    \item \textbf{(Conceptual)} Your trial expires in 14 days. Which three artifacts would you export or document first, and why?
+    \item \textbf{(Hands-on)} Run the full Verification section. Capture \texttt{databricks current-user me} output and the \texttt{hello} table read as evidence.
+    \item \textbf{(Hands-on)} Create a cluster policy that caps auto-termination at 30 minutes and workers at 2. Create a cluster from it and show the enforced settings.
+    \item \textbf{(Hands-on)} Run the billing query after your first week of labs and identify your largest SKU.
+    \item \textbf{(Security)} Convert a token-based CLI profile to an OAuth profile. Explain what changed about credential lifetime.
+    \item \textbf{(Design)} Write the naming conventions for a two-team organization (finance, logistics) sharing one workspace, extending \cref{tab:ch0-naming}.
+    \item \textbf{(Operations)} Draft the Friday cost-hygiene checklist you would run weekly for the rest of this program.
+\end{enumerate}
+
+\section{Curated Community Resources}
+\index{community resources}\index{case studies}\index{portfolio projects}%
+Beyond this book and the vendor documentation, the following community-curated resources are worth your time. Do not try to consume everything at once: pick one resource per category, practice it with real data, and build something small before moving on.
+
+\subsection*{Practical Case Studies (Video Walkthroughs)}
+Fifteen end-to-end builds that show how the tools work together:
+\begin{enumerate}
+    \item SQL Data Warehouse from Scratch --- SQL, ETL, data modeling, star schemas (\url{https://lnkd.in/gcrJ2qde})
+    \item End-to-End Data Analytics Project --- Python, Pandas, SQL Server, data cleaning (\url{https://lnkd.in/gHxTN-B2})
+    \item Netflix Data Engineering Project --- Python, SQL, ELT, exploratory analysis (\url{https://lnkd.in/gMkbpWmh})
+    \item DuckDB and Python Data Engineering Project --- API ingestion, pipeline development (\url{https://lnkd.in/gEPnubGA})
+    \item Airflow Podcast Data Pipeline --- Airflow, APIs, scheduling (\url{https://lnkd.in/gmy5rS4Z})
+    \item Automated Python ETL Pipeline with Airflow --- SQL Server, DAG development (\url{https://lnkd.in/ghrBc8BE})
+    \item PySpark and dbt Data Engineering Project --- incremental loading, dimensional modeling (\url{https://lnkd.in/gVZjvyR7})
+    \item Apache Spark Data Engineering Project --- PySpark, Databricks (\url{https://lnkd.in/gVNkqk5A})
+    \item Airbnb Data Engineering Project --- dbt, Snowflake, AWS, testing (\url{https://lnkd.in/g2f4TxPW})
+    \item AWS ETL Pipeline Project --- S3, Lambda, Glue, Athena, serverless ETL (\url{https://lnkd.in/gFC3NkNs})
+    \item AWS Data Warehouse Project --- PySpark, Glue, Redshift (\url{https://lnkd.in/gyZtHMEF})
+    \item End-to-End Azure Data Engineering Project --- Data Factory, Databricks, ADLS (\url{https://lnkd.in/gUpbRjzE})
+    \item Spotify Azure Data Engineering Project --- streaming, Delta Lake (\url{https://lnkd.in/gUGKuZ8N})
+    \item Uber Real-Time Data Engineering Project --- Event Hubs, structured streaming (\url{https://lnkd.in/gu7Tpg7D})
+    \item End-to-End GCP Data Engineering Project --- Cloud Storage, Dataproc, BigQuery (\url{https://lnkd.in/gv8Yedfu})
+\end{enumerate}
+
+\subsection*{Free Video Courses}
+Twenty videos covering the essential skill path --- recommended learning order: Python, SQL, Linux, Git, Docker, data modeling, data warehousing, Spark, Kafka, Airflow, dbt, cloud, portfolio projects.
+\begin{itemize}
+    \item \textbf{Foundations:} Data Engineering Course for Beginners (\url{https://lnkd.in/gprfkqnp}); Big Data Engineer Masterclass (\url{https://lnkd.in/gqPkrg63})
+    \item \textbf{Core tools:} Python for Data Engineers (\url{https://lnkd.in/gZeKJEi4}); SQL for Big Data Engineering (\url{https://lnkd.in/gt5DZXwQ}); PostgreSQL Full Course (\url{https://lnkd.in/gAU5n7gM}); Linux Command Line (\url{https://lnkd.in/gA-7zFaQ}); Git and GitHub Tutorial (\url{https://lnkd.in/gs73kHau}); Docker Tutorial (\url{https://lnkd.in/g59TCWPD})
+    \item \textbf{Warehousing and modeling:} Data Warehousing Beginner's Guide (\url{https://lnkd.in/gS_-iJAb}); Data Modeling, Star Schema and Kimball (\url{https://lnkd.in/g4it9vpy})
+    \item \textbf{Batch processing:} PySpark Tutorial for Beginners (\url{https://lnkd.in/gre86dH6}); PySpark Full Course (\url{https://lnkd.in/gZXg38hk})
+    \item \textbf{Streaming:} Apache Kafka Full Course (\url{https://lnkd.in/gnnXc9_d}); Kafka Crash Course with Project (\url{https://lnkd.in/gP6DFCem})
+    \item \textbf{Pipelines:} Apache Airflow Tutorial (\url{https://lnkd.in/gbFzzReZ}); dbt Tutorial with Netflix Project (\url{https://lnkd.in/gHvmdjNX}); ELT with dbt, Snowflake and Airflow (\url{https://lnkd.in/g5ZP_xC3})
+    \item \textbf{Cloud:} AWS for Data Engineers (\url{https://lnkd.in/g8vRZmkp})
+    \item \textbf{End-to-end projects:} Airbnb Project with Snowflake, dbt and AWS (\url{https://lnkd.in/g2f4TxPW}); Real-Time E-Commerce with Kafka and Snowflake (\url{https://lnkd.in/g58V6A3P})
+\end{itemize}
+
+\subsection*{GitHub Repositories}
+Twenty free repositories to learn from, practice with, and build upon. Choose one roadmap, complete one project, study the code structure, then break it, fix it, and document what you learned.
+\begin{itemize}
+    \item \textbf{Roadmaps and guides:} Data Engineering Zoomcamp (\url{https://lnkd.in/gxKmbbHc}); Data Engineer Handbook (\url{https://lnkd.in/gstev9z7}); Data Engineering Cookbook (\url{https://lnkd.in/gABzJ-vE}); Complete Data Engineer Roadmap (\url{https://lnkd.in/gmwQrmvm})
+    \item \textbf{Curated lists:} Awesome Data Engineering (\url{https://lnkd.in/gh4Ky273}); Awesome Big Data (\url{https://lnkd.in/g_y-n3zm}); Awesome Open-Source Data Engineering (\url{https://lnkd.in/ggDTw66U})
+    \item \textbf{Portfolio and analytics engineering:} Data Engineering Project Template (\url{https://lnkd.in/g-QKrMXV}); Jaffle Shop dbt Practice Project (\url{https://lnkd.in/gmXVhYKX}); dbt Core (\url{https://lnkd.in/gnCXxNbB})
+    \item \textbf{Ingestion and orchestration:} Apache Airflow (\url{https://lnkd.in/gqvG5F6N}); Airbyte (\url{https://lnkd.in/g2B9AVwM}); dlt (\url{https://lnkd.in/g3A8BMp3})
+    \item \textbf{Processing:} Apache Spark (\url{https://lnkd.in/g5CPE3hh}); Apache Kafka (\url{https://lnkd.in/gdH5T4xX})
+    \item \textbf{Storage and lakehouses:} DuckDB (\url{https://lnkd.in/gehQd42W}); Apache Iceberg (\url{https://lnkd.in/gVweVV8y})
+    \item \textbf{Quality, lineage and governance:} Great Expectations (\url{https://lnkd.in/g8TPyAy8}); OpenLineage (\url{https://lnkd.in/gz3_MiAP}); DataHub (\url{https://lnkd.in/gEcNMRkJ})
+\end{itemize}

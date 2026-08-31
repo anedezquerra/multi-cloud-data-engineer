@@ -1,0 +1,349 @@
+\chapter{Delta Lake Optimization: OPTIMIZE, Z-ORDER, and Liquid Clustering}
+\index{Delta Lake!optimization}\index{OPTIMIZE}\index{Z-ORDER}\index{liquid clustering}%
+\index{small-file problem}\index{data skipping}\index{deletion vectors}\index{VACUUM}\index{predictive optimization}%
+\begin{objectives}
+\begin{itemize}
+    \item Explain how file-level statistics enable data skipping, and why the small-file problem defeats it.
+    \item Compact tables with \texttt{OPTIMIZE} and cluster them with \texttt{ZORDER BY}.
+    \item Choose liquid clustering (\texttt{CLUSTER BY}) for new tables and articulate when partitioning still applies.
+    \item Use deletion vectors to make row-level deletes cheap, and auto-optimize versus scheduled compaction deliberately.
+    \item Operate \texttt{VACUUM} and predictive optimization within a retention policy.
+    \item Benchmark layout choices with controlled before/after measurements.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+Physical layout optimization exists on every analytical platform; the knobs differ, the physics
+does not.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{3.0cm}p{3.4cm}p{3.2cm}p{3.2cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{Databricks (Delta)} & \textbf{AWS} & \textbf{Azure / GCP / Fabric} \\
+\midrule
+Compaction & \texttt{OPTIMIZE} & Athena/Iceberg \texttt{OPTIMIZE} & \texttt{OPTIMIZE} (Fabric) / BigQuery managed \\
+Multi-dim clustering & \texttt{ZORDER BY} & Redshift sort keys & Synapse columnstore / Fabric V-Order+ZORDER \\
+Rewritable-free layout & Liquid clustering & Iceberg sort order evolution & BigQuery clustering / clustering keys (Snowflake) \\
+Row-level deletes & Deletion vectors & Iceberg position deletes & Native / deletion vectors (Fabric) \\
+Auto-maintenance & Predictive optimization & Redshift Auto WLM / S3 Tables & Automatic / BigQuery autoclustering \\
+Pruning metadata & File stats, bloom filters & Zone maps (Redshift) & Columnstore segments / block metadata \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+\textbf{MongoDB} answers the same question with indexes and the working set rather than file
+layout---an operational-store solution to an analytical problem it was not designed for.
+\end{crosscloud}
+
+\section{Week 5 Roadmap and Mental Model}
+Chapter 2 made tables correct; Chapter 5 makes them fast. Analytical query speed on a lakehouse is dominated by one question: \emph{how many bytes must be read to answer this query?} Everything in this chapter---compaction, clustering, statistics, deletion vectors---exists to shrink that number \cite{databricksDeltaOptimize}.
+
+The mental model: \textbf{a Delta scan is a funnel}. The query's predicates are evaluated first against the transaction log's per-file statistics (min/max per column, null counts), discarding files that cannot match; surviving files are opened, and column pruning plus row-group statistics discard more; only then are rows decoded. The optimizer's job is to make the funnel narrow early. The engineer's job is to arrange data so that statistics \emph{can} discard---which is what clustering does.
+
+\begin{definitionbox}
+\textbf{Data skipping} is the elimination of data files (and row groups) from a scan based on metadata alone, without reading row content. It works only when the data layout correlates file contents with the query's filter columns---the property that Z-ORDER and liquid clustering create.
+\end{definitionbox}
+
+\begin{keyterms}
+\textbf{Small-file problem}: thousands of tiny files whose metadata overhead and per-file cost dominate query time. \textbf{Z-ORDER}: multi-dimensional clustering that co-locates rows similar on several columns in the same files. \textbf{Liquid clustering}: Delta's self-managing layout where clustering keys are metadata, not directory structure. \textbf{Deletion vector}: a bitmap marking deleted rows so deletes need not rewrite files. \textbf{Predictive optimization}: Databricks-managed automatic \texttt{OPTIMIZE}/\texttt{ANALYZE}/\texttt{VACUUM} for Unity Catalog tables.
+\end{keyterms}
+
+\section{Monday: File Layout, Statistics, and the Small-File Problem}
+\subsection{How a Delta Scan Reads}
+Each commit records added files with per-column min/max statistics (for the first 32 columns by default). A query like \texttt{WHERE order\_date = '2026-08-01'} consults the log and opens only files whose statistics admit that date. Bloom filters (opt-in) add point-lookup skipping for high-cardinality columns such as \texttt{order\_id}.
+
+\subsection{The Small-File Problem}
+Every file costs: a listing/metadata entry, a footer read, a task slot, and open/close overhead. At thousands of 1 MB files, metadata work dwarfs data work; queries crawl, and \texttt{OPTIMIZE} itself becomes slow. Small files come from streaming micro-batches, over-partitioned writes, and un-coalesced outputs (Chapter 4). The fix is compaction; the prevention is write cadence \cite{databricksDeltaOptimize}.
+
+\begin{pitfall}
+\textbf{Optimizing while streaming into the same table.} A compaction job rewriting files that a stream is actively appending creates commit conflicts and wasted work. Coordinate schedules---triggered streams followed by \texttt{OPTIMIZE}---or use predictive optimization, which is conflict-aware.
+\end{pitfall}
+
+\section{Tuesday: OPTIMIZE and Z-ORDER}
+\subsection{Compaction}
+\texttt{OPTIMIZE table} rewrites small files into $\sim$1 GB targets. It is incremental (only unoptimized files are touched) and recorded in history like any commit. Run it on a schedule matched to write cadence: daily for batch-loaded tables, after each trigger group for streaming sinks.
+
+\subsection{Z-ORDER}
+\texttt{ZORDER BY (col1, col2)} adds multi-dimensional clustering: the compaction sorts data so rows similar on the given columns co-locate, making file-level statistics sharply effective for filters on those columns.
+
+\begin{lstlisting}[language=SQL,caption={Compaction and Z-ORDER, with evidence collection.},label={lst:ch5-optimize}]
+-- Baseline first: file count and a representative selective query
+SELECT region, COUNT(*) c, SUM(net_amount) AS rev
+FROM de_training.silver.events
+WHERE event_date = DATE '2026-08-01' AND customer_id = 4217
+GROUP BY region;
+
+OPTIMIZE de_training.silver.events;                          -- compaction only
+OPTIMIZE de_training.silver.events
+  ZORDER BY (customer_id, event_date);                       -- + clustering
+
+DESCRIBE DETAIL de_training.silver.events;                   -- numFiles, sizeInBytes
+DESCRIBE HISTORY de_training.silver.events;                  -- OPTIMIZE commits
+\end{lstlisting}
+
+\begin{tipbox}
+Choose Z-ORDER columns from \emph{actual query patterns}: high-cardinality columns used in selective equality or range filters. Z-ORDER on low-cardinality columns (like \texttt{region} with 5 values) wastes the sort; the table's partition columns rarely need to be Z-ORDER columns too.
+\end{tipbox}
+
+\section{Wednesday: Liquid Clustering, Deletion Vectors, VACUUM}
+\subsection{Liquid Clustering}
+Liquid clustering (\texttt{CLUSTER BY}) makes clustering a table \emph{property} rather than a physical directory layout. Unlike Hive-style partitioning, clustering keys can change (\texttt{ALTER TABLE ... CLUSTER BY (...)}) without rewriting the table; unlike Z-ORDER, clustering is maintained incrementally on write and optimize, and it composes with automatic file sizing \cite{databricksLiquidClustering}.
+
+\begin{lstlisting}[language=SQL,caption={Liquid clustering: creation, change, and the partition migration.},label={lst:ch5-liquid}]
+-- New table
+CREATE TABLE de_training.gold.fact_orders_lc (
+  order_id BIGINT, customer_id BIGINT, order_date DATE,
+  region STRING, net_amount DECIMAL(12,2))
+CLUSTER BY (order_date, customer_id);
+
+-- Existing table: opt in without a rewrite
+ALTER TABLE de_training.gold.fact_orders
+  CLUSTER BY (order_date, customer_id);
+
+-- Change clustering keys later: metadata operation
+ALTER TABLE de_training.gold.fact_orders
+  CLUSTER BY (region, order_date);
+\end{lstlisting}
+
+\begin{definitionbox}
+\textbf{Partitioning} encodes a column into directory paths---fast pruning, but immutable once written and dangerous at high cardinality. \textbf{Liquid clustering} records clustering in the log---similar pruning benefits, re-definable keys, no small-partition hazard. The default for new large Delta tables is liquid clustering; partitioning survives for genuinely coarse, stable dimensions like \texttt{country} or \texttt{business\_date} at low cardinality.
+\end{definitionbox}
+
+\subsection{Deletion Vectors}
+With deletion vectors enabled, \texttt{DELETE}/\texttt{UPDATE}/\texttt{MERGE} mark rows deleted via a bitmap stored alongside the file instead of rewriting it \cite{databricksDeletionVectors}. Reads apply the bitmap on the fly; a later \texttt{OPTIMIZE} physically purges. Enable deletion vectors on tables with frequent row-level mutations (CDC-heavy Silvers, GDPR deletes).
+
+\subsection{VACUUM and Predictive Optimization}
+\texttt{VACUUM table RETAIN 168 HOURS} removes unreferenced files past the horizon (Chapter 2 covered the recovery implications). With Unity Catalog managed tables, \textbf{predictive optimization} runs \texttt{OPTIMIZE}, \texttt{ANALYZE}, and \texttt{VACUUM} automatically where Databricks' telemetry shows benefit---on serverless, at no separate job cost. Enable it and spend your scheduling effort on the exceptions.
+
+\section{Thursday Hands-on Project: The Small-File Benchmark}
+Build a 50M-row events table degraded by tiny files, then measure the effect of compaction, Z-ORDER, and liquid clustering on the same selective query.
+\index{hands-on lab}\index{OPTIMIZE!lab}\index{liquid clustering!lab}
+
+\begin{lstlisting}[language=Python,caption={Week 5 lab: degrade, then optimize, with controlled measurement.},label={lst:ch5-lab}]
+from pyspark.sql import functions as F
+import time
+
+# 1. Generate 50M rows as ~2000 tiny files (the streaming-aftermath simulation)
+base = (spark.range(0, 50_000_000)
+        .withColumn("event_date", F.date_add(F.lit("2026-01-01"),
+                                             (F.rand(7) * 240).cast("int")))
+        .withColumn("customer_id", (F.rand(7) * 500_000).cast("long"))
+        .withColumn("amount", F.rand(7) * 100))
+base.repartition(2000).write.mode("overwrite") \
+    .saveAsTable("de_training.silver.events_raw")
+
+def bench(table, where, label):
+    spark.sql(f"SELECT * FROM {table} LIMIT 1").count()  # warm metadata
+    t0 = time.time()
+    spark.sql(f"SELECT COUNT(*) c, SUM(amount) s FROM {table} WHERE {where}") \
+         .collect()
+    return (label, round(time.time() - t0, 2))
+
+sel = "event_date = '2026-05-01' AND customer_id = 4217"
+results = [bench("de_training.silver.events_raw", sel, "baseline_small_files")]
+
+# 2. Compaction + Z-ORDER copy
+spark.sql("""CREATE TABLE de_training.silver.events_zo
+             AS SELECT * FROM de_training.silver.events_raw""")
+spark.sql("""OPTIMIZE de_training.silver.events_zo
+             ZORDER BY (customer_id, event_date)""")
+results.append(bench("de_training.silver.events_zo", sel, "optimize_zorder"))
+
+# 3. Liquid-clustered copy
+spark.sql("""CREATE TABLE de_training.silver.events_lc
+             CLUSTER BY (event_date, customer_id)
+             AS SELECT * FROM de_training.silver.events_raw""")
+spark.sql("OPTIMIZE de_training.silver.events_lc")
+results.append(bench("de_training.silver.events_lc", sel, "liquid_clustered"))
+
+spark.createDataFrame(results, ["variant", "seconds"]) \
+     .write.mode("overwrite").saveAsTable("de_training.silver.week05_results")
+\end{lstlisting}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item The three variants (raw, Z-ORDER, liquid) with \texttt{DESCRIBE DETAIL} file counts.
+    \item The \texttt{week05\_results} timing table with cold-run and warm-run columns.
+    \item A one-paragraph interpretation: which layout won, and why the statistics made it so.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item Identical result values across all three variants (layout changes must not change data).
+    \item File counts documented before and after compaction.
+    \item Benchmarks repeated three times with the median reported (first-run cold effects excluded).
+    \item \texttt{VACUUM} not run below 168-hour retention at any point.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Add a bloom filter on \texttt{customer\_id} and measure the point-query delta.
+    \item Enable deletion vectors, delete 1\% of rows, and compare delete cost with/without.
+    \item Repeat the benchmark on a partitioned variant and explain where partitioning beat clustering.
+\end{itemize}
+
+\section{Friday Use Case: Remediating Two Million Tiny Files}
+A nightly streaming sink has appended micro-batches to \texttt{silver.events} for six months. Analysts report multi-minute scans; the metadata listing alone takes minutes; \texttt{OPTIMIZE} times out. The data is correct---the layout has collapsed.
+\index{small-file problem!remediation}\index{streaming!compaction}
+
+\subsection{Symptoms and Diagnosis}
+Evidence collected: \texttt{DESCRIBE DETAIL} shows 2.1M files averaging 0.8 MB; stage summaries show thousands of one-file tasks; the driver spends most of each query planning against an enormous file list. The streaming trigger fires every 30 seconds; no compaction has ever run.
+
+\subsection{Remediation Strategy}
+Two phases: \textbf{repair}, then \textbf{prevent}.
+
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[
+        tiny/.style={rectangle, draw=red!60!black, thick, fill=red!8, align=center, minimum width=0.85cm, minimum height=0.4cm, font=\tiny},
+        big/.style={rectangle, rounded corners, draw=codegreen!60!black, thick, fill=green!8, align=center, minimum width=2.4cm, minimum height=0.85cm, font=\small\bfseries},
+        proc/.style={rectangle, rounded corners, draw=primary, thick, fill=primary!7, align=center, minimum width=3.0cm, minimum height=0.95cm, font=\small\bfseries},
+        flow/.style={-{Latex[length=2mm]}, draw=primary, thick}
+    ]
+        \node[tiny] (f1) at (0,0.6) {}; \node[tiny] (f2) at (0.9,0.6) {};
+        \node[tiny] (f3) at (0,0.0) {}; \node[tiny] (f4) at (0.9,0.0) {};
+        \node[tiny] (f5) at (0,-0.6) {}; \node[tiny] (f6) at (0.9,-0.6) {};
+        \node[font=\scriptsize\itshape] at (0.45,-1.2) {2.1M tiny files};
+        \node[proc] (pause) at (3.6,0) {Pause stream\\snapshot history};
+        \node[proc] (compact) at (7.4,0) {Deep \texttt{OPTIMIZE}\\(batched by date)};
+        \node[big] (healthy) at (11.0,0) {Healthy files\\$\sim$1 GB each};
+        \node[proc] (prevent) at (14.6,0) {Liquid clustering\\+ trigger cadence\\+ predictive opt.};
+        \draw[flow] (1.4,0) -- (pause);
+        \draw[flow] (pause) -- (compact);
+        \draw[flow] (compact) -- (healthy);
+        \draw[flow] (healthy) -- (prevent);
+    \end{tikzpicture}%
+    }
+    \caption{Small-file remediation: pause, snapshot, batch compaction, then prevent recurrence with clustering and write-cadence changes.}
+    \label{fig:ch5-remediation}
+\end{figure}
+
+\textbf{Repair.} Pause or throttle the stream (triggered mode with a longer interval), snapshot the history, and run compaction in date-banded batches so each \texttt{OPTIMIZE} operates on a tractable file set. Verify counts against the pre-repair baseline; only then resume.
+
+\textbf{Prevent.} Convert the table to liquid clustering on the dominant filter columns; move the stream from 30-second triggers to 5-minute micro-batches (or \texttt{availableNow} batches); enable predictive optimization; add a weekly file-count guardrail alert.
+
+\begin{pitfall}
+\textbf{VACUUM in the middle of repair.} During remediation you are one mistake away from needing history. Vacuum only after the repaired table has been validated and the stream has run cleanly against it for a full retention window.
+\end{pitfall}
+
+\subsection{Risks and Mitigations}
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{4.6cm}p{7.6cm}@{}}
+\toprule
+\textbf{Risk} & \textbf{Mitigation} \\
+\midrule
+Compaction job becomes the new bottleneck & Date-banded runs; predictive optimization absorbs routine work \\
+Layout change regresses unmeasured queries & Benchmark harness covers the top five query patterns \\
+Small files return via a new producer & File-count guardrail alert on every hot table \\
+VACUUM mid-incident destroys evidence & Freeze VACUUM during open incidents; runbook says so \\
+Clustering keys chosen by intuition & Keys derived from query-history analysis, reviewed quarterly \\
+\bottomrule
+\end{tabular}
+\caption{Week 5 scenario risks and mitigations.}
+\label{tab:ch5-risks}
+\end{table}
+
+\section{Design Decision Guide}
+\index{decision guide!Week 5}%
+Layout decisions age with the table; choose for the query patterns you can verify, not the ones you imagine.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.4cm}p{4.4cm}p{4.6cm}@{}}
+\toprule
+\textbf{Decision} & \textbf{Choose the first when} & \textbf{Choose the second when} \\
+\midrule
+Liquid clustering vs.\ partition+Z-ORDER & New large tables; evolving filter columns & Legacy tables you cannot migrate yet \\
+Predictive optimization vs.\ scheduled OPTIMIZE & UC managed tables on serverless & External tables or custom cadence needs \\
+Deletion vectors on vs.\ off & Row-level mutation is frequent & Append-mostly tables with scan-sensitive SLAs \\
+Bloom filter vs.\ statistics only & High-cardinality point lookups & Range-dominated queries \\
+Daily vs.\ post-trigger compaction & Batch-loaded tables & Streaming sinks with micro-batches \\
+Partition vs.\ cluster on date & Coarse day-grain filters and lifecycle drops & Selective queries on mixed columns \\
+\bottomrule
+\end{tabular}
+\caption{Week 5 decision guide.}
+\label{tab:ch5-decisions}
+\end{table}
+
+Benchmark before believing: the same clustering choice can win on one table and waste money on another. Chapter 5's lab harness is the template for every layout decision you will ever make.
+
+\section{Operational Guidance for Week 5}
+\index{operational guidance!Week 5}%
+\subsection{Performance and Reliability}
+Optimization is a cadence, not an event: set \texttt{OPTIMIZE} frequency from write volume (daily for batch-loaded tables, after each trigger window for streaming sinks) and review file counts monthly against a growth guardrail. Prefer predictive optimization on Unity Catalog managed tables so maintenance follows measured benefit; keep scheduled jobs for external tables and exceptions. Track the benchmark trio---file count, selective-query latency, scan bytes---before and after every layout change.
+
+\subsection{Security and Governance Checklist}
+\begin{itemize}
+    \item \texttt{ALTER TABLE ... CLUSTER BY} and \texttt{OPTIMIZE} rights restricted to the platform group.
+    \item Layout changes (clustering keys, partition retirement) documented in the change log with benchmark evidence.
+    \item Deletion vectors enabled on tables with GDPR/row-delete obligations---and the purge cadence documented.
+    \item \texttt{VACUUM} schedules reviewed against legal hold and recovery requirements quarterly.
+\end{itemize}
+
+\subsection{Troubleshooting Playbook}
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.6cm}p{4.2cm}p{4.8cm}@{}}
+\toprule
+\textbf{Symptom} & \textbf{Likely cause} & \textbf{First action} \\
+\midrule
+OPTIMIZE conflicts with writers & Compaction racing the stream & Stagger schedules or enable predictive optimization \\
+Z-ORDER shows no gain & Low-cardinality or rarely-filtered columns chosen & Re-derive columns from actual query predicates \\
+File count not dropping & Retention keeping old files / optimize not scheduled & Check history for OPTIMIZE commits; review VACUUM \\
+Reads slower after enabling DVs & Deletion bitmap merge overhead & Run OPTIMIZE to physically purge; review delete rate \\
+\bottomrule
+\end{tabular}
+\caption{Week 5 troubleshooting quick reference.}
+\label{tab:ch5-trouble}
+\end{table}
+
+\section{Interview Q\&A}
+\subsection{Concepts and Trade-offs}
+\begin{enumerate}
+    \item \textbf{Q: Why do small files hurt even when total bytes are the same?}\\
+    A: Per-file costs---listing, footer reads, task scheduling, open/close---scale with file count, not bytes. At millions of files, metadata work dominates and the driver becomes the bottleneck.
+    \item \textbf{Q: Z-ORDER versus liquid clustering?}\\
+    A: Both co-locate similar rows for data skipping. Liquid clustering keeps keys as metadata (changeable without rewrite, maintained incrementally, no partition-column commitment); Z-ORDER applies at compaction time on a fixed layout. New tables: liquid; legacy: Z-ORDER until migrated.
+    \item \textbf{Q: When does classic partitioning still win?}\\
+    A: Coarse, stable, low-cardinality dimensions that almost every query filters (e.g., \texttt{country}, business date at day grain), where directory pruning is exact and lifecycle operations drop whole directories.
+    \item \textbf{Q: What do deletion vectors change about a DELETE?}\\
+    A: The delete writes a bitmap instead of rewriting files---seconds instead of minutes---but every reader pays a small merge cost until the next OPTIMIZE purges physically.
+    \item \textbf{Q: Your OPTIMIZE job itself is slow. Why?}\\
+    A: Usually because it is fighting the same small-file mountain (schedule it more often, in bands) or competing with active writers (coordinate schedules or use predictive optimization).
+    \item \textbf{Q: Does \texttt{OPTIMIZE} change data or only layout?}\\
+    A: Layout only---it is a commit like any other, visible in history, and your reconciliation counts must be identical before and after. A row-count change after OPTIMIZE is a bug report, not a curiosity.
+    \item \textbf{Q: How would you convince a skeptic that liquid clustering helped?}\\
+    A: The lab's evidence table: same query, same data, controlled medians across cold and warm runs, plus the file-level statistics story. Feelings are not benchmarks.
+    \item \textbf{Q: Does liquid clustering remove the need to think about layout?}\\
+    A: It removes the \emph{irreversible} decision, not the decision: clustering keys still determine skipping quality, and they should still come from measured query patterns.
+\end{enumerate}
+
+\section{Further Reading}
+The Delta optimization guide covers compaction, Z-ORDER, bloom filters, and file sizing \cite{databricksDeltaOptimize}; the liquid clustering documentation explains the layout model and migration \cite{databricksLiquidClustering}; deletion vectors are covered in \cite{databricksDeletionVectors}. For the storage fundamentals underneath, revisit the Delta paper \cite{armbrust2020delta} and the Parquet format docs \cite{apacheParquet}. Spark-level tuning complements this chapter \cite{sparkSQLTuning}.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item Query speed on a lakehouse is a bytes-scanned problem; statistics-based skipping is the mechanism.
+    \item The small-file problem is a write-cadence disease; compaction is the treatment, clustering the prevention.
+    \item Liquid clustering is the default layout decision for new large tables; partitioning survives for coarse stable dimensions.
+    \item Deletion vectors make row-level mutation cheap at the cost of reader-side merge until compaction.
+    \item Benchmark layout changes with controlled medians, and never vacuum below your recovery horizon.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Explain data skipping to a PM in three sentences without using the word ``statistics.''
+    \item \textbf{(Conceptual)} Why is Z-ORDER on a 5-value column wasted work?
+    \item \textbf{(Hands-on)} Complete the Thursday lab; capture the results table and one \texttt{DESCRIBE DETAIL} per variant.
+    \item \textbf{(Hands-on)} Write the date-banded compaction script for the Friday scenario, with per-band logging.
+    \item \textbf{(Hands-on)} Enable predictive optimization on one catalog and find the evidence of its runs in system tables.
+    \item \textbf{(Design)} Choose partition/cluster/Z-ORDER strategies for: (a) clickstream by day, (b) IoT by device, (c) orders by country and date. Justify each.
+    \item \textbf{(Operations)} Write the alert rule and runbook for ``file count grows 20\% week-over-week.''
+    \item \textbf{(Architecture)} When would you disable deletion vectors on a table? Give a workload where the reader-side merge cost matters.
+\end{enumerate}

@@ -1,0 +1,327 @@
+\chapter{Auto Loader, Incremental Ingestion, and Change Data Capture}
+\index{Auto Loader}\index{cloudFiles}\index{incremental ingestion}\index{schema inference}%
+\index{rescued data}\index{CDC}\index{SCD Type 2}\index{AUTO CDC}\index{checkpoint}%
+\begin{objectives}
+\begin{itemize}
+    \item Explain Auto Loader's architecture: cloudFiles source, directory listing versus notification mode, and checkpointed exactly-once semantics.
+    \item Configure schema inference, schema hints, evolution, and the rescued-data column.
+    \item Build triggered incremental ingestion pipelines from cloud storage volumes.
+    \item Apply change data capture with \texttt{MERGE INTO} and DLT \texttt{AUTO CDC}, including SCD Type 1 and Type 2.
+    \item Handle out-of-order and duplicate CDC events with \texttt{SEQUENCE BY}.
+    \item Design ingestion for high file rates plus nightly CDC without double-processing.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+Auto Loader is Databricks' \textbf{managed file-ingestion} answer; CDC application is the second
+half of the pattern every platform implements.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{3.0cm}p{3.4cm}p{3.2cm}p{3.2cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{Databricks} & \textbf{AWS} & \textbf{Azure / GCP / Fabric} \\
+\midrule
+File ingestion & Auto Loader (cloudFiles) & S3 events + Glue bookmarks & Event Grid + ADF / GCS transfer + Dataflow / OneLake events \\
+Exactly-once & Checkpoint + write-ahead offsets & Bookmarks / idempotent sinks & Watermarks / manifests \\
+Schema drift & Inference + hints + evolution & Glue schema detection & ADF mapping drift / Dataflow \\
+Malformed rows & \texttt{\_rescued\_data} column & Dead-letter patterns & Error outputs / DLQ \\
+CDC source & Lakeflow Connect, partner tools & DMS CDC to S3 & ADF CDC / Datastream \\
+CDC apply & \texttt{MERGE} / DLT \texttt{AUTO CDC} & Glue/EMR MERGE & T-SQL MERGE / BigQuery MERGE \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+\textbf{Snowflake} ingests with Snowpipe (notification-driven) and applies CDC with streams/tasks
+or dynamic tables; \textbf{MongoDB} sources CDC naturally via change streams.
+\end{crosscloud}
+
+\section{Week 11 Roadmap and Mental Model}
+Most production data arrives as files and change feeds, not clean API calls. Week 11 covers the two ingestion workhorses: \textbf{Auto Loader}, which turns a growing directory of files into an exactly-once incremental stream, and \textbf{CDC application}, which turns a log of inserts/updates/deletes into a current (SCD1) or historical (SCD2) table \cite{databricksAutoLoader,databricksCDC}.
+
+The mental model: \textbf{ingestion is a state machine, and the checkpoint is the state}. Auto Loader's checkpoint records which files (or offsets) have been processed; the stream itself is conceptually stateless. Every exactly-once property, every recovery behavior, and every ``why did it reprocess everything'' mystery traces back to that checkpoint.
+
+\begin{definitionbox}
+\textbf{Auto Loader} (\texttt{cloudFiles}) is Databricks' incremental file-ingestion source: it discovers new files in cloud storage (by directory listing or cloud notifications), tracks processed files in a checkpoint, infers and evolves schemas, and rescues malformed records---delivering exactly-once ingestion with a single \texttt{.load()} call.
+\end{definitionbox}
+
+\begin{keyterms}
+\textbf{Notification mode}: cloud-provider events (SQS/Event Grid/GCS) announce new files. \textbf{Directory listing}: periodic listing to detect files. \textbf{Schema hints}: user-supplied type overrides layered on inference. \textbf{\texttt{\_rescued\_data}}: the column catching unparseable records. \textbf{\texttt{SEQUENCE BY}}: the ordering key resolving out-of-order CDC events. \textbf{SCD}: slowly changing dimension---Type 1 overwrites, Type 2 versions history.
+\end{keyterms}
+
+\section{Monday: Auto Loader Architecture}
+\subsection{Discovery: Listing versus Notification}
+In \textbf{directory-listing} mode (default), Auto Loader lists the source path and diffs against the checkpoint---simple, and fine to millions of files with partitioned directory layouts. In \textbf{notification mode}, the cloud provider pushes file events to a queue Auto Loader subscribes to---required at very high file rates or deeply nested layouts where listing becomes the bottleneck \cite{databricksAutoLoader}.
+
+\subsection{Exactly-Once and the Checkpoint}
+Each micro-batch commits file offsets to the checkpoint before writing; on restart, processing resumes from the checkpoint. Files already committed are never reprocessed; files never committed are always processed. Consequences to internalize: the checkpoint is per-stream state---two streams cannot share one; deleting it reprocesses everything; moving it without care skips or duplicates.
+
+\begin{pitfall}
+\textbf{Deleting the checkpoint to ``fix'' a stuck stream.} The checkpoint is the memory of what has been ingested. Deleting it means a full reprocess---into a table that already has the data, unless you also reset the target. If reprocessing is truly the goal, plan it: snapshot or version the target, reset both sides, reconcile after.
+\end{pitfall}
+
+\section{Tuesday: Schemas and the Rescued Column}
+\subsection{Inference, Hints, and Evolution}
+Auto Loader samples files to infer a schema, persists it at \texttt{cloudFiles.schemaLocation}, and applies it consistently. \textbf{Schema hints} override inference for known-trouble columns (\texttt{cloudFiles.schemaHints}), e.g.\ IDs that must stay strings. Evolution: with \texttt{cloudFiles.schemaEvolutionMode} (or \texttt{mergeSchema} patterns downstream), new columns are absorbed deliberately rather than silently.
+
+\subsection{The Rescued Data Column}
+With \texttt{cloudFiles.rescuedDataColumn} set (default \texttt{\_rescued\_data} in Databricks runtimes), any record that fails parsing lands in that column as raw JSON instead of failing the batch. The pipeline survives; the malformed evidence is queryable; a steward process can reprocess or report.
+
+\begin{lstlisting}[language=Python,caption={Production-shaped Auto Loader configuration.},label={lst:ch11-autoloader}]
+stream = (spark.readStream.format("cloudFiles")
+    .option("cloudFiles.format", "csv")
+    .option("header", True)
+    .option("cloudFiles.schemaHints", "order_id STRING, amount DECIMAL(12,2)")
+    .option("cloudFiles.schemaLocation",
+            "/Volumes/de_training/bronze/_schemas/orders")
+    .option("cloudFiles.schemaEvolutionMode", "addNewColumns")
+    .option("rescuedDataColumn", "_rescued_data")
+    .load("/Volumes/de_training/bronze/landing/orders/"))
+
+(stream.writeStream.format("delta")
+    .option("checkpointLocation", "/Volumes/de_training/bronze/_ckpt/orders")
+    .trigger(availableNow=True)          # batch economics on a stream source
+    .toTable("de_training.bronze.orders_stream"))
+\end{lstlisting}
+
+\section{Wednesday: CDC with MERGE and AUTO CDC}
+\subsection{The MERGE Pattern}
+A CDC feed is a stream of \texttt{(key, operation, values, sequence)}. The hand-rolled application is the Chapter 2 MERGE with operation awareness and an ordering guard:
+
+\begin{lstlisting}[language=SQL,caption={CDC application with delete handling and recency guard.},label={lst:ch11-cdc-merge}]
+MERGE INTO de_training.silver.customers AS t
+USING staging.cdc_batch AS s
+ON t.customer_id = s.customer_id
+WHEN MATCHED AND s.op = 'DELETE' THEN DELETE
+WHEN MATCHED AND s.seq > t.seq THEN UPDATE SET *
+WHEN NOT MATCHED AND s.op <> 'DELETE' THEN INSERT *;
+\end{lstlisting}
+
+\subsection{AUTO CDC for SCD}
+DLT's \texttt{AUTO CDC} (formerly \texttt{apply\_changes}) packages this: declare the key, the sequence column, and the SCD type; the framework builds the correct stateful application \cite{databricksCDC}.
+
+\begin{lstlisting}[language=Python,caption={SCD Type 2 customer history via AUTO CDC.},label={lst:ch11-autocdc}]
+import dlt
+from pyspark.sql import functions as F
+
+dlt.create_streaming_table("silver_customers_scd2")
+
+dlt.create_auto_cdc_flow(
+    target="silver_customers_scd2",
+    source="bronze_customer_cdc",
+    keys=["customer_id"],
+    sequence_by=F.col("updated_at"),     # out-of-order safety
+    stored_as_scd_type=2,                # full history with __START_AT/__END_AT
+    except_column_list=["op", "updated_at"])
+\end{lstlisting}
+
+\begin{definitionbox}
+\textbf{SCD Type 1} overwrites: the table shows current truth only. \textbf{SCD Type 2} versions: each change closes the old row (\texttt{\_\_END\_AT}) and opens a new one, so ``what did we believe on March 3rd?'' is a query, not a restore. Choose Type 2 whenever downstream joins (features, finance allocations) depend on historical attribute values.
+\end{definitionbox}
+
+\section{Thursday Hands-on Project: Incremental Files plus SCD2 Customers}
+Ingest daily CSV batches with triggered Auto Loader (including a mid-stream schema change and a corrupted row), then apply a CDC feed to a Silver customer table with full Type 2 history.
+\index{hands-on lab}\index{Auto Loader!lab}\index{AUTO CDC!lab}
+
+\begin{lstlisting}[language=Python,caption={Week 11 lab outline: ingestion drift drill + SCD2 verification.},label={lst:ch11-lab}]
+# Part A: Auto Loader drift drill
+#  1. Run the listing-mode stream from lst:ch11-autoloader (availableNow).
+#  2. Drop batch 2 WITH a new column (loyalty_tier) -> absorbed by evolution.
+#  3. Drop batch 3 with one malformed row -> lands in _rescued_data.
+#  4. Query: SELECT _rescued_data FROM de_training.bronze.orders_stream
+#           WHERE _rescued_data IS NOT NULL;
+
+# Part B: CDC into SCD2 (DLT pipeline as in lst:ch11-autocdc)
+#  5. Apply day 1 CDC (inserts + one update).
+#  6. Apply day 2 CDC (another update + one delete), INCLUDING an
+#     out-of-order event with an older updated_at -> must be ignored
+#     by SEQUENCE BY.
+#  7. Verify: the changed customer has exactly two rows, contiguous
+#     __START_AT/__END_AT; the out-of-order event changed nothing.
+\end{lstlisting}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item The Auto Loader stream definition with schema location, hints, evolution mode, and checkpoint---all under governed volumes.
+    \item Evidence of the evolved column and the rescued row.
+    \item The SCD2 table showing versioned customer history with contiguous validity windows.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item Batch 2's new column appears in Bronze without code edits; batch 3's bad row is rescued, not fatal.
+    \item A same-checkpoint re-run ingests zero files (exactly-once proof).
+    \item The out-of-order CDC event demonstrably does not corrupt the SCD2 history.
+    \item The delete produces a closed interval (or Type 1 removal per the chosen flow), documented.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Rebuild Part B with hand-written \texttt{MERGE} instead of \texttt{AUTO CDC} and compare the code you now maintain.
+    \item Switch Auto Loader to notification mode and document the cloud wiring (queue, events, permissions).
+    \item Write the steward query that reports rescued rows per day, and wire it as an expectation.
+\end{itemize}
+
+\section{Friday Use Case: 500 Files per Minute plus a Nightly CDC}
+A payments platform receives partner settlement files at $\sim$500 small files/minute around the clock, and a nightly CDC extract from the core banking database. Both feed the same Silver domain. Design the ingestion layer.
+\index{ingestion design}\index{payments}
+
+\subsection{Requirements and Assumptions}
+Settlement files are CSV, $\sim$2 KB each, arriving to a cloud container by partner/date hour. CDC is a nightly Debezium-exported feed. Downstream finance reconciliation runs at 06:00 and must reconcile to the penny against both sources.
+
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[
+        src/.style={rectangle, rounded corners, draw=codegray, thick, fill=white, align=center, minimum width=3.0cm, minimum height=0.95cm, font=\small\bfseries},
+        ing/.style={rectangle, rounded corners, draw=primary, thick, fill=primary!7, align=center, minimum width=3.2cm, minimum height=1.0cm, font=\small\bfseries},
+        store/.style={cylinder, draw=primary, shape border rotate=90, aspect=0.25, fill=primary!10, align=center, minimum width=2.4cm, minimum height=1.15cm, font=\small\bfseries},
+        flow/.style={-{Latex[length=2mm]}, draw=primary, thick}
+    ]
+        \node[src] (partners) at (0,1.2) {Partner files\\500/min};
+        \node[src] (cdc) at (0,-1.2) {Core banking\\nightly CDC};
+        \node[ing] (al) at (4.2,1.2) {Auto Loader\\notification mode\\triggered 5-min};
+        \node[ing] (merge) at (4.2,-1.2) {AUTO CDC\\SCD2, SEQUENCE BY};
+        \node[store] (bronze) at (8.4,1.2) {Bronze\\settlements};
+        \node[store] (silver) at (8.4,-1.2) {Silver\\accounts SCD2};
+        \node[ing, draw=orange!80!black, fill=orange!10] (recon) at (12.4,0) {06:00 reconciliation\\(Workflow gate)};
+        \draw[flow] (partners) -- (al);
+        \draw[flow] (cdc) -- (merge);
+        \draw[flow] (al) -- (bronze);
+        \draw[flow] (merge) -- (silver);
+        \draw[flow] (bronze) -- (recon);
+        \draw[flow] (silver) -- (recon);
+    \end{tikzpicture}%
+    }
+    \caption{Dual-path ingestion: high-rate files via notification-mode Auto Loader, nightly CDC via SCD2, reconciled by a gated job.}
+    \label{fig:ch11-ingestion}
+\end{figure}
+
+\subsection{Architecture Decisions}
+\textbf{File path.} At 500 files/minute ($\sim$700k/day), directory listing degrades---notification mode (cloud events to a queue) keeps discovery O(new files). Triggered 5-minute runs bound latency and compact naturally (Chapter 5's small-file lesson applied at design time); the checkpoint and schema location live on governed volumes so the estate is auditable and redeployable.
+
+\textbf{CDC path.} The nightly feed applies through \texttt{AUTO CDC} with \texttt{SEQUENCE BY updated\_at}; the accounts table is SCD2 because settlement disputes replay history. The 06:00 reconciliation is a Workflow task (Chapter 12) comparing Bronze settlement sums against Silver account movements---a failing gate pages the on-call, not the CFO.
+
+\begin{pitfall}
+\textbf{One stream, two sources.} Do not multiplex the CDC feed and the file stream into one checkpointed query ``for simplicity'': their rates, schemas, and recovery semantics differ. Two streams, two checkpoints, one reconciliation gate.
+\end{pitfall}
+
+\subsection{Risks and Mitigations}
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{4.6cm}p{7.6cm}@{}}
+\toprule
+\textbf{Risk} & \textbf{Mitigation} \\
+\midrule
+Checkpoint loss double-ingests & Governed volumes, backup, and a documented reset-with-target procedure \\
+Rescued data piles up unreviewed & Steward query weekly; spike alerts \\
+Notification queue expires silently & Queue-depth and age-of-oldest-event alerts \\
+CDC sequence column not unique & Uniqueness assertion on (\texttt{key}, \texttt{seq}) per batch \\
+Schema hints rot as sources evolve & Hints versioned in the repo with the contract they encode \\
+\bottomrule
+\end{tabular}
+\caption{Week 11 scenario risks and mitigations.}
+\label{tab:ch11-risks}
+\end{table}
+
+\section{Design Decision Guide}
+\index{decision guide!Week 11}%
+Ingestion decisions set your recovery story; make them with the failure drill in mind.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.4cm}p{4.4cm}p{4.6cm}@{}}
+\toprule
+\textbf{Decision} & \textbf{Choose the first when} & \textbf{Choose the second when} \\
+\midrule
+Directory listing vs.\ notification mode & Moderate file counts, clean layouts & Millions of files or high arrival rates \\
+Rescued data vs.\ fail-on-parse & Drifty external producers & Strict contracted feeds \\
+SCD Type 1 vs.\ Type 2 & Current truth suffices & History feeds features, finance, or audit \\
+\texttt{AUTO CDC} vs.\ hand-written MERGE & Standard upsert/SCD flows & Unusual sequencing or side effects \\
+\texttt{availableNow} vs.\ processing-time & Batch economics on file arrival & Continuous minute-level freshness \\
+Schema evolution vs.\ contract failure & Additive, tolerated change & Breaking change that must page someone \\
+\bottomrule
+\end{tabular}
+\caption{Week 11 decision guide.}
+\label{tab:ch11-decisions}
+\end{table}
+
+The two rules that override the table: one checkpoint per stream, and never delete state to fix a stall. Everything else is a judgment call you can revisit; those two are scars you cannot.
+
+\section{Operational Guidance for Week 11}
+\index{operational guidance!Week 11}%
+\subsection{Performance and Reliability}
+Checkpoints and schema locations are production assets: they live in governed volumes, appear in the runbook, and are covered by the same backup/DR thinking as tables. Steward the rescued-data column weekly---a spike means a producer changed shape. Trend files-ingested per run against files-arrived; divergence is a discovery lag or a stuck notification queue, not a data problem.
+
+\subsection{Security and Governance Checklist}
+\begin{itemize}
+    \item Landing volumes readable only by the ingestion identity and stewards.
+    \item Notification-mode queues and their credentials scoped to the source container.
+    \item CDC feeds carry operation semantics under contract (\texttt{op}, sequence column documented).
+    \item Rescued data containing PII is governed to the source's classification.
+\end{itemize}
+
+\subsection{Troubleshooting Playbook}
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.6cm}p{4.2cm}p{4.8cm}@{}}
+\toprule
+\textbf{Symptom} & \textbf{Likely cause} & \textbf{First action} \\
+\midrule
+Stream finds no new files & Checkpoint ahead of arrivals / wrong path & Verify source path listing; check trigger ran \\
+Everything reprocessed & Checkpoint lost or reset & Confirm target reset plan before re-running \\
+Rescued-data spike & Producer schema drift & Diff a rescued row against the inferred schema \\
+CDC applied out of order & Missing/wrong \texttt{SEQUENCE BY} & Verify the sequence column's monotonicity per key \\
+\bottomrule
+\end{tabular}
+\caption{Week 11 troubleshooting quick reference.}
+\label{tab:ch11-trouble}
+\end{table}
+
+\section{Interview Q\&A}
+\subsection{Concepts and Trade-offs}
+\begin{enumerate}
+    \item \textbf{Q: How does Auto Loader achieve exactly-once?}\\
+    A: The checkpoint durably records processed files/offsets per micro-batch commit; restarts resume from it. Exactly-once then depends on an idempotent sink---Delta commits---completing the contract.
+    \item \textbf{Q: Notification mode versus directory listing?}\\
+    A: Listing is simple and robust up to large file counts with clean layouts; notification mode scales to millions of files and high arrival rates by replacing listing with cloud events---at the cost of queue setup and permissions.
+    \item \textbf{Q: What is the rescued-data column for?}\\
+    A: Malformed records land there instead of failing the batch. The pipeline survives schema surprises; the evidence is queryable; reprocessing is a stewarded decision instead of a 3 a.m.\ incident.
+    \item \textbf{Q: SCD1 or SCD2 for customer dimension?}\\
+    A: SCD2 when downstream logic depends on historical attributes (features, finance allocations, dispute replay); SCD1 when only current truth matters and history is noise. When in doubt in regulated domains: SCD2.
+    \item \textbf{Q: What does \texttt{SEQUENCE BY} protect against?}\\
+    A: Out-of-order and replayed CDC events: without it, an older update can overwrite a newer one and silently regress your table state.
+    \item \textbf{Q: How does Auto Loader differ from a scheduled \texttt{COPY} of new files?}\\
+    A: Discovery, exactly-once tracking, schema management, and rescued-data handling are built in---a copy script rebuilds all four badly, usually discovering it during an incident.
+    \item \textbf{Q: What is the first thing to check when a CDC table's history looks wrong?}\\
+    A: The sequence column's uniqueness and monotonicity per key---nearly every SCD corruption is an ordering-contract violation upstream.
+    \item \textbf{Q: What belongs in the ingestion contract with an external producer?}\\
+    A: Schema and compatibility rules, key and sequence semantics, arrival SLA, and the malformed-data policy. Auto Loader tolerates drift; the contract decides which drift is tolerated versus paged.
+\end{enumerate}
+
+\section{Further Reading}
+The Auto Loader documentation covers modes, schema management, and scaling \cite{databricksAutoLoader}; the CDC guide covers \texttt{AUTO CDC} flows and SCD types \cite{databricksCDC}. The underlying streaming semantics are in the Structured Streaming guide \cite{sparkStructuredStreaming}; Delta's MERGE and idempotency patterns trace to Chapter 2's foundations \cite{deltaLakeDocs}.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item Auto Loader = discovery + checkpoint + schema management; the checkpoint is the pipeline's memory---govern it.
+    \item Notification mode is the scaling answer for high-rate file ingestion; listing is the simple default.
+    \item Rescued data turns malformed records from incidents into stewarded backlog.
+    \item CDC application is MERGE with operation awareness and a sequence guard; \texttt{AUTO CDC} packages it with SCD types.
+    \item Separate sources get separate streams and checkpoints; reconciliation is an explicit, gated step.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Why can't two streams share one checkpoint? What state would corrupt?
+    \item \textbf{(Conceptual)} Explain the failure sequence if schema inference runs without a schema location set.
+    \item \textbf{(Hands-on)} Complete the Thursday lab, including the out-of-order event test.
+    \item \textbf{(Hands-on)} Build the steward report for rescued rows and wire it as a DLT expectation.
+    \item \textbf{(Hands-on)} Replay the week's files into a recovery table using a fresh checkpoint; reconcile counts against the primary.
+    \item \textbf{(Design)} Specify the notification-mode wiring (events, queue, permissions) for your cloud of choice.
+    \item \textbf{(Design)} Design the 06:00 reconciliation gate for the Friday scenario: inputs, tolerances, failure action.
+    \item \textbf{(Architecture)} At what arrival rate would you move the file path from triggered to continuous? Model the cost crossover.
+\end{enumerate}

@@ -1,0 +1,386 @@
+\chapter{The Databricks Platform and Workspace Fundamentals}
+\index{Databricks platform}\index{control plane}\index{data plane}\index{workspace}\index{notebooks}%
+\index{compute}\index{cluster policies}\index{Git folders}\index{Databricks CLI}\index{dbutils}%
+\begin{objectives}
+\begin{itemize}
+    \item Explain the Databricks control plane / data plane split and where notebooks, clusters, jobs, and data physically live.
+    \item Navigate workspace objects---notebooks, Git folders, libraries, and the catalog explorer---and choose the right surface for a task.
+    \item Compare all-purpose clusters, job clusters, pools, and serverless compute, and enforce standards with cluster policies.
+    \item Authenticate and use the Databricks CLI and Python SDK against a workspace.
+    \item Run a smoke-test notebook programmatically and verify compute, identity, and storage end to end.
+    \item Design a workspace and compute layout for a multi-team organization with environment isolation.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+The Databricks \textbf{workspace} is the administrative home base; every cloud has an equivalent
+concept with a different blast radius.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{3.0cm}p{3.4cm}p{3.2cm}p{3.2cm}@{}}
+\toprule
+\textbf{Concept} & \textbf{Databricks} & \textbf{AWS} & \textbf{Azure / GCP} \\
+\midrule
+Admin home & Workspace + account console & AWS account + console & Entra tenant / GCP project \\
+Notebook UX & Databricks notebooks & EMR Studio / SageMaker & Synapse / Fabric notebooks; Vertex AI \\
+Interactive compute & All-purpose cluster & EMR cluster / Glue interactive & Synapse Spark pool / Dataproc \\
+Per-run compute & Job cluster & Glue job / EMR Serverless & Fabric job / Dataproc Serverless \\
+Compute guardrails & Cluster policies & IAM + service quotas & Azure Policy / org policy \\
+CLI & \texttt{databricks} & \texttt{aws} & \texttt{az} / \texttt{gcloud} \\
+\addlinespace
+Billing unit & DBU + VM cost & DPU / node-hours & CU (Fabric) / slots (BigQuery) \\
+Auth for automation & Service principal + OAuth & IAM role & Managed identity / service account \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+\textbf{Snowflake} collapses the compute decision into virtual warehouses (size, not topology);
+\textbf{Fabric} into a shared capacity pool. Databricks keeps explicit cluster control---more knobs,
+more responsibility, which is why cluster policies matter from day one.
+\end{crosscloud}
+
+\section{Week 1 Roadmap and Mental Model}
+Databricks is a data intelligence platform: one environment where data engineering, SQL analytics, data science, and governance share the same tables and the same catalog. Week 1 builds the mental model the rest of the book depends on: what the workspace is, how compute works, how code is organized, and how to drive everything from the CLI and SDK so that manual clicks can later become automation \cite{databricksDocs}.
+
+A useful starting model is the \emph{plane split}. The \textbf{control plane}---managed by Databricks---hosts the web application, notebook storage, the jobs scheduler, and cluster management. The \textbf{data plane}---in your cloud account (classic) or Databricks' account (serverless)---runs the compute that touches your data and holds the storage accounts where Delta tables live. Security reviews, network design, and cost analysis all start by asking which plane a component lives in \cite{databricksWorkspace}.
+
+\begin{definitionbox}
+\textbf{A Databricks workspace} is the deployment boundary: one URL, one set of users and groups, one catalog binding, one network posture. An \textbf{account} (account console) can govern many workspaces, metastores, and budgets.
+\end{definitionbox}
+
+\begin{keyterms}
+\textbf{Cluster}: a set of VMs running the Databricks Runtime. \textbf{All-purpose cluster}: interactive compute shared by users. \textbf{Job cluster}: ephemeral compute created for one job run. \textbf{Pool}: idle instances kept warm to cut cluster start time. \textbf{Cluster policy}: an admin-defined template restricting cluster configuration. \textbf{Git folder (Repo)}: a workspace folder synced to a remote Git branch.
+\end{keyterms}
+
+\section{Monday: Platform Architecture and Workspace Objects}
+\subsection{The Control Plane and the Data Plane}
+Every request you make---opening a notebook, starting a cluster, running a job---is orchestrated by the control plane, but data never has to leave your cloud account in a classic deployment. This separation is why Databricks can offer a SaaS experience while satisfying data-residency requirements: the control plane stores metadata and orchestration state; your storage accounts and cluster VMs hold the actual rows \cite{databricksSecurity}.
+
+For a data engineer, the plane split drives three habits. First, cost: control-plane features are flat, but every running VM in the data plane bills cloud infrastructure plus DBUs. Second, networking: private connectivity, firewalls, and egress rules are data-plane concerns (Chapter 21). Third, availability: a control-plane incident blocks orchestration, while a data-plane incident blocks your running pipelines---different runbooks.
+
+\subsection{Workspace Objects}
+The workspace organizes work into \textbf{notebooks} (multi-language cells with results), \textbf{folders}, \textbf{Git folders}, \textbf{libraries}, and \textbf{compute}. The catalog explorer separates data assets (catalogs, schemas, tables, volumes) from code assets. A disciplined team keeps code in Git folders and uses plain workspace folders only for scratch work.
+
+\begin{notebox}
+Workspace notebooks are collaborative documents, not version-controlled source files. Anything you would want to review, roll back, or deploy belongs in a Git folder (or an Asset Bundle from Chapter 23 onward).
+\end{notebox}
+
+\section{Tuesday: Notebooks, Git Folders, and dbutils}
+\subsection{Notebooks and Magic Commands}
+A Databricks notebook mixes languages per cell using magic commands: \texttt{\%python}, \texttt{\%sql}, \texttt{\%scala}, \texttt{\%r}, \texttt{\%sh}, and \texttt{\%md} for markdown. Cells run against the attached cluster (or serverless compute) in order, and results render inline. Parameters enter through \textbf{widgets}, which are how a manual notebook becomes a reusable pipeline component.
+
+\begin{definitionbox}
+\textbf{dbutils} is the notebook utilities library: \texttt{dbutils.widgets} for parameters, \texttt{dbutils.fs} for file operations, \texttt{dbutils.secrets} for scoped credentials, \texttt{dbutils.jobs.taskValues} for passing data between workflow tasks, and \texttt{dbutils.notebook.run} for notebook chaining.
+\end{definitionbox}
+
+\begin{lstlisting}[language=Python,caption={Parameterized notebook pattern used throughout the book.},label={lst:ch1-widgets}]
+dbutils.widgets.text("processing_date", "2026-08-31")
+dbutils.widgets.text("source_system", "olist")
+processing_date = dbutils.widgets.get("processing_date")
+source_system = dbutils.widgets.get("source_system")
+
+df = (spark.read
+      .option("header", True)
+      .csv(f"/Volumes/de_training/bronze/landing/{source_system}/"
+           f"dt={processing_date}/"))
+(df.write.format("delta").mode("overwrite")
+   .option("replaceWhere", f"processing_date = '{processing_date}'")
+   .saveAsTable("de_training.bronze.orders_raw"))
+\end{lstlisting}
+
+\subsection{Git Folders}
+A Git folder clones a remote repository into the workspace, giving notebooks real version control: branches, commits, diffs, and pull requests \cite{databricksRepos}. The rule for this book: \emph{labs may start in a scratch folder, but every capstone artifact lives in Git}. Week 23 upgrades Git folders into full CI/CD with Asset Bundles.
+
+\begin{pitfall}
+\textbf{Editing in two places.} A notebook edited both in the Git folder and through an external IDE without a pull will conflict. Pick one direction of truth---in this program, the remote repository is truth and the workspace is a working copy.
+\end{pitfall}
+
+\section{Wednesday: Compute, the CLI, and the SDK}
+\subsection{Choosing Compute}
+Compute choice is the first cost and performance decision of every workload \cite{databricksCompute}:
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.4cm}p{4.4cm}p{5.4cm}@{}}
+\toprule
+\textbf{Compute type} & \textbf{Best for} & \textbf{Caution} \\
+\midrule
+All-purpose cluster & Interactive notebooks, exploration & Expensive per DBU; enforce auto-termination \\
+Job cluster & Scheduled production runs & Starts per run; cold-start latency \\
+Pool-backed cluster & Latency-sensitive interactive teams & Idle instances still bill cloud cost \\
+Serverless & Notebooks, DLT, SQL with spiky load & Fewer configuration knobs; network features vary \\
+SQL warehouse & BI and SQL workloads (Chapter 6) & Separate SKU family; right-size with auto-stop \\
+\bottomrule
+\end{tabular}
+\caption{Compute options and their engineering trade-offs.}
+\label{tab:ch1-compute}
+\end{table}
+
+\subsection{Cluster Policies}
+A cluster policy restricts what users can configure: fixed auto-termination, maximum workers, allowed node types, required tags. Policies are how a platform team makes the cheap choice the easy choice. For this program, create one policy---\texttt{de-training-policy}---that pins auto-termination to 30 minutes and caps workers at 4, and use it for every classic cluster you create.
+
+\subsection{The CLI and SDK in Daily Work}
+Chapter 0 installed the CLI and SDK; this week puts them to work. The pattern that matters: \emph{everything you click in the UI, you can script}. Jobs, clusters, catalogs, permissions, secrets---all have CLI and SDK surfaces, which is what makes Chapter 23's infrastructure-as-code possible \cite{databricksCLI,databricksSDK}.
+
+\begin{lstlisting}[language=Python,caption={SDK inventory script: clusters, jobs, and their owners.},label={lst:ch1-sdk-inventory}]
+from databricks.sdk import WorkspaceClient
+
+w = WorkspaceClient()
+
+print("== Clusters ==")
+for c in w.clusters.list():
+    print(f"{c.cluster_name:30s} state={c.state.value:<10s} "
+          f"creator={c.creator_user_name}")
+
+print("== Jobs ==")
+for j in w.jobs.list():
+    print(f"{j.settings.name:40s} id={j.job_id} "
+          f"creator={j.creator_user_name}")
+\end{lstlisting}
+
+\section{Thursday Hands-on Project: Provision, Authenticate, Smoke-Test}
+This lab provisions the Week 1 environment end to end: OAuth CLI profile, a policy-guarded cluster, a Git folder, and a programmatically submitted smoke-test notebook. It is deliberately CLI-first so the same steps can become an Asset Bundle in Week 23.
+\index{hands-on lab}\index{cluster policies!lab}\index{smoke test}
+
+\begin{notebox}
+The commands below create billable resources. Use a trial or sandbox workspace, keep auto-termination tight, and delete the cluster after testing.
+\end{notebox}
+
+\begin{lstlisting}[language=PowerShell,caption={Week 1 lab: profile, policy-guarded cluster, Git folder.},label={lst:ch1-lab}]
+# 1. Authenticate (OAuth)
+databricks auth login --host https://<your-workspace>.azuredatabricks.net
+databricks current-user me
+
+# 2. Create a cluster policy enforcing guardrails
+'{
+  "name": "de-training-policy",
+  "definition": "{ \"autotermination_minutes\": {\"type\": \"fixed\", \"value\": 30}, \"num_workers\": {\"type\": \"range\", \"maxValue\": 4} }"
+}' | Out-File -Encoding ascii policy.json
+# (In the UI: Compute > Policies > Create, or paste policy.json via the API.)
+
+# 3. Create a small all-purpose cluster from the policy
+'{
+  "cluster_name": "de-week01-cluster",
+  "spark_version": "15.4.x-scala2.12",
+  "node_type_id": "Standard_DS3_v2",
+  "num_workers": 1,
+  "autotermination_minutes": 30,
+  "policy_id": "<policy-id>"
+}' | Out-File -Encoding ascii cluster.json
+databricks clusters create --json-file cluster.json
+
+# 4. Clone the course repo as a Git folder
+databricks repos create https://github.com/<you>/de-training gitHub
+\end{lstlisting}
+
+\begin{lstlisting}[language=Python,caption={Submitting the smoke-test notebook via the SDK.},label={lst:ch1-smoke}]
+from databricks.sdk import WorkspaceClient
+from databricks.sdk.service.jobs import SubmitTask, NotebookTask
+
+w = WorkspaceClient()
+result = w.jobs.submit(
+    run_name="week1-smoke",
+    tasks=[SubmitTask(
+        task_key="smoke",
+        existing_cluster_id="<cluster-id>",
+        notebook_task=NotebookTask(
+            notebook_path="/Repos/<you>/de-training/src/week01_smoke"),
+    )],
+).result()
+print(result.state.result_state)  # SUCCESS
+\end{lstlisting}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item A working CLI OAuth profile and \texttt{current-user me} output.
+    \item The cluster policy JSON and a running cluster created from it.
+    \item The course Git folder cloned into the workspace.
+    \item A successful SDK-submitted notebook run, visible in the Jobs UI.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item Cluster shows auto-termination 30 minutes enforced by the policy (attempting 60 is rejected).
+    \item The smoke notebook prints the current user, Spark version, and a one-row Delta write/read round trip.
+    \item No credentials appear in any committed file; the repo passes a secret scan.
+    \item The cluster is terminated (or auto-terminated) at lab end; a screenshot or \texttt{clusters list} output proves it.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Add a second CLI profile for a hypothetical ``prod'' workspace and demonstrate profile switching.
+    \item Script the entire lab as one idempotent PowerShell script (create-if-missing for each resource).
+    \item Write the lab's DBU cost estimate from \texttt{system.billing.usage}.
+\end{itemize}
+
+\section{Friday Use Case: Workspace Layout for a 200-Person Data Organization}
+A company with 200 data practitioners across three business units (finance, logistics, marketing) needs a Databricks estate. Requirements: environment isolation (dev/staging/prod), cost accountability per business unit, shared platform standards, and a path to audited production deployments.
+\index{workspace design}\index{multi-team}\index{environment isolation}
+
+\subsection{Requirements and Assumptions}
+Assume a single cloud (Azure) with three subscriptions available. Business units vary in maturity: finance has strict change control, logistics is streaming-heavy, marketing is experimentation-heavy. The platform team owns policies, budgets, and the account console; domain teams own pipelines.
+
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[
+        unit/.style={rectangle, rounded corners, draw=primary, thick, fill=primary!4, minimum width=4.6cm, minimum height=3.4cm},
+        svc/.style={rectangle, rounded corners, draw=primary, thick, fill=white, align=center, minimum width=2.0cm, minimum height=0.8cm, font=\scriptsize\bfseries},
+        gov/.style={rectangle, rounded corners, draw=red!60!black, thick, fill=red!5, align=center, minimum width=2.6cm, minimum height=0.9cm, font=\scriptsize\bfseries},
+        flow/.style={-{Latex[length=2mm]}, draw=primary, thick}
+    ]
+        \node[gov] (account) at (0,2.6) {Account console\\SSO + SCIM + budgets};
+        \node[unit, label={[font=\small\bfseries\color{primary}]above:Dev workspace}] (dev) at (-4.4,0) {};
+        \node[unit, label={[font=\small\bfseries\color{primary}]above:Prod workspace}] (prod) at (4.4,0) {};
+        \node[svc] at (-5.5,0.7) {BU clusters\\(policy-bound)};
+        \node[svc] at (-3.3,0.7) {Git folders};
+        \node[svc] at (-5.5,-0.7) {dev catalog};
+        \node[svc] at (-3.3,-0.7) {sandbox};
+        \node[svc] at (3.3,0.7) {job clusters\\only};
+        \node[svc] at (5.5,0.7) {service\\principals};
+        \node[svc] at (3.3,-0.7) {prod catalog};
+        \node[svc] at (5.5,-0.7) {audit tables};
+        \node[gov] (meta) at (0,-2.6) {Unity Catalog metastore\\(one per region)};
+        \draw[flow] (account) -- (dev);
+        \draw[flow] (account) -- (prod);
+        \draw[flow] (meta) -- (dev);
+        \draw[flow] (meta) -- (prod);
+    \end{tikzpicture}%
+    }
+    \caption{A multi-team workspace layout: one account, environment-split workspaces, one regional metastore, policy-bound compute, and service-principal production runs.}
+    \label{fig:ch1-workspace-layout}
+\end{figure}
+
+\subsection{Architecture Decisions}
+\textbf{Workspace topology.} One dev and one prod workspace per environment pair rather than one workspace per business unit: workspace count drives administrative overhead, while catalogs and cluster policies provide the per-unit isolation actually needed. Finance's change-control requirement is satisfied by prod being deploy-only via service principals---no human write access to prod catalogs.
+
+\textbf{Compute governance.} Every BU gets a cluster policy (max workers, pinned auto-termination, required \texttt{bu} tag) and a pool if interactive latency matters. Production jobs run on job clusters created per run: cheaper, isolated, and disposable. Tags flow into \texttt{system.billing.usage}, giving per-unit chargeback without separate accounts.
+
+\textbf{Identity.} SSO with SCIM provisioning from the IdP; BU groups synced; service principals for pipelines. Humans never run production jobs.
+
+\begin{pitfall}
+\textbf{One workspace per team.} It feels clean and becomes unmanageable: N metastores, N policy sets, N audit surfaces. Isolate with catalogs, groups, and policies inside fewer workspaces; split workspaces only across environment or trust boundaries.
+\end{pitfall}
+
+\subsection{Risks and Mitigations}
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{4.6cm}p{7.6cm}@{}}
+\toprule
+\textbf{Risk} & \textbf{Mitigation} \\
+\midrule
+BU cost overrun invisible until invoice & Policy-enforced tags feeding weekly chargeback queries \\
+A workspace split later forced by compliance & Catalog-level isolation from day one keeps the exit cheap \\
+Service-principal sprawl & One principal per pipeline domain, inventoried and owned \\
+Git folders forking from remotes & Remote is truth; weekly automation flags diverged folders \\
+Policy exceptions becoming the norm & Exceptions expire by default; renewal requires the owner \\
+\bottomrule
+\end{tabular}
+\caption{Week 1 scenario risks and mitigations.}
+\label{tab:ch1-risks}
+\end{table}
+
+\section{Design Decision Guide}
+\index{decision guide!Week 1}%
+Week 1's choices are platform-topology choices; they are expensive to reverse, so make them deliberately.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.4cm}p{4.4cm}p{4.6cm}@{}}
+\toprule
+\textbf{Decision} & \textbf{Choose the first when} & \textbf{Choose the second when} \\
+\midrule
+All-purpose vs.\ job cluster & Humans iterate interactively & A scheduled pipeline runs unattended \\
+Serverless vs.\ classic compute & Speed and zero-ops matter most & Custom networking/init or lowest DBU rate \\
+One workspace vs.\ many & Teams share governance and data & Trust or environment boundaries require isolation \\
+Git folder vs.\ workspace folder & Code must be reviewed or deployed & Scratch exploration with no downstream \\
+Cluster policy vs.\ convention & More than one person creates clusters & Never---conventions are not enforcement \\
+Pool vs.\ cold start & Interactive latency is worth idle cost & Schedules tolerate start-up minutes \\
+\bottomrule
+\end{tabular}
+\caption{Week 1 decision guide.}
+\label{tab:ch1-decisions}
+\end{table}
+
+The meta-lesson: topology decisions should be made once, written down, and enforced by policy. A workspace layout decided per-request is not a layout; it is an accumulation.
+
+\section{Operational Guidance for Week 1}
+\index{operational guidance!Week 1}%
+\subsection{Performance and Reliability}
+Cluster start time is the first reliability metric a new platform team feels: keep a small warm pool for interactive teams, use job clusters for schedules, and review cluster uptime versus actual usage weekly---an all-purpose cluster running 24/7 for a team working 8-hour days is a 3x cost with zero benefit. Track notebook job success rates from the jobs UI and promote any notebook run twice manually into a scheduled job with an owner.
+
+\subsection{Security and Governance Checklist}
+\begin{itemize}
+    \item PAT policy configured (or PATs disabled in favor of OAuth) before broad onboarding.
+    \item Every classic cluster created from a policy with auto-termination and worker caps.
+    \item No user-created local accounts beside SCIM-synced IdP groups.
+    \item Course/team repos cloned as Git folders; scratch work quarantined in user folders.
+    \item Weekly \texttt{system.billing.usage} review scheduled from day one.
+\end{itemize}
+
+\subsection{Troubleshooting Playbook}
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.6cm}p{4.2cm}p{4.8cm}@{}}
+\toprule
+\textbf{Symptom} & \textbf{Likely cause} & \textbf{First action} \\
+\midrule
+Cluster fails to start & Cloud vCPU quota exhausted & Check cloud quotas; request increase or shrink the cluster \\
+CLI commands 401 & Expired OAuth session & Re-run \texttt{databricks auth login} \\
+Notebook cannot find table & Missing \texttt{USE CATALOG}/\texttt{SELECT} grant & Verify grants as the affected principal, not as admin \\
+Job ran but wrote nothing & Wrong catalog/schema default in job context & Log \texttt{current\_catalog()} at task start \\
+\bottomrule
+\end{tabular}
+\caption{Week 1 troubleshooting quick reference.}
+\label{tab:ch1-trouble}
+\end{table}
+
+\section{Interview Q\&A}
+\subsection{Concepts and Trade-offs}
+\begin{enumerate}
+    \item \textbf{Q: Why does Databricks separate the control plane from the data plane?}\\
+    A: So the SaaS control plane can orchestrate work while data and compute stay in the customer's cloud account---satisfying data residency, network isolation, and existing cloud commitments.
+    \item \textbf{Q: All-purpose or job cluster for a nightly pipeline?}\\
+    A: Job cluster: created per run, priced lower, configured exactly for the workload, and destroyed after---no idle spend, no shared-state surprises.
+    \item \textbf{Q: What problem do cluster policies actually solve?}\\
+    A: They make platform standards enforceable rather than advisory: budgets (auto-termination caps), security (node restrictions), and chargeback (required tags) become properties of every cluster, not documentation.
+    \item \textbf{Q: Git folder or workspace folder for production notebooks?}\\
+    A: Git folder. Production code needs review, history, and deployability; workspace folders have none of these.
+    \item \textbf{Q: How would you give 200 users compute without 200 bill shocks?}\\
+    A: Policy-bound all-purpose clusters per team, serverless where possible, job clusters for schedules, and weekly per-tag chargeback from \texttt{system.billing.usage}.
+    \item \textbf{Q: Serverless or classic compute for a team onboarding this week?}\\
+    A: Serverless for speed and zero-ops; classic when labs need cluster policies, custom networking, or the tuning knobs Weeks 4 and 9 depend on.
+    \item \textbf{Q: What breaks first when a workspace has no naming conventions?}\\
+    A: Cost attribution and access review---you cannot charge back or audit what you cannot name. Conventions are the cheapest governance you will ever buy.
+    \item \textbf{Q: What would make you split into a second workspace?}\\
+    A: A hard trust or environment boundary---prod separation, a regulated enclave, or a business sale. Performance and organization are never reasons; catalogs and policies carry those.
+\end{enumerate}
+
+\section{Further Reading}
+Begin with the Databricks documentation portal \cite{databricksDocs} and the workspace \cite{databricksWorkspace} and compute \cite{databricksCompute} guides. Study Git folders \cite{databricksRepos}, then the CLI \cite{databricksCLI} and Python SDK \cite{databricksSDK} references---they are the automation surface for the whole book. For the architectural motivation behind the platform, read the lakehouse paper \cite{armbrust2021lakehouse} alongside the Delta Lake paper \cite{armbrust2020delta}.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item The control plane / data plane split explains Databricks' security, networking, and cost model in one picture.
+    \item All-purpose clusters are for humans; job clusters are for pipelines; policies keep both honest.
+    \item Notebooks are for exploration; Git folders are for anything you must review, roll back, or deploy.
+    \item The CLI and SDK turn every UI action into automation---Week 23's CI/CD is built on what you script this week.
+    \item Workspace layout is an organizational decision: isolate with catalogs, groups, and policies before multiplying workspaces.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} List three objects in the control plane and three in the data plane. Which plane does a Unity Catalog metastore's metadata belong to?
+    \item \textbf{(Conceptual)} Why does a job cluster usually cost less than leaving an all-purpose cluster running for a nightly job, even if the job runs every night?
+    \item \textbf{(Hands-on)} Complete the Thursday lab, then extend it: create a second cluster without the policy and document what the policy prevented.
+    \item \textbf{(Hands-on)} Write an SDK script that lists all clusters older than 7 days with no recent activity and prints their estimated idle cost.
+    \item \textbf{(Design)} Extend \cref{fig:ch1-workspace-layout} with a staging workspace and show where bundle targets (Week 23) would point.
+    \item \textbf{(Design)} Write the cluster policy JSON for a streaming team that needs exactly 8 workers, spot instances, and a 60-minute auto-termination ceiling.
+    \item \textbf{(Governance)} Design the group structure (BU, role, environment) that SCIM would sync for the Friday scenario.
+    \item \textbf{(Operations)} Write the runbook entry for ``prod workspace control plane unavailable'': what keeps running, what stops, who is paged?
+\end{enumerate}

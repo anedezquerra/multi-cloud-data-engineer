@@ -1,0 +1,380 @@
+\chapter{Workflows, Jobs, and Pipeline Orchestration}
+\index{Workflows}\index{jobs}\index{tasks}\index{orchestration}\index{task values}%
+\index{retry}\index{repair run}\index{cron}\index{if/else task}\index{for-each task}%
+\begin{objectives}
+\begin{itemize}
+    \item Compose multi-task jobs with dependency DAGs, job clusters, and schedules.
+    \item Pass data between tasks with job parameters and task values.
+    \item Control flow with conditional (\texttt{if/else}) and \texttt{for each} task types.
+    \item Engineer reliability: retries, timeouts, notifications, and repair runs.
+    \item Orchestrate DLT pipelines, notebooks, and SQL in one governed job.
+    \item Monitor an estate of jobs with system tables and define an on-call standard.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+Databricks Workflows is the platform's \textbf{native orchestrator}; the concepts---DAGs, tasks,
+retries, SLAs---map onto every cloud's orchestrator.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{3.0cm}p{3.4cm}p{3.2cm}p{3.2cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{Databricks} & \textbf{AWS} & \textbf{Azure / GCP / Fabric} \\
+\midrule
+Orchestrator & Workflows (jobs + tasks) & Step Functions / MWAA (Airflow) & ADF / Fabric pipelines / Cloud Composer \\
+Task compute & Job cluster per task/task group & Activity workers & Activity IRs / Composer workers \\
+Parameters & Job params + task values & SFN input/output passing & Pipeline params / Airflow XComs \\
+Conditional flow & if/else, for-each tasks & Choice / Map states & If Condition / ForEach activities \\
+Partial recovery & Repair run (failed + downstream) & Redrive / Airflow retries & Rerun from activity / task retry \\
+API/IaC & Jobs API, Asset Bundles & SFN ASL / CDK / Terraform & ARM / Bicep / Terraform \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+External orchestrators (Airflow, Dagster) still integrate via the Jobs API; the native advantage
+is colocation with clusters, catalogs, and lineage---one pane for run, retry, and data impact.
+\end{crosscloud}
+
+\section{Week 12 Roadmap and Mental Model}
+Chapters 9--11 built the pipeline \emph{components}; Week 12 assembles them into an \emph{operated system}. A Workflow job is a DAG of tasks---notebooks, DLT pipelines, SQL, JARs, dbt, conditionals---with scheduling, retries, notifications, and a repair model \cite{databricksWorkflows}. The engineering content is not drawing boxes; it is failure design: what happens at 03:00 when task 4 of 9 fails, and who finds out how.
+
+The mental model: \textbf{a job is a small distributed system}. Tasks are processes with dependencies, identity (run-as principal), resources (job clusters), inputs (parameters, task values), and failure semantics (retry, timeout, downstream skip, repair). Design it like one and the 03:00 page is boring; design it like a script and the page is not.
+
+\begin{definitionbox}
+\textbf{A Databricks job} is a scheduled or triggered DAG of \textbf{tasks} executed by Workflows. Each task has a type (notebook, pipeline, SQL, condition, for-each), compute (job cluster, serverless, warehouse), dependencies (\texttt{depends\_on}), and reliability settings (retries, timeout). A \textbf{repair run} re-executes only failed tasks and their dependents.
+\end{definitionbox}
+
+\begin{keyterms}
+\textbf{Job parameter}: a value set at job level, shared by all tasks. \textbf{Task value}: a runtime value set by one task (\texttt{dbutils.jobs.taskValues.set}) and read by dependents. \textbf{Job cluster}: ephemeral compute created for a task or run. \textbf{Repair run}: partial re-execution of failed and downstream tasks. \textbf{Run-as}: the identity the job executes as---a service principal in production.
+\end{keyterms}
+
+\section{Monday: Jobs, Tasks, and Compute Topology}
+\subsection{Anatomy of a Job}
+A job has: a schedule (cron or file-arrival/continuous trigger), tasks with \texttt{depends\_on} edges, per-task compute, notifications, and a run-as identity. The first design decision is compute topology: one shared job cluster for all tasks (cheap, coupled) versus a job cluster per task (isolated, slightly slower, failure-contained). Production standard in this book: \emph{per-task job clusters for anything that can fail independently}.
+
+\subsection{Scheduling}
+Cron schedules handle time-based runs; \textbf{file-arrival triggers} start jobs when data lands (composing beautifully with Chapter 11's partner files); continuous triggers keep jobs alive. Time zone and daylight-saving behavior are configuration, not folklore---set them explicitly.
+
+\begin{pitfall}
+\textbf{The shared-cluster cascade.} Six tasks on one job cluster: task 2's memory leak kills tasks 3--6 as ``failures'' that were really collateral damage. Per-task clusters cost a few extra start minutes and buy you accurate failure attribution---the repair run then retries the task that actually failed.
+\end{pitfall}
+
+\section{Tuesday: Parameters, Task Values, and Control Flow}
+\subsection{Static versus Runtime Values}
+\textbf{Job parameters} are declared at job level (e.g.\ \texttt{processing\_date}, \texttt{environment}) and referenced by every task. \textbf{Task values} are computed at runtime and passed downstream---the row count the ingestion task measured, the quality verdict the gate produced.
+
+\begin{lstlisting}[language=Python,caption={Task values: the runtime handoff between tasks.},label={lst:ch12-taskvalues}]
+# In the quality-gate task:
+bad = spark.sql("""
+    SELECT COUNT(*) c FROM de_training.silver.orders
+    WHERE order_id IS NULL OR total_amount < 0
+""").first().c
+
+if bad > 0:
+    dbutils.jobs.taskValues.set("quality", "failed")
+    raise ValueError(f"Quality gate failed: {bad} bad rows")
+dbutils.jobs.taskValues.set("quality", "passed")
+dbutils.jobs.taskValues.set("rows_silver",
+    spark.table("de_training.silver.orders").count())
+
+# In a downstream task:
+rows = dbutils.jobs.taskValues.get(task_key="quality_gate", key="rows_silver")
+\end{lstlisting}
+
+\subsection{Conditionals and For-Each}
+An \texttt{if/else} task evaluates a condition (often against a task value) and routes the DAG---the in-band alerting and branching mechanism. A \texttt{for each} task fans out over a list (e.g.\ one sub-run per partner feed) with concurrency controls---the answer to ``we onboard 40 tables with one config table'' without 40 hand-written DAGs.
+
+\section{Wednesday: Reliability Engineering}
+\subsection{Retries, Timeouts, Notifications}
+Retries handle transient failure (with backoff); timeouts bound hung tasks; notifications (email, webhook to PagerDuty/Teams/Slack) route failure to humans. The policy question is not ``retry or not'' but \emph{what is safe to retry}: idempotent tasks (Chapter 3's discipline) retry freely; side-effecting tasks retry only after a state check.
+
+\subsection{Repair Runs}
+When a run fails at task 4 of 9, a \textbf{repair run} re-executes task 4 and its dependents with the same parameters---the other five tasks' outputs are reused. Repair is the economic and operational alternative to full reruns, but it leans entirely on task idempotency: a non-idempotent task 2 ``reused'' by a repair is only safe because it succeeded the first time \cite{databricksJobsAPI}.
+
+\subsection{Monitoring the Estate}
+Job and run history live in \texttt{system.lakeflow} tables: success rates, duration trends, cost per job. The on-call standard this book adopts: every production job has an owner, a runbook link in its failure notification, and a weekly reliability review of the failure list.
+
+\section{Thursday Hands-on Project: The Orchestrated Medallion}
+Assemble Weeks 10--11 into one job: Auto Loader ingestion $\rightarrow$ DLT pipeline $\rightarrow$ quality-gate notebook $\rightarrow$ conditional alert, parameterized by date, with a forced failure and a repair run.
+\index{hands-on lab}\index{repair run!lab}\index{Workflows!lab}
+
+\begin{lstlisting}[language=json,caption={Week 12 lab: job definition (JSON view of the DAG).},label={lst:ch12-job}]
+{
+  "name": "de-week12-nightly-elt",
+  "parameters": [{"name": "processing_date", "default": "{{ds}}"}],
+  "tasks": [
+    {"task_key": "ingest", "job_cluster_key": "jc",
+     "notebook_task": {"notebook_path": "src/ingest_autoloader",
+                       "base_parameters": {"processing_date": "{{job.parameters.processing_date}}"}}},
+    {"task_key": "pipeline", "depends_on": [{"task_key": "ingest"}],
+     "pipeline_task": {"pipeline_id": "<dlt-pipeline-id>"}},
+    {"task_key": "quality_gate", "depends_on": [{"task_key": "pipeline"}],
+     "job_cluster_key": "jc",
+     "notebook_task": {"notebook_path": "src/quality_gate"}},
+    {"task_key": "route", "depends_on": [{"task_key": "quality_gate"}],
+     "condition_task": {"op": "EQUAL_TO",
+                        "left": "{{tasks.quality_gate.values.quality}}",
+                        "right": "passed"}},
+    {"task_key": "alert", "depends_on": [{"task_key": "route", "outcome": "false"}],
+     "notebook_task": {"notebook_path": "src/notify_oncall"}}
+  ],
+  "job_clusters": [{"job_cluster_key": "jc",
+    "new_cluster": {"spark_version": "15.4.x-scala2.12",
+                    "node_type_id": "Standard_DS3_v2", "num_workers": 1}}],
+  "schedule": {"quartz_cron_expression": "0 0 2 * * ?", "timezone_id": "UTC"}
+}
+\end{lstlisting}
+
+The drill: run the job; force the quality gate to fail (point it at a table with planted bad rows); observe the conditional alert fire; fix the data; then \texttt{databricks runs repair -{}-run-id <id>} and capture that only failed and dependent tasks re-executed.
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item The job definition (UI export or JSON) with the five-task DAG.
+    \item The forced-failure evidence: gate failure, alert task execution, notification.
+    \item The repair-run page showing partial re-execution.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item A same-day rerun (after success) changes zero Gold row counts---end-to-end idempotence.
+    \item The forced failure pages via the conditional path, with the runbook link present.
+    \item The repair run re-executes only the failed task and its dependents.
+    \item The job runs as a service principal with exactly the grants from Chapter 8's matrix.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Add a \texttt{for each} task fanning ingestion over the nine Olist tables from a config list.
+    \item Add a file-arrival trigger variant and compare its latency against the cron schedule.
+    \item Emit per-task duration and row counts to a run-ledger Delta table and chart a week of runs.
+\end{itemize}
+
+\section{Friday Use Case: Sixty Pipelines, Three Teams, One 6 A.M. SLA}
+A company runs 60 interdependent nightly pipelines across three teams with a shared 06:00 completion SLA. Today: cron-scheduled notebooks, failures discovered by customers, and monthly all-hands reruns. Design the orchestration layer.
+\index{orchestration!design}\index{SLA}
+
+\subsection{Requirements and Assumptions}
+Cross-team dependencies exist (finance consumes logistics' Gold). Backfills happen weekly. Teams deploy independently. The platform team owns the on-call rotation and the SLA.
+
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[
+        team/.style={rectangle, rounded corners, draw=primary, thick, fill=primary!4, minimum width=4.2cm, minimum height=2.6cm},
+        svc/.style={rectangle, rounded corners, draw=primary, thick, fill=white, align=center, minimum width=1.7cm, minimum height=0.7cm, font=\tiny\bfseries},
+        plat/.style={rectangle, rounded corners, draw=codegreen!60!black, thick, fill=green!7, align=center, minimum width=3.4cm, minimum height=0.9cm, font=\scriptsize\bfseries},
+        flow/.style={-{Latex[length=2mm]}, draw=primary, thick}
+    ]
+        \node[team, label={[font=\scriptsize\bfseries\color{primary}]above:logistics jobs}] (log) at (0,0) {};
+        \node[team, label={[font=\scriptsize\bfseries\color{primary}]above:finance jobs}] (fin) at (5.4,0) {};
+        \node[team, label={[font=\scriptsize\bfseries\color{primary}]above:marketing jobs}] (mkt) at (10.8,0) {};
+        \node[svc] at (-0.9,0.5) {ingest}; \node[svc] at (1.1,0.5) {dlt};
+        \node[svc] at (-0.9,-0.6) {gate};  \node[svc] at (1.1,-0.6) {publish};
+        \node[svc] at (4.5,0.5) {close};   \node[svc] at (6.5,0.5) {report};
+        \node[svc] at (4.5,-0.6) {gate};   \node[svc] at (6.5,-0.6) {publish};
+        \node[svc] at (9.9,0.5) {features}; \node[svc] at (11.9,0.5) {score};
+        \node[svc] at (9.9,-0.6) {gate};   \node[svc] at (11.9,-0.6) {publish};
+        \node[plat] (ledger) at (5.4,-2.6) {run ledger + SLA monitor\\(system.lakeflow + alerts)};
+        \draw[flow] (log) -- node[above, font=\scriptsize]{contract tables} (fin);
+        \draw[flow] (fin) -- (ledger);
+        \draw[flow] (log) -- (ledger);
+        \draw[flow] (mkt) -- (ledger);
+    \end{tikzpicture}%
+    }
+    \caption{Federated orchestration: team-owned jobs, contract tables between teams, one platform-owned ledger and SLA monitor.}
+    \label{fig:ch12-estate}
+\end{figure}
+
+\subsection{Architecture Decisions}
+\textbf{Federated jobs, contractual interfaces.} Each team owns its Workflow jobs; cross-team dependencies are \emph{data contracts}, not task edges across team boundaries---finance's job starts from a file-arrival trigger or a contract-table freshness check, not from a dependency on logistics' internals. This is what lets teams deploy independently without 03:00 cross-team debugging.
+
+\textbf{One ledger, one SLA monitor.} Every job writes run outcomes to a shared run-ledger table (task values make this cheap); the platform SLA monitor reads \texttt{system.lakeflow} plus the ledger, pages on trajectory-to-miss at 04:30 rather than on breach at 06:00, and drives the weekly reliability review. Backfills are bundle-parameterized runs (Chapter 23) against the same jobs, never hand-edited clones.
+
+\begin{pitfall}
+\textbf{Cross-team task dependencies.} Wiring team A's task directly into team B's job graph couples their deploys, retries, and failure pages. Depend on \emph{published data with a freshness contract}; alert the producer when the contract breaks.
+\end{pitfall}
+
+\subsection{Risks and Mitigations}
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{4.6cm}p{7.6cm}@{}}
+\toprule
+\textbf{Risk} & \textbf{Mitigation} \\
+\midrule
+Cross-team dependency couples releases & Contract tables with freshness SLAs, not task edges \\
+Repair run re-executes a side-effecting task & Idempotency review is a job-definition checklist item \\
+Alert fatigue from flaky tasks & Failure budgets per job; flakiness is a reliability bug \\
+Run ledger becomes unqueryable lore & Ledger schema versioned; weekly review uses saved queries \\
+On-call pages without runbooks & Notification template requires the runbook link to save \\
+\bottomrule
+\end{tabular}
+\caption{Week 12 scenario risks and mitigations.}
+\label{tab:ch12-risks}
+\end{table}
+
+\section{Design Decision Guide}
+\index{decision guide!Week 12}%
+Orchestration decisions are failure-shape decisions: choose based on what 03:00 looks like.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.4cm}p{4.4cm}p{4.6cm}@{}}
+\toprule
+\textbf{Decision} & \textbf{Choose the first when} & \textbf{Choose the second when} \\
+\midrule
+Per-task vs.\ shared job cluster & Tasks can fail independently & Tiny chained tasks where start-up dominates \\
+Task value vs.\ job parameter & Value is computed at runtime & Value is declared input \\
+Conditional task vs.\ external alerting & The response is in-band and automatable & Humans must decide with context \\
+Workflows vs.\ external orchestrator & The estate is Databricks-centric & Orchestration spans many external systems \\
+Repair run vs.\ full rerun & Tasks are idempotent & State is ambiguous---then fix idempotency \\
+Cron vs.\ file-arrival trigger & Time-driven SLAs & Data-arrival-driven work \\
+\bottomrule
+\end{tabular}
+\caption{Week 12 decision guide.}
+\label{tab:ch12-decisions}
+\end{table}
+
+Idempotency is the load-bearing assumption under repair runs, retries, and backfills. If you take one thing from Week 12: orchestration features are only as safe as the write patterns beneath them.
+
+\section{Operational Guidance for Week 12}
+\index{operational guidance!Week 12}%
+\subsection{Performance and Reliability}
+The run ledger is the estate's health record: review failure rate, mean repair time, and p95 duration per job weekly. Trajectory alerting (elapsed + remaining-p50 vs.\ SLA) pages early; breach alerts write postmortems. Keep repair drills on the calendar---a repair path exercised monthly works at 03:00; one last used at launch is a rumor.
+
+\subsection{Security and Governance Checklist}
+\begin{itemize}
+    \item Production jobs run-as service principals with Chapter 8's least-privilege matrix.
+    \item Notification webhooks (PagerDuty/Teams) carry no payload data---keys and links only.
+    \item Job parameters containing sensitive values come from secret scopes, not job config.
+    \item Schedule time zones set explicitly and reviewed before daylight-saving transitions.
+\end{itemize}
+
+\subsection{Troubleshooting Playbook}
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.6cm}p{4.2cm}p{4.8cm}@{}}
+\toprule
+\textbf{Symptom} & \textbf{Likely cause} & \textbf{First action} \\
+\midrule
+Downstream task reads empty value & Task value key/task\_key mismatch & Log the set/get keys; check dependency edge \\
+Condition task always false & Type mismatch in comparison & Compare string forms; log the evaluated value \\
+Repair re-ran half the job & Over-declared dependencies & Tighten \texttt{depends\_on} to true data edges \\
+Job fired an hour late/early & Time zone or DST in cron schedule & Set \texttt{timezone\_id} explicitly; re-check at DST \\
+\bottomrule
+\end{tabular}
+\caption{Week 12 troubleshooting quick reference.}
+\label{tab:ch12-trouble}
+\end{table}
+
+\section{Interview Q\&A}
+\subsection{Concepts and Trade-offs}
+\begin{enumerate}
+    \item \textbf{Q: Task values versus job parameters?}\\
+    A: Parameters are static inputs declared at job level; task values are runtime outputs of one task consumed by dependents. Confusing them is how ``yesterday's date'' ends up hardcoded.
+    \item \textbf{Q: What makes a repair run safe?}\\
+    A: Task idempotency plus correct dependency modeling: repair reuses successful outputs and re-runs the failed subtree, so each task must produce the same effect when executed twice with the same inputs.
+    \item \textbf{Q: How do you alert on trajectory, not breach?}\\
+    A: Track per-task duration baselines in a run ledger; at 04:30 compare elapsed + remaining-p50 against the SLA and page early. Breach alerts tell you what you already lost.
+    \item \textbf{Q: Job cluster per task or one shared cluster?}\\
+    A: Per task for failure isolation and accurate attribution; shared only for tight-latency chains of small tasks where start-up dominates. State the trade-off explicitly in the job's README.
+    \item \textbf{Q: When do you reach for Airflow instead of Workflows?}\\
+    A: When orchestration must span many non-Databricks systems with complex scheduling logic already expressed in Airflow---and even then, Workflows runs the Databricks tasks via the Jobs API while Airflow coordinates the perimeter.
+    \item \textbf{Q: How do you onboard a new pipeline into an existing job estate?}\\
+    A: As a new job with its own SLA and ledger entries, depending on contract tables---never as a task inside another team's job.
+    \item \textbf{Q: What does the repair-run button assume about your code?}\\
+    A: That every task is idempotent and dependencies reflect true data edges. Repair is safe exactly to the extent your write discipline is real.
+    \item \textbf{Q: How would you decommission a job safely?}\\
+    A: Lineage first (who reads its outputs), then a deprecation notice in the run ledger, then schedule removal, then data-retention handling for its tables---the reverse of onboarding, with the same discipline.
+\end{enumerate}
+
+\section{Further Reading}
+The Workflows documentation covers jobs, task types, triggers, and repair \cite{databricksWorkflows}; the Jobs API is the automation surface for Chapter 23 \cite{databricksJobsAPI}. System-table monitoring is documented in \cite{databricksSystemTables}. Revisit DLT \cite{databricksDLT} for how pipelines appear as tasks.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item A job is a small distributed system: identity, compute, inputs, and failure semantics per task.
+    \item Per-task job clusters buy failure isolation and honest attribution for a few start-up minutes.
+    \item Task values carry runtime facts; parameters carry declared inputs---keep them separate.
+    \item Repair runs are the economics of recovery; they rest entirely on idempotent tasks.
+    \item Federate orchestration at team boundaries with data contracts and freshness checks, not cross-team task edges.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Diagram the difference between retry, rerun, and repair; give a scenario where each is the right response.
+    \item \textbf{(Conceptual)} Why does a shared job cluster corrupt failure attribution?
+    \item \textbf{(Hands-on)} Complete the Thursday lab, including the forced failure and repair evidence.
+    \item \textbf{(Hands-on)} Add the run-ledger emission to every task and produce the week-in-review query.
+    \item \textbf{(Hands-on)} Convert the cron schedule to a file-arrival trigger; measure arrival-to-start latency.
+    \item \textbf{(Design)} Write the data contract (schema, freshness SLA, quality gate) between logistics and finance from the Friday scenario.
+    \item \textbf{(Operations)} Draft the 04:30 trajectory alert query against the run ledger.
+    \item \textbf{(Architecture)} Which tasks of this job become bundle resources in Chapter 23, and which stay UI-managed? Defend the split.
+\end{enumerate}
+
+\section{Milestone 3 Capstone: The Orchestrated Batch ELT Platform}\label{sec:ch12-capstone}
+\index{Milestone 3 capstone}\index{capstone project!Part III}\index{Workflows!capstone}\index{Auto Loader!capstone}
+
+\begin{capstonebox}
+\textbf{Mission.} Close Part III by delivering the batch platform as one operated system: Auto Loader ingestion of daily Olist extracts, a DLT pipeline with expectations into Silver/Gold, a blocking quality gate, conditional failure alerting, and a demonstrated repair run---all parameterized and idempotent.
+
+\textbf{Estimated time.} 6--8 hours.
+
+\textbf{What you'll practice.}
+\begin{itemize}
+    \item Triggered Auto Loader with schema evolution and rescued data.
+    \item DLT expectations wired to real severity decisions.
+    \item Multi-task Workflow design with task values, conditionals, and repair.
+    \item Idempotence proof and DBU cost accounting per nightly run.
+\end{itemize}
+\end{capstonebox}
+
+\subsection*{Scenario}
+Contoso Retail's nightly load has grown from one CSV to nine partner feeds plus a CDC extract. The current cron-and-notebook setup double-loads on reruns and fails silently twice a month. You are replacing it with the orchestrated platform---and proving every failure mode is now loud, repairable, and reconciled.
+
+\subsection*{Requirements}
+\begin{itemize}
+    \item One Workflow job: ingest (Auto Loader) $\rightarrow$ DLT medallion pipeline $\rightarrow$ quality gate $\rightarrow$ publish $\rightarrow$ conditional alert path.
+    \item Schema-evolving batch and one corrupted row handled without manual repair.
+    \item Expectations with deliberate severities; quality metrics queryable from the event log.
+    \item Forced mid-pipeline failure repaired (not fully rerun) with evidence.
+    \item Same-day idempotence proof; per-run DBU cost from system tables.
+    \item README with architecture diagram, runbook, and failure drill results.
+\end{itemize}
+
+\subsection*{Reference Architecture}
+Reuse \cref{fig:ch12-estate}'s single-team slice: ingestion task $\rightarrow$ DLT task $\rightarrow$ gate $\rightarrow$ publish, with the conditional alert branch and the run ledger---deployed as one job with per-task job clusters.
+
+\subsection*{Implementation Steps}
+\begin{enumerate}
+    \item Stand up the Auto Loader volume ingestion with checkpoint and schema location under governance.
+    \item Convert the medallion flow to DLT with expectations (reuse Chapter 10).
+    \item Author the job JSON per \cref{lst:ch12-job}; wire task values and the conditional alert.
+    \item Run the failure drill; repair; capture evidence.
+    \item Produce the cost report and the runbook; finalize the README.
+\end{enumerate}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item Job definition, DLT pipeline source, and the quality-gate notebook in Git.
+    \item Failure-drill and repair-run evidence; idempotence proof.
+    \item Cost-per-run report with the job-cluster decision documented.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item A poisoned feed demonstrably drops/fails per expectation severity, with event-log metrics.
+    \item The repair run re-executes only the failed subtree; total rerun cost is documented.
+    \item Gold row counts are identical across a forced same-day rerun.
+    \item The job runs as a service principal; no credentials in any committed file.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Add the \texttt{for each} fan-out over the nine feeds from a config table.
+    \item Add the trajectory-based SLA alert from the Friday scenario.
+    \item Wrap the job in an Asset Bundle with dev/prod targets (preview of Chapter 23).
+\end{itemize}

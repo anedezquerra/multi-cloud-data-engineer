@@ -1,0 +1,342 @@
+\chapter{Kafka, Event Hubs, and Kinesis Integration}
+\index{Apache Kafka}\index{Event Hubs}\index{Kinesis}\index{consumer group}\index{offsets}%
+\index{maxOffsetsPerTrigger}\index{schema registry}\index{Avro}\index{backpressure}%
+\begin{objectives}
+\begin{itemize}
+    \item Explain Kafka's log model: topics, partitions, consumer groups, and offset semantics.
+    \item Connect Structured Streaming to Kafka with authentication and secure credential handling.
+    \item Use the Event Hubs Kafka endpoint and the Kinesis source with their platform-specific options.
+    \item Control throughput with \texttt{maxOffsetsPerTrigger}, \texttt{startingOffsets}, and partition sizing.
+    \item Deserialize JSON and Avro (schema registry) safely under schema evolution.
+    \item Execute a broker migration with replay-based reconciliation.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+Kafka is the \textbf{lingua franca} of streaming backbones; each cloud's managed bus either speaks
+Kafka or offers a close analog.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{3.0cm}p{3.4cm}p{3.2cm}p{3.2cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{Kafka} & \textbf{AWS} & \textbf{Azure / GCP / Fabric} \\
+\midrule
+Managed offering & MSK / Confluent & MSK; Kinesis Data Streams & Event Hubs (Kafka endpoint) / Pub/Sub / Eventstream \\
+Scale unit & Partition & Shard (Kinesis) & Throughput unit / partitions \\
+Consumer model & Consumer groups + offsets & Iterator per shard & Consumer groups / subscriptions \\
+Retention & Configurable per topic & 24 h--365 d (Kinesis) & 1--90 d / Pub/Sub retention \\
+Schema governance & Schema Registry (Avro/Proto/JSON) & Glue Schema Registry & Azure Schema Registry / Pub/Sub schemas \\
+Spark source & \texttt{kafka} format & \texttt{kinesis} connector & Kafka endpoint / Pub/Sub connectors \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+\textbf{Snowflake} and \textbf{MongoDB} sit downstream of these buses (Snowpipe Streaming, Kafka
+Connector; Atlas Stream Processing, change streams as a source).
+\end{crosscloud}
+
+\section{Week 15 Roadmap and Mental Model}
+Weeks 13--14 streamed from files and synthetic sources. Production streams come from message buses, and Apache Kafka is the one you will meet most---directly, or through Azure Event Hubs' Kafka-compatible endpoint, or alongside Amazon Kinesis in AWS estates \cite{kafkaDocs,sparkKafkaIntegration}. Week 15 is the integration chapter: connections, security, throughput control, schema discipline, and replay.
+
+The mental model: \textbf{Kafka is a durable, partitioned, replayable log; your stream is a cursor}. Producers append; the log retains; consumers (identified by group) track an offset per partition. Replay, scaling, and exactly-once all follow from that: offsets are the cursor, partitions are the parallelism, retention is your replay window.
+
+\begin{definitionbox}
+\textbf{Apache Kafka} is a distributed commit log: producers append records to \textbf{topics} split into ordered \textbf{partitions}; \textbf{consumer groups} read partitions with each group tracking its own \textbf{offsets}. Delivery is at-least-once by default---consumers choose when to commit progress.
+\end{definitionbox}
+
+\begin{keyterms}
+\textbf{Partition}: the unit of ordering and parallelism. \textbf{Consumer group}: a named set of consumers sharing a topic's partitions. \textbf{Offset}: a consumer's position in a partition. \textbf{Schema registry}: a versioned contract store for message schemas. \textbf{\texttt{maxOffsetsPerTrigger}}: the per-batch volume cap---the backpressure knob.
+\end{keyterms}
+
+\section{Monday: The Log Model for Data Engineers}
+\subsection{Topics, Partitions, Groups}
+Ordering exists only \emph{within a partition}; parallelism exists only \emph{across partitions}. A topic for 50k events/second with 3 partitions gives you 3 lanes no matter how big the cluster (Chapter 13's ad-tech case). A consumer group of N readers gets each partition assigned to exactly one member---two groups reading the same topic each see every message (fan-out for free).
+
+\subsection{Offset Semantics}
+Kafka's default is at-least-once: read, process, commit. Crash between process and commit $\rightarrow$ redelivery. Structured Streaming stores offsets in its checkpoint and commits after the sink write---the at-least-once delivery plus the idempotent Delta sink is what composes into exactly-once effect (Chapter 14's argument, now with the source half explicit).
+
+\begin{pitfall}
+\textbf{Deriving per-event ordering across partitions.} Events for one entity must land in one partition---key your producers by entity ID (\texttt{card\_id}, \texttt{device\_id}). Cross-partition ordering does not exist; a watermark cannot repair an ordering you never had.
+\end{pitfall}
+
+\section{Tuesday: The Spark Kafka Source, Securely}
+\subsection{Connection and Deserialization}
+The Kafka source is a \texttt{format("kafka")} stream; values arrive as bytes---you deserialize. JSON with an explicit schema for simple cases; Avro/Protobuf with a schema registry for governed evolution.
+
+\begin{lstlisting}[language=Python,caption={Kafka source with schema-registry Avro and scoped credentials.},label={lst:ch15-kafka}]
+from pyspark.sql import functions as F
+from pyspark.sql.avro.functions import from_avro
+
+kafka_user = dbutils.secrets.get("kv-lab", "kafka-user")
+kafka_pass = dbutils.secrets.get("kv-lab", "kafka-password")
+
+raw = (spark.readStream.format("kafka")
+    .option("kafka.bootstrap.servers", "broker1:9093,broker2:9093")
+    .option("subscribe", "card_transactions")
+    .option("kafka.security.protocol", "SASL_SSL")
+    .option("kafka.sasl.mechanism", "PLAIN")
+    .option("kafka.sasl.jaas.config",
+            f'kafkashaded.org.apache.kafka.common.security.plain.'
+            f'PlainLoginModule required username="{kafka_user}" '
+            f'password="{kafka_pass}";')
+    .option("startingOffsets", "latest")
+    .option("maxOffsetsPerTrigger", 100000)      # backpressure cap
+    .option("failOnDataLoss", "false")           # survive retention gaps
+    .load())
+
+events = raw.select(
+    F.col("key").cast("string").alias("event_key"),
+    from_avro(F.expr("substring(value, 6)"),   # strip registry magic bytes
+              avro_schema_from_registry).alias("v"),
+    F.col("timestamp").alias("kafka_ts"))
+.select("event_key", "v.*", "kafka_ts")
+\end{lstlisting}
+
+\subsection{Event Hubs via the Kafka Endpoint}
+Azure Event Hubs exposes a Kafka-compatible endpoint: the same source configuration with the Event Hubs connection string as the SASL password and the namespace as the bootstrap server \cite{eventHubsKafka}. The migration story is the headline: consumers written against Kafka move to Event Hubs with configuration, not code. (Note the Event Hubs Kafka surface does not implement every Kafka API---verify transactions and admin operations against current docs.)
+
+\section{Wednesday: Kinesis, Throughput, and Replay}
+\subsection{The Kinesis Source}
+For AWS estates, the Kinesis connector reads shards with per-shard iterators \cite{kinesisDocs}. The mapping: shard $\approx$ partition, iterator $\approx$ offset, enhanced fan-out $\approx$ dedicated consumer throughput. Rate limits matter---\texttt{DescribeStream} and read throttles appear as consumer lag; coalesce small records and size shard count to peak, not average.
+
+\subsection{Replay and Reconciliation}
+Both buses retain; both let a new consumer (or a reset one) re-read history. The discipline from Chapter 11 applies: replay into a \emph{separate} recovery table with its own checkpoint, reconcile counts against the primary, and only then consider the primary touched. \texttt{startingOffsets="earliest"} is the replay switch; \texttt{failOnDataLoss} governs behavior when retention has already expired.
+
+\begin{tipbox}
+Budget replay before you need it: re-reading 7 days of a 50k/s topic at capped offsets takes hours. Measure your replay throughput once, record it in the DR runbook, and set the recovery-time expectation from the measurement.
+\end{tipbox}
+
+\section{Thursday Hands-on Project: Local Kafka to Bronze, with Replay}
+Stand up a local Kafka in Docker, produce synthetic card transactions, consume into Bronze Delta with a capped trigger, then replay from earliest into a recovery table and reconcile.
+\index{hands-on lab}\index{Kafka!lab}\index{replay!lab}
+
+\begin{lstlisting}[language=bash,caption={Week 15 lab: local broker and topic.},label={lst:ch15-docker}]
+# docker-compose: single-broker Kafka (KRaft) on localhost:9092
+docker compose up -d
+docker exec kafka kafka-topics --create --topic card_transactions `
+    --partitions 6 --replication-factor 1 --bootstrap-server localhost:9092
+\end{lstlisting}
+
+\begin{lstlisting}[language=Python,caption={Producer (unique IDs) and capped consumer with replay drill.},label={lst:ch15-lab}]
+# producer.py (faker-seeded; run outside Spark)
+from confluent_kafka import Producer
+from faker import Faker
+import json, uuid, time
+fake = Faker(); Faker.seed(42)
+p = Producer({"bootstrap.servers": "localhost:9092"})
+for i in range(100_000):
+    evt = {"event_id": str(uuid.uuid5(uuid.NAMESPACE_DNS, f"evt-{i}")),
+           "card_id": f"C{fake.random_int(1,5000):05d}",
+           "city": fake.city(), "amount": round(fake.random.uniform(1,500),2),
+           "event_ts": time.time()}
+    p.produce("card_transactions", key=evt["card_id"],
+              value=json.dumps(evt))
+p.flush()
+
+# consumer: capped trigger into Bronze
+stream = (spark.readStream.format("kafka")
+    .option("kafka.bootstrap.servers", "localhost:9092")
+    .option("subscribe", "card_transactions")
+    .option("startingOffsets", "latest")
+    .option("maxOffsetsPerTrigger", 1000)      # visible batching
+    .load())
+parsed = stream.select(F.from_json(F.col("value").cast("string"),
+    "event_id STRING, card_id STRING, city STRING, amount DOUBLE, event_ts DOUBLE"
+    ).alias("v")).select("v.*")
+q = (parsed.writeStream.format("delta")
+    .option("checkpointLocation", "/Volumes/de_training/bronze/_ckpt/cards")
+    .trigger(processingTime="10 seconds")
+    .toTable("de_training.bronze.card_txns"))
+
+# Replay drill: fresh checkpoint + earliest offsets into a RECOVERY table
+replay = (spark.readStream.format("kafka")
+    .option("kafka.bootstrap.servers", "localhost:9092")
+    .option("subscribe", "card_transactions")
+    .option("startingOffsets", "earliest")
+    .option("maxOffsetsPerTrigger", 10000)
+    .load())
+# ... same parsing, checkpoint _ckpt/cards_replay, toTable ...card_txns_replay
+# Reconcile: COUNT(*), COUNT(DISTINCT event_id), SUM(amount) must match.
+\end{lstlisting}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item The seeded producer, the capped streaming consumer, and the Bronze table.
+    \item The replay table plus the three-way reconciliation output.
+    \item A note on where credentials live (secret scope) even in the local lab.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item 100k produced events all land in Bronze; no duplicates (unique-ID check).
+    \item Replay from \texttt{earliest} reconciles exactly against the primary table.
+    \item \texttt{maxOffsetsPerTrigger} demonstrably bounds batch size in \texttt{lastProgress}.
+    \item No connection strings or credentials appear in committed code.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Repeat against an Event Hubs namespace using the Kafka endpoint; document the configuration delta.
+    \item Add a schema-registry Avro variant and break it with an incompatible schema change; capture the failure.
+    \item Measure replay throughput (events/second) and record the 7-day replay estimate.
+\end{itemize}
+
+\section{Friday Use Case: On-Prem Kafka to Event Hubs, Zero Downtime}
+A retailer runs self-managed Kafka on premises and must migrate 40 topics to Azure Event Hubs while Databricks consumers keep running---no downtime, no duplicate billing events.
+\index{migration}\index{Event Hubs!migration}\index{zero downtime}
+
+\subsection{Requirements and Assumptions}
+Producers cut over gradually over two weeks (by service). Consumers must not see duplicates across the boundary. Some topics have 30-day retention needs; Event Hubs retention caps require planning (or a capture-to-ADLS pattern).
+
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[
+        box/.style={rectangle, rounded corners, draw=primary, thick, fill=primary!7, align=center, minimum width=3.0cm, minimum height=0.95cm, font=\small\bfseries},
+        store/.style={cylinder, draw=primary, shape border rotate=90, aspect=0.25, fill=primary!10, align=center, minimum width=2.3cm, minimum height=1.1cm, font=\small\bfseries},
+        flow/.style={-{Latex[length=2mm]}, draw=primary, thick}
+    ]
+        \node[box] (onprem) at (0,0.9) {On-prem Kafka\\(draining)};
+        \node[box] (eh) at (0,-0.9) {Event Hubs\\(filling)};
+        \node[box] (mirror) at (4.2,0) {MirrorMaker 2\\bridge (interim)};
+        \node[box] (spark) at (8.2,0) {Structured Streaming\\dedup by event\_id\\(watermarked)};
+        \node[store] (bronze) at (12.0,0) {Bronze Delta\\exactly-once};
+        \draw[flow] (onprem) -- (mirror);
+        \draw[flow] (eh) -- (spark);
+        \draw[flow] (mirror) -- (eh);
+        \draw[flow] (spark) -- (bronze);
+    \end{tikzpicture}%
+    }
+    \caption{Migration topology: mirror the old bus into the new, consume both through one deduplicating stream, retire the bridge.}
+    \label{fig:ch15-migration}
+\end{figure}
+
+\subsection{Architecture Decisions}
+\textbf{Mirror, then move.} MirrorMaker 2 replicates on-prem topics into Event Hubs during the transition; producers migrate service by service; the Spark consumers read the Event Hubs endpoint throughout---configuration changes, not code. The dual-write window is absorbed by the stream's watermarked \texttt{dropDuplicates} on \texttt{event\_id} (Chapter 14): the same event arriving via both paths is seen once.
+
+\textbf{Cutover gates.} Per topic: producer moved $\rightarrow$ mirror verified empty of new messages for that topic $\rightarrow$ consumer lag zero $\rightarrow$ reconciliation query (counts + sums vs.\ the old cluster's log-end offsets) $\rightarrow$ topic retired. Duplicates across the boundary are impossible \emph{by construction} only because dedup keys survived the producer migration---the one invariant the whole plan depends on.
+
+\begin{pitfall}
+\textbf{Changing the key scheme during a bus migration.} The dedup key, partition key, and schema must all survive the move untouched. A ``while we're in there'' key change turns a configuration migration into a data-correctness incident spanning two weeks of dual-run ambiguity.
+\end{pitfall}
+
+\subsection{Risks and Mitigations}
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{4.6cm}p{7.6cm}@{}}
+\toprule
+\textbf{Risk} & \textbf{Mitigation} \\
+\midrule
+Migration dual-write duplicates events & Watermarked dedup on a stable event ID across both buses \\
+Retention difference truncates replay window & Capture-to-storage pattern; replay budget pre-measured \\
+Producer key scheme changes mid-migration & Key contract frozen during migration; CI check on producers \\
+Event Hubs Kafka-surface feature gaps & Feature checklist verified per workload before commitment \\
+Credential rotation drops consumers & Vault-backed scopes; post-rotation smoke test automated \\
+\bottomrule
+\end{tabular}
+\caption{Week 15 scenario risks and mitigations.}
+\label{tab:ch15-risks}
+\end{table}
+
+\section{Design Decision Guide}
+\index{decision guide!Week 15}%
+Bus integration decisions are contracts: schemas, keys, and offsets outlive any single consumer.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.4cm}p{4.4cm}p{4.6cm}@{}}
+\toprule
+\textbf{Decision} & \textbf{Choose the first when} & \textbf{Choose the second when} \\
+\midrule
+Kafka vs.\ Event Hubs vs.\ Kinesis & Ecosystem, portability, existing estate & Cloud-native simplicity on Azure / AWS \\
+JSON vs.\ Avro + registry & Prototypes, tolerant consumers & Governed, evolving, multi-consumer topics \\
+Keyed vs.\ unkeyed producers & Per-entity ordering or dedup matters & Truly order-independent telemetry \\
+\texttt{earliest} vs.\ \texttt{latest} start & Backfill/replay & Steady-state new consumer \\
+Cap offsets vs.\ uncapped & Production, always & Never---uncapped is a lab setting \\
+Mirror vs.\ dual-write migration & Consumers stay put during migration & Producer fleet is small and coordinated \\
+\bottomrule
+\end{tabular}
+\caption{Week 15 decision guide.}
+\label{tab:ch15-decisions}
+\end{table}
+
+The invariant worth memorizing: dedup keys, partition keys, and schema contracts must survive any migration or consumer change. Those three are the stream's public API.
+
+\section{Operational Guidance for Week 15}
+\index{operational guidance!Week 15}%
+\subsection{Performance and Reliability}
+Consumer lag is the top-line metric: alert on sustained lag, not instantaneous spikes. Rotate bus credentials on the vault's schedule and smoke-test the stream after each rotation. Register schema changes through the registry with compatibility enforcement; track deserialization error rates so a bad producer deploy is visible in minutes. Measure replay throughput once and record it in the DR runbook.
+
+\subsection{Security and Governance Checklist}
+\begin{itemize}
+    \item JAAS/connection configuration references secret scopes---never literals.
+    \item TLS enforced (\texttt{SASL\_SSL}); plaintext listeners disabled on managed offerings.
+    \item Producer key contracts (entity ID as key) documented per topic.
+    \item Topics carry an owner, retention, and classification tag.
+\end{itemize}
+
+\subsection{Troubleshooting Playbook}
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.6cm}p{4.2cm}p{4.8cm}@{}}
+\toprule
+\textbf{Symptom} & \textbf{Likely cause} & \textbf{First action} \\
+\midrule
+Consumer lag grows steadily & Partition ceiling or slow batches & Check batch duration; scale partitions/parallelism \\
+Deserialization errors after deploy & Incompatible schema change & Registry compatibility report; roll back producer \\
+Duplicates after a replay & Dedup key changed or missing & Verify \texttt{event\_id} continuity across the producer change \\
+Event Hubs throttling & Throughput units exhausted & Check TU usage; raise units or smooth producer bursts \\
+\bottomrule
+\end{tabular}
+\caption{Week 15 troubleshooting quick reference.}
+\label{tab:ch15-trouble}
+\end{table}
+
+\section{Interview Q\&A}
+\subsection{Concepts and Trade-offs}
+\begin{enumerate}
+    \item \textbf{Q: Why at-least-once, and where does exactly-once come from?}\\
+    A: The bus cannot know when your processing finished safely, so redelivery is always possible. Exactly-once effect is composed: checkpointed offsets + deterministic state + idempotent sink---all three.
+    \item \textbf{Q: What does \texttt{maxOffsetsPerTrigger} protect?}\\
+    A: Executors from oversized micro-batches (memory, GC, SLA breaches) at peak or on backlog replay---you trade a little latency for bounded, predictable batches.
+    \item \textbf{Q: Kafka or Kinesis?}\\
+    A: Kinesis for AWS-native simplicity and per-shard managed scaling; Kafka (MSK/self-managed) for the ecosystem (connectors, schema registry, exactly-once producers) and multi-cloud portability. Most enterprises answer ``both, somewhere.''
+    \item \textbf{Q: Why a schema registry for streams?}\\
+    A: Schemas become versioned contracts with compatibility rules; a producer breaking change fails at registration instead of corrupting every consumer at 03:00.
+    \item \textbf{Q: How do consumer groups give you free fan-out?}\\
+    A: Each group tracks independent offsets, so the fraud group and the billing group each read every message---one write, N independent readers, no copies.
+    \item \textbf{Q: How many partitions should a topic have?}\\
+    A: Ceiling of parallelism needed at peak: peak rate divided by per-partition sustainable throughput, times headroom---measured, then rounded up, because partitions only ever get added.
+    \item \textbf{Q: What breaks when a schema registry enforces backward compatibility?}\\
+    A: Producers cannot deploy incompatible changes---the failure moves from ``consumers corrupt at 03:00'' to ``producer CI fails at commit time,'' which is exactly where you want it.
+    \item \textbf{Q: What is your answer when a producer says ``just infer the schema''?}\\
+    A: Inference is a convenience for onboarding, not a contract. Production topics get registered schemas with compatibility rules; inference belongs in the sandbox where its surprises are free.
+\end{enumerate}
+
+\section{Further Reading}
+The Spark--Kafka integration guide is the configuration reference \cite{sparkKafkaIntegration}; Kafka's own documentation covers the log model and consumer semantics \cite{kafkaDocs}. Event Hubs' Kafka endpoint is documented in \cite{eventHubsKafka}; Kinesis in \cite{kinesisDocs}. The streaming foundations this chapter builds on are in \cite{sparkStructuredStreaming}.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item Kafka is a replayable partitioned log; offsets are cursors, partitions are parallelism, groups are fan-out.
+    \item Credentials come from secret scopes; connection strings never appear in code.
+    \item \texttt{maxOffsetsPerTrigger} is the backpressure dial; partition count is the parallelism ceiling.
+    \item Schema registries turn message shapes into enforced, versioned contracts.
+    \item Migrations move buses by mirroring and deduplicating---keys and schemas do not change mid-flight.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Why does ordering exist only within a partition, and what does that force on your producer keys?
+    \item \textbf{(Conceptual)} Explain \texttt{failOnDataLoss} and when \texttt{false} is the honest choice.
+    \item \textbf{(Hands-on)} Complete the Thursday lab including the replay reconciliation.
+    \item \textbf{(Hands-on)} Add a second consumer group reading the same topic into an independent table; verify both receive everything.
+    \item \textbf{(Hands-on)} Chart consumer lag versus \texttt{maxOffsetsPerTrigger} at three settings under a synthetic burst.
+    \item \textbf{(Design)} Write the per-topic cutover checklist for the Friday scenario.
+    \item \textbf{(Design)} Choose partition counts for 1k/s, 50k/s, and 1M/s topics; show your arithmetic.
+    \item \textbf{(Architecture)} When would you keep self-managed Kafka instead of Event Hubs/MSK? Name two technical reasons.
+\end{enumerate}

@@ -1,0 +1,231 @@
+\chapter{Lab Solutions and Acceptance Guidance}
+\index{lab solutions}\index{acceptance criteria}\index{capstone!solutions}%
+This appendix provides reference solutions for the weekly Thursday labs and the six milestone
+capstones. Each entry gives the approach, the critical steps, and the evidence that satisfies the
+chapter's acceptance criteria. Use it to unblock yourself after a genuine attempt---not instead
+of one: the labs are the curriculum, and the Databricks Data Engineer certification measures
+exactly the judgment they build \cite{databricksCertification}.
+
+\begin{notebox}
+A solution counts only when the chapter's acceptance criteria are met with evidence: row counts,
+screenshots, history entries, drill outputs. ``It ran once on my cluster'' is the starting point
+of each lab, never the end.
+\end{notebox}
+
+\section{Part I: Lakehouse Foundations (Weeks 1--4)}
+\subsection{Week 1: Workspace, CLI, and Smoke Test}
+\textbf{Approach.} Create the trial workspace, authenticate the CLI with OAuth, create a
+policy-guarded cluster, and submit the smoke-test notebook via the SDK.
+\textbf{Critical evidence.} \texttt{databricks current-user me} output; the cluster showing a
+30-minute auto-termination \emph{enforced by policy}; the job run visible in the UI.
+\textbf{Common failure.} A personal access token pasted into a script---the lab exists to learn
+OAuth profiles, not to leak a secret.
+
+\subsection{Week 2: Schema Enforcement, Evolution, and RESTORE}
+\textbf{Approach.} Create Delta tables from CSVs, force a schema mismatch, evolve deliberately,
+delete a partition, and recover via \texttt{RESTORE}.
+\textbf{Critical evidence.} \texttt{DESCRIBE HISTORY} showing the failed append (rejected), the
+\texttt{mergeSchema} evolution, the delete, and the restore; recovered row count matching the
+pre-delete baseline.
+\textbf{Common failure.} Running \texttt{VACUUM} before the recovery step, destroying the versions
+the lab exists to demonstrate.
+
+\subsection{Week 3: Medallion Transformations}
+\textbf{Approach.} Bronze landing as-is with ingestion metadata, Silver typed and deduplicated,
+Gold star schema.
+\textbf{Critical evidence.} Row-count reconciliation Bronze $\rightarrow$ Silver (accepted +
+rejected = input), and Gold aggregates matching a direct source computation.
+\textbf{Common failure.} Silent row drops between layers with no quarantine accounting.
+
+\subsection{Week 4: Spark Skew Remediation}
+\textbf{Approach.} Ingest 10M taxi rows, aggregate, read the Spark UI stage summary, fix skew with
+salting or \texttt{repartition}.
+\textbf{Critical evidence.} Before/after task-duration distributions and total stage time.
+\textbf{Common failure.} ``Fixing'' the job by caching everything and concluding from a warm-cache
+second run.
+
+\subsection{Milestone 1 Capstone}
+The reference flow: volume-landed CSVs $\rightarrow$ append-only Bronze $\rightarrow$ parameterized
+Silver notebooks $\rightarrow$ Gold star schema, with the corruption/\texttt{RESTORE} drill and
+reconciliation notebook as the differentiating artifacts. Reviewers check the idempotent Silver
+\texttt{MERGE} and the history evidence first.
+
+\section{Part II: Warehousing and Analytics (Weeks 5--8)}
+\subsection{Week 5: OPTIMIZE versus Liquid Clustering}
+\textbf{Approach.} Build the small-file table, baseline a selective query, compact with
+\texttt{ZORDER BY}, convert a copy to liquid clustering, re-benchmark.
+\textbf{Critical evidence.} The results table with file counts and timings for all three variants.
+\textbf{Common failure.} Benchmarking before the data is cached consistently---first-run cold reads
+pollute the comparison.
+
+\subsection{Week 6: Warehouse and Materialized View}
+\textbf{Approach.} Serverless warehouse on Gold, materialized view for daily revenue, query-profile
+capture, auto-stop configured.
+\textbf{Critical evidence.} The before/after query profiles and a \texttt{system.billing.usage}
+cost line for the warehouse.
+\textbf{Common failure.} Leaving the warehouse at max-clusters with no auto-stop---the cost section
+of the report then writes itself, unhappily.
+
+\subsection{Week 7: Dashboard and Genie Space}
+\textbf{Approach.} Parameterized AI/BI dashboard over certified Gold views; Genie space with
+instructions and example queries.
+\textbf{Critical evidence.} The captured wrong Genie answer and the instruction (or certified
+measure) that fixed it.
+\textbf{Common failure.} Pointing Genie at Bronze---fluent, confident, wrong SQL.
+
+\subsection{Week 8: Grants and Masking View}
+\textbf{Approach.} Groups, schema-scoped \texttt{GRANT}s, the dynamic masking view, validated as a
+restricted principal.
+\textbf{Critical evidence.} The same query returning unmasked values as owner and masked values as
+the analyst test principal.
+\textbf{Common failure.} Testing grants as the object owner---where every check passes trivially.
+
+\subsection{Milestone 2 Capstone}
+The reference flow: liquid-clustered Gold $\rightarrow$ serverless warehouse $\rightarrow$ AI/BI
+dashboard + instructed Genie space, behind group grants and the masking view, with
+\texttt{system.access.audit} evidence. Reviewers check the benchmark table, the access matrix
+implemented (not described), and the audit query, in that order.
+
+\section{Part III: Batch ETL and Orchestration (Weeks 9--12)}
+\subsection{Week 9: PySpark Tuning Evidence Table}
+\textbf{Approach.} Fix shuffle partitions, broadcast the small side, salt the skewed key, replace
+the Python UDF with a pandas UDF.
+\textbf{Critical evidence.} Four independent improvements each with isolated before/after metrics.
+\textbf{Common failure.} Changing four things at once and being unable to attribute the gain.
+
+\subsection{Week 10: DLT Expectations}
+\textbf{Approach.} Rebuild the medallion flow as DLT with warn/drop/fail expectations; inject a
+poison record.
+\textbf{Critical evidence.} The event log query showing the dropped record counted, and Gold
+untouched by the failed-expectation run.
+\textbf{Common failure.} Expectations that log but are never wired to drop or fail---aspirational
+quality control.
+
+\subsection{Week 11: Auto Loader and CDC}
+\textbf{Approach.} Triggered Auto Loader from the volume, mid-stream schema change, rescued row,
+\texttt{AUTO CDC} SCD2 on customers.
+\textbf{Critical evidence.} The schema-evolved batch ingested without code edits; the corrupted row
+visible in \texttt{\_rescued\_data}; the changed customer showing two SCD rows with contiguous
+validity.
+\textbf{Common failure.} Deleting the checkpoint to ``re-run'' and double-ingesting the volume.
+
+\subsection{Week 12: Orchestrated Workflow}
+\textbf{Approach.} Ingest $\rightarrow$ DLT $\rightarrow$ quality gate $\rightarrow$ conditional
+alert, parameterized by date, with a forced failure and repair run.
+\textbf{Critical evidence.} The repair-run page re-executing only failed tasks; one ledger row per
+run outcome.
+\textbf{Common failure.} The quality gate existing but not blocking Gold publish.
+
+\subsection{Milestone 3 Capstone}
+The reference flow: Auto Loader Bronze $\rightarrow$ DLT Silver/Gold with expectations
+$\rightarrow$ gated publish under one Workflow. The decisive artifacts are the repair-run evidence
+and same-day idempotence (rerun changes zero Gold counts).
+
+\section{Part IV: Streaming and Real-Time (Weeks 13--16)}
+\subsection{Week 13: Checkpointed Stream Restart}
+\textbf{Approach.} Rate/file source $\rightarrow$ Delta sink with checkpoint; kill and restart
+mid-stream.
+\textbf{Critical evidence.} Post-restart counts proving no loss and no duplication.
+\textbf{Common failure.} Pointing two queries at one checkpoint---offsets corrupt silently.
+
+\subsection{Week 14: Watermark and Dedup}
+\textbf{Approach.} 10-minute watermark, \texttt{dropDuplicates} on \texttt{event\_id}, injected
+late/duplicate events, RocksDB comparison.
+\textbf{Critical evidence.} Late events within the watermark included, beyond it excluded; replay
+producing zero duplicates; state-store memory comparison.
+\textbf{Common failure.} Dedup without a watermark---state grows until the executor dies.
+
+\subsection{Week 15: Kafka Replay Reconciliation}
+\textbf{Approach.} Local Kafka producer with unique IDs, capped offsets per trigger, replay from
+\texttt{earliest} into a recovery table.
+\textbf{Critical evidence.} Recovery-table counts reconciled against the primary table.
+\textbf{Common failure.} The producer connection string committed to source.
+
+\subsection{Week 16: Real-Time Medallion}
+\textbf{Approach.} Kafka $\rightarrow$ Bronze $\rightarrow$ Silver \texttt{foreachBatch} MERGE
+$\rightarrow$ Gold tumbling aggregates $\rightarrow$ dashboard.
+\textbf{Critical evidence.} The dashboard refreshing at decision cadence with a freshness
+indicator; the daily batch reconciliation agreeing with the stream.
+\textbf{Common failure.} Refresh cadence set to platform maximum rather than decision cadence.
+
+\subsection{Milestone 4 Capstone}
+The reference flow: Kafka $\rightarrow$ Bronze $\rightarrow$ deduped watermarked Silver
+$\rightarrow$ impossible-travel rule $\rightarrow$ Gold aggregates $\rightarrow$ AI/BI, with the
+replay drill producing zero duplicate alerts. Reviewers check the dedup-before-rule ordering and
+the exactly-once evidence.
+
+\section{Part V: ML and MLOps (Weeks 17--20)}
+\subsection{Week 17: Autologged Champion}
+\textbf{Approach.} Six autologged runs on a fixed snapshot, registry round-trip by alias.
+\textbf{Critical evidence.} Every run tagged with dataset snapshot and commit; the champion loading
+from \texttt{models:/...@champion} in a fresh notebook.
+\textbf{Common failure.} Comparing runs across different data snapshots and calling the difference
+model quality.
+
+\subsection{Week 18: Point-in-Time Training Set}
+\textbf{Approach.} Feature tables with as-of timestamps, \texttt{create\_training\_set} with
+timestamp lookups, lineage recorded.
+\textbf{Critical evidence.} Rebuilds for three historical as-of dates, identical on rerun.
+\textbf{Common failure.} A windowed feature computed past its as-of date---leakage by construction.
+
+\subsection{Week 19: RAG with Evaluation}
+\textbf{Approach.} Chunks in Delta, Delta-sync Vector Search index, retrieval + Foundation Model
+assembly, MLflow evaluation on 10 questions.
+\textbf{Critical evidence.} The logged quality metrics and one retrieval failure diagnosed and
+fixed via chunking or metadata filters.
+\textbf{Common failure.} Evaluating by eyeballing three answers and declaring victory.
+
+\subsection{Week 20: Serving and Drift Gate}
+\textbf{Approach.} Serverless endpoint with inference table, idempotent batch scoring, injected
+skew, gated retraining.
+\textbf{Critical evidence.} The drift alert firing; the retrain run completing while promotion
+stays blocked.
+\textbf{Common failure.} Scoring against ad hoc features instead of the governed feature
+tables---training-serving skew by design.
+
+\subsection{Milestone 5 Capstone}
+The reference flow: leakage-safe features $\rightarrow$ tracked training $\rightarrow$ UC registry
+$\rightarrow$ gated serving $\rightarrow$ monitoring, plus the RAG branch with evaluated answers.
+The decisive artifacts are the point-in-time proof and the human-gated promotion evidence.
+
+\section{Part VI: Security, Production, and Certification (Weeks 21--24)}
+\subsection{Week 21: Service Principal and Secret Scope}
+\textbf{Approach.} Least-privilege service principal, Key Vault-backed scope, notebook converted to
+\texttt{dbutils.secrets.get}, IP access list verified.
+\textbf{Critical evidence.} The blocked connection denied; the notebook running without any literal
+credential.
+\textbf{Common failure.} The service principal granted account admin ``temporarily.''
+
+\subsection{Week 22: Lineage, Audit, and Sharing}
+\textbf{Approach.} Column-lineage trace, audit alert on PII reads, Delta Sharing share with
+revocation test.
+\textbf{Critical evidence.} The revoked recipient's failed read; the audit alert firing on a
+planted non-approved read.
+\textbf{Common failure.} Sharing the whole schema when one table was the agreement.
+
+\subsection{Week 23: Bundle and Terraform Deployment}
+\textbf{Approach.} Bundle with dev/staging/prod targets, GitHub Actions with service-principal
+auth, Terraform workspace resources, DBU cost report.
+\textbf{Critical evidence.} The clean-environment redeploy; the cost report with two implemented
+optimizations.
+\textbf{Common failure.} Terraform state in a local file---the second apply from CI corrupts it.
+
+\subsection{Week 24: Mock Exams and Remediation}
+\textbf{Approach.} Two timed, closed-book mocks scored by domain; misses classified; weak domains
+remediated by rebuilding labs.
+\textbf{Critical evidence.} Two consecutive 80\%+ mocks with no domain below 70\%.
+\textbf{Common failure.} Reviewing answer keys instead of rebuilding labs.
+
+\subsection{Milestone 6 Capstone}
+The reference flow: one bundle defining the platform across three targets, Terraform-provisioned
+workspace resources, governance evidence (access matrix, lineage, audit alert, share revocation),
+and the cost report. The decisive artifacts are the clean-environment redeploy and the replay
+drill---the two things that cannot be faked in a screenshot.
+
+\begin{tipbox}
+For portfolio use, each capstone README should lead with the problem statement and architecture
+diagram, include clean-environment setup, screenshots of the pipeline run, dashboard, and alert,
+the DBU cost estimate, and a lessons-learned section naming what broke. Interviewers probe
+trade-offs: be ready to defend DLT versus plain Spark, Z-ORDER versus liquid clustering, and
+continuous versus triggered streaming at ten times the scale.
+\end{tipbox}

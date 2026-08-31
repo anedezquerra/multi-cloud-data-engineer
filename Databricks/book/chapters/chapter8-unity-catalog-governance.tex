@@ -1,0 +1,425 @@
+\chapter{Unity Catalog Foundations and Data Governance}
+\index{Unity Catalog}\index{metastore}\index{catalog}\index{schema}\index{volume}%
+\index{GRANT}\index{dynamic view}\index{row-level security}\index{column masking}\index{external location}%
+\begin{objectives}
+\begin{itemize}
+    \item Explain the Unity Catalog object hierarchy: metastore, catalog, schema, table, volume, function, model.
+    \item Distinguish managed from external tables and volumes from external locations.
+    \item Implement least-privilege access with groups, ownership, and \texttt{GRANT}/\texttt{REVOKE}.
+    \item Enforce row- and column-level security with dynamic views, row filters, and column masks.
+    \item Query the audit system tables to answer ``who touched what.''
+    \item Design a governance model for a regulated multi-team lakehouse.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+Unity Catalog is Databricks' \textbf{unified governance plane}; the hyperscalers split the same
+job across a catalog plus a policy engine.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{3.0cm}p{3.4cm}p{3.2cm}p{3.2cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{Databricks (UC)} & \textbf{AWS} & \textbf{Azure / GCP / Fabric} \\
+\midrule
+Catalog & Metastore $\rightarrow$ catalog $\rightarrow$ schema & Glue Data Catalog & Purview + OneLake / Dataplex + BigLake \\
+Fine-grained grants & GRANT on any object + row filters + masks & Lake Formation LF-Tags + cell filters & Entra + RLS / policy tags / OneLake security \\
+File governance & Volumes + external locations & S3 + bucket policies & ADLS ACLs / GCS IAM \\
+Audit & \texttt{system.access.audit} & CloudTrail & Activity Log / Cloud Audit Logs \\
+Lineage & Built-in table/column lineage & Glue / SageMaker lineage & Purview / Dataplex lineage \\
+Sharing & Delta Sharing (Ch. 22) & Redshift sharing / S3 Access Grants & Data Share / Analytics Hub / OneLake shortcuts \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+\textbf{Snowflake} governs through its account role hierarchy; \textbf{MongoDB} through Atlas
+roles at cluster scope. Unity Catalog's distinctive move is one governance model spanning tables,
+files, notebooks, models, and functions.
+\end{crosscloud}
+
+\section{Week 8 Roadmap and Mental Model}
+Seven chapters of building now get a control plane. Unity Catalog (UC) is the reason ``lakehouse'' and ``governed'' can appear in the same sentence: every asset---table, file volume, model, function, dashboard---lives in one hierarchy with one privilege model, one audit log, and automatic lineage \cite{databricksUnityCatalog}.
+
+The mental model: \textbf{UC is DNS plus ACLs for data}. The three-level namespace (\texttt{catalog.schema.table}) names every object unambiguously across the account; privileges (\texttt{SELECT}, \texttt{MODIFY}, \texttt{CREATE}, \dots) attach to any level and flow downward; the metastore binds it all to storage credentials and audit. Govern once at the right level and every engine---notebooks, SQL warehouses, jobs, Genie---enforces it identically.
+
+\begin{definitionbox}
+\textbf{Unity Catalog} is Databricks' unified governance layer: a per-region metastore containing catalogs (data domains/environments), schemas (groupings), and objects (tables, views, volumes, functions, models), with a single privilege model, audit log, and lineage capture across all Databricks workloads.
+\end{definitionbox}
+
+\begin{keyterms}
+\textbf{Metastore}: the regional UC root. \textbf{Managed table}: UC owns the storage lifecycle. \textbf{External table}: UC registers data you store and lifecycle-manage. \textbf{Volume}: governed access to files. \textbf{Dynamic view}: a view whose output changes with the querying principal. \textbf{Owner}: the principal responsible for an object, holding grant authority.
+\end{keyterms}
+
+\section{Monday: The Hierarchy and the Namespace}
+\subsection{Metastore to Table}
+A metastore is created per cloud region and attached to workspaces. Below it: \textbf{catalogs} (the isolation unit---commonly per environment or domain), \textbf{schemas} (groupings---this book's bronze/silver/gold), and \textbf{objects}. The three-level name makes every reference unambiguous and every grant addressable: \texttt{GRANT SELECT ON SCHEMA de\_training.gold TO analysts} \cite{databricksUnityCatalog}.
+
+\subsection{Managed versus External}
+Managed tables and volumes live in metastore-controlled storage; \texttt{DROP TABLE} deletes the data, and lifecycle is automatic. External tables register data at an external location you control; drop removes only the registration. Default to managed for anything Databricks pipelines own; use external for data shared with non-Databricks writers or under an external retention regime.
+
+\begin{pitfall}
+\textbf{External-table sprawl.} Registering every table as external ``for flexibility'' forfeits managed lifecycle, complicates predictive optimization, and scatters your storage estate. Make external the exception with a stated reason---usually a non-Databricks writer or a mandated location.
+\end{pitfall}
+
+\section{Tuesday: The Privilege Model}
+\subsection{Groups, Owners, and GRANT}
+Privileges grant to \textbf{groups} (synced from your IdP---Chapter 21), never individuals. Every object has an \textbf{owner} who can grant. The habit that keeps estates sane: grant at the highest level that expresses the intent (\texttt{SELECT ON SCHEMA gold}), and only drop to table level for genuine exceptions.
+
+\begin{lstlisting}[language=SQL,caption={Least-privilege grants for the medallion estate.},label={lst:ch8-grants}]
+-- Engineers build; analysts consume; pipelines write.
+GRANT USE CATALOG ON CATALOG de_training TO `data-engineers`, `analysts`;
+GRANT USE SCHEMA ON SCHEMA de_training.silver TO `data-engineers`;
+GRANT MODIFY ON SCHEMA de_training.silver TO `data-engineers`;
+GRANT USE SCHEMA ON SCHEMA de_training.gold TO `analysts`;
+GRANT SELECT ON SCHEMA de_training.gold TO `analysts`;
+-- No Bronze grant for analysts: raw data is not a consumer surface.
+
+-- The pipeline identity writes where humans only read:
+GRANT MODIFY ON SCHEMA de_training.bronze TO `sp-etl-prod`;
+GRANT MODIFY ON SCHEMA de_training.gold   TO `sp-etl-prod`;
+\end{lstlisting}
+
+\subsection{Row Filters and Column Masks}
+For fine-grained control without view proliferation, UC supports \textbf{row filters} and \textbf{column masks} as named functions applied to tables---the policy lives with the table and applies to every reader automatically.
+
+\begin{lstlisting}[language=SQL,caption={Row filter and column mask as table-level policy.},label={lst:ch8-rls}]
+CREATE OR REPLACE FUNCTION de_training.gold.region_filter(region STRING)
+RETURN IF(is_member('us_analysts'), region = 'US', true);
+
+ALTER TABLE de_training.gold.fact_orders
+  SET ROW FILTER de_training.gold.region_filter ON (region);
+
+CREATE OR REPLACE FUNCTION de_training.gold.mask_email(email STRING)
+RETURN IF(is_member('pii_readers'), email, sha2(email, 256));
+
+ALTER TABLE de_training.gold.dim_customer
+  ALTER COLUMN email SET MASK de_training.gold.mask_email;
+\end{lstlisting}
+
+\section{Wednesday: Volumes, Dynamic Views, and Audit}
+\subsection{Volumes for File Data}
+Files (CSVs, images, checkpoints) need governance too. A \textbf{volume} is a UC object over a storage path with the same GRANT model; external locations define the storage credential boundary. Rule: pipelines read and write \texttt{/Volumes/...} paths, never raw cloud URLs---so access, audit, and lineage cover files exactly like tables.
+
+\subsection{Dynamic Views}
+Before row filters/column masks---and still, for logic too rich for them---the \textbf{dynamic view} is the workhorse: a view whose \texttt{is\_member()} / \texttt{current\_user()} calls change output per principal (Chapter 7's masking pattern). Prefer table-level filters/masks for simple policy; use dynamic views when masking logic is compound or shared across tables.
+
+\subsection{Audit}
+Every governed action lands in \texttt{system.access.audit}: who ran what statement against which object, when, from where \cite{databricksSystemTables}.
+
+\begin{lstlisting}[language=SQL,caption={Who read the PII table this week?},label={lst:ch8-audit}]
+SELECT event_time, user_identity.email AS actor, action_name,
+       request_params.full_name_arg AS object
+FROM system.access.audit
+WHERE request_params.full_name_arg = 'de_training.gold.dim_customer'
+  AND action_name = 'getTable'      -- plus queryText via Query History joins
+  AND event_date >= current_date() - 7
+ORDER BY event_time DESC;
+\end{lstlisting}
+
+\section{Thursday Hands-on Project: Govern the Medallion Estate}
+Implement the full governance model for the Month 1 lakehouse: groups, schema-scoped grants, a masked dynamic view over customer PII, and audit proof that the mask works.
+\index{hands-on lab}\index{GRANT!lab}\index{column masking!lab}
+
+\begin{lstlisting}[language=SQL,caption={Week 8 lab: groups, grants, masking, and proof.},label={lst:ch8-lab}]
+-- 1. Groups (account console or SCIM; shown for clarity)
+--    data-engineers, analysts, pii-readers
+
+-- 2. Grants per the medallion access matrix
+GRANT USE CATALOG ON CATALOG de_training TO `analysts`;
+GRANT USE SCHEMA ON SCHEMA de_training.gold TO `analysts`;
+GRANT SELECT  ON SCHEMA de_training.gold TO `analysts`;
+
+-- 3. The masked view analysts actually read
+CREATE OR REPLACE VIEW de_training.gold.v_dim_customer AS
+SELECT customer_id,
+       CASE WHEN is_member('pii_readers') THEN email
+            ELSE sha2(email, 256) END AS email,
+       CASE WHEN is_member('pii_readers') THEN full_name
+            ELSE 'REDACTED' END AS full_name,
+       region, created_at
+FROM de_training.gold.dim_customer;
+
+REVOKE SELECT ON TABLE de_training.gold.dim_customer FROM `analysts`;
+GRANT SELECT ON VIEW de_training.gold.v_dim_customer TO `analysts`;
+
+-- 4. Proof: run both SELECTs as the test analyst principal and as owner;
+--    then confirm the access appeared in system.access.audit.
+\end{lstlisting}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item The implemented access matrix: groups, grants per schema, the masked view.
+    \item Side-by-side query output: owner (unmasked) vs.\ test analyst (masked).
+    \item An audit query result showing the analyst's masked read.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item The test analyst can read Gold views and \emph{cannot} read Silver, Bronze, or the base PII table (failed-read evidence captured).
+    \item Masking is provably effective as the restricted principal---not merely assumed.
+    \item All grants target groups; no individual holds a direct grant.
+    \item The pipeline service principal can write Bronze/Silver/Gold but cannot \texttt{MANAGE} the catalog.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Replace the dynamic view with a column mask + row filter pair and compare governance ergonomics.
+    \item Add a per-region row filter and prove two analysts in different regions see disjoint rows.
+    \item Write the audit alert query: any read of the base PII table by a non-\texttt{pii\_readers} principal.
+\end{itemize}
+
+\section{Friday Use Case: HIPAA-Grade Governance for a Healthcare Lakehouse}
+A healthcare analytics platform holds claims and clinical extracts. Analysts query Gold; engineers build in Silver; only pipelines write Bronze; every access to patient identifiers must be auditable, and PII must be masked by default for all but a named break-glass group.
+\index{HIPAA}\index{healthcare}\index{governance!design}
+
+\subsection{Requirements and Assumptions}
+Three environments (dev/staging/prod catalogs). Access reviews are quarterly; auditors sample monthly. Break-glass access must be time-boxed, logged, and reviewed within 24 hours.
+
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[
+        layer/.style={rectangle, rounded corners, draw=primary, thick, fill=primary!6, align=center, minimum width=2.9cm, minimum height=1.0cm, font=\small\bfseries},
+        grp/.style={rectangle, rounded corners, draw=codegreen!60!black, thick, fill=green!7, align=center, minimum width=2.7cm, minimum height=0.85cm, font=\scriptsize\bfseries},
+        ctrl/.style={rectangle, rounded corners, draw=red!60!black, thick, fill=red!5, align=center, minimum width=2.9cm, minimum height=0.85cm, font=\scriptsize\bfseries},
+        flow/.style={-{Latex[length=2mm]}, draw=primary, thick}
+    ]
+        \node[grp] (eng) at (0,1.5) {engineers\\(write Silver)};
+        \node[grp] (ana) at (0,0) {analysts\\(masked Gold)};
+        \node[grp] (bg)  at (0,-1.5) {break-glass\\(time-boxed)};
+        \node[layer] (bronze) at (4.4,1.5) {bronze\\pipeline-only};
+        \node[layer] (silver) at (4.4,0) {silver\\engineers};
+        \node[layer] (gold) at (4.4,-1.5) {gold + masked views\\analysts};
+        \node[ctrl] (audit) at (8.8,0.75) {system.access.audit\\+ alerts};
+        \node[ctrl] (mask) at (8.8,-0.75) {column masks\\+ row filters};
+        \draw[flow] (eng) -- (silver);
+        \draw[flow] (ana) -- (gold);
+        \draw[flow, dashed] (bg) -- (gold);
+        \draw[flow] (bronze) -- (audit);
+        \draw[flow] (gold) -- (mask);
+        \draw[flow, dashed] (mask) -- (audit);
+    \end{tikzpicture}%
+    }
+    \caption{Healthcare governance: group-scoped layer access, default masking, break-glass with review, and audit everywhere.}
+    \label{fig:ch8-hipaa}
+\end{figure}
+
+\subsection{Architecture Decisions}
+\textbf{Default-deny, group-grant.} Nobody has standing access to unmasked PII; \texttt{pii\_readers} membership is provisioned by ticket, expires via IdP group automation, and every use lands in the audit alert the compliance dashboard reviews daily.
+
+\textbf{Masking at the table, not the dashboard.} Column masks on \texttt{dim\_patient} (and equivalents) make masking engine-independent: SQL warehouse, notebook, Genie, and export all enforce identically. Quarterly access reviews re-run the lab's proof pattern against every PII-tagged object.
+
+\begin{pitfall}
+\textbf{A masked copy that drifts.} A nightly ``sanitized extract'' table is a second source of truth that misses corrections and multiplies the PII surface. Masks and dynamic views keep one governed table; copies exist only under a documented exception with its own retention and audit.
+\end{pitfall}
+
+\subsection{Risks and Mitigations}
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{4.6cm}p{7.6cm}@{}}
+\toprule
+\textbf{Risk} & \textbf{Mitigation} \\
+\midrule
+Break-glass access becomes standing access & Time-boxed IdP group with expiry and 24-hour review \\
+Masked view drifts from base schema & View change control with masked-output tests in CI \\
+Direct grants bypass the group model & Monthly direct-grant diff; auto-revoke with notice \\
+External locations leak storage credentials & Credential inventory; scope per container; rotation \\
+Audit lag during an incident & Documented minutes-scale lag; queries tolerate it \\
+\bottomrule
+\end{tabular}
+\caption{Week 8 scenario risks and mitigations.}
+\label{tab:ch8-risks}
+\end{table}
+
+\section{Design Decision Guide}
+\index{decision guide!Week 8}%
+Governance decisions are cheapest at creation and most expensive at audit time.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.4cm}p{4.4cm}p{4.6cm}@{}}
+\toprule
+\textbf{Decision} & \textbf{Choose the first when} & \textbf{Choose the second when} \\
+\midrule
+Schema-level vs.\ table-level grants & The intent covers the layer & True per-table exceptions \\
+Column mask/row filter vs.\ dynamic view & Declarative per-table policy & Compound or cross-table masking logic \\
+Managed vs.\ external tables & Pipelines own the data & External writers or mandated locations \\
+Volume vs.\ external location & Governed file access for jobs & Legacy tools need direct storage paths \\
+Few catalogs vs.\ many & Environment/domain split suffices & Hard tenancy or blast-radius isolation \\
+Owner as group vs.\ individual & Always group & Never individual---people rotate \\
+\bottomrule
+\end{tabular}
+\caption{Week 8 decision guide.}
+\label{tab:ch8-decisions}
+\end{table}
+
+Design for the reviewer: a grant model you can print on one page is a grant model that survives an audit. Every exception should have a name, a reason, and an expiry.
+
+\section{Operational Guidance for Week 8}
+\index{operational guidance!Week 8}%
+\subsection{Performance and Reliability}
+Governance needs its own SLOs: grant changes propagate quickly, but audit and lineage tables lag minutes---build checks that tolerate the lag before paging. Review direct (non-group) grants monthly; they accumulate silently. Track object ownership hygiene: every object has a group owner, and departed-owner objects are reassigned before the account is deprovisioned.
+
+\subsection{Security and Governance Checklist}
+\begin{itemize}
+    \item Grants to groups only; direct grants expire by policy.
+    \item External locations and storage credentials inventoried and least-privilege scoped.
+    \item Quarterly access review runs the lab's negative tests against production grants.
+    \item PII classification tags applied at table creation (feeds Chapter 22's alerts).
+\end{itemize}
+
+\subsection{Troubleshooting Playbook}
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.6cm}p{4.2cm}p{4.8cm}@{}}
+\toprule
+\textbf{Symptom} & \textbf{Likely cause} & \textbf{First action} \\
+\midrule
+``Table not found'' with correct name & Missing \texttt{USE CATALOG}/\texttt{USE SCHEMA} & Check grants as the principal; namespace is not permission \\
+Mask not applying in a notebook & Reader is owner or has direct base-table grant & Test as a non-owner restricted principal \\
+Volume path access denied & External location credential lacks storage rights & Verify the storage credential's cloud IAM role \\
+Audit query returns nothing & System tables not enabled for the metastore & Ask the account admin to enable the schemas \\
+\bottomrule
+\end{tabular}
+\caption{Week 8 troubleshooting quick reference.}
+\label{tab:ch8-trouble}
+\end{table}
+
+\section{Interview Q\&A}
+\subsection{Concepts and Trade-offs}
+\begin{enumerate}
+    \item \textbf{Q: Managed or external table---how do you decide?}\\
+    A: Managed when Databricks owns the data lifecycle (default); external when a non-Databricks writer owns the files or storage location is mandated. External is the exception with a reason, not the default.
+    \item \textbf{Q: Where do you grant---catalog, schema, or table?}\\
+    A: The highest level that matches intent: schema for ``analysts read Gold,'' catalog rarely (too broad), table only for true exceptions. High-level grants are reviewable; a thousand table grants are not.
+    \item \textbf{Q: Row filters/column masks versus dynamic views?}\\
+    A: Filters and masks live on the table and apply to every consumer automatically---prefer them for declarative policy. Dynamic views remain for compound logic or when a shared semantic layer is itself the goal.
+    \item \textbf{Q: How do you prove least privilege to an auditor?}\\
+    A: The grant matrix (group $\times$ object), a negative test per principal class, and \texttt{system.access.audit} samples---implemented, tested, logged, in that order.
+    \item \textbf{Q: What does Unity Catalog buy you over bucket policies and a Hive metastore?}\\
+    A: One namespace, one privilege model, one audit log, automatic lineage---across tables, files, models, and functions---enforced identically by every compute path. Bucket policies govern storage, not semantics.
+    \item \textbf{Q: What is the blast radius of a compromised storage credential?}\\
+    A: Every external location and volume it backs---which is why credentials scope to single containers, rotate on schedule, and never carry wildcard storage rights.
+    \item \textbf{Q: Why test grants as a restricted principal rather than reviewing GRANTs?}\\
+    A: Grants compose (ownership, catalog inheritance, group nesting) in ways reviewers misread. The negative test is the only proof that survives composition.
+    \item \textbf{Q: What is the minimum viable governance for a new project?}\\
+    A: A catalog per environment, group-based grants at schema level, PII classification at table creation, and the audit alert on sensitive reads. Four moves, all cheap on day one, all painful retrofitted.
+\end{enumerate}
+
+\section{Further Reading}
+The Unity Catalog documentation is the reference \cite{databricksUnityCatalog}; system tables (audit, billing, lineage) are documented in \cite{databricksSystemTables}; lineage specifics are in \cite{databricksLineage}. The security overview places these controls in the platform's shared-responsibility model \cite{databricksSecurity}. Chapter 22 goes deep on lineage, audit practice, and Delta Sharing \cite{databricksDeltaSharing}.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item Unity Catalog is one namespace, one privilege model, and one audit log for tables, files, models, and functions.
+    \item Managed tables are the default; external tables need a stated reason.
+    \item Grant to groups, at the highest level that expresses intent; individuals and table-level grants are exceptions.
+    \item Prefer table-level row filters and column masks; dynamic views for compound or shared masking logic.
+    \item Governance is proven by negative tests and audit queries, not by policy documents.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Draw the UC hierarchy for a two-environment, three-domain estate and place five objects in it.
+    \item \textbf{(Conceptual)} Why is \texttt{REVOKE} on the base table as important as \texttt{GRANT} on the masked view?
+    \item \textbf{(Hands-on)} Complete the Thursday lab, including the failed-read evidence as the analyst principal.
+    \item \textbf{(Hands-on)} Implement the PII audit alert as a scheduled query; plant a violating read and capture the alert.
+    \item \textbf{(Hands-on)} Register an external table over a cloud-storage path and document exactly what lifecycle responsibility you kept.
+    \item \textbf{(Design)} Write the access matrix for the Friday scenario (groups $\times$ layers $\times$ privileges), including break-glass expiry mechanics.
+    \item \textbf{(Operations)} Draft the quarterly access-review procedure: inputs, evidence, sign-off.
+    \item \textbf{(Architecture)} When would you split this estate into multiple metastores? What would it cost?
+\end{enumerate}
+
+\section{Milestone 2 Capstone: The Governed Analytics Lakehouse}\label{sec:ch8-capstone}
+\index{Milestone 2 capstone}\index{capstone project!Part II}\index{Unity Catalog!capstone}\index{Genie!capstone}
+
+\begin{capstonebox}
+\textbf{Mission.} Close Part II by turning the Month 1 lakehouse into a governed analytics product: liquid-clustered Gold storage, a serverless SQL warehouse, a published AI/BI dashboard, an instructed Genie space, and an enforced access matrix with masking and audit evidence.
+
+\textbf{Estimated time.} 6--8 hours.
+
+\textbf{What you'll practice.}
+\begin{itemize}
+    \item Benchmarked storage optimization (liquid clustering vs.\ Z-ORDER).
+    \item Warehouse topology with scaling bounds, auto-stop, and cost attribution.
+    \item Certified semantic views feeding both dashboards and Genie.
+    \item Group-based grants, column masking, and audit proof.
+\end{itemize}
+\end{capstonebox}
+
+\subsection*{Scenario}
+Contoso Retail's analytics platform is live but ungoverned: everyone reads everything, dashboards disagree, and nobody can say who saw customer emails last week. You are delivering the governed version---fast, certified, masked, auditable---without breaking the existing analysts' Monday morning.
+
+\subsection*{Requirements}
+\begin{itemize}
+    \item Gold fact table converted to liquid clustering with a before/after benchmark recorded.
+    \item Serverless SQL warehouse (documented size, min/max, auto-stop) serving all BI.
+    \item Certified view \texttt{gold.v\_sales\_certified} as the single metric source.
+    \item Three-page AI/BI dashboard and a Genie space answering five questions correctly.
+    \item Access matrix implemented: engineers/analysts/pipeline groups; customer PII masked via column mask or dynamic view; negative-test evidence.
+    \item Audit evidence: a \texttt{system.access.audit} query showing a masked read by the analyst group.
+    \item Cost report: warehouse + pipeline DBUs for the week, with two optimizations documented.
+\end{itemize}
+
+\subsection*{Reference Architecture}
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[
+        store/.style={cylinder, shape border rotate=90, aspect=0.25, draw=primary, thick, fill=yellow!15, align=center, minimum width=2.8cm, minimum height=1.3cm, font=\small\bfseries},
+        proc/.style={rectangle, rounded corners, draw=primary, thick, fill=primary!7, align=center, minimum width=3.0cm, minimum height=1.0cm, font=\small\bfseries},
+        cons/.style={rectangle, rounded corners, draw=codegray, thick, fill=white, align=center, minimum width=2.6cm, minimum height=0.9cm, font=\small\bfseries},
+        gov/.style={rectangle, rounded corners, draw=red!60!black, thick, fill=red!5, align=center, minimum width=3.2cm, minimum height=0.9cm, font=\scriptsize\bfseries}
+    ]
+        \node[store] (gold) at (0,0) {Gold\\liquid clustered};
+        \node[proc] (views) at (4.2,0) {Certified views\\(+ masks)};
+        \node[proc] (wh) at (8.4,0) {Serverless\\SQL warehouse};
+        \node[cons] (dash) at (12.4,1.1) {AI/BI\\dashboard};
+        \node[cons] (genie) at (12.4,-1.1) {Genie\\space};
+        \node[gov] (uc) at (4.2,-2.1) {UC grants\\(groups)};
+        \node[gov] (audit) at (8.4,-2.1) {system.access.audit};
+        \draw[arrow] (gold) -- (views);
+        \draw[arrow] (views) -- (wh);
+        \draw[arrow] (wh) -- (dash);
+        \draw[arrow] (wh) -- (genie);
+        \draw[arrow, dashed] (uc) -- (views);
+        \draw[arrow, dashed] (audit) -- (wh);
+    \end{tikzpicture}%
+    }
+    \caption{Milestone 2 reference architecture: governed serving from optimized Gold through one semantic layer.}
+    \label{fig:ch8-capstone-arch}
+\end{figure}
+
+\subsection*{Implementation Steps}
+\begin{enumerate}
+    \item Run the Chapter 5 benchmark on the Gold fact; apply liquid clustering; record results.
+    \item Provision the warehouse; wire dashboards and Genie to it; capture query profiles.
+    \item Build the certified view; refactor the dashboard datasets to read it; write Genie instructions against it.
+    \item Implement groups, grants, and masking per the access matrix; run the negative tests.
+    \item Produce the audit and cost queries; file the evidence in the repo.
+\end{enumerate}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item Benchmark table, query profiles, warehouse config, and cost report.
+    \item Dashboard link/export and Genie test log (including one fixed wrong answer).
+    \item Access matrix, negative-test evidence, and the masked-read audit output.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item Analysts cannot read the base PII table; the masked view provably masks for the analyst principal.
+    \item Genie's ``revenue by state last quarter'' equals the dashboard's certified number.
+    \item Liquid clustering improved the benchmarked selective query measurably; results table committed.
+    \item The warehouse auto-stops; the cost report identifies the top SKU and one implemented saving.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Replace the masking view with table-level column masks and row filters; document the trade-offs.
+    \item Add a Genie ``explore'' space over non-certified Gold with a documented guardrail.
+    \item Wire the PII audit alert to fire on any non-approved read and demonstrate it.
+\end{itemize}

@@ -1,0 +1,328 @@
+\chapter{MLflow and Experiment Tracking}
+\index{MLflow}\index{experiment tracking}\index{model registry}\index{autologging}%
+\index{model alias}\index{champion challenger}\index{run artifacts}\index{reproducibility}%
+\begin{objectives}
+\begin{itemize}
+    \item Explain MLflow's components: Tracking, Models, Registry, and evaluation.
+    \item Instrument training with autologging plus deliberate manual logging of parameters, metrics, and artifacts.
+    \item Tag runs with dataset snapshots and code versions for reproducibility.
+    \item Register models in Unity Catalog and manage lifecycle with aliases (champion/challenger).
+    \item Load models by alias for inference without code changes.
+    \item Design experiment governance for a regulated environment.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+MLflow is the \textbf{experiment ledger}; every cloud has a tracking/registry pair, but MLflow is
+the open standard most of them also integrate.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{3.0cm}p{3.4cm}p{3.2cm}p{3.2cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{Databricks} & \textbf{AWS} & \textbf{Azure / GCP / Fabric} \\
+\midrule
+Tracking & Managed MLflow & SageMaker Experiments & Azure ML runs / Vertex Experiments / Fabric MLflow \\
+Registry & Unity Catalog model registry & SageMaker Model Registry & Azure ML registry / Vertex Model Registry \\
+Autologging & sklearn/XGBoost/etc. & SageMaker Debugger (partial) & Azure ML MLflow integration \\
+Lifecycle & Aliases (champion/challenger) & Approval states & Stages / aliases \\
+Governance & UC lineage: data $\rightarrow$ model & SageMaker lineage & Purview / Vertex lineage \\
+Deployment hooks & Model Serving (Ch. 20) & SageMaker endpoints & Azure ML online endpoints / Vertex endpoints \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+\textbf{Snowflake} registries models in its own model registry with Snowpark ML; \textbf{MongoDB}
+has no registry---Atlas pairs with external MLOps tooling, which is often MLflow.
+\end{crosscloud}
+
+\section{Week 17 Roadmap and Mental Model}
+Part V connects data engineering to machine learning---not by turning you into a data scientist, but by making you the engineer who makes ML reproducible, governed, and operable. Week 17 starts with the ledger: every training run recorded with its parameters, metrics, artifacts, code, and data version, so that ``which model is in production and why is it this one'' is a query, not an archaeology project \cite{mlflowDocs,databricksMLflow}.
+
+The mental model: \textbf{MLflow is version control for the experiment dimension}. Git versions code; Delta versions data; MLflow versions the \emph{combination}: code + data + parameters $\rightarrow$ metrics + artifacts. The registry then versions the promotion decision. All four versioned layers together are what ``reproducible ML'' actually means.
+
+\begin{definitionbox}
+\textbf{MLflow Tracking} records runs (parameters, metrics, artifacts, code version, environment) against experiments. \textbf{MLflow Models} package artifacts with signatures and dependencies. The \textbf{Model Registry in Unity Catalog} versions models as governed catalog objects with aliases, permissions, and lineage to the training data.
+\end{definitionbox}
+
+\begin{keyterms}
+\textbf{Run}: one execution of training code. \textbf{Experiment}: a named collection of runs. \textbf{Autologging}: framework integrations that capture parameters/metrics/artifacts without explicit calls. \textbf{Model signature}: the input/output schema contract of a model. \textbf{Alias}: a mutable pointer (e.g.\ \texttt{champion}) to a registered version---the deployable reference.
+\end{keyterms}
+
+\section{Monday: Tracking, Runs, and Artifacts}
+\subsection{What a Run Records}
+A run bundles: parameters (hyperparameters, config), metrics (accuracy, AUC, custom), artifacts (the model binary, plots, data profiles), tags (your metadata---dataset snapshot, business owner), the code version (git commit when in a Git folder), and the environment. Autologging fills most of this for common frameworks; your job is the tags and the dataset identity---the parts that make runs comparable and reproducible.
+
+\begin{lstlisting}[language=Python,caption={Autologging plus the tags that make runs governable.},label={lst:ch17-autolog}]
+import mlflow
+from sklearn.ensemble import RandomForestClassifier
+
+mlflow.set_experiment("/de_training/churn")
+
+with mlflow.start_run(run_name="rf-depth-sweep-12"):
+    mlflow.autolog()                       # params, metrics, artifacts
+    mlflow.set_tags({
+        "dataset_snapshot": "de_training.ml.training_v2026_08_31",
+        "git_commit": "a1b2c3d",
+        "feature_set": "customer_v3",
+        "owner": "de-team",
+    })
+    model = RandomForestClassifier(max_depth=12, random_state=42)
+    model.fit(X_train, y_train)
+    mlflow.log_metric("holdout_auc", holdout_auc)
+    mlflow.log_input(mlflow.data.load_delta(
+        table_name="de_training.ml.training_v2026_08_31"), context="training")
+\end{lstlisting}
+
+\subsection{Comparing Runs Honestly}
+The experiment UI compares runs---valid comparisons require a \emph{fixed data snapshot} and evaluation harness. Comparing a Tuesday model against a Friday model trained on different data measures data drift, not modeling progress. The tag discipline above is what makes the comparison honest.
+
+\begin{pitfall}
+\textbf{The unlogged winner.} ``The best model was that Tuesday run, but we overwrote the notebook.'' If a run is not tracked, it does not exist: no artifact, no environment, no defense in an audit. Autolog plus tags is two lines; archaeology is two weeks.
+\end{pitfall}
+
+\section{Tuesday: Signatures, Inputs, and Reproducibility}
+\subsection{Model Signatures and Input Examples}
+A signature declares the model's input/output schema; an input example documents a valid request. Both are validated at log time and enforced at serving time (Chapter 20)---they are the compile-time type-check of the ML lifecycle, catching the ``production sends strings, training expected floats'' class of incident before deployment.
+
+\subsection{Reproducing a Run}
+Reproducibility = code (git SHA) + data (Delta version or snapshot table) + parameters + environment (logged \texttt{conda.yaml}/requirements). With all four logged, \texttt{mlflow run} or a re-executed notebook rebuilds the model; Delta time travel pins the training data to the exact version even if the table has moved on. The audit story for a bank: \emph{any} production prediction traces to a reproducible run.
+
+\section{Wednesday: The Unity Catalog Model Registry}
+\subsection{Versions, Aliases, Governance}
+Registering a model in UC creates versioned, permissioned catalog objects with lineage back to the training notebook and data \cite{databricksMLflow}. \textbf{Aliases} (\texttt{champion}, \texttt{challenger}) are mutable pointers production code references by name---promotion moves the alias; nothing redeploys.
+
+\begin{lstlisting}[language=Python,caption={Register, promote by alias, load by alias.},label={lst:ch17-registry}]
+import mlflow
+
+mlflow.set_registry_uri("databricks-uc")
+result = mlflow.register_model(
+    f"runs:/{run.info.run_id}/model",
+    "ml.churn_model")                       # catalog.schema.model
+
+client = mlflow.MlflowClient()
+client.set_registered_model_alias(
+    "ml.churn_model", "champion", result.version)
+
+# Inference code NEVER hardcodes a version:
+model = mlflow.pyfunc.load_model("models:/ml.churn_model@champion")
+\end{lstlisting}
+
+\begin{definitionbox}
+\textbf{Alias-based deployment}: production jobs load \texttt{models:/<name>@champion}; promotion is \texttt{set\_registered\_model\_alias}; rollback is re-pointing the alias. Version numbers are immutable history; aliases are the operational interface. This one indirection eliminates redeploy-on-promote and makes rollback instantaneous.
+\end{definitionbox}
+
+\section{Thursday Hands-on Project: Six Runs, One Champion}
+Train six churn model variants with autologging on a fixed snapshot, tag every run, register the winner, promote it to \texttt{champion}, and load it in a fresh notebook by alias.
+\index{hands-on lab}\index{MLflow!lab}\index{model registry!lab}
+
+\begin{lstlisting}[language=Python,caption={Week 17 lab: the tracked sweep.},label={lst:ch17-lab}]
+import mlflow
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.linear_model import LogisticRegression
+
+train = spark.table("de_training.ml.training_v2026_08_31").toPandas()
+X, y = train.drop(columns=["churned", "customer_id"]), train["churned"]
+
+mlflow.set_experiment("/de_training/churn_week17")
+for i, depth in enumerate([4, 6, 8, 10, 12]):
+    with mlflow.start_run(run_name=f"rf_d{depth}"):
+        mlflow.autolog()
+        m = RandomForestClassifier(max_depth=depth, random_state=42)
+        m.fit(X, y)
+        mlflow.set_tag("dataset_snapshot", "training_v2026_08_31")
+        mlflow.log_metric("holdout_auc", holdout_auc_of(m))
+with mlflow.start_run(run_name="logreg_baseline"):
+    mlflow.autolog()
+    m = LogisticRegression(max_iter=1000).fit(X, y)
+    mlflow.log_metric("holdout_auc", holdout_auc_of(m))
+
+# Winner -> registry -> alias -> clean-notebook load by alias
+best = mlflow.search_runs(order_by=["metrics.holdout_auc DESC"]).iloc[0]
+reg = mlflow.register_model(f"runs:/{best.run_id}/model", "ml.churn_model")
+mlflow.MlflowClient().set_registered_model_alias(
+    "ml.churn_model", "champion", reg.version)
+\end{lstlisting}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item The experiment with six fully tagged runs and a comparison screenshot or export.
+    \item The registered model with the \texttt{champion} alias.
+    \item A fresh notebook loading by alias and scoring a sample---proving registry round-trip.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item Every run carries dataset snapshot, git commit, and feature-set tags.
+    \item The comparison table is reproducible: re-running the evaluation yields identical metrics on the fixed snapshot.
+    \item The clean notebook loads \texttt{@champion} with no version number anywhere in its code.
+    \item A re-promotion (champion $\rightarrow$ previous version) is demonstrated as rollback.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Add a model signature and input example; show serving-time validation rejecting a bad payload (preview of Chapter 20).
+    \item Reproduce the champion run end-to-end from its logged environment on a different cluster.
+    \item Write the lineage query: registered model $\rightarrow$ training notebook $\rightarrow$ source tables.
+\end{itemize}
+
+\section{Friday Use Case: Experiment Governance for a Bank}
+A bank's models approve credit. Regulators require every production model to trace to training data, code, hyperparameters, evaluation evidence, and a named approver; and any prediction to be explainable back to a model version within one business day.
+\index{model governance}\index{regulation}\index{audit}
+
+\subsection{Requirements and Assumptions}
+DoS-style protection: models retrain monthly; approvals are committee decisions recorded outside Databricks; production scoring is batch nightly plus a real-time endpoint.
+
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[
+        box/.style={rectangle, rounded corners, draw=primary, thick, fill=primary!7, align=center, minimum width=2.9cm, minimum height=0.95cm, font=\small\bfseries},
+        gov/.style={rectangle, rounded corners, draw=red!60!black, thick, fill=red!5, align=center, minimum width=2.9cm, minimum height=0.9cm, font=\scriptsize\bfseries},
+        flow/.style={-{Latex[length=2mm]}, draw=primary, thick}
+    ]
+        \node[box] (data) at (0,0) {Training snapshot\\(Delta version)};
+        \node[box] (runs) at (3.7,0) {Tracked runs\\(MLflow)};
+        \node[box] (reg) at (7.4,0) {UC registry\\versions + aliases};
+        \node[box] (prod) at (11.1,0) {Production\\(batch + endpoint)};
+        \node[gov] (appr) at (7.4,1.7) {Approval evidence\\(ticket ID tag)};
+        \node[gov] (lineage) at (11.1,-1.7) {Lineage + inference\\log (Ch. 20)};
+        \draw[flow] (data) -- (runs);
+        \draw[flow] (runs) -- (reg);
+        \draw[flow] (reg) -- (prod);
+        \draw[flow, dashed] (appr) -- (reg);
+        \draw[flow, dashed] (prod) -- (lineage);
+    \end{tikzpicture}%
+    }
+    \caption{Regulated model lifecycle: every link from data to production prediction is recorded and queryable.}
+    \label{fig:ch17-governance}
+\end{figure}
+
+\subsection{Architecture Decisions}
+\textbf{The traceability chain.} Snapshot tables are immutable per training cycle (Delta versions pinned); every run logs the snapshot name, commit, and environment; registration requires an \texttt{approval\_ticket} tag (enforced by a deployment-time check in CI); aliases move only via the release pipeline, which writes the committee decision ID into the model version's tags. The one-business-day question---``why did the model decline this application?''---is answered by joining the inference log (Chapter 20) to the registry version to the run to the snapshot.
+
+\textbf{Separation of duties.} Data scientists propose (experiments, challenger alias); the release pipeline disposes (champion moves only in CI with the approval tag); engineers operate (serving, monitoring). Nobody both trains and promotes.
+
+\begin{pitfall}
+\textbf{Approvals in chat.} A ``LGTM'' in a chat channel is not audit evidence. The approval must land \emph{on the artifact}---a tag on the model version written by the pipeline that verified the ticket---or it did not happen.
+\end{pitfall}
+
+\subsection{Risks and Mitigations}
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{4.6cm}p{7.6cm}@{}}
+\toprule
+\textbf{Risk} & \textbf{Mitigation} \\
+\midrule
+Approval tag forged or bypassed & Alias moves only via the CI pipeline's principal \\
+Snapshot tables pruned too early & Retention schedule aligned to model-risk policy \\
+Experiment metadata leaks PII & Tag taxonomy review; metadata scanning in CI \\
+Registry permissions accumulate & Quarterly registry access review with the access matrix \\
+Rollback target itself untested & Quarterly rollback drill against a staging endpoint \\
+\bottomrule
+\end{tabular}
+\caption{Week 17 scenario risks and mitigations.}
+\label{tab:ch17-risks}
+\end{table}
+
+\section{Design Decision Guide}
+\index{decision guide!Week 17}%
+Experiment-governance decisions decide whether your best model can be proven to exist.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.4cm}p{4.4cm}p{4.6cm}@{}}
+\toprule
+\textbf{Decision} & \textbf{Choose the first when} & \textbf{Choose the second when} \\
+\midrule
+Autologging vs.\ manual logging & Framework-standard artifacts & Custom metrics, tags, dataset identity \\
+Alias vs.\ version in production code & Always alias & Never version-pin deployable code \\
+UC registry vs.\ workspace registry & Governance, lineage, sharing & Legacy constraints only \\
+Fixed snapshot vs.\ latest data per run & Any comparable experimentation & Exploratory drift studies only \\
+Signature enforcement vs.\ lenient serving & Production endpoints & Prototypes behind no consumers \\
+Promotion via pipeline vs.\ by hand & Anything production-visible & Personal experiments \\
+\bottomrule
+\end{tabular}
+\caption{Week 17 decision guide.}
+\label{tab:ch17-decisions}
+\end{table}
+
+Reproducibility is the currency: code + data + parameters + environment, all four, every run. A run missing one is a demo; a registry entry with all four is an asset.
+
+\section{Operational Guidance for Week 17}
+\index{operational guidance!Week 17}%
+\subsection{Performance and Reliability}
+Experiment hygiene is a reliability property: name runs, tag them with the dataset snapshot and commit, and prune or archive experiment clutter monthly so the comparison UI stays usable. Registry changes (alias moves) belong in the release pipeline with a log; a hand-moved champion is untraceable. Watch artifact-store growth---large model artifacts on every sweep add up; autolog what you need, not everything loggable.
+
+\subsection{Security and Governance Checklist}
+\begin{itemize}
+    \item Registry permissions: scientists register versions; only the release pipeline moves aliases.
+    \item Approval tags required for registration to production-visible namespaces.
+    \item Training snapshots retained per the model-risk retention schedule.
+    \item Experiment names and tags carry no PII or secrets (they are metadata, widely visible).
+\end{itemize}
+
+\subsection{Troubleshooting Playbook}
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.6cm}p{4.2cm}p{4.8cm}@{}}
+\toprule
+\textbf{Symptom} & \textbf{Likely cause} & \textbf{First action} \\
+\midrule
+Cannot reproduce an old run & Missing snapshot tag or environment & Check tags; time-travel the data; rebuild env from logged spec \\
+Alias points at wrong version & Hand-moved alias outside the pipeline & Audit alias history; re-point; tighten registry permissions \\
+Model fails to load in serving & Environment/signature mismatch & Check the logged environment and the signature validation error \\
+Experiment comparison looks random & Runs trained on different snapshots & Filter by \texttt{dataset\_snapshot} tag before comparing \\
+\bottomrule
+\end{tabular}
+\caption{Week 17 troubleshooting quick reference.}
+\label{tab:ch17-trouble}
+\end{table}
+
+\section{Interview Q\&A}
+\subsection{Concepts and Trade-offs}
+\begin{enumerate}
+    \item \textbf{Q: What does autologging not capture that you must add?}\\
+    A: Your context: dataset identity/version, business owner, feature-set version, approval linkage---the metadata that makes runs comparable, governable, and reproducible.
+    \item \textbf{Q: Why register in Unity Catalog rather than the workspace registry?}\\
+    A: Governance: permissions, lineage to training data, cross-workspace sharing, and one namespace with the rest of your governed assets.
+    \item \textbf{Q: Alias versus version in production code?}\\
+    A: Always the alias. Version-pinned code redeploys on every promotion and turns rollback into a release; alias-referenced code promotes and rolls back by moving a pointer.
+    \item \textbf{Q: Reproduce a nine-month-old run. What do you need?}\\
+    A: Git SHA, dataset snapshot (or Delta version), parameters, and environment---all four logged. Missing any one, you are approximating, not reproducing.
+    \item \textbf{Q: Two runs, same code, different AUC. First suspect?}\\
+    A: The data. Check dataset versions/snapshots before suspecting the model---this is why the snapshot tag is mandatory.
+    \item \textbf{Q: How do you compare two candidate models fairly?}\\
+    A: Same snapshot, same evaluation harness, logged metrics---anything else compares data vintages, not models.
+    \item \textbf{Q: What is the registry's role in an incident?}\\
+    A: Instant answers: which version served, trained on what, approved by whom, and how to roll back---the alias re-point measured in seconds, with evidence.
+    \item \textbf{Q: How many experiments should one project have?}\\
+    A: One per question being investigated, with runs named for hypotheses. A single \texttt{Default} experiment with 400 runs is a landfill, not a lab notebook.
+\end{enumerate}
+
+\section{Further Reading}
+The MLflow documentation covers tracking, models, signatures, and evaluation \cite{mlflowDocs}; MLflow on Databricks adds the UC registry and workspace integration \cite{databricksMLflow}. Feature Store (Chapter 18) and Model Serving (Chapter 20) complete the lifecycle \cite{databricksFeatureStore,databricksModelServing}.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item MLflow versions the experiment dimension: code + data + parameters $\rightarrow$ metrics + artifacts.
+    \item Autolog captures the framework; your tags capture the context that makes runs governable.
+    \item Compare runs only on fixed snapshots---otherwise you are measuring data drift.
+    \item Aliases are the deployment interface: promote and roll back by moving a pointer, never by redeploying code.
+    \item In regulated settings, approval evidence lives on the artifact, enforced by the pipeline.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} List the four things required to reproduce a training run and the MLflow mechanism that records each.
+    \item \textbf{(Conceptual)} Why is a model signature a data-engineering artifact as much as an ML one?
+    \item \textbf{(Hands-on)} Complete the Thursday lab including the rollback demonstration.
+    \item \textbf{(Hands-on)} Break a run's reproducibility deliberately (no snapshot tag) and document what you can no longer prove.
+    \item \textbf{(Hands-on)} Write the deployment-time check that refuses registration without an \texttt{approval\_ticket} tag.
+    \item \textbf{(Design)} Design the tag taxonomy (required keys, formats, owners) for a 10-team ML organization.
+    \item \textbf{(Operations)} Write the audit query: ``all production predictions last month, by model version, traced to training snapshot.''
+    \item \textbf{(Architecture)} Where does the registry's governance intersect Chapter 8's access matrix? Design the grants for the three personas.
+\end{enumerate}

@@ -1,0 +1,413 @@
+\chapter{Model Serving, Monitoring, and MLOps}
+\index{Model Serving}\index{serverless endpoint}\index{inference table}\index{Lakehouse Monitoring}%
+\index{batch scoring}\index{drift detection}\index{MLOps}\index{model promotion}\index{rollback}%
+\begin{objectives}
+\begin{itemize}
+    \item Deploy registered models to serverless serving endpoints with governed access.
+    \item Implement idempotent batch scoring with alias-loaded models.
+    \item Capture inference tables and monitor input drift and prediction quality.
+    \item Build the retraining loop with metric thresholds and human-gated promotion.
+    \item Execute rollback by alias re-pointing and prove it.
+    \item Design an auditable MLOps control plane for a regulated operator.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+Model serving and monitoring close the MLOps loop; each platform pairs an endpoint service with a
+drift monitor.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{3.0cm}p{3.4cm}p{3.2cm}p{3.2cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{Databricks} & \textbf{AWS} & \textbf{Azure / GCP / Fabric} \\
+\midrule
+Real-time serving & Model Serving (serverless) & SageMaker endpoints & Azure ML online / Vertex endpoints \\
+Batch scoring & Spark UDF from registry + jobs & SageMaker Batch Transform & Batch endpoints / Vertex batch / notebook jobs \\
+Request logging & Inference tables (Delta) & Endpoint data capture & Application Insights / request logging \\
+Drift monitoring & Lakehouse Monitoring & SageMaker Model Monitor & Azure ML monitoring / Vertex monitoring \\
+Promotion & Alias + CI gate & Registry approval states & Registered model stages / aliases \\
+Rollback & Alias re-point & Endpoint config rollback & Traffic shift / alias \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+The Databricks distinction: inference logs are \emph{Delta tables in your catalog}---monitoring
+is a SQL/BI problem over data you already govern, not a separate observability silo.
+\end{crosscloud}
+
+\section{Week 20 Roadmap and Mental Model}
+A registered model is inventory; Week 20 makes it a \emph{service}. Serving exposes the champion to applications; batch scoring applies it at pipeline scale; monitoring watches what production does to it; and the promotion loop---gated, evidenced, reversible---decides when the challenger becomes the champion \cite{databricksModelServing,databricksLakehouseMonitoring}.
+
+The mental model: \textbf{production ML is a control loop, not a deployment}. Sense (inference tables, drift metrics), decide (thresholds, human approval), act (retrain, promote by alias), verify (post-promotion metrics, rollback readiness). Each stage is a pipeline you already know how to build; MLOps is wiring them with evidence.
+
+\begin{definitionbox}
+\textbf{Model Serving} exposes registered models as REST endpoints (serverless, scaling to zero, or provisioned throughput). \textbf{Inference tables} capture endpoint requests and responses into Delta. \textbf{Lakehouse Monitoring} computes profile and drift metrics over any Delta table---including inference logs and feature tables.
+\end{definitionbox}
+
+\begin{keyterms}
+\textbf{Serverless endpoint}: scale-to-zero model serving. \textbf{Provisioned throughput}: reserved capacity for latency guarantees. \textbf{Inference table}: the Delta log of requests/responses behind an endpoint. \textbf{Drift}: distribution change in inputs or predictions versus the training baseline. \textbf{Champion/challenger}: alias pattern for gated promotion.
+\end{keyterms}
+
+\section{Monday: Model Serving}
+\subsection{Serverless Endpoints}
+Deploying is a registry-to-endpoint operation: pick the model version (by alias), the compute size, scale-to-zero, and---always---the inference table. Access is governed: endpoint-level permissions decide who can query, manage, or even see the endpoint \cite{databricksModelServing}.
+
+\begin{lstlisting}[language=Python,caption={Creating a governed serverless endpoint with inference logging.},label={lst:ch20-endpoint}]
+from databricks.sdk import WorkspaceClient
+from databricks.sdk.service.serving import (EndpointCoreConfigInput,
+    ServedEntityInput, AutoCaptureConfigInput)
+
+w = WorkspaceClient()
+w.serving_endpoints.create(
+    name="churn-champion",
+    config=EndpointCoreConfigInput(
+        served_entities=[ServedEntityInput(
+            entity_name="ml.churn_model",
+            entity_version=None,               # resolve via alias below
+            workload_size="Small",
+            scale_to_zero_enabled=True)],
+        auto_capture_config=AutoCaptureConfigInput(
+            catalog_name="de_training", schema_name="ml",
+            table_name_prefix="churn_inference", enabled=True)),
+    # In the UI/API you can bind the served entity to the @champion alias,
+    # so promotion changes what the endpoint serves without redeploying it.
+)
+\end{lstlisting}
+
+\subsection{Endpoint Hygiene}
+Scale-to-zero for intermittent traffic; provisioned throughput when measured p95 demands it. Every endpoint gets: inference logging on, an owner tag, and a queryable health dashboard (latency, error rate, request volume)---the same operational surface you would demand of any production service.
+
+\begin{pitfall}
+\textbf{The unlogged endpoint.} An endpoint without an inference table is unmonitorable by construction: no drift detection, no audit trail, no answer to ``what did the model say to this customer?'' Inference capture is not an option; it is the price of admission.
+\end{pitfall}
+
+\section{Tuesday: Batch Scoring at Scale}
+\subsection{The Alias-Loaded UDF}
+Batch scoring loads the champion as a Spark UDF and writes results idempotently---the Chapter 3 patterns applied to predictions:
+
+\begin{lstlisting}[language=Python,caption={Idempotent batch scoring from the governed feature table.},label={lst:ch20-scoring}]
+import mlflow
+from pyspark.sql import functions as F
+
+predict = mlflow.pyfunc.spark_udf(
+    spark, "models:/ml.churn_model@champion", result_type="double")
+
+as_of = dbutils.widgets.get("as_of_date")
+features = (spark.table("de_training.ml.customer_features")
+            .where(F.col("as_of_date") == as_of))
+
+scored = features.withColumn("churn_score", predict(F.struct(*features.columns)))
+(scored.write.format("delta").mode("overwrite")
+   .option("replaceWhere", f"as_of_date = '{as_of}'")   # rerun-safe
+   .saveAsTable("de_training.ml.churn_scores"))
+\end{lstlisting}
+
+\subsection{Scoring Discipline}
+Score from the governed feature tables (Chapter 18), never from ad-hoc joins---that is training-serving skew by design. The scoring job is a Workflow task gated on feature freshness; its output is itself a governed table with the model version recorded per partition, so ``scored with which model'' is always answerable.
+
+\section{Wednesday: Monitoring and the Retraining Loop}
+\subsection{Lakehouse Monitoring}
+Create a monitor over the inference table (or the scores table): it computes profile metrics and drift versus a baseline (the training snapshot), refreshing on a schedule and writing metrics tables you can dashboard and alert on \cite{databricksLakehouseMonitoring}. Input drift (feature distributions shifting), prediction drift (score distribution shifting), and---when labels arrive---quality decay are three different alarms with three different responses.
+
+\subsection{The Gated Loop}
+Drift alarm $\rightarrow$ retraining job (on fresh snapshots) $\rightarrow$ challenger registered $\rightarrow$ evaluation gate (beats champion on the fixed eval set \emph{and} passes fairness/quality checks) $\rightarrow$ \textbf{human approval} $\rightarrow$ alias moves. Never auto-promote: retraining on drifted data proves the new model fits the new data, not that it serves the business better.
+
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[
+        box/.style={rectangle, rounded corners, draw=primary, thick, fill=primary!7, align=center, minimum width=2.7cm, minimum height=0.95cm, font=\small\bfseries},
+        gate/.style={rectangle, rounded corners, draw=orange!80!black, thick, fill=orange!10, align=center, minimum width=2.6cm, minimum height=0.9cm, font=\scriptsize\bfseries},
+        flow/.style={-{Latex[length=2mm]}, draw=primary, thick}
+    ]
+        \node[box] (serve) at (0,0) {Serving /\\batch scoring};
+        \node[box] (log) at (3.5,0) {Inference table\\(Delta)};
+        \node[box] (mon) at (7.0,0) {Lakehouse\\Monitoring};
+        \node[gate] (gate) at (10.5,0) {Drift alarm\\$\rightarrow$ retrain};
+        \node[gate] (human) at (13.8,0) {Eval gate +\\human approval};
+        \node[box] (alias) at (10.5,-1.6) {champion alias moves\\(instant rollback)};
+        \draw[flow] (serve) -- (log);
+        \draw[flow] (log) -- (mon);
+        \draw[flow] (mon) -- (gate);
+        \draw[flow] (gate) -- (human);
+        \draw[flow, dashed] (human) -- (alias);
+        \draw[flow, dashed] (alias.west) -| (serve.south);
+    \end{tikzpicture}%
+    }
+    \caption{The MLOps control loop: sense, decide (with a human gate), act by alias, stay reversible.}
+    \label{fig:ch20-loop}
+\end{figure}
+
+\section{Thursday Hands-on Project: Serve, Score, Drift, Gate}
+Deploy the Week 17 champion, run idempotent batch scoring, inject skewed inputs, and prove the monitor alarms while retraining fires---but promotion waits for a human.
+\index{hands-on lab}\index{drift!lab}\index{model serving!lab}
+
+\begin{lstlisting}[language=Python,caption={Week 20 lab: drift drill and the promotion gate.},label={lst:ch20-lab}]
+# 1. Endpoint + inference table (lst:ch20-endpoint); send 100 requests.
+# 2. Batch score with replaceWhere idempotency (lst:ch20-scoring);
+#    rerun the same as_of date -> identical row count, no duplicates.
+
+# 3. Create the monitor over the inference table (UI or API):
+from databricks.sdk.service.catalog import MonitorInfoSec, MonitorMetric
+# (shown schematically; the UI flow: Catalog > inference table > Quality)
+#    baseline = training snapshot;  schedule = daily;  output = ml.monitors
+
+# 4. Inject drift: score a batch where spend_90d is shifted 10x.
+# 5. Read the drift metrics table -> input_drift alert fires.
+# 6. Retraining job runs; challenger registers; eval gate runs;
+#    WITHOUT the human approval tag, the alias does NOT move:
+from databricks.sdk import WorkspaceClient
+w = WorkspaceClient()
+champ = w.model_registry.get_model_alias("ml.churn_model", "champion")
+assert champ.version == "3"   # still v3: the gate held
+\end{lstlisting}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item The serving endpoint with inference table; latency evidence from a 100-request run.
+    \item The idempotent scoring job with rerun proof.
+    \item The drift-drill evidence: metric rows, the alarm, the held promotion.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item Scoring rerun on the same \texttt{as\_of\_date} changes zero rows.
+    \item The injected skew is detected by the monitor (metric evidence, not vibes).
+    \item Retraining fires on the alarm; promotion demonstrably requires the approval step.
+    \item Rollback is executed (alias back to the previous version) and verified with a live request.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Add prediction-drift and (with delayed labels) quality-decay monitors; document the three alarm responses.
+    \item Wire the whole loop as a Workflow with the approval as a manual task.
+    \item Canary the challenger: 10\% of traffic, compare live metrics, then promote.
+\end{itemize}
+
+\section{Friday Use Case: The Lender's MLOps Control Plane}
+A consumer lender must show its regulator, for every model in production: drift evidence over time, approval records for every promotion, and a demonstrated rollback capability. Quarterly exams sample these.
+\index{MLOps!regulated}\index{model risk management}
+
+\subsection{Requirements and Assumptions}
+Twelve models in production; batch scoring nightly; two real-time endpoints. Regulators sample quarterly and expect evidence within one business day.
+
+\subsection{Architecture Decisions}
+\textbf{Evidence by default.} Every endpoint has an inference table; every inference table and feature table has a monitor; every monitor's metrics land in governed tables; every promotion is a CI step that requires the approval tag (Chapter 17) and writes the decision record. The quarterly exam is a SQL query pack over system tables, registry tags, and monitor metrics---assembled continuously, not in a panic.
+
+\textbf{The rollback drill.} Quarterly, in staging and annually in production (off-peak, guarded): move the alias back, verify with a scored request, move it forward, file the timings. Rollback that has never been executed is a hypothesis; the drill is the evidence the regulator actually asks for.
+
+\begin{pitfall}
+\textbf{Monitoring the model but not the features.} A model can be stable while its inputs rot---a broken upstream job serving stale features is invisible to prediction-drift monitors that only watch outputs. Monitor the feature tables (freshness + distribution) alongside the inference table; Chapter 18's freshness gate is part of the same control plane.
+\end{pitfall}
+
+\subsection{Risks and Mitigations}
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{4.6cm}p{7.6cm}@{}}
+\toprule
+\textbf{Risk} & \textbf{Mitigation} \\
+\midrule
+Drift alarm noise mutes the channel & Monthly precision review; seasonal baselines \\
+Stale features masquerade as model failure & Feature monitors run beside prediction monitors \\
+Regulator request exceeds retention & Inference/metrics retention aligned to exam schedule \\
+Rollback drill never executed & Quarterly drill with timing recorded as an SLA metric \\
+Champion overwritten without evidence & Alias writes restricted to the gated pipeline identity \\
+\bottomrule
+\end{tabular}
+\caption{Week 20 scenario risks and mitigations.}
+\label{tab:ch20-risks}
+\end{table}
+
+\section{Design Decision Guide}
+\index{decision guide!Week 20}%
+Serving decisions close the loop; reversibility is the design goal.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.4cm}p{4.4cm}p{4.6cm}@{}}
+\toprule
+\textbf{Decision} & \textbf{Choose the first when} & \textbf{Choose the second when} \\
+\midrule
+Endpoint vs.\ batch scoring & Interactive applications & Bulk periodic decisions \\
+Scale-to-zero vs.\ provisioned & Intermittent traffic & Measured latency-critical load \\
+Gated vs.\ automatic promotion & Anything business-critical & Internal experiments only \\
+Monitor inputs vs.\ outputs & Both---inputs catch pipeline rot & Outputs catch behavior shift \\
+Canary vs.\ big-bang release & Traffic can split safely & Small blast radius and instant rollback \\
+Alias rollback vs.\ redeploy & Always alias & Never redeploy to roll back \\
+\bottomrule
+\end{tabular}
+\caption{Week 20 decision guide.}
+\label{tab:ch20-decisions}
+\end{table}
+
+The control loop only works end to end: inference tables without monitors are logs nobody reads; monitors without a gated promotion path are alarms nobody can act on.
+
+\section{Operational Guidance for Week 20}
+\index{operational guidance!Week 20}%
+\subsection{Performance and Reliability}
+Treat endpoints as services: latency/error-rate dashboards, scale-to-zero reviewed against actual traffic, and a promotion log (who approved, when, which metrics). Review monitor alarm precision monthly---a drift alarm that always fires gets muted, and a muted alarm is worse than none. Schedule the rollback drill; record its duration as a first-class SLA metric.
+
+\subsection{Security and Governance Checklist}
+\begin{itemize}
+    \item Endpoint query permissions scoped to calling applications' identities.
+    \item Inference tables classified---they contain request payloads, possibly PII.
+    \item Promotion requires the approval tag enforced by CI, not by convention.
+    \item Scores tables record the model version per partition for traceability.
+\end{itemize}
+
+\subsection{Troubleshooting Playbook}
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.6cm}p{4.2cm}p{4.8cm}@{}}
+\toprule
+\textbf{Symptom} & \textbf{Likely cause} & \textbf{First action} \\
+\midrule
+First request slow after idle & Scale-to-zero cold start & Expected; provisioned concurrency if p95 mandates it \\
+Drift alarm fires weekly & Threshold tighter than real seasonality & Rebaseline against weekly seasonality; widen bands \\
+Scoring rerun duplicated rows & Non-idempotent write & Convert to \texttt{replaceWhere}/keyed MERGE \\
+``Rollback'' changed nothing & Alias not what serving resolves & Verify the served entity binds the alias, not a version \\
+\bottomrule
+\end{tabular}
+\caption{Week 20 troubleshooting quick reference.}
+\label{tab:ch20-trouble}
+\end{table}
+
+\section{Interview Q\&A}
+\subsection{Concepts and Trade-offs}
+\begin{enumerate}
+    \item \textbf{Q: Serverless endpoint versus batch scoring---how do you choose?}\\
+    A: By consumption pattern: interactive applications need endpoints (latency, scale-to-zero economics); bulk periodic decisions need batch scoring through Spark (throughput economics, pipeline integration). Many models need both---from the same registry version.
+    \item \textbf{Q: What does the inference table buy you?}\\
+    A: The raw material for everything after deployment: drift monitoring, audit trails, quality measurement when labels arrive, and dispute answers---all as governed Delta data.
+    \item \textbf{Q: Why must promotion stay human-gated?}\\
+    A: Automated retraining proves fit to recent data, not business acceptability---fairness, stability, and threshold effects need judgment. Automate everything up to the gate; gate the alias move.
+    \item \textbf{Q: How fast is rollback, and why?}\\
+    A: As fast as an alias re-point: serving resolves the alias, so rollback is a registry operation, not a deployment. The drill exists because untested rollbacks fail when needed.
+    \item \textbf{Q: Your champion drifts weekly. Retrain weekly?}\\
+    A: First ask why inputs drift that fast (feature bug? seasonality? genuine behavior change?). Retraining cadence follows the drift mechanism, not the alarm frequency---an alarm you always answer with retraining is a cron job with extra steps.
+    \item \textbf{Q: What changes when a model serves both batch and real-time?}\\
+    A: Nothing about the model---the same registry version backs both paths. What changes is your testing: the batch and endpoint outputs must be reconciled, because serving-mode divergence is its own drift class.
+    \item \textbf{Q: Which monitor would you build first with one week to launch?}\\
+    A: Input drift on the top features plus the freshness gate. Prediction drift without label latency teaches little; input drift catches the pipeline failures that actually happen first.
+    \item \textbf{Q: What does ``the model is in production'' mean, concretely?}\\
+    A: An alias resolves to a version with logged lineage; an endpoint or job serves it; inference is captured; monitors watch it; a gate controls its promotion; a drill proves its rollback. Six artifacts, all queryable.
+\end{enumerate}
+
+\section{Further Reading}
+Model Serving \cite{databricksModelServing} and Lakehouse Monitoring \cite{databricksLakehouseMonitoring} are the product references; the registry mechanics come from Chapter 17 \cite{databricksMLflow,mlflowDocs}; the feature freshness contract from Chapter 18 \cite{databricksFeatureStore}. The Workflow wiring reuses Chapter 12 \cite{databricksWorkflows}.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item Production ML is a control loop: inference tables sense, monitors measure, gates decide, aliases act.
+    \item Every endpoint gets inference logging, an owner, and a health dashboard---no exceptions.
+    \item Batch scoring is alias-loaded, feature-table-fed, and partition-idempotent.
+    \item Retraining is triggered by drift; promotion is gated by humans; rollback is drilled.
+    \item In regulated settings, the evidence pack is continuous queries over governed tables, not a quarterly scramble.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Why does ``the model said so'' fail an audit, and what artifact answers it correctly?
+    \item \textbf{(Conceptual)} Distinguish input drift, prediction drift, and quality decay; give a business cause of each.
+    \item \textbf{(Hands-on)} Complete the Thursday lab, including the rollback verification.
+    \item \textbf{(Hands-on)} Build the three-alarm dashboard (input drift, prediction drift, endpoint health) over the metrics tables.
+    \item \textbf{(Hands-on)} Write the eval-gate notebook: challenger beats champion on the fixed set \emph{and} approval tag present, else no alias move.
+    \item \textbf{(Design)} Design the quarterly evidence pack for the Friday scenario as a list of queries and artifacts.
+    \item \textbf{(Operations)} Write the rollback runbook with timings and verification steps.
+    \item \textbf{(Architecture)} Where would the RAG endpoint from Chapter 19 plug into this control plane? What monitors differ for LLM outputs?
+\end{enumerate}
+
+\section{Milestone 5 Capstone: The End-to-End MLOps Pipeline}\label{sec:ch20-capstone}
+\index{Milestone 5 capstone}\index{capstone project!Part V}\index{MLOps!capstone}
+
+\begin{capstonebox}
+\textbf{Mission.} Close Part V by operating the full ML lifecycle: leakage-safe feature tables, tracked and tagged training, a UC-registered champion, a RAG assistant over the platform's own runbooks, serverless serving with inference capture, idempotent batch scoring, drift monitoring, and a human-gated retraining loop.
+
+\textbf{Estimated time.} 8--10 hours.
+
+\textbf{What you'll practice.}
+\begin{itemize}
+    \item Point-in-time feature engineering with registry lineage.
+    \item Alias-based deployment and rollback.
+    \item RAG with a golden-set evaluation gate.
+    \item Monitoring-driven retraining with held promotion.
+\end{itemize}
+\end{capstonebox}
+
+\subsection*{Scenario}
+Contoso's retention team gets a churn score list every morning from a notebook nobody owns, on features nobody can reproduce. You are replacing it with the governed MLOps platform---and adding the runbook RAG assistant the on-call team keeps asking for.
+
+\subsection*{Requirements}
+\begin{itemize}
+    \item Feature tables with as-of discipline; training set via timestamp lookups; the leakage negative control documented.
+    \item Six tracked runs; champion registered and alias-served; rollback demonstrated.
+    \item RAG assistant with a 10-question golden set and logged evaluation metrics.
+    \item Serverless endpoint with inference table; batch scoring with \texttt{replaceWhere} idempotency.
+    \item Drift monitor with an injected-skew alarm; retraining fires; promotion waits for approval.
+    \item README with architecture diagram, DBU/token cost estimate, and the failure story.
+\end{itemize}
+
+\subsection*{Reference Architecture}
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[
+        box/.style={rectangle, rounded corners, draw=primary, thick, fill=primary!7, align=center, minimum width=2.7cm, minimum height=0.95cm, font=\small\bfseries},
+        ml/.style={rectangle, rounded corners, draw=magenta!70!black, thick, fill=magenta!8, align=center, minimum width=2.6cm, minimum height=0.9cm, font=\scriptsize\bfseries},
+        flow/.style={-{Latex[length=2mm]}, draw=primary, thick}
+    ]
+        \node[box] (gold) at (0,0) {Gold tables};
+        \node[box] (feat) at (3.2,0) {Feature tables\\(as-of)};
+        \node[ml] (reg) at (6.4,0) {MLflow +\\UC registry};
+        \node[box] (serve) at (9.6,0.8) {Endpoint +\\inference table};
+        \node[box] (batch) at (9.6,-0.8) {Batch scoring\\(idempotent)};
+        \node[ml] (mon) at (12.8,0) {Monitoring +\\gated retrain};
+        \node[ml] (rag) at (3.2,1.7) {RAG assistant\\(Vector Search)};
+        \draw[flow] (gold) -- (feat);
+        \draw[flow] (feat) -- (reg);
+        \draw[flow] (reg) -- (serve);
+        \draw[flow] (reg) -- (batch);
+        \draw[flow] (serve) -- (mon);
+        \draw[flow] (batch) -- (mon);
+        \draw[flow, dashed] (mon.north) .. controls (8,2.2) .. (reg.north);
+        \draw[flow, dashed] (gold) -- (rag);
+    \end{tikzpicture}%
+    }
+    \caption{Milestone 5 reference architecture: governed MLOps loop with the RAG branch.}
+    \label{fig:ch20-capstone-arch}
+\end{figure}
+
+\subsection*{Implementation Steps}
+\begin{enumerate}
+    \item Feature jobs + training set + lineage (Chapter 18).
+    \item Tracked sweep, registry, alias, rollback drill (Chapter 17).
+    \item Endpoint, scoring job, monitors, drift drill, gated promotion (Chapter 20).
+    \item RAG pipeline with golden-set evaluation (Chapter 19).
+    \item Cost report (DBUs + tokens) and README; present the failure story.
+\end{enumerate}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item All code in Git; the architecture diagram; the runbook.
+    \item Evidence pack: lineage query, drift alarm, held promotion, rollback log, eval metrics.
+    \item Cost report with at least two documented optimizations.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item Point-in-time correctness is proven, not asserted; the leaky control is documented.
+    \item A rerun of batch scoring changes zero rows; a replay of the endpoint load changes nothing downstream.
+    \item Drift demonstrably triggers retraining and demonstrably does not promote without approval.
+    \item The RAG assistant abstains correctly on an out-of-corpus question.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Canary deployment of the challenger with live metric comparison.
+    \item Add the feature-freshness gate to the scoring workflow and demonstrate a held score.
+    \item Wire the weekly golden-set RAG eval into CI (preview of Chapter 23).
+\end{itemize}

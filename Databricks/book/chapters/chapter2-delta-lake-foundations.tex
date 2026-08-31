@@ -1,0 +1,374 @@
+\chapter{Delta Lake Foundations}
+\index{Delta Lake}\index{transaction log}\index{ACID}\index{Parquet}\index{schema enforcement}%
+\index{schema evolution}\index{time travel}\index{RESTORE}\index{VACUUM}\index{MERGE INTO}%
+\begin{objectives}
+\begin{itemize}
+    \item Explain Delta Lake's architecture: Parquet data files plus the \texttt{\_delta\_log} transaction log, and how atomic commits work.
+    \item Describe Delta's ACID guarantees, optimistic concurrency control, and isolation levels for concurrent writers.
+    \item Apply schema enforcement, deliberate schema evolution, check constraints, and generated columns.
+    \item Use time travel (\texttt{VERSION AS OF}, \texttt{TIMESTAMP AS OF}), \texttt{DESCRIBE HISTORY}, and \texttt{RESTORE} for auditing and recovery.
+    \item Write idempotent upserts with \texttt{MERGE INTO} and explain why it beats delete-then-insert.
+    \item Reason about \texttt{VACUUM} retention and its interaction with recovery objectives.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+Delta Lake is the \textbf{open table format} layer; the same idea---ACID tables over object
+storage---appears across every platform.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{3.0cm}p{3.4cm}p{3.2cm}p{3.2cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{Databricks (Delta)} & \textbf{AWS / Azure / GCP} & \textbf{Snowflake / Fabric} \\
+\midrule
+Table format & Delta Lake & Iceberg / Hudi / Delta on S3, ADLS, GCS & Micro-partitions / Delta on OneLake \\
+Transaction log & \texttt{\_delta\_log} JSON + checkpoints & Iceberg metadata tree / Hudi timeline & Internal / \texttt{\_delta\_log} \\
+Time travel & \texttt{VERSION AS OF} & Iceberg snapshot IDs & Time Travel / Delta versions \\
+Recovery & \texttt{RESTORE} & Iceberg rollback & UNDROP / \texttt{RESTORE} \\
+Retention cleanup & \texttt{VACUUM} & Iceberg \texttt{expire\_snapshots} & Fail-safe / \texttt{VACUUM} \\
+Upsert & \texttt{MERGE INTO} & Iceberg MERGE / Athena & \texttt{MERGE} / T-SQL MERGE \\
+\addlinespace
+Interop & UniForm (Iceberg/Hudi reads) & Glue Catalog sync & Iceberg catalog / OneLake Delta \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+\textbf{MongoDB} provides document-level ACID inside a database rather than table-level ACID over
+files---the contrast clarifies what problem the table format actually solves.
+\end{crosscloud}
+
+\section{Week 2 Roadmap and Mental Model}
+Week 1 gave you the platform; Week 2 gives you the storage contract. Delta Lake is the layer that turns a folder of Parquet files into a \emph{table}: transactional, versioned, schema-enforced, and queryable by time \cite{armbrust2020delta}. Nearly everything else in this program---medallion design, optimization, streaming exactly-once, governance, ML reproducibility---assumes these guarantees.
+
+The mental model: \textbf{a Delta table is its log}. The data files are immutable Parquet; the \texttt{\_delta\_log} directory is an ordered sequence of JSON commit files describing which data files constitute each version. Readers open the log, learn the current file set, and scan only those files. Writers read the log, write new files, and attempt to commit a new log entry; if someone else committed first, they reconcile or retry. That one mechanism delivers atomicity, isolation, and time travel \cite{deltaLakeDocs}.
+
+\begin{definitionbox}
+\textbf{Delta Lake} is an open table format for cloud object storage: immutable Parquet data files, an append-only transaction log, and protocol guarantees (ACID commits, schema enforcement, versioning) layered on top.
+\end{definitionbox}
+
+\begin{keyterms}
+\textbf{Transaction log}: the \texttt{\_delta\_log} directory of commits. \textbf{Optimistic concurrency}: writers assume no conflict and retry on collision. \textbf{Schema enforcement}: writes must match the table schema unless evolution is requested. \textbf{Time travel}: querying any retained historical version. \textbf{Deletion vector}: a bitmap marking deleted rows without rewriting files (Chapter 5).
+\end{keyterms}
+
+\section{Monday: Data Files and the Transaction Log}
+\subsection{Parquet Data Files}
+Delta stores rows in Apache Parquet: columnar, compressed, splittable, and self-describing \cite{apacheParquet}. Columnar layout means a query selecting three columns from a hundred reads only those columns' data---the foundation of analytical performance. Files are immutable: an update never modifies a Parquet file in place; it writes new files and flips the log pointer.
+
+\subsection{The JSON Transaction Log}
+Every commit appends a numbered JSON file (for example \texttt{00000000000000000007.json}) listing \emph{actions}: add file, remove file, update metadata, change protocol. Every ten commits, Delta writes a Parquet \textbf{checkpoint} file summarizing the log so readers do not replay thousands of JSON files. \texttt{DESCRIBE HISTORY} is simply a readable view over the log \cite{databricksDelta}.
+
+\begin{lstlisting}[language=SQL,caption={Inspecting the transaction log through history.},label={lst:ch2-history}]
+DESCRIBE HISTORY de_training.silver.orders;
+-- version, timestamp, operation, operationParameters, userName, ...
+-- Every INSERT, DELETE, MERGE, OPTIMIZE, and RESTORE appears here.
+\end{lstlisting}
+
+\begin{pitfall}
+\textbf{Editing or deleting files directly in storage.} If you remove a Parquet file outside Delta (or worse, edit \texttt{\_delta\_log}), the log and the files disagree and the table corrupts. All changes go through Delta APIs---the log is the only writer of record.
+\end{pitfall}
+
+\subsection{Atomic Commits}
+A commit is a single file write into \texttt{\_delta\_log}; object stores make small file puts atomic. Either the new log entry exists (the version exists, fully) or it does not (nothing changed). A job that writes 10,000 files and fails before the commit leaves orphan files on storage---invisible to readers, cleanable later---but never a half-visible table.
+
+\section{Tuesday: ACID, Concurrency, and MERGE}
+\subsection{Optimistic Concurrency}
+Concurrent writers read the log at a version, compute their changes, and race to write the next commit file. The loser re-reads the log and checks for semantic conflict: two jobs appending disjoint partitions can both succeed after reconciliation; two jobs updating the same rows conflict and one retries or fails. Delta's default isolation for concurrent writes is snapshot isolation with conflict checking---strong enough for every workload in this book \cite{armbrust2020delta}.
+
+\subsection{MERGE INTO}
+\texttt{MERGE INTO} is the lakehouse upsert: match target rows against a source, then update, insert, or delete in one atomic operation.
+
+\begin{lstlisting}[language=SQL,caption={The idempotent upsert pattern used across the book.},label={lst:ch2-merge}]
+MERGE INTO de_training.silver.orders AS t
+USING de_training.bronze.orders_deduped AS s
+ON t.order_id = s.order_id
+WHEN MATCHED AND s.updated_at > t.updated_at THEN
+  UPDATE SET *
+WHEN NOT MATCHED THEN
+  INSERT *
+WHEN NOT MATCHED BY SOURCE AND t.is_active = true THEN
+  UPDATE SET t.is_active = false;  -- soft-delete pattern
+\end{lstlisting}
+
+\begin{definitionbox}
+\textbf{Idempotent write}: a write whose effect is the same whether it runs once or many times. Key-based \texttt{MERGE} and partition-scoped \texttt{replaceWhere} overwrites are the two idempotent write patterns this book uses; blind \texttt{INSERT} is not idempotent.
+\end{definitionbox}
+
+\begin{tipbox}
+Always give \texttt{MERGE} a deterministic match condition on a unique business key, and (for updates) a recency guard like \texttt{s.updated\_at > t.updated\_at}. That one clause makes replays and out-of-order CDC safe (Chapter 11 builds on this).
+\end{tipbox}
+
+\section{Wednesday: Schema Discipline, Time Travel, and Recovery}
+\subsection{Schema Enforcement and Evolution}
+By default, a write whose schema does not match the table fails loudly---this is \textbf{schema enforcement}, and it is the first data-quality gate in every pipeline. Deliberate evolution opts in: \texttt{mergeSchema} adds new columns on append; \texttt{overwriteSchema} permits breaking rewrites. Additive changes evolve; breaking changes are a migration with a plan \cite{deltaLakeDocs}.
+
+\begin{lstlisting}[language=Python,caption={Deliberate, opt-in schema evolution.},label={lst:ch2-merge-schema}]
+# New optional column appears in the source feed
+(df.write.format("delta").mode("append")
+   .option("mergeSchema", "true")          # additive only
+   .saveAsTable("de_training.silver.orders"))
+
+# A breaking change is a deliberate rewrite, never an accident:
+(df.write.format("delta").mode("overwrite")
+   .option("overwriteSchema", "true")      # explicit breaking change
+   .saveAsTable("de_training.silver.orders"))
+\end{lstlisting}
+
+\subsection{Constraints and Generated Columns}
+\texttt{CHECK} constraints reject bad rows at write time; generated columns derive values (for example a date from a timestamp) so partitions and queries stay consistent. Both are cheap correctness at the table boundary.
+
+\begin{lstlisting}[language=SQL,caption={Constraints and generated columns at the table boundary.},label={lst:ch2-constraints}]
+ALTER TABLE de_training.silver.orders
+  ADD CONSTRAINT valid_amount CHECK (total_amount >= 0);
+
+ALTER TABLE de_training.silver.orders
+  ADD COLUMN order_day DATE GENERATED ALWAYS AS (CAST(order_ts AS DATE));
+\end{lstlisting}
+
+\subsection{Time Travel and RESTORE}
+Because the log is versioned, any retained version is queryable: \texttt{VERSION AS OF n}, \texttt{TIMESTAMP AS OF '...'}. \texttt{RESTORE} makes a previous version the new head---a new commit, not a rewrite of history, so the incident itself remains auditable.
+
+\begin{lstlisting}[language=SQL,caption={Recovery after a bad delete.},label={lst:ch2-restore}]
+-- What did the table look like before the incident?
+SELECT COUNT(*) FROM de_training.silver.orders VERSION AS OF 11;
+
+-- Roll forward back to the good version (creates a new commit):
+RESTORE TABLE de_training.silver.orders TO VERSION AS OF 11;
+\end{lstlisting}
+
+\subsection{VACUUM and Retention}
+Time travel depends on old data files surviving. \texttt{VACUUM} deletes files no longer referenced beyond the retention horizon (default 168 hours = 7 days). Shorter retention ends time travel earlier; never vacuum a table you might still need to restore \cite{databricksDelta}.
+
+\begin{pitfall}
+\textbf{\texttt{VACUUM} before the recovery drill.} The classic lab failure---and the classic production incident---is vacuuming away the versions you needed to restore. Retention is a recovery objective, not a disk-hygiene preference; change it through change control.
+\end{pitfall}
+
+\section{Thursday Hands-on Project: Enforcement, Evolution, and Recovery}
+This lab exercises the full Delta contract: create tables, watch enforcement reject a bad write, evolve a schema deliberately, ``accidentally'' delete a partition, and recover with time travel and \texttt{RESTORE}---documenting everything from the history.
+\index{hands-on lab}\index{schema evolution!lab}\index{RESTORE!lab}
+
+\begin{lstlisting}[language=Python,caption={Week 2 lab: enforcement, evolution, and recovery drills.},label={lst:ch2-lab}]
+from pyspark.sql import functions as F
+
+# 1. Create a Silver table from seed CSVs
+orders = (spark.read.option("header", True).option("inferSchema", True)
+          .csv("/Volumes/de_training/bronze/landing/olist/orders/"))
+(orders.write.format("delta").mode("overwrite")
+   .saveAsTable("de_training.silver.orders"))
+spark.sql("DESCRIBE HISTORY de_training.silver.orders").show(truncate=False)
+
+# 2. Schema enforcement: this append MUST FAIL (column renamed)
+bad = orders.withColumnRenamed("order_id", "id")
+try:
+    bad.write.format("delta").mode("append") \
+       .saveAsTable("de_training.silver.orders")
+except Exception as e:
+    print("Enforcement rejected the write:", type(e).__name__)
+
+# 3. Deliberate evolution: add review_score as a new column
+evolved = orders.withColumn("review_score", F.lit(None).cast("int"))
+(evolved.write.format("delta").mode("append")
+   .option("mergeSchema", "true")
+   .saveAsTable("de_training.silver.orders"))
+
+# 4. The accident: delete a partition
+spark.sql("""DELETE FROM de_training.silver.orders
+             WHERE order_status = 'delivered'""")
+
+# 5. Recover: find the last good version, then RESTORE
+hist = spark.sql("DESCRIBE HISTORY de_training.silver.orders") \
+           .orderBy(F.desc("version")).limit(3)
+hist.select("version", "operation", "timestamp").show(truncate=False)
+last_good = 0  # replace with the version before the DELETE
+spark.sql(f"""RESTORE TABLE de_training.silver.orders
+              TO VERSION AS OF {last_good}""")
+assert spark.sql("""SELECT COUNT(*) c FROM de_training.silver.orders
+                    WHERE order_status = 'delivered'""").first().c > 0
+\end{lstlisting}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item The history output showing create, rejected append, evolution, delete, and restore.
+    \item A note explaining which step would have corrupted data without Delta's guarantees.
+    \item The recovered row count matching the pre-delete baseline.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item The mismatched append demonstrably fails with a schema error.
+    \item Evolution adds only the new column; no existing data is rewritten.
+    \item \texttt{RESTORE} returns the deleted partition; the post-restore count equals the baseline.
+    \item \texttt{VACUUM} is \emph{not} run before recovery; retention is left at 168 hours with a one-line justification.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Repeat recovery with \texttt{TIMESTAMP AS OF} instead of a version number.
+    \item Add a \texttt{CHECK} constraint and prove it rejects a negative amount.
+    \item Script the whole drill so a teammate can run it from a clean catalog.
+\end{itemize}
+
+\section{Friday Use Case: Auditable 90-Day History for a Financial Lake}
+A financial-services firm must prove to auditors exactly what any table contained at any moment in the last 90 days, support same-day correction of erroneous loads, and never allow ``the pipeline overwrote it'' as an answer.
+\index{auditability}\index{financial services}\index{retention}
+
+\subsection{Requirements and Assumptions}
+Tables range from 10M to 2B rows. Corrected files arrive up to 5 days late. Auditors sample randomly. Retention policy requires 90 days of queryable history and 7 years of archived raw files (in Bronze, append-only).
+
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[
+        zone/.style={rectangle, rounded corners, draw=primary, thick, fill=primary!3, minimum width=6.6cm, minimum height=3.6cm},
+        svc/.style={rectangle, rounded corners, draw=primary, thick, fill=white, align=center, minimum width=2.4cm, minimum height=0.85cm, font=\scriptsize\bfseries},
+        logstore/.style={cylinder, draw=primary, shape border rotate=90, aspect=0.25, fill=primary!10, minimum height=1.2cm, text width=2.0cm, align=center, font=\scriptsize\bfseries},
+        flow/.style={-{Latex[length=2mm]}, draw=primary, thick}
+    ]
+        \node[zone, label={[font=\small\bfseries\color{primary}]above:Delta table: positions}] (tbl) at (0,0) {};
+        \node[logstore] (log) at (-1.6,0.6) {\_delta\_log\\90-day versions};
+        \node[svc] (files) at (1.6,0.6) {Parquet files\\(immutable)};
+        \node[svc] (corr) at (-1.6,-0.9) {Late corrections\\MERGE by key};
+        \node[svc] (aud) at (1.6,-0.9) {Auditor queries\\VERSION AS OF};
+        \node[svc, draw=red!60!black, fill=red!5] (vac) at (6.2,0.6) {VACUUM policy\\RETAIN 2160 HOURS};
+        \node[svc, draw=red!60!black, fill=red!5] (hist) at (6.2,-0.9) {DESCRIBE HISTORY\\change evidence};
+        \draw[flow] (log) -- (files);
+        \draw[flow] (corr) -- (log);
+        \draw[flow] (aud) -- (log);
+        \draw[flow] (vac) -- (files);
+        \draw[flow] (hist) -- (log);
+    \end{tikzpicture}%
+    }
+    \caption{An auditable Delta table: versioned log with 90-day retention, key-based corrections, auditor time-travel queries, and history as change evidence.}
+    \label{fig:ch2-audit-lake}
+\end{figure}
+
+\subsection{Architecture Decisions}
+\textbf{Retention.} \texttt{VACUUM RETAIN 2160 HOURS} (90 days) on Silver and Gold; Bronze raw files archived by storage lifecycle beyond Delta retention. The vacuum job is scheduled, logged, and change-controlled.
+
+\textbf{Corrections.} Late corrections arrive as replacement files keyed by business key; a keyed \texttt{MERGE} applies them atomically. Every correction is a visible commit with \texttt{userName} and operation parameters---the audit trail is the log itself, exportable via \texttt{DESCRIBE HISTORY} into a governance table.
+
+\textbf{Evidence.} Monthly drill: pick a random table and timestamp, run \texttt{TIMESTAMP AS OF}, reconcile against the archived raw file, and file the result. Auditors trust rehearsed evidence, not asserted capability.
+
+\begin{pitfall}
+\textbf{Confusing log retention with data retention.} \texttt{VACUUM} controls time travel (files); the log itself is compacted by checkpoints and has its own retention. If auditors need 90 days of \emph{history entries}, verify log retention matches---and export history to a governance table for anything longer.
+\end{pitfall}
+
+\subsection{Risks and Mitigations}
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{4.6cm}p{7.6cm}@{}}
+\toprule
+\textbf{Risk} & \textbf{Mitigation} \\
+\midrule
+VACUUM run early under cost pressure & Retention values are change-controlled config with sign-off \\
+A ``temporary'' schema override becomes permanent & \texttt{mergeSchema}/\texttt{overwriteSchema} allowed only via reviewed jobs \\
+Auditor request exceeds log retention & Monthly \texttt{DESCRIBE HISTORY} export to a governance table \\
+Late corrections overwrite newer state & Recency guard (\texttt{seq > t.seq}) in every CDC MERGE \\
+Recovery drill never practiced & Quarterly timed restore drill with measured RTO recorded \\
+\bottomrule
+\end{tabular}
+\caption{Week 2 scenario risks and mitigations.}
+\label{tab:ch2-risks}
+\end{table}
+
+\section{Design Decision Guide}
+\index{decision guide!Week 2}%
+Delta's guarantees make the safe choice easy; the guide below names the defaults this program uses.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.4cm}p{4.4cm}p{4.6cm}@{}}
+\toprule
+\textbf{Decision} & \textbf{Choose the first when} & \textbf{Choose the second when} \\
+\midrule
+Managed vs.\ external table & Databricks owns the data lifecycle & A non-Databricks writer owns the files \\
+\texttt{mergeSchema} vs.\ \texttt{overwriteSchema} & Evolution is additive & The change is deliberately breaking \\
+\texttt{RESTORE} vs.\ recompute & The table state was damaged & The transformation logic was wrong \\
+Long vs.\ short \texttt{VACUUM} horizon & Recovery/audit needs dominate & Storage cost dominates and recovery is rebuildable \\
+MERGE vs.\ append-then-dedup & Upserts arrive as changes & Facts are immutable events \\
+Constraint vs.\ downstream validation & The rule must never be violated & The rule is advisory or source-dependent \\
+\bottomrule
+\end{tabular}
+\caption{Week 2 decision guide.}
+\label{tab:ch2-decisions}
+\end{table}
+
+When in doubt, pick the option that keeps history intact and the failure loud. Delta gives you both almost for free; spending them lightly is the only real mistake.
+
+\section{Operational Guidance for Week 2}
+\index{operational guidance!Week 2}%
+\subsection{Performance and Reliability}
+Small, frequent commits bloat the transaction log and the file count together---batch writers should commit per partition batch, not per file. Schedule \texttt{OPTIMIZE} (Chapter 5) and export \texttt{DESCRIBE HISTORY} monthly into a governance table so audit evidence survives log retention. Set \texttt{VACUUM} retention per table from the recovery objective, and record the value in the table comment where the next engineer will actually see it.
+
+\subsection{Security and Governance Checklist}
+\begin{itemize}
+    \item New tables default to managed; external tables carry a documented reason.
+    \item \texttt{VACUUM} retention $\ge$ the longest recovery objective; changes go through change control.
+    \item No direct file manipulation in table storage paths---all writes through Delta APIs.
+    \item PII-bearing tables tagged at creation so Chapter 22's audit rules cover them.
+\end{itemize}
+
+\subsection{Troubleshooting Playbook}
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.6cm}p{4.2cm}p{4.8cm}@{}}
+\toprule
+\textbf{Symptom} & \textbf{Likely cause} & \textbf{First action} \\
+\midrule
+\texttt{ConcurrentAppendException} & Two writers racing one table & Retry; then serialize writers or partition their keyspaces \\
+Time travel query fails & Version vacuumed away & Check last \texttt{VACUUM} time vs.\ requested version \\
+MERGE suddenly slow & File layout degraded (many small files) & \texttt{DESCRIBE DETAIL}; run \texttt{OPTIMIZE} \\
+Append rejected & Schema enforcement working & Diff writer schema against table; evolve deliberately \\
+\bottomrule
+\end{tabular}
+\caption{Week 2 troubleshooting quick reference.}
+\label{tab:ch2-trouble}
+\end{table}
+
+\section{Interview Q\&A}
+\subsection{Concepts and Trade-offs}
+\begin{enumerate}
+    \item \textbf{Q: How can a file store be ACID?}\\
+    A: Files are immutable; the atomic unit is the single-file commit to the transaction log. Readers see a version only after its commit exists---so multi-file writes appear all at once or not at all.
+    \item \textbf{Q: Two jobs MERGE into the same table simultaneously---what happens?}\\
+    A: Optimistic concurrency: both read a snapshot, one commits first, the other re-reads and either reconciles (disjoint keys/partitions) or retries/fails on conflict.
+    \item \textbf{Q: When is \texttt{mergeSchema} unacceptable?}\\
+    A: When the change is breaking (type change, rename, drop) or when an upstream schema drift should halt the pipeline for review---enforcement is a feature, not friction.
+    \item \textbf{Q: \texttt{RESTORE} versus re-running the pipeline to fix a bad load?}\\
+    A: RESTORE is instant and auditable for table-level mistakes; re-running is correct when the bug is in the transformation logic itself. Both leave history intact.
+    \item \textbf{Q: Why not set VACUUM retention to 1 hour to save storage?}\\
+    A: You would delete the files time travel and long-running readers depend on. Retention must exceed your recovery objective and your longest query duration.
+    \item \textbf{Q: Why is the transaction log small-file-averse too?}\\
+    A: Thousands of tiny commits mean thousands of JSON log files to list and replay---checkpoints mitigate, but commit cadence is a design decision, like file size.
+    \item \textbf{Q: Can two Delta tables share one set of data files?}\\
+    A: Safely, no: each table's log owns its file lifecycle, and one table's \texttt{VACUUM} would delete files the other references. Shallow clones exist for exactly this need---reference without copy.
+    \item \textbf{Q: Does Delta's ACID protect against a logically wrong write?}\\
+    A: No---ACID guarantees the commit is atomic and durable, not correct. Correctness comes from constraints, expectations, and reconciliation; Delta makes their failures recoverable via time travel and \texttt{RESTORE}.
+\end{enumerate}
+
+\section{Further Reading}
+Read the Delta Lake VLDB paper for the storage protocol \cite{armbrust2020delta} and the open-source documentation for command details \cite{deltaLakeDocs}. The Databricks Delta guide covers time travel, constraints, and retention behavior on the platform \cite{databricksDelta}, and the Parquet documentation explains the columnar format underneath \cite{apacheParquet}. The lakehouse paper frames why this layer displaced two-tier architectures \cite{armbrust2021lakehouse}.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item A Delta table is its transaction log: immutable Parquet files plus atomic, versioned commits.
+    \item Optimistic concurrency makes multi-writer pipelines safe without locks.
+    \item Schema enforcement is a free data-quality gate; evolution is deliberate and opt-in.
+    \item Time travel and \texttt{RESTORE} turn ``we overwrote it'' into a recoverable, auditable event.
+    \item \texttt{VACUUM} retention is a recovery objective---treat it as change-controlled configuration.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Walk through a commit, step by step, from \texttt{df.write} to a reader seeing the new version.
+    \item \textbf{(Conceptual)} Why does immutability of data files make concurrent readers simpler?
+    \item \textbf{(Hands-on)} Complete the Thursday lab; capture the five history entries as a screenshot or exported table.
+    \item \textbf{(Hands-on)} Force a \texttt{MERGE} conflict between two sessions on the same keys; capture the conflict error and explain the resolution.
+    \item \textbf{(Hands-on)} Export \texttt{DESCRIBE HISTORY} for a table into \texttt{de\_training.gold.table\_history\_audit} and query it for all DELETE operations.
+    \item \textbf{(Design)} Write the retention policy (VACUUM horizon, log retention, archive lifecycle) for the Friday scenario as a one-page decision record.
+    \item \textbf{(Governance)} Explain to an auditor how you would prove a specific row's value on June 1st. List every artifact you would show.
+    \item \textbf{(Architecture)} When would you choose Iceberg interoperability (UniForm) for this lake, and what governance gap would it open?
+\end{enumerate}

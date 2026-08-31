@@ -1,0 +1,340 @@
+\chapter{PySpark Deep Dive and Performance Tuning}
+\index{PySpark}\index{performance tuning}\index{AQE}\index{broadcast join}\index{sort-merge join}%
+\index{salting}\index{pandas UDF}\index{shuffle partitions}\index{Ganglia}%
+\begin{objectives}
+\begin{itemize}
+    \item Explain how Catalyst and Tungsten compile and execute DataFrame code, including whole-stage codegen.
+    \item Choose join strategies---broadcast hash versus sort-merge---and direct them with hints and AQE.
+    \item Tune shuffle partitions, memory, and parallelism for a given data volume.
+    \item Remediate skew with salting and AQE skew handling, with measured evidence.
+    \item Replace Python UDFs with built-ins or pandas UDFs and quantify the difference.
+    \item Deliver an evidence-based performance report with attributable, isolated improvements.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+Spark tuning is \textbf{portable}---the same knobs exist on every managed Spark; what changes is
+the default and the telemetry surface.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{3.0cm}p{3.4cm}p{3.2cm}p{3.2cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{Databricks} & \textbf{AWS (EMR/Glue)} & \textbf{Azure / GCP} \\
+\midrule
+Adaptive execution & AQE on by default & AQE (EMR 6.x+) & AQE (Synapse/Fabric/Dataproc) \\
+Execution engine & Photon (vectorized) & EMR runtime & Fabric native / vanilla Spark \\
+Observability & Spark UI + query profile + Ganglia & Spark UI + CloudWatch & Spark UI + Synapse/Fabric monitoring \\
+Join hints & \texttt{broadcast()}, SQL hints & Same API & Same API \\
+Python UDF accel & pandas UDFs, Arrow & pandas UDFs & pandas UDFs \\
+Skew handling & AQE skew split + salting & AQE skew (EMR) & AQE skew \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+Outside Spark: \textbf{Snowflake} pushes the same work into its engine via Snowpark with warehouse
+sizing as the main lever; \textbf{BigQuery} abstracts execution entirely---you trade the knobs for
+simplicity and lose the tuning surface this chapter teaches.
+\end{crosscloud}
+
+\section{Week 9 Roadmap and Mental Model}
+Chapter 4 taught the execution model and the UI; Week 9 turns that literacy into a tuning method. The promise: most Spark performance problems are one of five---a bad join strategy, wrong shuffle partition count, skew, an expensive UDF, or a missing cache/predicate---and each has a signature you can read in the plan or the UI \cite{sparkSQLTuning,chambersZaharia}.
+
+The mental model: \textbf{tune in a loop with isolated variables}. Measure a baseline, change exactly one thing, measure again, attribute. A report that changes four configs at once proves nothing and teaches nobody; the acceptance criteria of this week's lab enforce the discipline.
+
+\begin{definitionbox}
+\textbf{Adaptive Query Execution (AQE)} re-optimizes a query at stage boundaries using runtime statistics: coalescing small shuffle partitions, switching sort-merge joins to broadcast, and splitting skewed partitions. It is on by default in the Databricks Runtime; tuning means knowing when its defaults misfit.
+\end{definitionbox}
+
+\begin{keyterms}
+\textbf{Whole-stage codegen}: fusing operators into one generated Java/native function. \textbf{Broadcast join}: replicating the small side to every executor, avoiding the shuffle. \textbf{Salting}: artificially spreading a hot key across buckets. \textbf{pandas UDF}: a vectorized UDF exchanging Arrow columnar batches instead of per-row Python calls. \textbf{Spill}: intermediate data evicted to disk under memory pressure.
+\end{keyterms}
+
+\section{Monday: Catalyst, Tungsten, and When Not to RDD}
+\subsection{The Optimization Stack}
+Your DataFrame code becomes an unresolved logical plan, then an analyzed plan (catalog-resolved), then an optimized logical plan (predicate pushdown, column pruning, constant folding, join reordering by statistics), then a physical plan (join strategy, aggregation mode), then generated code fused into whole stages. Reading \texttt{explain(True)} output top-to-bottom is reading this pipeline.
+
+\subsection{When (Not) to Use RDDs}
+RDDs trade the optimizer for control: no Catalyst, no codegen, no Photon, manual partitioning. The valid reasons in 2026 are rare---custom partitioner algorithms, legacy libraries. Every workload in this program stays on the DataFrame/SQL API; the moment you write \texttt{.rdd}, you have left the performance warranty.
+
+\begin{pitfall}
+\textbf{Collecting to the driver ``to inspect.''} \texttt{collect()}, \texttt{toPandas()}, and Python loops over rows move data to the driver; at scale they are the out-of-memory classic. Inspect with \texttt{show}/\texttt{limit}/aggregates; if you need local analysis, sample explicitly with \texttt{.sample()} first.
+\end{pitfall}
+
+\section{Tuesday: Joins and AQE}
+\subsection{Broadcast versus Sort-Merge}
+A \textbf{sort-merge join} shuffles both sides by the join key, sorts, and merges---correct at any size, expensive by construction. A \textbf{broadcast hash join} sends the small side to every executor and probes a hash table---no shuffle of the big side. The threshold (\texttt{spark.sql.autoBroadcastJoinThreshold}, default 10 MB) and AQE's runtime statistics decide; you direct with \texttt{broadcast(dim\_df)} when you know better than the estimates \cite{sparkSQLTuning}.
+
+\begin{lstlisting}[language=Python,caption={Directing the join strategy with evidence.},label={lst:ch9-joins}]
+from pyspark.sql import functions as F
+
+facts = spark.read.table("de_training.gold.fact_orders")
+prods = spark.read.table("de_training.gold.dim_product")
+
+# If dim_product is small (check!), force broadcast:
+facts.join(F.broadcast(prods), "product_id").explain(True)
+# Physical plan should show BroadcastHashJoin, no Exchange on the fact side.
+
+# AQE will convert SMJ to BHJ at runtime when stats prove it fits;
+# the query profile shows "AdaptiveSparkPlan" with the final strategy.
+\end{lstlisting}
+
+\subsection{Skew and Salting}
+Skew defeats parallelism: one task holds 80\% of a shuffle. AQE's skew-splitting helps by splitting the hot partition after the fact; \textbf{salting} prevents it by exploding the hot key across N buckets and replicating the small side per bucket. Chapter 4's lab built the muscle; this week's discipline is knowing when each applies.
+
+\section{Wednesday: Shuffle Tuning, UDFs, and Memory}
+\subsection{Shuffle Partitions and I/O}
+\texttt{spark.sql.shuffle.partitions} (default 200) sets post-shuffle parallelism. Target $\sim$100--200 MB per partition: 200 GB shuffled $\rightarrow$ $\sim$1500 partitions. With AQE coalescing, overshooting is safer than undershooting. Watch \emph{spill} in the UI---spilling tasks signal memory pressure that partition sizing or executor memory must absorb.
+
+\subsection{UDF Performance}
+A row-at-a-time Python UDF serializes every row between the JVM and Python---often 10--100x slower than a native expression. The ladder, best to worst: built-in SQL functions, \textbf{pandas (Arrow) UDFs} over columnar batches, plain Python UDFs, RDD \texttt{map}.
+
+\begin{lstlisting}[language=Python,caption={The UDF ladder: native, then vectorized, then---rarely---plain Python.},label={lst:ch9-udfs}]
+from pyspark.sql import functions as F
+from pyspark.sql.functions import pandas_udf
+import pandas as pd
+
+# Best: built-in
+df.withColumn("amount_band", F.when(F.col("amount") > 100, "high")
+                              .otherwise("low"))
+
+# Good: vectorized pandas UDF when the logic truly needs Python
+@pandas_udf("string")
+def risky_band(s: pd.Series) -> pd.Series:
+    return pd.cut(s, bins=[0, 50, 200, 1e9], labels=["low", "mid", "high"]).astype(str)
+
+df.withColumn("risk_band", risky_band("amount"))
+
+# Last resort: plain Python UDF (row-at-a-time serialization cost)
+\end{lstlisting}
+
+\begin{tipbox}
+Before writing any UDF, search the function list: \texttt{spark.sql.functions} covers dates, strings, arrays, maps, math, and windowing. Most ``I need a UDF'' moments are undiscovered built-ins.
+\end{tipbox}
+
+\section{Thursday Hands-on Project: The Attributable Tuning Report}
+Take a deliberately degraded 2 TB-scale job (or a 200 GB surrogate) and produce a tuning report where every improvement is isolated and measured.
+\index{hands-on lab}\index{salting!lab}\index{broadcast join!lab}
+
+\begin{lstlisting}[language=Python,caption={Week 9 lab: four isolated optimizations, one evidence table.},label={lst:ch9-lab}]
+from pyspark.sql import functions as F
+import time
+
+def timed(label, fn):
+    t0 = time.time(); fn(); return (label, round(time.time() - t0, 1))
+
+facts = spark.read.table("de_training.silver.big_facts")
+dim   = spark.read.table("de_training.silver.big_dim")
+
+results = []
+# Baseline: shuffle join, default partitions, Python UDF
+spark.conf.set("spark.sql.adaptive.enabled", "false")
+results.append(timed("baseline", lambda:
+    facts.join(dim, "k").groupBy("dim.v").agg(F.sum("amount")).count()))
+
+# Opt 1: right-size shuffle partitions for the measured volume
+spark.conf.set("spark.sql.shuffle.partitions", "1500")
+results.append(timed("shuffle_partitions_1500", lambda:
+    facts.join(dim, "k").groupBy("dim.v").agg(F.sum("amount")).count()))
+
+# Opt 2: broadcast the measured-small dimension
+results.append(timed("broadcast_dim", lambda:
+    facts.join(F.broadcast(dim), "k")
+         .groupBy("dim.v").agg(F.sum("amount")).count()))
+
+# Opt 3: re-enable AQE (skew split + coalesce) and compare
+spark.conf.set("spark.sql.adaptive.enabled", "true")
+results.append(timed("aqe_on", lambda:
+    facts.join(F.broadcast(dim), "k")
+         .groupBy("dim.v").agg(F.sum("amount")).count()))
+
+spark.createDataFrame(results, ["experiment", "seconds"]) \
+     .write.mode("overwrite").saveAsTable("de_training.silver.week09_results")
+\end{lstlisting}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item The evidence table: one row per experiment, identical result values across all.
+    \item Spark UI screenshots per experiment highlighting the stage that changed.
+    \item A written report: symptom, hypothesis, change, measurement, conclusion---per optimization.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item Each experiment changes exactly one variable; confounded results are redone.
+    \item Result correctness is reconciled across all experiments.
+    \item The report names the single largest win and explains its mechanism from the plan.
+    \item One experiment deliberately regresses (e.g., broadcasting the large side) and is documented as a negative control.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Add a salted-join variant for an injected hot key and compare against AQE skew handling.
+    \item Replace a Python UDF with a pandas UDF and quantify rows/second processed.
+    \item Repeat the best configuration on Photon off vs.\ on (runtime toggle) and quantify the engine effect.
+\end{itemize}
+
+\section{Friday Use Case: The 2 TB Join That Misses Its SLA}
+A logistics partner's daily join job (2 TB facts against 40 GB of reference data) must finish by 06:00; it currently finishes at 09:15. You are engaged for a one-week performance engagement with a written deliverable.
+\index{SLA}\index{performance engagement}
+
+\subsection{Requirements and Assumptions}
+The job runs on a fixed-size job cluster; the cluster may be resized only with justification. Reference data grows 5\% monthly. The business accepts logic-preserving rewrites but no result changes.
+
+\subsection{Architecture Decisions}
+\textbf{The engagement structure.} Day 1: capture three consecutive runs' Spark UI exports and \texttt{explain} plans---the baseline dossier. Day 2: attribute time per stage; expect the classic finding (the ``small'' reference side grew past the broadcast threshold months ago, flipping the join to sort-merge). Days 3--4: isolated fixes with A/B runs---forced broadcast with a memory check, shuffle partition sizing, skew audit on the tenant key. Day 5: regression suite (row-for-row reconciliation against the slow baseline), the report, and the handover runbook.
+
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[
+        ph/.style={rectangle, rounded corners, draw=primary, thick, fill=primary!7, align=center, minimum width=2.9cm, minimum height=1.0cm, font=\small\bfseries},
+        art/.style={rectangle, rounded corners, draw=codegreen!60!black, thick, fill=green!7, align=center, minimum width=2.9cm, minimum height=0.8cm, font=\scriptsize},
+        flow/.style={-{Latex[length=2mm]}, draw=primary, thick}
+    ]
+        \node[ph] (base) at (0,0) {Baseline\\dossier};
+        \node[ph] (attr) at (3.6,0) {Attribute\\per stage};
+        \node[ph] (fix)  at (7.2,0) {Isolated\\fixes};
+        \node[ph] (reg)  at (10.8,0) {Regression\\reconcile};
+        \node[ph] (rep)  at (14.4,0) {Report +\\runbook};
+        \node[art] (a1) at (0,-1.5) {UI exports, plans};
+        \node[art] (a2) at (3.6,-1.5) {stage time table};
+        \node[art] (a3) at (7.2,-1.5) {A/B measurements};
+        \node[art] (a4) at (10.8,-1.5) {row-for-row diff};
+        \node[art] (a5) at (14.4,-1.5) {SLA projection};
+        \draw[flow] (base) -- (attr);
+        \draw[flow] (attr) -- (fix);
+        \draw[flow] (fix) -- (reg);
+        \draw[flow] (reg) -- (rep);
+        \foreach \a/\b in {base/a1, attr/a2, fix/a3, reg/a4, rep/a5} {\draw[flow, dashed] (\a) -- (\b);}
+    \end{tikzpicture}%
+    }
+    \caption{The one-week performance engagement: every phase produces an artifact.}
+    \label{fig:ch9-engagement}
+\end{figure}
+
+\textbf{The expected fix.} \texttt{broadcast()} the reference side (40 GB compressed fits executor memory across the fleet---verified, not assumed), right-size shuffle partitions, and add a scheduled \texttt{ANALYZE TABLE} so AQE's statistics stop drifting. Projected: 09:15 $\rightarrow$ 05:20 with the same cluster.
+
+\begin{pitfall}
+\textbf{Promising the number before the dossier.} ``We can get you under 6 a.m.'' is a guess until stage attribution exists. Commit to the method and the evidence standard; let the measured bottleneck set the projection.
+\end{pitfall}
+
+\subsection{Risks and Mitigations}
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{4.6cm}p{7.6cm}@{}}
+\toprule
+\textbf{Risk} & \textbf{Mitigation} \\
+\midrule
+Tuning report changes behavior subtly & Regression suite with row-for-row reconciliation \\
+Salting key leaks into downstream logic & Salt columns dropped before publish; contract documented \\
+Config tuned for today's volume only & Quarterly re-baseline against volume growth \\
+UDF logic forked from native behavior & Unit tests pin UDF semantics against built-ins \\
+Hardware scale-up masks the real fix & Plan-level fixes land first; sizing changes are separate PRs \\
+\bottomrule
+\end{tabular}
+\caption{Week 9 scenario risks and mitigations.}
+\label{tab:ch9-risks}
+\end{table}
+
+\section{Design Decision Guide}
+\index{decision guide!Week 9}%
+Tuning decisions compound; isolate, measure, and record each one.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.4cm}p{4.4cm}p{4.6cm}@{}}
+\toprule
+\textbf{Decision} & \textbf{Choose the first when} & \textbf{Choose the second when} \\
+\midrule
+Salting vs.\ AQE skew handling & Extreme, known hot keys & Moderate, emergent skew \\
+Built-in function vs.\ pandas UDF & The function exists & Genuinely custom row logic \\
+pandas UDF vs.\ Python UDF & Always, if a UDF is needed & Never the plain Python UDF \\
+More partitions vs.\ more memory & Spill with healthy GC & GC pressure with small tasks \\
+Tune plan vs.\ scale hardware & Always plan first & Plan is sane and hardware-bound \\
+\texttt{ANALYZE TABLE} cadence & Hot, changing tables & Static reference data \\
+\bottomrule
+\end{tabular}
+\caption{Week 9 decision guide.}
+\label{tab:ch9-decisions}
+\end{table}
+
+The engagement rule from Friday applies to every row: baseline, one variable, re-measure, reconcile. A tuning change you cannot attribute is a superstition you now maintain.
+
+\section{Operational Guidance for Week 9}
+\index{operational guidance!Week 9}%
+\subsection{Performance and Reliability}
+Institutionalize the regression watch: p50/p95 duration per job trended weekly, with a config-change log so every performance delta has a suspect. Schedule \texttt{ANALYZE TABLE ... COMPUTE STATISTICS} on hot tables so Catalyst and AQE plan from current reality---stale statistics are the silent join-flipper. Keep the tuning experiments reproducible: the evidence table pattern from the lab becomes the team's standard for any ``make it faster'' request.
+
+\subsection{Security and Governance Checklist}
+\begin{itemize}
+    \item Custom init scripts and libraries reviewed; they run with the cluster's full data access.
+    \item Shuffle partitions and memory configs changed through code review, not notebook conf cells.
+    \item Tuning experiments never run against production tables with write modes enabled.
+    \item Broadcast targets verified against actual sizes, not assumptions (a grown dimension is a bomb).
+\end{itemize}
+
+\subsection{Troubleshooting Playbook}
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.6cm}p{4.2cm}p{4.8cm}@{}}
+\toprule
+\textbf{Symptom} & \textbf{Likely cause} & \textbf{First action} \\
+\midrule
+Sudden job regression, no code change & Statistics drift flipped the join strategy & Diff the plan against last week's; refresh stats \\
+Broadcast join OOMs & ``Small'' side outgrew executor memory & Measure it; drop the hint or raise memory \\
+Python UDF dominates stage time & Row-at-a-time serialization & Rewrite as built-in or pandas UDF \\
+Heavy GC in executor logs & Memory pressure / oversized partitions & Check spill; repartition; right-size executors \\
+\bottomrule
+\end{tabular}
+\caption{Week 9 troubleshooting quick reference.}
+\label{tab:ch9-trouble}
+\end{table}
+
+\section{Interview Q\&A}
+\subsection{Concepts and Trade-offs}
+\begin{enumerate}
+    \item \textbf{Q: How does Catalyst decide broadcast versus sort-merge?}\\
+    A: From table statistics versus \texttt{autoBroadcastJoinThreshold}; AQE revises at runtime with measured sizes. Stale statistics are why a growing dimension silently flips a job to sort-merge.
+    \item \textbf{Q: When is salting better than AQE skew handling?}\\
+    A: When skew is extreme and known (one key with most rows)---salting spreads it by construction, while AQE splits only after the shuffle plan exists. Salting costs a replicated small side and a two-stage aggregation.
+    \item \textbf{Q: Why are pandas UDFs faster than Python UDFs?}\\
+    A: Arrow columnar batches cross the JVM/Python boundary once per batch instead of once per row, and the Python side runs vectorized pandas instead of per-row interpreter calls.
+    \item \textbf{Q: Your job spills heavily. Options?}\\
+    A: More shuffle partitions (smaller tasks), more executor memory, a different join strategy, or less cached competition for memory. Read which stage spills before choosing.
+    \item \textbf{Q: What do you check first when a job regresses with no code change?}\\
+    A: The data: volume, skew, and statistics freshness. Then the plan diff---a flipped join strategy from grown input is the usual culprit.
+    \item \textbf{Q: What is the fastest legitimate win in most Spark jobs?}\\
+    A: Fix the join: broadcast the provably small side and prune columns/filters into the scan. Shuffle avoidance beats micro-optimization every time.
+    \item \textbf{Q: How do you keep a tuned job tuned?}\\
+    A: Duration trend alerts, fresh statistics (\texttt{ANALYZE TABLE}), and the config-change log---regressions are caught as data-shape changes, not discovered as SLA breaches.
+    \item \textbf{Q: When is a job ``tuned enough''?}\\
+    A: When the next measured improvement costs more engineering time than the compute it saves, given the SLA margin---tuning has a stopping rule, and it is economic.
+\end{enumerate}
+
+\section{Further Reading}
+The Spark performance-tuning guide is the core reference \cite{sparkSQLTuning}; \textit{Spark: The Definitive Guide} gives the practitioner's tour of joins, partitions, and UDFs \cite{chambersZaharia}. The Spark documentation covers AQE configuration \cite{sparkDocs}, and the Photon page explains Databricks' execution layer \cite{databricksPhoton}.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item Tune in isolated experiments with reconciliation; confounded changes teach nothing.
+    \item The five usual suspects: join strategy, shuffle partitions, skew, UDFs, and pushdown/caching.
+    \item AQE handles the average case; your job is recognizing the misfit---known skew, provable broadcasts.
+    \item Stay on the DataFrame API; RDDs and plain Python UDFs exit the optimizer's warranty.
+    \item A performance engagement is an evidence pipeline: dossier, attribution, isolated fixes, regression, report.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Explain why sort-merge joins exist at all, given broadcast joins are faster.
+    \item \textbf{(Conceptual)} What information do table statistics give Catalyst, and what goes wrong when they are stale?
+    \item \textbf{(Hands-on)} Complete the Thursday lab with all four experiments and the negative control.
+    \item \textbf{(Hands-on)} Find one UDF in an existing notebook and replace it with built-ins; measure the delta.
+    \item \textbf{(Hands-on)} Force a spill and identify it in the UI; then fix it two different ways.
+    \item \textbf{(Design)} Write the shuffle-partitions rule of thumb as a decision table for 1 GB / 100 GB / 10 TB shuffles.
+    \item \textbf{(Operations)} Add a scheduled \texttt{ANALYZE TABLE} to the Friday scenario's pipeline and justify its cadence.
+    \item \textbf{(Architecture)} When would you move this workload to DLT (Chapter 10) instead of hand-tuned Spark? What would you lose?
+\end{enumerate}

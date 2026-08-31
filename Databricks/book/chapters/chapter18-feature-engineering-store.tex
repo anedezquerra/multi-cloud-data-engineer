@@ -1,0 +1,319 @@
+\chapter{Feature Engineering and the Feature Store}
+\index{feature engineering}\index{Feature Store}\index{point-in-time correctness}\index{label leakage}%
+\index{training-serving skew}\index{feature table}\index{online store}\index{feature lookup}%
+\begin{objectives}
+\begin{itemize}
+    \item Define label leakage and point-in-time correctness, and detect them in a pipeline.
+    \item Build governed feature tables in Unity Catalog with as-of timestamps.
+    \item Assemble training sets with timestamp-aware feature lookups.
+    \item Serve the same features online for inference without skew.
+    \item Trace feature-to-model lineage and monitor feature freshness.
+    \item Audit a leaking model and redesign its feature pipeline.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+The feature store is the \textbf{contract between training and serving}; every serious ML platform
+implements one.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{3.0cm}p{3.4cm}p{3.2cm}p{3.2cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{Databricks} & \textbf{AWS} & \textbf{Azure / GCP / Fabric} \\
+\midrule
+Feature registry & Feature Engineering in UC & SageMaker Feature Store & Azure ML FS / Vertex FS / Fabric feature sets \\
+Offline store & Delta tables (UC) & S3 + Glue catalog & ADLS / BigQuery / OneLake \\
+Online store & Feature serving endpoints & ElastiCache-backed online store & Cosmos DB / Bigtable serving \\
+Point-in-time join & \texttt{create\_training\_set} timestamp lookups & Event-time joins & As-of joins \\
+Lineage & Auto: features $\rightarrow$ model in registry & SageMaker lineage & Purview / Vertex lineage \\
+Skew defense & Same table feeds train + serve & Same store, dual interfaces & Same principle \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+\textbf{Snowflake} has its own Feature Store over Snowflake tables; the pattern---one governed
+definition feeding both training and inference---is identical.
+\end{crosscloud}
+
+\section{Week 18 Roadmap and Mental Model}
+Chapter 17 versioned the experiment; Week 18 versions the \emph{inputs}. The Feature Store's promise to the data engineer: features are data products---defined once as code, computed by pipelines you own, stored as governed Delta tables, joined into training sets with time correctness, and served to models through the same definitions \cite{databricksFeatureStore}.
+
+The mental model: \textbf{a feature is a function of history, evaluated as of a moment}. \texttt{customer\_90d\_spend} means ``spend in the 90 days \emph{before the event being predicted}.'' Train with tomorrow's data in that window and the model learns the future---spectacular validation metrics, useless production model. Point-in-time correctness is the discipline of evaluating every feature strictly before its label's timestamp.
+
+\begin{definitionbox}
+\textbf{Label leakage} is the inclusion of information in training features that would not be available at prediction time. \textbf{Point-in-time correctness} means each training row's features are computed only from data available before that row's label timestamp. \textbf{Training-serving skew} is computing features differently in training versus inference.
+\end{definitionbox}
+
+\begin{keyterms}
+\textbf{Feature table}: a governed Delta table of (entity keys, timestamp, feature values). \textbf{Feature lookup}: a declared join from label rows to feature tables. \textbf{Timestamp lookup}: a lookup constrained to feature rows $\le$ the label's timestamp. \textbf{Online store}: low-latency feature serving for inference. \textbf{As-of date}: the reference timestamp for a feature computation.
+\end{keyterms}
+
+\section{Monday: Leakage and Point-in-Time Discipline}
+\subsection{Recognizing Leakage}
+Leakage wears disguises: the \texttt{days\_to\_refund} column (refunds happen \emph{after} the prediction moment), the aggregate computed over the full table instead of up-to-as-of, the ``last known address'' join that returns tomorrow's value. The test for any feature: \emph{could I compute this exact value at prediction time, given only what exists then?} If the answer needs a time machine, it leaks.
+
+\subsection{As-of Computation}
+Features are computed per as-of date: for labels at time $t$, features aggregate history $[t-w, t)$. This is a pipeline-design constraint, not a notebook convenience---the feature job takes \texttt{as\_of\_date} as a parameter (Chapter 3's parameterization pays off) and never reads past it.
+
+\begin{pitfall}
+\textbf{The full-history aggregate.} \texttt{SUM(amount) OVER (...)} without a timestamp bound uses future rows for early labels. It validates beautifully---the leakage is in the validation too. The tell: offline metrics that production cannot reproduce within tolerance.
+\end{pitfall}
+
+\section{Tuesday: Feature Tables and Training Sets}
+\subsection{Feature Engineering in Unity Catalog}
+A feature table is a Delta table with entity keys and (for time-series features) a timestamp, registered so that training and serving can look it up \cite{databricksFeatureStore}. Writing one is a normal pipeline with an as-of parameter:
+
+\begin{lstlisting}[language=Python,caption={A point-in-time-safe feature job.},label={lst:ch18-features}]
+from pyspark.sql import functions as F
+
+as_of = dbutils.widgets.get("as_of_date")     # e.g. 2026-08-31
+orders = (spark.table("de_training.silver.orders")
+          .where(F.col("order_ts") < F.lit(as_of)))   # never past as_of
+
+features = (orders.groupBy("customer_id")
+    .agg(F.count("*").alias("orders_90d"),
+         F.sum("total_amount").alias("spend_90d"))
+    .withColumn("as_of_date", F.lit(as_of)))
+
+(features.write.format("delta").mode("overwrite")
+   .option("replaceWhere", f"as_of_date = '{as_of}'")   # idempotent per date
+   .saveAsTable("de_training.ml.customer_features"))
+\end{lstlisting}
+
+\subsection{Training Sets with Timestamp Lookups}
+\texttt{FeatureEngineeringClient.create\_training\_set} joins label rows to feature tables \emph{as of each label's timestamp}---the point-in-time join done correctly by the framework, with the resulting training set linked to the model at registration:
+
+\begin{lstlisting}[language=Python,caption={A training set with point-in-time-correct lookups.},label={lst:ch18-training-set}]
+from databricks.feature_engineering import FeatureEngineeringClient, FeatureLookup
+
+fe = FeatureEngineeringClient()
+training_set = fe.create_training_set(
+    df=spark.table("de_training.ml.churn_labels"),   # customer_id + event_ts + label
+    feature_lookups=[
+        FeatureLookup("de_training.ml.customer_features",
+                      lookup_key="customer_id",
+                      timestamp_lookup_key="as_of_date"),
+    ],
+    label="churned",
+    exclude_columns=["customer_id", "event_ts"])
+df = training_set.load_df()
+# At log_model time: fe.log_model(..., training_set=training_set)
+# -> the registry records exactly which feature tables built this model.
+\end{lstlisting}
+
+\section{Wednesday: Online Serving and Skew Prevention}
+\subsection{The Same Features, Online}
+At inference, the model needs the same feature values fast. Feature serving exposes the latest feature rows through a low-latency endpoint (or you precompute into an online store); models logged with the feature store know their lookups and fetch features by entity key at scoring time. The anti-skew property is the point: \emph{one definition, two access patterns}---training reads history as-of; serving reads latest.
+
+\subsection{Freshness and Monitoring}
+Features decay: a job that fails silently serves stale values that look valid. Every feature table carries a freshness contract (\texttt{max(as\_of\_date)} within SLA of now); the Workflow from Chapter 12 gates model scoring on feature freshness, and Lakehouse Monitoring (Chapter 20) watches feature drift over time.
+
+\begin{tipbox}
+Name feature tables with the entity and window---\texttt{customer\_90d\_features}, not \texttt{features\_v2}---and document the window, source tables, and owner in the table comment. Six months later, the name is the documentation someone debugging skew will actually read.
+\end{tipbox}
+
+\section{Thursday Hands-on Project: Point-in-Time Churn Features}
+Build \texttt{customer\_features} and \texttt{order\_features} with as-of timestamps, assemble a point-in-time training set, train and register a model with feature lineage, and verify serving consistency.
+\index{hands-on lab}\index{point-in-time!lab}\index{Feature Store!lab}
+
+\begin{lstlisting}[language=Python,caption={Week 18 lab: the leakage hunt.},label={lst:ch18-lab}]
+# 1. Feature jobs run for three historical as_of dates (idempotent overwrites).
+for as_of in ["2026-06-30", "2026-07-31", "2026-08-31"]:
+    build_customer_features(as_of)   # the lst:ch18-features pattern
+
+# 2. Training set with timestamp lookups (lst:ch18-training-set).
+
+# 3. Deliberate-leakage control: build a leaky feature table
+#    (full-history aggregate, no as_of bound) and compare AUCs:
+#    leaky: 0.97 (suspicious) vs point-in-time: 0.83 (believable).
+
+# 4. Register with lineage; load by alias; score via feature lookups:
+import mlflow
+model = mlflow.pyfunc.load_model("models:/ml.churn_model@champion")
+# scoring with feature lookups fetches features by key at serve time,
+# from the SAME tables training used -> no skew by construction.
+\end{lstlisting}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item Two feature tables with as-of partitions and documented windows.
+    \item The training set code with timestamp lookups; three historical rebuilds identical on rerun.
+    \item The leakage control experiment with both AUCs and the explanation.
+    \item Registry evidence of feature-table lineage on the model version.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item No feature reads past its label's timestamp---proven by rebuilding one label's features with a mocked ``prediction moment.''
+    \item Feature jobs are idempotent per as-of date (\texttt{replaceWhere}).
+    \item The leaky-feature experiment is documented as the negative control.
+    \item Scoring loads features via declared lookups, not hand-written joins.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Add an on-demand feature (computed from request-time fields) and explain when on-demand is legitimate.
+    \item Wire the freshness gate into the scoring Workflow from Chapter 12.
+    \item Publish the feature table to an online store and measure lookup latency.
+\end{itemize}
+
+\section{Friday Use Case: The Churn Model That Lied}
+A churn model shows 0.97 AUC in training and 0.61 in production. The data science team blames ``distribution shift.'' You are asked to audit the feature pipeline.
+\index{leakage!audit}\index{model debugging}
+
+\subsection{Requirements and Assumptions}
+Features were built in a notebook from Gold tables; training used a 12-month extract; production scores nightly via a separate SQL query ``equivalent'' to the notebook logic. The 0.97/0.61 gap appeared at launch and has persisted.
+
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[
+        box/.style={rectangle, rounded corners, draw=primary, thick, fill=primary!7, align=center, minimum width=3.0cm, minimum height=0.95cm, font=\small\bfseries},
+        bad/.style={rectangle, rounded corners, draw=red!60!black, thick, fill=red!6, align=center, minimum width=3.0cm, minimum height=0.9cm, font=\scriptsize\bfseries},
+        good/.style={rectangle, rounded corners, draw=codegreen!60!black, thick, fill=green!8, align=center, minimum width=3.0cm, minimum height=0.9cm, font=\scriptsize\bfseries},
+        flow/.style={-{Latex[length=2mm]}, draw=primary, thick}
+    ]
+        \node[bad] (leak) at (0,0.8) {Finding 1:\\days\_to\_refund\\(post-outcome)};
+        \node[bad] (skew) at (0,-0.8) {Finding 2:\\SQL ``equivalent''\\diverges};
+        \node[box] (audit) at (4.6,0) {Feature audit\\(per-feature\\time-machine test)};
+        \node[good] (store) at (9.2,0) {Feature Store\\one definition\\train + serve};
+        \node[box] (fixed) at (13.0,0) {Model v2\\0.83 / 0.81\\(honest)};
+        \draw[flow] (leak) -- (audit);
+        \draw[flow] (skew) -- (audit);
+        \draw[flow] (audit) -- (store);
+        \draw[flow] (store) -- (fixed);
+    \end{tikzpicture}%
+    }
+    \caption{The audit: find the leak, find the skew, replace both with one governed feature definition.}
+    \label{fig:ch18-audit}
+\end{figure}
+
+\subsection{Architecture Decisions}
+\textbf{The two findings.} (1) \emph{Leakage}: \texttt{days\_to\_refund} and a full-history \texttt{lifetime\_spend} both encode post-outcome information---the 0.97 was partly the model reading the future. (2) \emph{Skew}: production's ``equivalent'' SQL rounds timestamps differently and misses a null-handling branch, so even honest features arrive differently at serving.
+
+\textbf{The fix.} Both die the same death: features become governed tables computed by one parameterized job with as-of timestamps; training uses timestamp lookups; serving uses the same tables through the feature store. New metrics: 0.83 offline, 0.81 online---lower, honest, and \emph{stable}. The audit's lasting artifact is the per-feature time-machine test added to the feature-review checklist.
+
+\begin{pitfall}
+\textbf{Blaming drift before auditing leakage.} ``Distribution shift'' is the comforting explanation; leakage is the common one. The gap signature tells: leakage shows as a large, persistent train/production gap from day one; drift degrades a correct model gradually.
+\end{pitfall}
+
+\subsection{Risks and Mitigations}
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{4.6cm}p{7.6cm}@{}}
+\toprule
+\textbf{Risk} & \textbf{Mitigation} \\
+\midrule
+New feature leaks quietly & Time-machine test is a review checklist item, enforced in CI \\
+Feature window drifts from intent & Window definitions versioned; quarterly review vs.\ model metrics \\
+Serving reads a stale feature table & Freshness gate blocks scoring; alert pages the feature owner \\
+Training set rebuilt differently later & \texttt{create\_training\_set} spec versioned with the model \\
+Lineage gap for a hand-joined model & Registration requires feature lookups, not ad-hoc frames \\
+\bottomrule
+\end{tabular}
+\caption{Week 18 scenario risks and mitigations.}
+\label{tab:ch18-risks}
+\end{table}
+
+\section{Design Decision Guide}
+\index{decision guide!Week 18}%
+Feature decisions are time decisions; every row below is a variant of ``as of when?''
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.4cm}p{4.4cm}p{4.6cm}@{}}
+\toprule
+\textbf{Decision} & \textbf{Choose the first when} & \textbf{Choose the second when} \\
+\midrule
+Feature store vs.\ ad-hoc joins & Any model that reaches production & Throwaway exploration \\
+Timestamp lookup vs.\ latest join & Training sets & Serving-time enrichment \\
+Precomputed vs.\ on-demand features & History-derived values & Request-time-only inputs \\
+SCD2-aware features vs.\ current values & Historical attribute truth matters & Current-state-only models \\
+Batch refresh vs.\ streaming features & Hourly/daily freshness suffices & Measured sub-minute feature SLAs \\
+Online store vs.\ serving endpoint & Ultra-low-latency lookups at scale & Standard request-time fetches \\
+\bottomrule
+\end{tabular}
+\caption{Week 18 decision guide.}
+\label{tab:ch18-decisions}
+\end{table}
+
+The time-machine test settles arguments: if you could not compute the value at prediction time, it is leakage regardless of how good the validation score looks.
+
+\section{Operational Guidance for Week 18}
+\index{operational guidance!Week 18}%
+\subsection{Performance and Reliability}
+Feature tables are pipelines with SLAs: freshness gates in the scoring workflow, a daily \texttt{max(as\_of\_date)} check per table, and an owner per table. Review feature windows quarterly against model performance---stale window definitions are silent quality drag. Keep the feature-to-model lineage report current; it is the impact analysis for every feature change.
+
+\subsection{Security and Governance Checklist}
+\begin{itemize}
+    \item Feature tables containing PII carry classification tags and masked serving views.
+    \item Feature job parameters (\texttt{as\_of\_date}) logged per run for auditability.
+    \item New features pass the time-machine test in review before registration.
+    \item Online-serving endpoints inherit the feature tables' access model.
+\end{itemize}
+
+\subsection{Troubleshooting Playbook}
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.6cm}p{4.2cm}p{4.8cm}@{}}
+\toprule
+\textbf{Symptom} & \textbf{Likely cause} & \textbf{First action} \\
+\midrule
+Train/serve metric gap & Leakage or skew & Run the per-feature time-machine test; diff train vs.\ serve values \\
+Scores silently stale & Feature job failing upstream & Freshness gate should catch it---verify the gate is wired \\
+Training set row count off & Lookups missing keys/timestamps & Check join coverage and timestamp granularity \\
+Feature rebuild changes history & Non-idempotent feature job & Add \texttt{replaceWhere} per as-of date; rerun and diff \\
+\bottomrule
+\end{tabular}
+\caption{Week 18 troubleshooting quick reference.}
+\label{tab:ch18-trouble}
+\end{table}
+
+\section{Interview Q\&A}
+\subsection{Concepts and Trade-offs}
+\begin{enumerate}
+    \item \textbf{Q: Define point-in-time correctness and its violation cost.}\\
+    A: Every feature for a label at time $t$ computed only from data before $t$. Violate it and the model trains on the future: inflated offline metrics, useless production behavior, and a debugging odyssey.
+    \item \textbf{Q: How does a feature store prevent training-serving skew?}\\
+    A: One governed definition feeds both paths: training reads the same tables through timestamp lookups that serving reads through latest-value lookups. Skew requires two definitions; the store has one.
+    \item \textbf{Q: When is an on-demand (request-time) feature legitimate?}\\
+    A: When its inputs genuinely exist only at request time---current cart contents, device of this request. The rule holds: request-time inputs are fine; future-relative-to-label data is not.
+    \item \textbf{Q: What lineage should a registered model carry?}\\
+    A: The training code (commit), the training set definition, and the feature tables with their versions---so a production answer traces back to every input.
+    \item \textbf{Q: A feature job failed silently for three days. What do users see?}\\
+    A: Stale-but-plausible predictions---the dangerous failure. Defense: freshness gates in the scoring workflow and drift monitoring on feature distributions.
+    \item \textbf{Q: Why not let data scientists hand-join features for training?}\\
+    A: Because the hand-join is the skew and leakage factory: a different join at serving, or a join without the as-of bound, invalidates the model silently. The training-set API makes the correct join the easy one.
+    \item \textbf{Q: How do you detect feature drift before model quality drops?}\\
+    A: Monitor the feature tables' distributions (Lakehouse Monitoring) against the training baseline---feature drift is the leading indicator; quality decay is the lagging one.
+    \item \textbf{Q: When does a feature graduate from a notebook to the store?}\\
+    A: The moment a second model wants it, or the first model approaches production---whichever comes first. The store is the sharing and correctness layer; both triggers arrive earlier than intuition suggests.
+\end{enumerate}
+
+\section{Further Reading}
+Feature Engineering in Unity Catalog is the product reference \cite{databricksFeatureStore}; MLflow ties feature lineage into the registry \cite{databricksMLflow,mlflowDocs}. The Delta write patterns that keep feature jobs idempotent are in \cite{databricksDelta}; monitoring arrives in Chapter 20 \cite{databricksLakehouseMonitoring}.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item A feature is a function of history evaluated as of a moment---parameterize the moment.
+    \item Leakage inflates offline metrics; the train/production gap is the tell; audit before blaming drift.
+    \item Timestamp lookups make point-in-time correctness the framework's job, not your discipline's.
+    \item One feature definition feeding training and serving is the structural end of skew.
+    \item Freshness is a contract: gate scoring on it, monitor drift on it.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Classify as safe or leaking: \texttt{orders\_last\_30d}, \texttt{refund\_amount\_next\_7d}, \texttt{account\_age\_at\_event}, \texttt{final\_dispute\_outcome}.
+    \item \textbf{(Conceptual)} Why does the leaky model also inflate validation metrics?
+    \item \textbf{(Hands-on)} Complete the Thursday lab including the leakage control.
+    \item \textbf{(Hands-on)} Add the freshness gate to a scoring workflow; force it to fail and capture the behavior.
+    \item \textbf{(Hands-on)} Write the registry-lineage query from a model version to its feature tables.
+    \item \textbf{(Design)} Spec the feature-review checklist (the time-machine test and friends) for new features.
+    \item \textbf{(Operations)} Write the incident runbook for ``feature table 2 days stale.''
+    \item \textbf{(Architecture)} When would you replicate features to an external online store instead of feature serving? Quantify the latency case.
+\end{enumerate}
