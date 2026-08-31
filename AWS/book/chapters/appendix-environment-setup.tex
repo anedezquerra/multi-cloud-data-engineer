@@ -1,0 +1,169 @@
+\chapter{Environment Setup Reference}
+\index{environment setup}\index{AWS CLI}\index{Boto3}\index{cost guardrails}%
+This appendix consolidates Chapter~0 into a single reference you can return to before any lab:
+account and identity, command-line tooling, SDKs, infrastructure-as-code, and cost guardrails,
+followed by a per-chapter table of the tools each week's hands-on project requires. Everything
+here assumes the Windows workstation and PowerShell conventions established in Chapter~0.
+
+\begin{notebox}
+Use a personal learning account or an organization-approved sandbox for every lab in this book.
+Do not run training commands in a production account unless your employer has explicitly approved
+the account, Region, budget, and cleanup process.
+\end{notebox}
+
+\section{Account and Identity}
+\index{root user}\index{IAM Identity Center}\index{multi-factor authentication}%
+The account setup sequence is fixed; do it once, in order:
+
+\begin{enumerate}
+    \item \textbf{Create the account} with a long-term email address, a non-sensitive account name
+    (for example \texttt{data-engineering-sandbox}), a payment card, and a reachable phone number.
+    \item \textbf{Enable MFA on the root user} before building anything. Sign out and back in once
+    to confirm the second factor is required, then stop using root for daily work.
+    \item \textbf{Create a daily administrative identity}, preferring \textbf{IAM Identity Center}
+    (workforce sign-in with temporary credentials) over a long-lived IAM admin user. Never create
+    access keys for the root user.
+    \item \textbf{Set the IAM password policy} (minimum length 14, all character classes) and add
+    billing and security contacts.
+    \item \textbf{Record the account ID} and store root credentials, MFA recovery notes, and the
+    admin profile name in a password manager---never in notes, screenshots, or source files.
+\end{enumerate}
+
+\begin{pitfall}
+\textbf{Working as root or leaving root without MFA.} An unprotected root sign-in is a high-risk
+target: it can change billing, close the account, and lock you out. Root is the owner, not the
+operator.
+\end{pitfall}
+
+\section{AWS CLI v2 and Profiles}
+\index{AWS CLI!profiles}\index{CloudShell}%
+Install AWS CLI v2 from the official MSI \cite{awsCliV2UserGuide}, open a fresh PowerShell window,
+and verify with \texttt{aws --version}. Then configure access through one of two paths:
+
+\begin{itemize}
+    \item \textbf{IAM Identity Center (preferred):} \texttt{aws configure sso} captures the SSO
+    start URL and Region; \texttt{aws sso login -{}-profile sandbox} opens the browser flow and
+    issues short-lived credentials. No long-lived keys touch the laptop.
+    \item \textbf{Access keys (legacy-compatible):} \texttt{aws configure -{}-profile sandbox}
+    stores an IAM user's access key under a named profile. Rotate keys periodically and delete
+    unused ones.
+\end{itemize}
+
+Named profiles keep sandbox and any employer credentials strictly separate; every command in this
+book accepts \texttt{-{}-profile <name>}. Set the default Region (\texttt{us-east-1} unless the
+chapter says otherwise) in the profile so it travels with the credentials. \textbf{AWS CloudShell}
+is the zero-install fallback: a browser shell in the console, pre-authenticated to your console
+identity, with the CLI and common SDKs already present.
+
+Verification before any lab:
+
+\begin{lstlisting}[language=bash,caption={Environment smoke test used throughout the book.},label={lst:app-setup-smoke}]
+aws sts get-caller-identity --profile sandbox
+aws s3 ls --profile sandbox
+\end{lstlisting}
+
+The first command proves authentication and shows which account and identity you are acting as;
+run it \emph{every} time you switch profiles. The second proves S3 access in the expected Region.
+
+\section{SDKs: Boto3 and Friends}
+\index{Boto3}\index{SDK}%
+Python scripts in this book use Boto3, the AWS SDK for Python \cite{boto3UserGuide}:
+
+\begin{lstlisting}[language=bash,caption={Installing the Python tooling used across chapters.},label={lst:app-setup-pip}]
+pip install boto3 pandas pyarrow redis
+\end{lstlisting}
+
+Boto3 reads the same profile chain as the CLI: \texttt{boto3.Session(profile\_name="sandbox")} or
+the \texttt{AWS\_PROFILE} environment variable. The recurring pattern is
+\texttt{session.client("s3")} for operation-level APIs and
+\texttt{session.resource("s3")} where an object-oriented interface reads better. Streaming
+chapters add \texttt{redshift-data} (execute SQL without a persistent connection), and the ML
+chapters add \texttt{sagemaker} and \texttt{pyspark} where noted.
+
+\section{Infrastructure as Code: CDK and Terraform}
+\index{AWS CDK}\index{Terraform}%
+Chapters~12 and~24 move from CLI commands to infrastructure as code. Two toolchains appear:
+
+\begin{itemize}
+    \item \textbf{AWS CDK} (Chapter~12, orchestration environments): install Node.js, then
+    \texttt{npm install -g aws-cdk}, and bootstrap each account/Region pair once with
+    \texttt{cdk bootstrap}. CDK synthesizes CloudFormation, so \texttt{cdk synth} is the
+    review-before-deploy step \cite{awsCDKDeveloperGuide}.
+    \item \textbf{Terraform} (Chapter~24, DataOps): the AWS provider with a remote S3 backend and
+    DynamoDB state locking; \texttt{terraform plan} is the review-before-deploy step. CI
+    authenticates via OIDC to an IAM role---never stored long-lived keys.
+\end{itemize}
+
+Both coexist with the CLI: the CLI is for exploration and smoke tests, IaC is for anything you
+intend to keep, repeat, or hand to a teammate.
+
+\section{Cost Guardrails}
+\index{AWS Budgets}\index{Cost Explorer}\index{Free Tier}%
+Set every guardrail in Chapter~0 before the first lab, and keep them on for the whole program:
+
+\begin{itemize}
+    \item \textbf{AWS Budgets:} a monthly cost budget with alerts at 50\%, 80\%, and 100\% of a
+    small threshold (for example \$10), plus a forecasted-spend alert.
+    \item \textbf{Free Tier usage alerts:} enabled in Billing preferences so approaching an
+    allowance emails you before it is exceeded.
+    \item \textbf{Cost Explorer:} reviewed weekly, grouped by service, to catch forgotten
+    resources---idle NAT gateways, unattached volumes, running clusters, and Serverless workgroups
+    left at high base capacity are the recurring offenders.
+    \item \textbf{Cleanup habit:} every lab chapter ends with deletion commands; run them. Tag all
+    lab resources (\texttt{Environment=Training}, \texttt{Project=<chapter>}) so
+    \texttt{aws resourcegroupstaggingapi} can enumerate what a lab created.
+\end{itemize}
+
+\begin{pitfall}
+\textbf{Assuming Free Tier means no bill.} Free Tier is a discount schedule with limits. Resources
+outside the offer, usage above the allowance, idle billable infrastructure, data egress, and
+forgotten resources all create charges.
+\end{pitfall}
+
+\section{Per-Chapter Tool Requirements}
+\index{lab prerequisites}%
+The table below distills each chapter's Thursday lab prerequisites. ``CLI'' always means AWS CLI
+v2 with a configured profile; ``PS'' means Windows PowerShell. Everything builds on the Chapter~0
+sandbox: secured account, named profile, budget alerts.
+
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{1.1cm}p{5.1cm}p{8.6cm}@{}}
+\toprule
+\textbf{Ch.} & \textbf{Services} & \textbf{Local tooling and prerequisites} \\
+\midrule
+0 & IAM, STS, S3, Budgets & CLI v2, CloudShell, password manager \\
+1 & S3, SQS & CLI; globally unique bucket names; Python + Boto3 for the checker script \\
+2 & RDS/Aurora, VPC, Secrets Manager & CLI; small ACU ranges; restrictive security groups \\
+3 & DynamoDB & CLI + Boto3; on-demand capacity \\
+4 & ElastiCache (Redis), RDS & Python \texttt{redis} client; sandbox VPC with two private subnets; existing RDS/Aurora endpoint \\
+5 & Redshift Serverless, S3, IAM & CLI; Python data generator; query editor v2 \\
+6 & Redshift Serverless & Chapter~5 workgroup; EXPLAIN for plan inspection \\
+7 & Glue crawlers, Athena, Spectrum & Chapter~5 dataset exported as CSV; Athena workgroup with results bucket \\
+8 & Lake Formation, Athena & Chapter~7 catalog; two IAM roles (marketing, analytics) \\
+9 & EMR (EC2 + Spot fleets), S3 & CLI; PySpark job from Chapter~7 curated zone \\
+10 & Glue Studio, Redshift & Chapter~7 catalog tables; Redshift workgroup from Chapter~5 \\
+11 & DMS, RDS PostgreSQL, EventBridge & Parameter group with \texttt{rds.logical\_replication=1}; CloudWatch alarms \\
+12 & MWAA, Step Functions, SNS & S3 DAG bucket; least-privilege execution role; optional CDK for the environment \\
+13 & Kinesis Data Streams & Python + Boto3 producer/consumer \\
+14 & Data Firehose, Lambda, Glue table & Chapter~13 stream; Glue table for Parquet conversion \\
+15 & Managed Service for Apache Flink & Source and sink Kinesis streams; Studio notebook \\
+16 & QuickSight, Redshift, SNS & Chapter~5 warehouse; QuickSight account (free trial tier suffices) \\
+17 & Redshift ML, SageMaker, S3 & RedshiftML IAM role; \texttt{ml-artifacts} staging bucket \\
+18 & SageMaker Studio, Data Wrangler, Autopilot & Studio domain; governed bucket read through Lake Formation grant \\
+19 & SageMaker Pipelines, Feature Store, Registry, Model Monitor & Chapter~18 domain; injected-bad-batch dataset for the gate demo \\
+20 & Textract, Comprehend, Lambda, OpenSearch & S3 event notification on \texttt{raw/documents/}; sample scanned PDFs \\
+21 & VPC, endpoints, KMS, EC2 + SSM & VPC with no internet gateway; Session Manager for instance access \\
+22 & Glue Data Quality, SNS, LF-Tags & Existing Glue job (Chapter~10); deliberately violating batch \\
+23 & Macie, EventBridge, Lambda, Object Lock & Object-Locked quarantine bucket; synthetic PII CSV (never real data) \\
+24 & Terraform, dbt-redshift, GitHub Actions & GitHub account; S3+DynamoDB backend; OIDC-to-IAM role; Dev/Prod environments \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{tipbox}
+When a lab fails on an unfamiliar error, check the three usual suspects in order: wrong profile
+(\texttt{aws sts get-caller-identity}), wrong Region (resources are Regional; the console and CLI
+must agree), and a missing Chapter~0 guardrail (budget alerts off, tagging skipped). These three
+account for most first-hour failures in every chapter.
+\end{tipbox}

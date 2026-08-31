@@ -1,0 +1,308 @@
+\chapter{Interview Question Bank}
+\index{interview questions}\index{question bank}%
+This appendix consolidates the Interview Q\&A sections of Chapters~1--24 into a single
+bank, organized by domain and tagged by difficulty. Answers are abbreviated to the core
+argument; the chapter reference holds the full explanation, diagrams, and labs. Use it for
+spaced repetition, mock interviews, and capstone-defense rehearsal.
+
+\begin{notebox}
+\textbf{Difficulty tags.} \textbf{[F]} foundational---expected of any candidate;
+\textbf{[I]} intermediate---separates practitioners from readers; \textbf{[A]}
+advanced---staff-level trade-off and failure-mode reasoning. Answer aloud in under ninety
+seconds; if you cannot, rebuild the referenced chapter's lab, not just its prose.
+\end{notebox}
+
+\section{Platform and Workspace (Chapter 1)}
+\index{interview questions!platform}%
+\begin{itemize}
+    \item \textbf{[F] Why does Databricks separate the control plane from the data plane?}
+    (Ch.~1) The SaaS control plane orchestrates while data and compute stay in the customer's
+    cloud account---data residency, network isolation, existing cloud commitments.
+    \item \textbf{[F] All-purpose or job cluster for a nightly pipeline?} (Ch.~1) Job cluster:
+    created per run, cheaper, workload-exact, destroyed after---no idle spend or shared state.
+    \item \textbf{[I] What problem do cluster policies actually solve?} (Ch.~1) They make
+    standards enforceable: budgets, node restrictions, and required tags become properties of
+    every cluster, not documentation.
+    \item \textbf{[I] How would you give 200 users compute without 200 bill shocks?} (Ch.~1)
+    Policy-bound clusters per team, serverless where possible, job clusters for schedules,
+    weekly per-tag chargeback from \texttt{system.billing.usage}.
+    \item \textbf{[A] What would make you split into a second workspace?} (Ch.~1) Only a hard
+    trust or environment boundary; performance and organization are handled by catalogs and
+    policies.
+\end{itemize}
+
+\section{Delta Lake and Medallion Design (Chapters 2, 3, 5)}
+\index{interview questions!Delta Lake}%
+\begin{itemize}
+    \item \textbf{[F] How can a file store be ACID?} (Ch.~2) Files are immutable; the atomic
+    unit is the single-file commit to the transaction log---readers see a version only after
+    its commit exists.
+    \item \textbf{[I] Two jobs MERGE into the same table simultaneously---what happens?}
+    (Ch.~2) Optimistic concurrency: one commits first; the other re-reads and reconciles
+    (disjoint keys) or retries/fails on conflict.
+    \item \textbf{[I] \texttt{RESTORE} versus re-running the pipeline to fix a bad load?}
+    (Ch.~2) RESTORE for table-level mistakes (instant, auditable); re-run when the bug is in
+    the transformation logic itself.
+    \item \textbf{[I] Why not set VACUUM retention to 1 hour?} (Ch.~2) It deletes the files
+    time travel and long-running readers need; retention must exceed the recovery objective
+    and the longest query.
+    \item \textbf{[A] Does Delta's ACID protect against a logically wrong write?} (Ch.~2)
+    No---ACID guarantees atomicity and durability, not correctness. Correctness comes from
+    constraints, expectations, and reconciliation.
+    \item \textbf{[F] Why keep Bronze forever when storage costs money?} (Ch.~3) Bronze is the
+    only answer to ``what did the source actually say'' and the only input for rebuilding
+    after logic changes.
+    \item \textbf{[I] How do you prove a transition lost no rows?} (Ch.~3) Reconciliation
+    arithmetic per run: input $=$ accepted $+$ quarantined, asserted and logged to a run
+    ledger.
+    \item \textbf{[I] MERGE or \texttt{replaceWhere} for Silver?} (Ch.~3) MERGE for keyed
+    upserts; \texttt{replaceWhere} for full-partition restatements. Both idempotent; never
+    mixed per table.
+    \item \textbf{[A] Why does the medallion make streaming easier later?} (Ch.~3) Each layer
+    already has idempotent, keyed writes---exactly what streaming sinks require. Batch becomes
+    streaming by changing triggers, not contracts.
+    \item \textbf{[F] Why do small files hurt even at the same total bytes?} (Ch.~5) Per-file
+    costs (listing, footers, scheduling) scale with file count; metadata work dominates and
+    the driver becomes the bottleneck.
+    \item \textbf{[I] Z-ORDER versus liquid clustering?} (Ch.~5) Both co-locate rows for
+    skipping; liquid keeps keys as changeable metadata maintained incrementally. New tables:
+    liquid; legacy: Z-ORDER until migrated.
+    \item \textbf{[A] How would you convince a skeptic that liquid clustering helped?}
+    (Ch.~5) Same query, same data, controlled medians across cold and warm runs, plus the
+    file-statistics story. Feelings are not benchmarks.
+\end{itemize}
+
+\section{Spark Execution and Performance (Chapters 4, 9)}
+\index{interview questions!Spark}%
+\begin{itemize}
+    \item \textbf{[F] Walk through what happens on \texttt{df.write.saveAsTable()}.} (Ch.~4)
+    Catalyst optimizes the logical plan, the physical plan splits into stages at shuffles,
+    one task per partition runs on executors, and the final commit publishes the table
+    version.
+    \item \textbf{[I] Why is the shuffle the usual suspect?} (Ch.~4) It is the only all-to-all
+    data movement---network, serialization, spill---plus a barrier. Most big-job pathologies
+    are shuffle pathologies.
+    \item \textbf{[I] What does AQE give you, and when do you override it?} (Ch.~4) Runtime
+    coalescing, broadcast conversion, and skew splitting from actual statistics; override on
+    known-skewed keys or a provably fittable broadcast it declined.
+    \item \textbf{[I] When do you cache?} (Ch.~4) When one expensive DataFrame feeds multiple
+    actions. Never for single-scan pipelines; always unpersist on shared clusters.
+    \item \textbf{[A] How do you size a cluster for a brand-new job?} (Ch.~4) Estimate shuffle
+    volume, partition for $\sim$100--200\,MB per task, memory for the largest task plus spill
+    headroom---then let three runs of UI metrics correct the estimate.
+    \item \textbf{[I] When is salting better than AQE skew handling?} (Ch.~9) Extreme, known
+    skew (one dominant key): salting spreads it by construction; AQE splits only after the
+    plan exists.
+    \item \textbf{[F] Why are pandas UDFs faster than Python UDFs?} (Ch.~9) Arrow columnar
+    batches cross the JVM/Python boundary once per batch, not once per row.
+    \item \textbf{[A] When is a job ``tuned enough''?} (Ch.~9) When the next measured
+    improvement costs more engineering time than the compute it saves, given the SLA
+    margin---tuning has an economic stopping rule.
+\end{itemize}
+
+\section{SQL Warehousing and BI (Chapters 6, 7)}
+\index{interview questions!SQL and BI}%
+\begin{itemize}
+    \item \textbf{[F] Why is Databricks SQL different from a BI tool on a Spark cluster?}
+    (Ch.~6) Photon execution, warehouse-level caching and scaling, governance integration,
+    per-query profiles---a serving layer, not a general cluster with a SQL cell.
+    \item \textbf{[I] Materialized view or scheduled Gold table?} (Ch.~6) MV for stable
+    derived shapes with freshness tolerance; scheduled Gold when the logic is versioned
+    business logic needing tests and review.
+    \item \textbf{[I] A dashboard is slow only at 9 a.m. Diagnose.} (Ch.~6) Queueing at the
+    concurrency bound: raise max clusters for the burst, move the dashboard to an MV, confirm
+    serverless for seconds-fast scale-up.
+    \item \textbf{[I] What does the query profile tell you that duration does not?} (Ch.~6)
+    Where the time went: which operator scanned what and spilled what. Duration says slow; the
+    profile says why.
+    \item \textbf{[I] How do you stop Genie from hallucinating metrics?} (Ch.~7) Scope to
+    certified tables, encode definitions as instructions, provide example queries, and measure
+    first-try accuracy on a fixed question set.
+    \item \textbf{[A] Who should a published dashboard run as?} (Ch.~7) A service identity
+    whose access equals what subscribers may see; publishing as a privileged user silently
+    escalates every subscriber's access.
+\end{itemize}
+
+\section{Governance and Security (Chapters 8, 21, 22)}
+\index{interview questions!governance}\index{interview questions!security}%
+\begin{itemize}
+    \item \textbf{[F] Managed or external table---how do you decide?} (Ch.~8) Managed by
+    default; external only when a non-Databricks writer owns the files or the location is
+    mandated.
+    \item \textbf{[I] Where do you grant---catalog, schema, or table?} (Ch.~8) The highest
+    level matching intent: schema for ``analysts read Gold,'' table only for true exceptions.
+    High-level grants are reviewable; a thousand table grants are not.
+    \item \textbf{[I] Row filters/column masks versus dynamic views?} (Ch.~8) Filters and
+    masks live on the table and apply to every consumer---prefer them; dynamic views for
+    compound or shared logic.
+    \item \textbf{[A] How do you prove least privilege to an auditor?} (Ch.~8) The grant
+    matrix, a negative test per principal class, and \texttt{system.access.audit}
+    samples---implemented, tested, logged.
+    \item \textbf{[A] Why test grants as a restricted principal rather than reviewing GRANTs?}
+    (Ch.~8) Grants compose (ownership, inheritance, nesting) in ways reviewers misread; only
+    the negative test survives composition.
+    \item \textbf{[F] Why must production jobs run as service principals?} (Ch.~21) Person-run
+    jobs break when the person leaves, inherit excessive access, and blur accountability;
+    principals are scoped, owned, rotated, auditable.
+    \item \textbf{[I] Is an IP access list sufficient network security?} (Ch.~21) No---it is a
+    perimeter filter; stolen credentials from an allowed network pass. Layer with SSO/MFA,
+    short-lived tokens, private connectivity, and audit alerts.
+    \item \textbf{[A] Which single control gives the most risk reduction per hour?} (Ch.~21)
+    Running production workloads as least-privilege service principals: caps blast radius,
+    survives personnel change, makes actions attributable.
+    \item \textbf{[I] What does column-level lineage change operationally?} (Ch.~22) Impact
+    analysis becomes a query---every downstream consumer enumerable before a change, every
+    metric traceable after an anomaly.
+    \item \textbf{[A] How do you handle a data-subject erasure request in a lakehouse?}
+    (Ch.~22) Targeted deletes through the layers with deletion vectors, a provenance query for
+    every copy, \texttt{VACUUM} timing understood---erasure is a pipeline with evidence.
+\end{itemize}
+
+\section{Ingestion, Pipelines, and Orchestration (Chapters 10--12)}
+\index{interview questions!pipelines}%
+\begin{itemize}
+    \item \textbf{[F] What does DLT do that a notebook chain does not?} (Ch.~10) Dependency
+    inference, execution-mode management, checkpointing, retries, per-dataset quality metrics,
+    an event log, and UC lineage---the operational layer you would otherwise hand-build.
+    \item \textbf{[I] Streaming table versus materialized view?} (Ch.~10) A streaming table
+    appends each source record exactly once (facts); a materialized view maintains a query
+    result (derived state). ``What arrived'' versus ``what is true.''
+    \item \textbf{[I] \texttt{expect\_or\_drop} versus \texttt{expect\_or\_fail}?} (Ch.~10)
+    Drop when the row is expendable and the pipeline must continue (with quarantine
+    visibility); fail when bad data invalidates the whole batch.
+    \item \textbf{[I] How does Auto Loader achieve exactly-once?} (Ch.~11) The checkpoint
+    durably records processed files per micro-batch; restarts resume from it, and idempotent
+    Delta sink commits complete the contract.
+    \item \textbf{[A] What does \texttt{SEQUENCE BY} protect against?} (Ch.~11) Out-of-order
+    and replayed CDC events: without it, an older update overwrites a newer one and silently
+    regresses table state.
+    \item \textbf{[I] What belongs in the ingestion contract with an external producer?}
+    (Ch.~11) Schema and compatibility rules, key and sequence semantics, arrival SLA, and the
+    malformed-data policy.
+    \item \textbf{[I] What makes a repair run safe?} (Ch.~12) Task idempotency plus true
+    dependency modeling: repair reuses successful outputs and re-runs only the failed subtree.
+    \item \textbf{[A] How do you alert on trajectory, not breach?} (Ch.~12) Track per-task
+    duration baselines; compare elapsed $+$ remaining-p50 against the SLA and page early.
+    Breach alerts tell you what you already lost.
+\end{itemize}
+
+\section{Streaming and Real-Time (Chapters 13--16)}
+\index{interview questions!streaming}%
+\begin{itemize}
+    \item \textbf{[F] Explain micro-batch execution to a backend engineer.} (Ch.~13) The
+    stream is an infinite table; each trigger runs a small incremental batch over rows since
+    the last committed offset, writes transactionally, and commits offsets to the checkpoint.
+    \item \textbf{[I] What exactly does the checkpoint make safe?} (Ch.~13) Restart position,
+    stateful-operator state, and query metadata. With an idempotent sink: exactly-once;
+    without it: at-least-once with duplicates.
+    \item \textbf{[I] When is \texttt{availableNow} the right trigger?} (Ch.~13) Whenever
+    freshness is minutes-to-hours: streaming sources at batch economics---process the backlog,
+    stop, pay nothing until next schedule.
+    \item \textbf{[F] What does a watermark actually do?} (Ch.~14) Defines the lateness
+    horizon after which events drop, and authorizes eviction of older state---unbounded memory
+    becomes a bounded budget.
+    \item \textbf{[I] Why is \texttt{dropDuplicates} dangerous without a watermark?} (Ch.~14)
+    Deduplication remembers every key ever seen; without eviction, state grows until the
+    executors die.
+    \item \textbf{[A] Argue exactly-once for a pipeline, end to end.} (Ch.~14) Checkpointed
+    offsets, deterministically derived and checkpointed state, idempotent sink (keyed MERGE or
+    Delta replace): a crash replays a batch into a sink that ignores replays.
+    \item \textbf{[A] A stakeholder wants ``no late data dropped, ever.'' Response?} (Ch.~14)
+    Then state is unbounded and windows never close; the honest design is a long watermark
+    plus a batch reconciliation path for the long tail.
+    \item \textbf{[I] Why a schema registry for streams?} (Ch.~15) Schemas become versioned
+    contracts with compatibility rules; a breaking producer change fails at registration
+    instead of corrupting every consumer at 03:00.
+    \item \textbf{[I] How many partitions should a topic have?} (Ch.~15) Peak rate divided by
+    per-partition sustainable throughput, times headroom---measured, then rounded up, because
+    partitions only ever get added.
+    \item \textbf{[A] Why \texttt{foreachBatch} instead of a native MERGE sink?} (Ch.~16)
+    Streaming DataFrames do not support MERGE directly; \texttt{foreachBatch} exposes each
+    micro-batch as a batch DataFrame while the checkpoint preserves exactly-once across the
+    hand-off.
+    \item \textbf{[A] When is continuous processing justified over 30-second micro-batches?}
+    (Ch.~16) When the measured business cost of 30 seconds of staleness exceeds the
+    premium---rare. Most ``real-time'' requirements are micro-batch requirements.
+\end{itemize}
+
+\section{ML and MLOps (Chapters 17--20)}
+\index{interview questions!MLOps}%
+\begin{itemize}
+    \item \textbf{[F] What does autologging not capture that you must add?} (Ch.~17) Your
+    context: dataset identity/version, business owner, feature-set version, approval
+    linkage---the metadata that makes runs governable.
+    \item \textbf{[I] Alias versus version in production code?} (Ch.~17) Always the alias:
+    promote and roll back by moving a pointer, never by redeploying version-pinned code.
+    \item \textbf{[I] Reproduce a nine-month-old run. What do you need?} (Ch.~17) Git SHA,
+    dataset snapshot (or Delta version), parameters, and environment---all four logged.
+    \item \textbf{[I] Define point-in-time correctness and its violation cost.} (Ch.~18)
+    Every feature for a label at time $t$ computed only from data before $t$; violate it and
+    the model trains on the future---inflated offline metrics, useless production behavior.
+    \item \textbf{[A] How does a feature store prevent training-serving skew?} (Ch.~18) One
+    governed definition feeds both paths: timestamp lookups for training, latest-value lookups
+    for serving. Skew requires two definitions; the store has one.
+    \item \textbf{[A] A feature job failed silently for three days. What do users see?}
+    (Ch.~18) Stale-but-plausible predictions---the dangerous failure. Defense: freshness gates
+    in scoring and drift monitoring on feature distributions.
+    \item \textbf{[I] Why keep chunks in Delta if the vector index serves queries?} (Ch.~19)
+    Delta is the governed, versioned, rebuildable source of truth; the index is a derived
+    projection you rebuild when embeddings change or sync corrupts.
+    \item \textbf{[I] How do you evaluate a RAG system?} (Ch.~19) A fixed golden set;
+    retrieval metrics and LLM-judged generation metrics logged per run; changes gated on the
+    metrics in CI.
+    \item \textbf{[I] Serverless endpoint versus batch scoring---how do you choose?} (Ch.~20)
+    By consumption pattern: interactive apps need endpoints; bulk periodic decisions need
+    batch scoring. Many models need both, from the same registry version.
+    \item \textbf{[A] Why must promotion stay human-gated?} (Ch.~20) Automated retraining
+    proves fit to recent data, not business acceptability---fairness, stability, and threshold
+    effects need judgment. Automate up to the gate; gate the alias move.
+\end{itemize}
+
+\section{Delivery and CI/CD (Chapter 23)}
+\index{interview questions!CI/CD}%
+\begin{itemize}
+    \item \textbf{[I] Asset Bundles versus Terraform---what goes where?} (Ch.~23) Terraform
+    for the slow perimeter (workspaces, principals, metastores); bundles for the fast
+    application layer (jobs, pipelines, dashboards). Both in Git, both through review.
+    \item \textbf{[F] What does \texttt{bundle validate} actually catch?} (Ch.~23) Schema
+    errors, missing variables, bad references, and permission problems---before any cloud
+    change. It is the compile step for your platform.
+    \item \textbf{[I] Why remote, locked Terraform state?} (Ch.~23) State records what exists;
+    local state forks under team/CI use, and a forked state proposes recreating---or
+    deleting---your production estate.
+    \item \textbf{[A] How do you keep humans out of prod without slowing hotfixes?} (Ch.~23)
+    The same pipeline with an expedited approval gate: the hotfix is a PR with a faster review
+    SLA, not a different process.
+    \item \textbf{[I] How do you attribute a cost spike to a change?} (Ch.~23) Join the
+    billing window to deployment history---bundle deploys and Terraform applies are logged, so
+    the cost curve diffs against the release curve.
+\end{itemize}
+
+\section{Capstone and Architecture Defense (Chapter 24)}
+\index{interview questions!architecture defense}%
+\begin{itemize}
+    \item \textbf{[F] Walk me through your platform end to end.} (Ch.~24) Ninety seconds:
+    sources $\rightarrow$ ingestion $\rightarrow$ medallion $\rightarrow$ serving/ML
+    $\rightarrow$ governance $\rightarrow$ delivery, one number per arrow. Five minutes means
+    you do not yet own it.
+    \item \textbf{[A] What would you rebuild differently at 10x scale?} (Ch.~24) Have the real
+    answer: partition/parallelism ceilings, orchestration fan-in, the cost model. ``Nothing''
+    fails the question.
+    \item \textbf{[A] Your most expensive mistake in this build?} (Ch.~24) Name one---the
+    untested rollback, the unmonitored endpoint, the leaked token---quantify it, and show the
+    mechanism that now prevents it.
+    \item \textbf{[I] How does your platform prove data correctness to a skeptic?} (Ch.~24)
+    Reconciliation arithmetic per transition, expectation metrics from the event log, replay
+    drills, and the audit trail---evidence, not assurances.
+    \item \textbf{[A] Why Databricks over a point-solution stack?} (Ch.~24) One governed
+    storage and catalog under batch, streaming, SQL, and ML---versus four governance models
+    and four copies. Know the honest counter-costs too (DBU economics, Spark operational
+    depth).
+\end{itemize}
+
+\begin{tipbox}
+Mock-interview protocol: draw three questions at random across domains, answer aloud in
+ninety seconds each, and have the interviewer probe one level deeper than your answer. Any
+question you survive only by reciting---rather than reasoning from a lab you built---goes on
+the rebuild list from Appendix~E.
+\end{tipbox}

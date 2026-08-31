@@ -1,0 +1,190 @@
+\chapter{Interview Question Bank}
+\index{interview questions}\index{question bank}%
+Every chapter's Interview Q\&A section, consolidated into one categorized bank. Questions are
+grouped by domain and tagged by difficulty: \textbf{[F]} foundational (expect in any screening),
+\textbf{[I]} intermediate (mid-level loops), \textbf{[A]} advanced (senior/architect loops).
+Answers are deliberately abbreviated to revision-card density; the chapter cross-reference holds
+the full reasoning. Drill by covering the answer column and answering aloud---recall, not
+recognition.
+
+\section{Storage Engine (Chapter 1)}
+\begin{enumerate}
+    \item \textbf{[F] What does WiredTiger cache, and why is it different from the OS page cache?} (Ch.~1) --- Database pages and update state inside \texttt{mongod}, with dirty-page and eviction awareness; the OS caches filesystem blocks outside the process.
+    \item \textbf{[I] Why can a checkpoint create latency spikes?} (Ch.~1) --- Accumulated dirty pages make checkpoint flush compete with foreground work; the symptom is p99 latency, not average.
+    \item \textbf{[F] How do write concern and journaling differ?} (Ch.~1) --- Journaling is local crash recovery; write concern is the acknowledgement contract, including replication to other members.
+    \item \textbf{[I] Why are too many indexes dangerous for write-heavy workloads?} (Ch.~1) --- Every write updates every index; indexes consume cache, increase checkpoint work, and lengthen recovery.
+\end{enumerate}
+
+\section{Schema Design and Relationships (Chapters 2--3)}
+\begin{enumerate}
+    \item \textbf{[F] How do you decide whether to embed or reference?} (Ch.~2--3) --- Embed data read together, bounded, sharing lifecycle; reference data that is large, independently updated or secured, or queried alone.
+    \item \textbf{[I] Why does the Attribute Pattern help product catalogs?} (Ch.~2) --- Sparse category-specific fields become a key-value array, enabling shared indexes without many sparse top-level indexes.
+    \item \textbf{[I] What is the main risk of the Bucket Pattern?} (Ch.~2) --- Unbounded or contended buckets; close buckets by count/time/size and distribute writes.
+    \item \textbf{[I] When is the Computed Pattern appropriate?} (Ch.~2) --- When a derived value is read often enough that materializing beats recomputing, with an acceptable consistency strategy.
+    \item \textbf{[I] How does Schema Versioning reduce migration risk?} (Ch.~2) --- Readers and writers tolerate old and new shapes during a rolling migration; no blocking rewrite.
+    \item \textbf{[F] Why is TTL not the same as archival?} (Ch.~2) --- TTL deletes asynchronously; archival copies and validates cold data before removing it from the hot store.
+    \item \textbf{[F] Why are unbounded arrays dangerous?} (Ch.~3) --- Document growth, update amplification, multikey overhead, and eventual collision with the 16 MB BSON limit.
+    \item \textbf{[I] When would you use \texttt{\$lookup}?} (Ch.~3) --- Targeted joins where references are the right model and indexes support the predicate---never to excuse a model that ignores cardinality.
+    \item \textbf{[I] How do you model N:M relationships?} (Ch.~3) --- An edge collection with both identifiers, a uniqueness rule, traversal indexes in both directions, and relationship attributes.
+    \item \textbf{[F] What does JSON Schema validation protect?} (Ch.~3) --- Structural invariants at the database boundary: required fields, types, enums, nested shapes, array bounds, selected ranges.
+    \item \textbf{[I] Can MongoDB enforce foreign keys like a relational database?} (Ch.~3) --- Not declaratively; applications enforce references, aided by transactions, change streams, or reconciliation jobs for bounded workflows.
+    \item \textbf{[A] What should you do after seeing ``BSON object size exceeds 16MB''?} (Ch.~3) --- Identify the growing field, stop new growth, move high-cardinality data to a referenced collection, migrate history, add validation and retention controls.
+\end{enumerate}
+
+\section{Migration (Chapter 4)}
+\begin{enumerate}
+    \item \textbf{[F] Why not map one table to one collection?} (Ch.~4) --- It preserves relational fragmentation and forces excessive joins; model to access patterns, cardinality, lifecycle, and size limits.
+    \item \textbf{[F] Which 3NF tables are good embedding candidates?} (Ch.~4) --- Tables read with the parent, bounded in cardinality, sharing lifecycle and security, with no independent retention need.
+    \item \textbf{[I] What does CDC solve during migration?} (Ch.~4) --- Keeps the target current after initial load so cutover is short; it does not replace validation, backups, or rollback design.
+    \item \textbf{[I] How do dual-writes differ from CDC?} (Ch.~4) --- CDC replicates committed source changes after the fact; dual-writes make the application write both systems to protect rollback.
+    \item \textbf{[F] What is a shadow read?} (Ch.~4) --- A target read compared against the source while the user still receives the source response.
+    \item \textbf{[A] How do you guarantee zero data loss in rollback?} (Ch.~4) --- A single write authority, or durable dual-writes/replay, so every acknowledged write exists in the rollback target before traffic returns.
+    \item \textbf{[I] What metrics decide cutover readiness?} (Ch.~4) --- CDC lag, failed events, reconciliation differences, query parity, p95/p99 latency, error rate, index readiness, rollback drill results.
+    \item \textbf{[I] How should relational constraints become MongoDB safeguards?} (Ch.~4) --- Deterministic IDs, unique indexes, JSON Schema validation, application checks, bounded transactions, reconciliation jobs.
+\end{enumerate}
+
+\section{Replication and Durability (Chapter 5)}
+\begin{enumerate}
+    \item \textbf{[F] Why can \texttt{w:1} writes be rolled back?} (Ch.~5) --- They are acknowledged pre-replication; if the primary dies, the elected primary's history lacks them and the old primary's copies become rollback files.
+    \item \textbf{[I] Why must oplog entries be idempotent?} (Ch.~5) --- Secondaries apply entries in parallel and may re-apply after crashes; only idempotent operations converge.
+    \item \textbf{[A] Why is an arbiter dangerous in a PSA set?} (Ch.~5) --- \texttt{w:majority} can be satisfied by one data-bearing member plus the arbiter, so acknowledged writes may live on a single copy that a later failure loses.
+    \item \textbf{[F] What does \texttt{j:true} add?} (Ch.~5) --- A journal-flush requirement: acknowledged writes are on disk, surviving process and host crash, not just replication lag.
+    \item \textbf{[I] Which read concern avoids reading rolled-back data?} (Ch.~5) --- \texttt{majority}: only majority-committed data, which elections cannot erase.
+\end{enumerate}
+
+\section{Sharding and Global Distribution (Chapters 6--8)}
+\begin{enumerate}
+    \item \textbf{[F] What do \texttt{mongos} and the CSRS each own?} (Ch.~6) --- \texttt{mongos} owns routing (stateless chunk-map cache); the CSRS owns the authoritative chunk map. Neither owns user data.
+    \item \textbf{[F] Hashed versus ranged shard key?} (Ch.~6) --- Hash spreads writes evenly but destroys locality so range queries scatter; range preserves locality and enables zones but monotonic keys hotspot.
+    \item \textbf{[I] Why does a monotonic key create a hot shard?} (Ch.~6) --- Every insert lands in the single top chunk owned by one shard; writes never parallelize regardless of cluster size.
+    \item \textbf{[I] What is a jumbo chunk?} (Ch.~6) --- A chunk that cannot split (no midpoint key, typically low cardinality), so the balancer cannot move it and skew is permanent.
+    \item \textbf{[I] What does the balancer cost?} (Ch.~6) --- Migrations copy data and defer cleanup on the donor, taxing I/O and cache on both shards; restrict them to a window.
+    \item \textbf{[F] Name the three properties of a good shard key.} (Ch.~7) --- High cardinality, low frequency concentration, non-monotonic inserts---plus the implicit fourth: your hot queries predicate on it.
+    \item \textbf{[A] What does \texttt{refineCollectionShardKey} allow without downtime?} (Ch.~7) --- Appending suffix fields to the existing key; the prefix is fixed---changing it requires resharding or migration.
+    \item \textbf{[I] Why are scatter-gather queries expensive?} (Ch.~7) --- Every shard executes the query and \texttt{mongos} merges; adding shards multiplies per-query work. Count shards hit.
+    \item \textbf{[A] What does the shard key have to do with transaction cost?} (Ch.~7) --- Same-shard documents commit locally; cross-shard means two-phase commit with rounds, coordination state, and coupled availability.
+    \item \textbf{[A] What exactly does zone sharding pin?} (Ch.~8) --- Shard-key ranges, via chunks, to zone-labeled shards; the residency unit is the chunk, so the residency field must lead the key.
+    \item \textbf{[A] How do you prove EU residency to an auditor?} (Ch.~8) --- Query the chunk map: every EU-intersecting chunk must live on EU-zoned shards; automate it as a scheduled assertion.
+    \item \textbf{[I] What does the \texttt{nearest} read preference actually minimize?} (Ch.~8) --- Network ping time, regardless of member state or jurisdiction---which is why tag sets are needed.
+    \item \textbf{[I] Why three fault domains for electors?} (Ch.~8) --- A majority must survive any single domain loss; two domains cannot both hold a majority, so one loss halts writes or risks split brain.
+    \item \textbf{[A] What breaks if a country code is covered by no zone range?} (Ch.~8) --- Its chunks float anywhere: a silent residency violation only exhaustive-coverage review catches.
+\end{enumerate}
+
+\section{Indexing and Query Performance (Chapters 9, 12)}
+\begin{enumerate}
+    \item \textbf{[F] Why does field order matter in a compound index?} (Ch.~9) --- Keys sort lexicographically by field order: equality pins the range, sort provides stored order, range goes last. ESR encodes that physics.
+    \item \textbf{[F] What does \texttt{totalDocsExamined} $\gg$ \texttt{nReturned} mean?} (Ch.~9) --- The plan fetched and discarded many documents: index missing, mis-ordered, or non-selective. The clearest signal of wasted work.
+    \item \textbf{[I] Why can a compound index contain only one array field?} (Ch.~9) --- Two arrays would index the Cartesian product of elements per document, exploding size and update cost.
+    \item \textbf{[I] When is a partial index better than a full index?} (Ch.~9) --- When queries always imply the same predicate; smaller, cheaper, more cache-resident, but usable only for implying queries.
+    \item \textbf{[A] Why build indexes with a rolling procedure on large replica sets?} (Ch.~9) --- Foreground builds on the primary compete with production writes; build on secondaries, step down, build the primary last.
+    \item \textbf{[I] Why rank slow queries by total cost instead of worst latency?} (Ch.~12) --- Frequency $\times$ latency ranks by business impact; fixing the frequent 300 ms query buys back the most capacity.
+    \item \textbf{[I] What does \texttt{SORT\_KEY\_GENERATOR} tell you?} (Ch.~12) --- The plan sorts in memory: the index did not provide order. Revisit ESR field order or direction.
+    \item \textbf{[A] What do high \texttt{qr/qw} values mean?} (Ch.~12) --- Operations queue for WiredTiger tickets: storage-layer saturation from cache pressure, slow I/O, or excess concurrency---rarely the planner.
+    \item \textbf{[I] Why profile secondaries separately?} (Ch.~12) --- \texttt{system.profile} is local and unreplicated; secondary analytical load is invisible in the primary's profile.
+    \item \textbf{[A] When is dropping a ``zero-usage'' index wrong?} (Ch.~12) --- When the observation window missed its business cycle; collect across representative periods and hide before dropping.
+\end{enumerate}
+
+\section{Aggregation Framework (Chapters 10--11)}
+\begin{enumerate}
+    \item \textbf{[F] Why put \texttt{\$match} first even when the optimizer can push it down?} (Ch.~10) --- Pushdown applies only to provably safe cases; any reshaping stage defeats it. Written order is the reliable contract.
+    \item \textbf{[I] What makes \texttt{\$facet} different from running three pipelines?} (Ch.~10) --- One input scan feeds all branches, but the combined output must fit one 16 MB document.
+    \item \textbf{[I] When does \texttt{\$lookup} become a performance problem?} (Ch.~10) --- Unindexed foreign field (per-document collection scan) or a huge outer stream (correlated cost per document).
+    \item \textbf{[A] What can go wrong with an unbounded \texttt{\$graphLookup}?} (Ch.~10) --- Cycles and deep hierarchies explode the traversal; bound with \texttt{maxDepth}, prune with \texttt{restrictSearchWithMatch}.
+    \item \textbf{[I] Why is \texttt{allowDiskUse:true} not a free lunch?} (Ch.~10) --- Spilled sorts/groups run 10--100$\times$ slower and compete with the storage engine; a safety valve, not a strategy.
+    \item \textbf{[F] \texttt{\$rank} versus \texttt{\$denseRank}?} (Ch.~11) --- After ties, \texttt{\$rank} skips positions (1,2,2,4); \texttt{\$denseRank} does not (1,2,2,3). Leaderboards want dense.
+    \item \textbf{[I] Why does \texttt{\$setWindowFields} require \texttt{sortBy}?} (Ch.~11) --- Frames are defined by order; without a sort, ``the last 30 days per row'' is nondeterministic.
+    \item \textbf{[A] How does a MongoDB materialized view differ from Snowflake's?} (Ch.~11) --- Snowflake auto-maintains; the \texttt{\$merge} pattern is maintained by your job---you own freshness, idempotency, reconciliation.
+    \item \textbf{[A] Why the lookback window in incremental refresh?} (Ch.~11) --- Late events change old frames; refreshing watermark-minus-window re-computes everything late data could touch.
+    \item \textbf{[I] What does \texttt{\$derivative} compute?} (Ch.~11) --- Slope between the frame's first and last points per unit time---a rate of change, not a point-to-point diff.
+\end{enumerate}
+
+\section{Search and Vector Retrieval (Chapters 13--14)}
+\begin{enumerate}
+    \item \textbf{[F] Which engine powers Atlas Search, and how does data reach it?} (Ch.~13) --- Apache Lucene inside the Atlas platform, synchronized from the collection automatically---eventually consistent, with observable lag.
+    \item \textbf{[F] Which stage invokes Atlas Search, and what is its position rule?} (Ch.~13) --- \texttt{\$search} (or \texttt{\$searchMeta}), as the pipeline's first stage, composed downstream with projection, sort, facets.
+    \item \textbf{[I] Which operator suits a type-ahead box?} (Ch.~13) --- \texttt{autocomplete} over an edge-ngram path: prefixes match indexed partial tokens at interactive latency without leading-wildcard scans.
+    \item \textbf{[I] Standard versus keyword versus ngram analyzers?} (Ch.~13) --- Standard tokenizes/lowercases prose; keyword keeps one exact token; ngram emits substrings for partial match at index-size cost.
+    \item \textbf{[I] Why does a bulk import need index-status polling?} (Ch.~13) --- Sync is asynchronous; serving traffic before the index catches up returns incomplete results with no error.
+    \item \textbf{[A] What makes HNSW fast?} (Ch.~14) --- A layered proximity graph: coarse layers route long hops, fine layers refine; greedy walks find near-exact neighbors without a corpus scan.
+    \item \textbf{[I] Cosine versus Euclidean for text embeddings?} (Ch.~14) --- Cosine: text models train for angular similarity and magnitude is usually noise.
+    \item \textbf{[I] What does hybrid search buy?} (Ch.~14) --- BM25 nails exact tokens (SKUs, codes); vectors capture paraphrase; RRF fusion keeps both without score-scale normalization.
+    \item \textbf{[I] What does \texttt{\$vectorSearch} do inside a RAG pipeline?} (Ch.~14) --- The retrieval stage: query vector to nearest filtered chunks, feeding generation context with an audit trail.
+    \item \textbf{[A] Why declare filter fields in the vector index?} (Ch.~14) --- Filters apply during the graph walk; undeclared fields force post-filter over-fetching, worse latency, and cross-tenant exposure risk.
+\end{enumerate}
+
+\section{Streaming and Change Data Capture (Chapters 15--16)}
+\begin{enumerate}
+    \item \textbf{[A] Why does unbounded state from high-cardinality keys kill a streaming job?} (Ch.~15) --- Every open key holds memory and must be checkpointed; growth means pressure, slow checkpoints, and restarts that never converge.
+    \item \textbf{[I] What does \texttt{\$lookup} enable inside a stream-processing pipeline?} (Ch.~15) --- Stream-collection enrichment against current Atlas state; current-state, not temporal---event-time-correct dimensions need stream-stream joins.
+    \item \textbf{[I] What do late events imply for windowed joins?} (Ch.~15) --- Within allowed lateness they correct output; beyond it they are dropped or side-output. Watermarks are business decisions.
+    \item \textbf{[A] How do checkpointing + idempotent \texttt{\$merge} deliver exactly-once effect?} (Ch.~15) --- Checkpoints resume consistently; replay re-emits (at-least-once); the deterministic-key upsert absorbs duplicates.
+    \item \textbf{[A] What happens when a resume token outlives the oplog window?} (Ch.~15--16) --- The stream cannot resume; re-bootstrap from a snapshot and open a fresh stream. Size the oplog beyond worst-case downtime.
+    \item \textbf{[F] What does a change-stream resume token identify?} (Ch.~16) --- A position in the oplog; persisted post-processing, it resumes exactly after the last handled event while its entries survive.
+    \item \textbf{[I] Why persist the resume token only after processing?} (Ch.~16) --- Saving before the sink write loses events on crash; saving after replays---absorbed by the idempotent sink.
+    \item \textbf{[I] What is reverse ETL, and what problem does identity resolution solve?} (Ch.~16) --- Pushing analytical aggregates back to operational systems; identity resolution binds entities on stable keys so scores land on the right record.
+    \item \textbf{[I] Real-time versus batch CRM sync?} (Ch.~16) --- Real-time is fresh but hits rate limits and noise; batch with a materiality threshold is calmer and cheaper. Document the freshness contract.
+    \item \textbf{[A] Why the outbox pattern instead of ``write then publish''?} (Ch.~16) --- The two-write sequence can crash in between; the outbox commits the event with the business write in one transaction.
+    \item \textbf{[A] How do serverless functions exhaust a cluster's connections?} (Ch.~16) --- Every cold start opens a fresh pool; warm-scope the client, bound \texttt{maxPoolSize}, or use the Data API.
+\end{enumerate}
+
+\section{Security, Encryption, and Auditing (Chapters 17--19)}
+\begin{enumerate}
+    \item \textbf{[I] SCRAM versus x.509 for services at scale?} (Ch.~17) --- x.509: certificates rotate via PKI automation, no passwords to leak, revocation is a PKI primitive; SCRAM leaves credential hygiene to you.
+    \item \textbf{[F] Why are \texttt{AnyDatabase} roles indefensible for services?} (Ch.~17) --- Zero containment: one leaked token equals full-cluster access. Per-collection privileges bound the blast radius.
+    \item \textbf{[I] What does \texttt{grantPrivilegesToRole} change operationally?} (Ch.~17) --- It mutates the role in place---every holder gains the privilege immediately; role definitions belong in reviewed code.
+    \item \textbf{[F] What is the least-privilege rule for service accounts?} (Ch.~17) --- Per-collection, per-action privileges matching documented access patterns; reads get \texttt{find}, writes get \texttt{insert}/\texttt{update}, nothing administrative.
+    \item \textbf{[A] Why alert on spikes of authorization failures?} (Ch.~17) --- They are ambiguous in the useful direction: a misconfigured release or a probing attacker; the runbook distinguishes them.
+    \item \textbf{[A] CSFLE versus Queryable Encryption?} (Ch.~18) --- CSFLE encrypts client-side with per-field deterministic/random choices; QE adds server-side encrypted indexes so supported queries run without decryption---at 2--4$\times$ storage and restricted query shapes.
+    \item \textbf{[I] Why is deterministic encryption dangerous on low-cardinality fields?} (Ch.~18) --- Identical plaintexts give identical ciphertexts; frequency analysis recovers values without breaking the cipher.
+    \item \textbf{[A] Why is losing the KMS master key catastrophic?} (Ch.~18) --- Every DEK is wrapped by it; no master key means no encrypted field is ever readable again. Policy, backup, and rotation drills are the control.
+    \item \textbf{[A] Why is naive DELETE insufficient for GDPR erasure?} (Ch.~18) --- Copies persist in backups, oplog, archives, and consumers; crypto-shredding makes all copies unreadable with one key deletion.
+    \item \textbf{[I] Why is PrivateLink preferred over IP access lists?} (Ch.~19) --- Private endpoints remove public exposure by construction and decouple from CIDR churn; IP lists go stale and audit poorly.
+    \item \textbf{[I] Why enforce TLS 1.3 with custom certificate authorities?} (Ch.~19) --- Issuance, rotation, and revocation stay under enterprise PKI policy; the operational half is fail-closed clients and expiry monitoring.
+    \item \textbf{[F] What do audit filters limit?} (Ch.~19) --- Which events are recorded: identity plus scoped DML on sensitive collections, not a full-fidelity stream that drowns detections.
+    \item \textbf{[A] Why ship audit logs off-host?} (Ch.~19) --- A host-privileged attacker can edit local logs; the trail is trustworthy only where the compromised host cannot rewrite it.
+    \item \textbf{[A] Name the layers of a zero-trust Atlas perimeter.} (Ch.~19) --- Private endpoints, TLS 1.3 with custom CA, OIDC/x.509 identity, least-privilege RBAC, in-use encryption where required, off-host audit stream---each independently verified.
+\end{enumerate}
+
+\section{Governance, Lifecycle, and DataOps (Chapters 20--22)}
+\begin{enumerate}
+    \item \textbf{[I] How does PITR reconstruct an arbitrary point in time?} (Ch.~20) --- Restore the preceding snapshot, replay retained oplog forward; granularity equals oplog retention, not snapshot interval.
+    \item \textbf{[I] Why partition Online Archive on the query date key?} (Ch.~20) --- Archive queries bill per byte scanned; partition-aligned pruning reads only relevant Parquet. Wrong key, unbounded invoice.
+    \item \textbf{[F] Why restore to a new cluster during drills?} (Ch.~20) --- A drill must never endanger the source of truth, and restoring beside production validates the recovery topology, not just the snapshot.
+    \item \textbf{[A] When is recomputation better than backup?} (Ch.~20) --- For derived data whose source of truth is elsewhere; the regeneration pipeline \emph{is} the backup.
+    \item \textbf{[A] What makes destruction auditable?} (Ch.~20) --- Scheduled partition drops gated by a hold registry, each writing an audit event with actor, scope, rule citation, and timestamp.
+    \item \textbf{[F] Why remote state with locking?} (Ch.~21) --- State is the source of truth for what exists; locking serializes applies, the remote backend makes them reviewable.
+    \item \textbf{[I] Why forward-only migrations?} (Ch.~21) --- Down migrations are rarely tested and needed under maximum stress; rollback is a new, reviewed forward migration.
+    \item \textbf{[I] What does expand--contract actually buy?} (Ch.~21) --- Every intermediate state is valid for old and new code, so rolling deploys never straddle an incompatible schema.
+    \item \textbf{[F] Where do Atlas API keys live?} (Ch.~21) --- In the CI secret store, injected at runtime, least-privilege, rotated---never in code or committed variable files.
+    \item \textbf{[I] Why bundle the schema contract test into the infra pipeline?} (Ch.~21) --- Schema, indexes, and infrastructure are one logical change; separate validation ships incompatible pairs.
+    \item \textbf{[F] What is a CRD?} (Ch.~22) --- A Kubernetes API extension defining a new object kind; the operator watches instances and reconciles reality toward each spec.
+    \item \textbf{[I] What does the operator automate versus decide?} (Ch.~22) --- Automates deployment, membership, TLS, rolls, healing; cannot decide shard keys, sizing, topology, anti-affinity---the spec encodes your design.
+    \item \textbf{[I] How does a rolling upgrade stay safe?} (Ch.~22) --- Member-at-a-time with health gates; the replica-set protocol keeps a majority serving, and a failed member halts the roll.
+    \item \textbf{[I] Operator versus Ops Manager?} (Ch.~22) --- Community Operator is self-contained reconciliation; Enterprise Operator drives Ops Manager, which owns agents, backup, and monitoring---more capability, one more system to run.
+\end{enumerate}
+
+\section{Resilience and Disaster Recovery (Chapter 23)}
+\begin{enumerate}
+    \item \textbf{[F] RPO versus RTO?} (Ch.~23) --- RPO bounds data loss; RTO bounds downtime. Bought separately: sync lag buys RPO, automation and warm standbys buy RTO.
+    \item \textbf{[I] What does the Atlas Performance Advisor do?} (Ch.~23) --- Mines slow-query evidence to recommend indexes and schema changes; a hypothesis to verify with \texttt{explain()}, since every index taxes every write.
+    \item \textbf{[I] Which two alert thresholds anchor operations, and why alert on backup job failures?} (Ch.~23) --- Replication lag $>10$ s and connections $>80\%$ of max; backup failures page because backup decay is silent until restore day.
+    \item \textbf{[I] What do the three Ops Manager agents do?} (Ch.~23) --- Monitoring (metrics up), backup (snapshots + oplog), automation (converging \texttt{mongod} to declared config); each is a credential and network path to protect.
+    \item \textbf{[A] What makes a runbook entry production-grade?} (Ch.~23) --- Numbered triage with expected outputs, mitigations ordered by reversibility, named escalation, and a recent drill by a non-author.
+    \item \textbf{[A] Why are production drills run during business hours?} (Ch.~23) --- Real failures arrive at peak load; a 2 a.m.\ Sunday drill tests neither the traffic condition nor the human response that matters.
+    \item \textbf{[I] What belongs in a blameless postmortem?} (Ch.~23) --- Timeline, detection analysis, contributing system conditions (not people), and owned action items tracked to closure.
+\end{enumerate}
+
+\section{Synthesis: The Senior Loop (Chapter 24)}
+\begin{enumerate}
+    \item \textbf{[A] Walk me through your platform's write path for a payment.} (Ch.~24) --- Authenticated service (Ch.~17), single-shard transaction at \texttt{w:majority} (Ch.~7), journaled write path (Ch.~1), replication (Ch.~5), CDC fan-out (Ch.~16), SLO monitoring and PITR recovery (Ch.~23)---each hop with its measured cost.
+    \item \textbf{[A] What breaks first at 10$\times$ scale?} (Ch.~24) --- Name your platform's own constraint (single-region write throughput, the analytics secondary) and the Chapter 12 measurement that warns you.
+    \item \textbf{[A] How do you change the schema of a 2-billion-document collection?} (Ch.~24) --- Expand--migrate--contract: dual-write, throttled resumable backfill, feature-flagged reads, contract last (Ch.~21).
+    \item \textbf{[A] A regulator asks you to prove one user's data is gone.} (Ch.~24) --- Crypto-shredding: per-subject DEK destruction, KMS audit record, and an unreadability evidence pack across live data, streams, and backups (Ch.~18).
+    \item \textbf{[A] Your biggest production incident---and what changed after?} (Ch.~24) --- Answer with a real drill or postmortem: timeline, detection, systemic fix, re-drill evidence (Ch.~23). Judgment is demonstrated, never asserted.
+\end{enumerate}
+
+\begin{tipbox}
+Interviewers grade the reasoning chain, not the keyword. For any question above, practice the
+follow-up: ``and what would you measure to know you were wrong?'' Every chapter in this book ends
+with an instrument that answers it.
+\end{tipbox}

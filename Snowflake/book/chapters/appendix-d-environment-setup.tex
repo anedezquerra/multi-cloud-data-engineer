@@ -1,0 +1,140 @@
+\chapter{Environment Setup Reference}
+\index{environment setup}\index{trial account}\index{SnowSQL}\index{Snowpark!setup}\index{Terraform!setup}%
+This appendix consolidates every installation and configuration step the book assumes, so a
+fresh machine can be made lab-ready in one sitting. Chapter~0 teaches each step with context
+and troubleshooting; this appendix is the checklist you return to when rebuilding the
+environment. Where a chapter needs additional tooling, the per-chapter table at the end says so.
+
+\section{Snowflake Account, Edition, and Trial}
+\index{Snowflake!trial}\index{edition}
+\begin{itemize}
+    \item \textbf{Trial:} sign up for the Snowflake free trial---30 days and approximately
+    \$400 of credits, no credit card required (Ch.~0). Record the account URL, account
+    identifier, administrator username, cloud provider, region, and trial expiration in a
+    password manager, never in source code.
+    \item \textbf{Edition:} choose \textbf{Enterprise} for the trial. Standard covers basic SQL,
+    but Enterprise exposes features used later in the book (multi-cluster warehouses,
+    materialized views at full capability, longer Time Travel). Business Critical is required
+    only for the compliance features touched in Chapters 17--20 (Tri-Secret, some clean-room
+    scenarios); a trial on Enterprise completes every lab.
+    \item \textbf{Cloud and region:} choose the cloud and region you expect to use
+    professionally (Ch.~0). Region affects latency, data residency, marketplace availability,
+    and which integrations are possible.
+    \item \textbf{Lab role and user:} create \texttt{DE\_LEARNER\_ROLE} and
+    \texttt{DE\_TRAINING\_USER} with least privilege, plus the \texttt{DE\_TRAINING\_WH}
+    warehouse (\texttt{XSMALL}, \texttt{AUTO\_SUSPEND = 60}, \texttt{AUTO\_RESUME = TRUE}) and
+    the \texttt{SNOWFLAKE\_DE\_BOOK} database, exactly as in Chapter~0's setup listing. Run DDL
+    as \texttt{SYSADMIN} or the lab role---never as \texttt{ACCOUNTADMIN}.
+    \item \textbf{MFA:} enroll multi-factor authentication on the administrator user before
+    creating any data objects (Ch.~0).
+\end{itemize}
+
+\section{Command-Line Clients: SnowSQL and the Snow CLI}
+\index{SnowSQL}\index{Snow CLI}
+Two clients appear in this book; install both.
+\begin{itemize}
+    \item \textbf{SnowSQL} (the classic SQL client): download the Windows installer from
+    Snowflake's documentation, install, open a new PowerShell window, and verify with
+    \texttt{snowsql -v} (Ch.~0). Configure a named connection profile in the user config file
+    under the user profile directory; keep that file out of Git.
+    \item \textbf{Snow CLI} (\texttt{snow}, the modern developer CLI): install from Snowflake's
+    documentation (a standalone installer or \texttt{pip install snowflake-cli-labs} in the
+    dedicated virtual environment below). Verify with \texttt{snow --version}. Used from
+    Chapter~16 onward for Native App and object management workflows.
+    \item \textbf{Authentication:} for both clients, prefer key-pair authentication for any
+    scripted or CI use (Ch.~13, 17, 23): generate an RSA key pair, assign the public key to the
+    service user with \texttt{ALTER USER ... SET RSA\_PUBLIC\_KEY = '...'}, and store the
+    private key in a secrets manager---never a password in code, CI variables, or committed
+    config.
+\end{itemize}
+
+\section{Python, Connector, and Snowpark}
+\index{Python connector}\index{Snowpark!setup}
+\begin{enumerate}
+    \item Install Python 3.10--3.12 (a version supported by the current Snowpark release) and
+    create a dedicated virtual environment from PowerShell:
+    \texttt{python -m venv .venv} then \texttt{.\textbackslash .venv\textbackslash Scripts\textbackslash Activate.ps1}.
+    \item Install the stack used across Part III:
+    \texttt{pip install snowflake-connector-python "snowflake-snowpark-python[pandas]"}.
+    \item For Chapter~15 add \texttt{snowflake-ml-python}; pin versions in a
+    \texttt{requirements.txt} and match the server-side Anaconda channel versions when code runs
+    inside Snowflake (Ch.~13, 14).
+    \item Verify connectivity with a minimal script that connects with the account identifier
+    (not the full browser URL---see Chapter~0's pitfall), runs
+    \texttt{SELECT CURRENT\_VERSION()}, and prints the result.
+\end{enumerate}
+
+\begin{pitfall}
+\textbf{Client/server version skew.} Snowpark client code serializes plans for the server-side
+runtime; mismatched package versions cause serialization and API errors that look like network
+faults. Pin the client, declare server packages in \texttt{PACKAGES} clauses, and test in CI
+(Ch.~13).
+\end{pitfall}
+
+\section{Terraform Provider and DataOps Toolchain}
+\index{Terraform!Snowflake provider}\index{dbt}\index{schemachange}
+Chapter~23's toolchain, installed once:
+\begin{itemize}
+    \item \textbf{Terraform:} install from HashiCorp (or \texttt{winget install
+    HashiCorp.Terraform}); verify with \texttt{terraform -version}. Configure the
+    \texttt{snowflake-labs/snowflake} provider authenticating as a dedicated
+    \texttt{TERRAFORM\_USER} service account with key-pair auth (Ch.~23). Keep state remote and
+    the private key in the CI secret store.
+    \item \textbf{dbt:} \texttt{pip install dbt-snowflake} in the same virtual environment;
+    verify with \texttt{dbt --version}. The profile uses key-pair auth and a
+    least-privilege role (Ch.~23).
+    \item \textbf{schemachange:} \texttt{pip install schemachange} for versioned DDL migrations
+    tracked in a change-history table (Ch.~23).
+    \item \textbf{Git and GitHub:} Git for Windows plus a GitHub account; CI runs in GitHub
+    Actions with Snowflake credentials stored as encrypted secrets (Ch.~23).
+\end{itemize}
+
+\section{Resource Monitors and Cost Guardrails}
+\index{resource monitor}\index{cost guardrails}
+A credit-limited trial survives 24 weeks only with guardrails in place \emph{before} the first
+heavy lab. Chapter~0 creates the baseline; Chapter~22 explains the mechanics.
+\begin{itemize}
+    \item \textbf{Account monitor:} as \texttt{ACCOUNTADMIN}, create a resource monitor with a
+    monthly credit quota sized to the trial budget (for example 100 credits/month), with
+    \texttt{TRIGGERS} at 50\% (notify), 75\% (notify), and 90\% (suspend). Apply it at account
+    level: \texttt{ALTER ACCOUNT SET RESOURCE\_MONITOR = ...} (Ch.~0, 22).
+    \item \textbf{Warehouse monitor:} attach a stricter monitor to \texttt{DE\_TRAINING\_WH}
+    with \texttt{SUSPEND\_IMMEDIATE} near its quota so a runaway lab cannot burn the month.
+    \item \textbf{Credit habits:} \texttt{XSMALL} warehouses by default; \texttt{AUTO\_SUSPEND
+    = 60} everywhere; explicitly \texttt{ALTER WAREHOUSE ... SUSPEND} after labs; never leave a
+    multi-cluster warehouse running (Ch.~0, 2).
+    \item \textbf{Review loop:} check warehouse metering in Snowsight weekly
+    (\texttt{WAREHOUSE\_METERING\_HISTORY} for attribution), and treat every credit anomaly as
+    a finding to explain (Ch.~22).
+\end{itemize}
+
+\section{Per-Chapter Tool Requirements}
+\index{tool requirements}
+The full toolchain once installed covers the whole book; this table shows when each piece first
+becomes mandatory, so a broken install is caught before the chapter that needs it.
+
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{3.4cm}p{4.6cm}p{6.2cm}@{}}
+\toprule
+\textbf{Chapters} & \textbf{Required tooling} & \textbf{Notes} \\
+\midrule
+0--4 & Snowsight only & Trial account, lab role, resource monitor; no local installs needed. \\
+5--6 & Snowsight + cloud console access & An AWS (or Azure/GCP) account for the bucket, IAM role, and event notifications behind storage integrations and Snowpipe. \\
+7--12 & Snowsight only & Streams, tasks, dynamic tables, and profiling run entirely in the account. \\
+13--15 & Python venv + connector + Snowpark & Add \texttt{snowflake-ml-python} for Ch.~15; pin versions (see above). \\
+16 & Snow CLI + a cloud API endpoint & External functions need an API Gateway/Lambda (or Azure/GCP equivalent) behind an API integration. \\
+17--20 & Snowsight only & RBAC, masking, sharing, and clean-room labs are account-internal; Enterprise edition assumed. \\
+21 & Snowsight only & Hybrid tables and profiling; no new installs. \\
+22 & Snowsight + billing views & Cortex functions consume credits---confirm the resource monitor is active first. \\
+23 & Terraform + dbt + schemachange + GitHub & The full DataOps toolchain above; key-pair auth in CI secrets. \\
+24 & Everything installed & The capstone deploys through Terraform and GitHub Actions end to end. \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{tipbox}
+Rebuild drill: after finishing Chapter~0, wipe nothing but \emph{re-run} the setup from this
+appendix on a second profile or machine. An environment you can rebuild from a checklist is an
+environment you understand; the same drill at production scale is Chapter~23's Terraform lab.
+\end{tipbox}

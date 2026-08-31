@@ -1,0 +1,161 @@
+\chapter{Production-Readiness and Governance Checklists}
+\index{production readiness}\index{checklists}\index{governance!checklists}%
+This appendix distills the production notes, pitfalls, and acceptance criteria scattered through
+the chapters into domain checklists. Use them two ways: as a pre-launch gate (every box ticked or
+consciously deferred with a reason) and as exam preparation---Professional Data Engineer scenario
+questions are, in large part, these checklists wearing a story. Items marked \emph{(neg)} require
+a negative test: proving the control denies what it must deny.
+
+\section{Storage and Data Lake (Chapters 1, 8)}
+\begin{itemize}
+    \item[$\square$] Bucket location matches compute locality; dual/multi-region only where an
+    availability requirement justifies the price.
+    \item[$\square$] Lifecycle rules transition and expire objects; no bucket grows unbounded
+    (Archive minimum-duration cost considered before archiving active data).
+    \item[$\square$] Versioning, retention policy, or soft delete chosen deliberately per bucket;
+    the three mechanisms are not conflated.
+    \item[$\square$] Uniform bucket-level access enabled; no legacy ACLs leaking object-level
+    exceptions.
+    \item[$\square$] Encryption posture recorded: Google-managed, CMEK, or CSEK, with key rotation
+    and \emph{(neg)} access revocation tested.
+    \item[$\square$] Transfer jobs (Storage Transfer Service) validated on bytes, object counts,
+    sampled checksums, and incremental sync---not just ``it ran.''
+    \item[$\square$] Lake zones mapped to a medallion layout (\texttt{raw/}, \texttt{validated/},
+    \texttt{curated/}) with IAM boundaries per zone.
+    \item[$\square$] BigLake connections enforce policy tags and row access policies on lake files;
+    \emph{(neg)} a direct GCS read by an unauthorized identity fails.
+\end{itemize}
+
+\section{Warehousing and Analytics (Chapters 5--8)}
+\begin{itemize}
+    \item[$\square$] Fact tables declare a grain; every measure and key respects it.
+    \item[$\square$] Large tables partitioned (usually by date) and clustered on the dominant
+    high-cardinality filter columns; bytes-billed before/after measured.
+    \item[$\square$] Materialized views cover the top recurring aggregations; refresh cost is
+    budgeted.
+    \item[$\square$] Pricing model chosen from measured slot usage
+    (\texttt{INFORMATION\_SCHEMA.JOBS\_BY\_PROJECT}), not guessed: on-demand for spiky, Editions
+    reservation for steady workloads.
+    \item[$\square$] Custom query cost quotas per user/project; dry-run byte checks in CI.
+    \item[$\square$] SCD Type~2 dimensions match on key \emph{and} \texttt{is\_current}; history
+    reconstruction tested on a known entity.
+    \item[$\square$] External/BigLake tables accepted with their limits (no clustering, no managed
+    statistics) or promoted to native tables where performance matters.
+    \item[$\square$] Semantic layer (LookML or equivalent) owns metric definitions; no dashboard
+    re-implements a governed measure.
+    \item[$\square$] BI Engine capacity sized for hot dashboard tables only, not batch ELT.
+    \item[$\square$] Analytics Hub listings grant read-only linked datasets; revocation tested.
+\end{itemize}
+
+\section{Batch ETL and Orchestration (Chapters 9--12, 24)}
+\begin{itemize}
+    \item[$\square$] Dataproc clusters are ephemeral per job (or serverless batches), with
+    preemptible capacity confined to secondary workers and jobs made retry-safe.
+    \item[$\square$] Spark jobs sized from evidence: skew inspected in the Spark UI before memory
+    is raised; autoscaling policy bounds and cooldowns set.
+    \item[$\square$] Data Fusion instances use private IP where sources are internal; macros
+    parameterize dates and paths so one definition serves schedules, backfills, and reruns.
+    \item[$\square$] Datastream streams monitored for freshness lag; backfill strategy documented
+    per source table.
+    \item[$\square$] Every Airflow task is idempotent (deterministic partition overwrites or
+    upserts); retries and clears are safe by construction.
+    \item[$\square$] XComs carry small control values only---paths, counts, verdicts---never
+    payloads.
+    \item[$\square$] Event-driven readiness uses sensors (file arrival) rather than clock guesses;
+    schedules have catchup behavior chosen deliberately.
+    \item[$\square$] Dataform (or dbt) assertions gate the pipeline; a failing test blocks
+    dependents.
+    \item[$\square$] Terraform state is remote and locked; applies run from CI after review;
+    Workload Identity Federation replaces all committed keys.
+    \item[$\square$] Schema evolution follows expand--contract: additive change, dual-run shim,
+    consumer migration, contract cleanup---never a one-release breaking change.
+\end{itemize}
+
+\section{Streaming and Real-Time (Chapters 13--16)}
+\begin{itemize}
+    \item[$\square$] Topics carry Avro/Proto schemas so the broker rejects contract violations at
+    publish time.
+    \item[$\square$] Every subscription has a dead-letter topic and a triage owner; poison
+    messages never silently vanish.
+    \item[$\square$] Deduplication is designed in: message IDs, idempotent sinks, or Dataflow
+    exactly-once mode---at-least-once delivery is assumed.
+    \item[$\square$] Pub/Sub Lite chosen only after the steady-throughput cost comparison against
+    Standard.
+    \item[$\square$] \texttt{oldest\_unacked\_message\_age} alerts exist per subscription.
+    \item[$\square$] Windowing, watermark, and allowed-lateness choices are written down per
+    pipeline; late-data handling (side output or update) is explicit.
+    \item[$\square$] Per-key state is bounded by timers or watermark garbage collection; unbounded
+    state growth is treated as a bug.
+    \item[$\square$] Sinks are exactly-once (Storage Write API) or at-least-once with a merge/dedup
+    step---and the choice is justified by cost.
+    \item[$\square$] Streaming jobs drain (not cancel) for deploys; autoscaling floor/ceiling set
+    for known traffic peaks.
+    \item[$\square$] Reverse-ETL syncs resolve identity before writing to operational systems and
+    respect API rate limits on a freshness-versus-cost cadence.
+\end{itemize}
+
+\section{Machine Learning and MLOps (Chapters 17--20)}
+\begin{itemize}
+    \item[$\square$] The simplest sufficient model is the baseline (BQML logistic regression or
+    AutoML) before any custom training spend.
+    \item[$\square$] Training/serving skew prevented by construction: one feature definition
+    (feature store or shared SQL) feeds both paths.
+    \item[$\square$] Evaluation uses the metric that matches the decision---precision/recall at a
+    chosen threshold for imbalanced problems, never bare accuracy.
+    \item[$\square$] Models live in a registry with lineage to dataset and code; promotion is an
+    alias move; rollback is tested.
+    \item[$\square$] Online endpoints serve only latency-bound paths; batch prediction covers bulk
+    scoring; endpoints are undeployed when idle.
+    \item[$\square$] Retraining triggers fire on drift evidence (with data-quality preconditions),
+    not on a calendar; candidates must beat the incumbent before registration.
+    \item[$\square$] External AI API calls inside pipelines are batched, bounded in concurrency,
+    retried with backoff and jitter, and dead-lettered on permanent failure; per-call cost is
+    forecast and alerted.
+    \item[$\square$] GenAI/RAG pipelines govern source chunks and prompts like data assets:
+    versioned, access-controlled, evaluated.
+\end{itemize}
+
+\section{Security, Governance, and Compliance (Chapters 21--23)}
+\begin{itemize}
+    \item[$\square$] Least privilege everywhere: predefined or custom roles, no primitive Owner/
+    Editor grants in shared projects; service accounts per workload, not shared.
+    \item[$\square$] No service-account key files exist; Workload Identity (Federation) issues
+    short-lived tokens instead.
+    \item[$\square$] VPC Service Controls perimeters enclose sensitive projects; access levels
+    carve only documented exceptions; \emph{(neg)} a valid-credential request from outside the
+    perimeter is denied and alerted.
+    \item[$\square$] CMEK on regulated datasets and buckets with rotation; key destruction
+    procedure rehearsed (it is the erasure backstop).
+    \item[$\square$] Cloud Audit Logs (including Data Access where required) route to a log
+    bucket or BigQuery with alerting on policy denials and IAM changes.
+    \item[$\square$] Dataplex lakes/zones map to data-mesh domains; domains own product quality
+    and SLAs; the platform owns taxonomy and minimum rules.
+    \item[$\square$] Policy tags (not per-role views) enforce column-level security; row access
+    policies have \emph{(neg)} tests.
+    \item[$\square$] AutoDQ scans plus declared quality rules cover completeness, uniqueness,
+    validity, and freshness on curated assets; findings route to owners.
+    \item[$\square$] DLP discovery scans the estate on a schedule; sensitive columns are masked
+    (irreversible) or tokenized (KMS-wrapped, reversible under audit)---never left cleartext
+    ``temporarily.''
+    \item[$\square$] Right-to-erasure design accounts for time travel, backups, and replicas;
+    quasi-identifier risk analysis runs on ``safe'' de-identified tables.
+    \item[$\square$] Lineage is queryable from dashboard tile back to source system; impact
+    analysis is a lookup, not archaeology.
+\end{itemize}
+
+\section{Reliability and FinOps (Chapter 23 and throughout)}
+\begin{itemize}
+    \item[$\square$] RPO/RTO stated per pipeline; restore and failover are drilled, not assumed.
+    \item[$\square$] Budgets alert at 50/90/100\%; billing export to BigQuery feeds a weekly
+    cost-by-service review.
+    \item[$\square$] Idle-billing resources (clusters, Composer, endpoints, instances) have
+    same-day teardown or auto-stop.
+    \item[$\square$] Every architecture review answers: what breaks when this component fails, who
+    is paged, and what does it cost at 10$\times$ volume.
+\end{itemize}
+
+\begin{tipbox}
+During the exam, each checklist above compresses into one elimination rule: prefer the managed
+service, the least-privilege grant, the answer that includes monitoring, and the design that
+satisfies the stem's stated constraint---then verify none of these checklists is violated.
+\end{tipbox}

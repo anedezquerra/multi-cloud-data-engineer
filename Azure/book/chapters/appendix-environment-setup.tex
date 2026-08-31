@@ -1,0 +1,180 @@
+\chapter{Environment Setup Reference}
+\index{environment setup}\index{tooling reference}%
+This appendix consolidates the environment requirements scattered through the book into one
+reference you can revisit before any chapter. Chapter~0 walks through each step with narrative
+and screenshots-in-words; this appendix is the checklist and command summary. Everything assumes
+Windows with PowerShell, a sandbox subscription, and the book's naming and tagging conventions.
+
+\begin{notebox}
+Install once, verify always. Run \texttt{az account show --output table} at the start of every
+session and before any destructive command. Most lab accidents come from the wrong subscription,
+not from the wrong command.
+\end{notebox}
+
+\section{Azure Subscription and Microsoft Entra ID}
+\index{Azure subscription}\index{Microsoft Entra ID}%
+The labs assume the management hierarchy from Chapter~0: one Microsoft Entra tenant, one
+subscription used only for this book, and one resource group per chapter named
+\texttt{rg-de-azbook-chNN-dev} so cleanup is a single \texttt{az group delete}.
+
+\begin{itemize}
+    \item \textbf{Free account}: \$200 credit for 30 days, selected services free for 12 months,
+    and always-free quotas \cite{microsoft2025azureFreeAccount}. The credit is not a safety
+    net---a forgotten dedicated pool or premium cluster can exhaust it in days.
+    \item \textbf{Identity separation}: never run daily labs as Global Administrator. Use a normal
+    user account with \textbf{Contributor} on the lab resource groups, MFA enabled, and a separate
+    break-glass admin account \cite{microsoft2025entra,microsoft2025rbac}.
+    \item \textbf{Data-plane roles}: several labs need data-plane RBAC in addition to Contributor,
+    notably \texttt{Storage Blob Data Contributor} on ADLS Gen2 accounts and Cosmos DB data-plane
+    roles for keyless access. Owner on the resource is never a substitute.
+    \item \textbf{Automation identity}: create resource-group-scoped service principals only when a
+    lab requires non-interactive runs (Chapters 18, 24); store the secret in Key Vault, never in
+    source control.
+\end{itemize}
+
+\section{Azure CLI}
+\index{Azure CLI!setup}%
+The primary command-line tool for every chapter \cite{microsoft2025azureCliInstall}.
+
+\begin{lstlisting}[language=bash,caption={Installing and verifying Azure CLI on Windows.},label={lst:appenv-azcli}]
+winget install --exact --id Microsoft.AzureCLI
+az version
+az login
+az account list --output table
+az account set --subscription "00000000-0000-0000-0000-000000000000"
+az account show --output table
+\end{lstlisting}
+
+Useful extensions used by later chapters install on demand with
+\texttt{az extension add --name <name>} (for example \texttt{databricks}, \texttt{datafactory},
+\texttt{kusto}). Azure Cloud Shell is the no-install fallback for locked-down machines
+\cite{microsoft2025cloudShell}, but copy commands and outputs back into your lab notes---its file
+system and network path are not your machine's.
+
+\section{Azure PowerShell}
+\index{Azure PowerShell!setup}%
+The \texttt{Az} module family is the first-class alternative when an organization standardizes on
+PowerShell automation \cite{microsoft2025azurePowerShell}.
+
+\begin{lstlisting}[language=bash,caption={Installing the Az module and selecting a context.},label={lst:appenv-azps}]
+Install-Module -Name Az -Scope CurrentUser -Repository PSGallery -Force
+Connect-AzAccount
+Set-AzContext -Subscription "00000000-0000-0000-0000-000000000000"
+Get-AzContext | Select-Object Name, Subscription, Tenant
+\end{lstlisting}
+
+\begin{pitfall}
+\textbf{Split contexts.} \texttt{az account set} configures Azure CLI; \texttt{Set-AzContext}
+configures Azure PowerShell. They are independent and can silently point at different
+subscriptions in the same terminal. Check both before destructive operations.
+\end{pitfall}
+
+\section{Python SDKs and Local Tooling}
+\index{Python SDK!setup}\index{development environment}%
+Chapters with Python code assume Python 3.11+ with a per-book virtual environment. The recurring
+packages are:
+
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{4.6cm}p{8.6cm}@{}}
+\toprule
+\textbf{Package} & \textbf{Used for} \\
+\midrule
+\texttt{azure-identity} & DefaultAzureCredential sign-in for all SDK clients \\
+\texttt{azure-storage-file-datalake} & ADLS Gen2 file-system operations (Ch. 1, 7) \\
+\texttt{azure-cosmos} & Cosmos DB NoSQL reads/writes (Ch. 3) \\
+\texttt{azure-eventhub} & Event Hubs producers and consumers (Ch. 13) \\
+\texttt{azure-ai-ml} & Azure ML workspaces, pipelines, endpoints (Ch. 17--19) \\
+\texttt{redis} & Cache-aside client for Azure Cache for Redis (Ch. 4) \\
+\texttt{pyodbc} / \texttt{sqlalchemy} & Azure SQL and Synapse connectivity (Ch. 2, 5) \\
+\texttt{faker}, \texttt{pyarrow} & Synthetic data generation and Parquet writing (Ch. 5--6) \\
+\texttt{databricks-cli} / \texttt{databricks-sdk} & Workspace automation (Ch. 9, 12, 15, 24) \\
+\texttt{dbt-core} + \texttt{dbt-fabric}/\texttt{dbt-databricks} & Transformations as code (Ch. 22, 24) \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Keep credentials out of code: \texttt{DefaultAzureCredential} picks up the \texttt{az login}
+session locally and the managed identity in Azure, so the same code runs in both places.
+
+\section{Bicep and Terraform}
+\index{Bicep}\index{Terraform!setup}%
+Chapter~24 introduces infrastructure as code; install both tools early so later chapters can show
+declarative alternatives to portal clicks.
+
+\begin{lstlisting}[language=bash,caption={Installing Bicep and Terraform on Windows.},label={lst:appenv-iac}]
+az bicep install && az bicep version
+winget install --exact --id Hashicorp.Terraform
+terraform version
+\end{lstlisting}
+
+Bicep is Azure-native and needs no state file; Terraform is the cross-cloud constant and stores
+state in an Azure Storage account backend with lease locking \cite{microsoft2025bicep,hashicorp2025azurerm}.
+Chapter~24's lab wires both into GitHub Actions with OIDC workload identity---no stored secrets.
+
+\section{Cost Guardrails}
+\index{cost guardrails}\index{budget!setup}%
+Guardrails are part of the environment, not an afterthought. Before Chapter~1, create a monthly
+subscription budget with alerts at 25\%, 50\%, 75\%, and 90\% of a small amount
+\cite{microsoft2025costBudgets}, tag every resource group with
+\texttt{project}, \texttt{environment}, \texttt{chapter}, and \texttt{owner}, and rehearse
+deletion once:
+
+\begin{lstlisting}[language=bash,caption={The budget-and-cleanup habit every chapter assumes.},label={lst:appenv-budget}]
+az consumption budget create --budget-name budget-de-azbook-monthly `
+  --amount 25 --time-grain Monthly --category Cost `
+  --time-period start-date=2026-08-01 end-date=2027-08-01
+
+az group delete --name rg-de-azbook-chNN-dev --yes --no-wait
+\end{lstlisting}
+
+\begin{tipbox}
+End every lab session with two measurements: the resource list in the chapter's resource group
+(\texttt{az resource list --resource-group <rg> --output table}) and the current forecast in Cost
+Management. Pause or delete anything that bills while idle---dedicated pools, Databricks clusters,
+VMs---before closing the terminal.
+\end{tipbox}
+
+\section{Per-Chapter Tool Requirements}
+\index{tool requirements by chapter}%
+The table below lists what each chapter expects to be installed or provisioned \emph{before}
+Monday. ``CLI'' means Azure CLI; ``Python'' means the virtual environment above.
+
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{0.9cm}p{5.4cm}p{6.9cm}@{}}
+\toprule
+\textbf{Ch.} & \textbf{Primary services} & \textbf{Tooling prerequisites} \\
+\midrule
+0 & Entra ID, Cost Management & CLI, Azure PowerShell, budget, MFA \\
+1 & ADLS Gen2 & CLI; Python: \texttt{azure-storage-file-datalake}; AzCopy optional \\
+2 & Azure SQL, PostgreSQL Flexible Server & CLI; Python: \texttt{pyodbc}; sqlcmd optional \\
+3 & Cosmos DB for NoSQL & CLI; Python: \texttt{azure-cosmos} \\
+4 & Azure Cache for Redis, API Management & CLI; Python: \texttt{redis}, \texttt{pyodbc} \\
+5 & Synapse dedicated SQL pool & CLI (\texttt{az synapse}); Python: \texttt{faker}, \texttt{pyarrow} \\
+6 & Synapse dedicated SQL pool (existing) & Chapter 5 pool; T-SQL client \\
+7 & Synapse serverless SQL pool & Chapter 5 workspace; ADLS data from Ch. 1 \\
+8 & Microsoft Purview, Data Share & Purview account; scan credentials; Ch. 1 lake \\
+9 & Azure Databricks & CLI \texttt{databricks} extension; workspace; ABFS access \\
+10 & Azure Data Factory & CLI \texttt{datafactory} extension; Ch. 1 lake; Ch. 5 pool \\
+11 & Azure DMS, Self-Hosted IR, Event Grid & Source Azure SQL DB; DMS; contract JSON schemas \\
+12 & Databricks, ADF, Logic Apps, Event Grid & Ch. 9 workspace; Teams webhook for notifications \\
+13 & Event Hubs, IoT Hub & Python: \texttt{azure-eventhub} (asyncio); Ch. 1 lake for Capture \\
+14 & Azure Stream Analytics & Ch. 13 hub; target Azure SQL DB \\
+15 & Databricks Structured Streaming & Ch. 9 workspace; Ch. 13 hub Kafka endpoint \\
+16 & Power BI, Synapse & Power BI Desktop; Ch. 5 pool; gateway if on-prem \\
+17 & Synapse Spark, AML, ONNX & \texttt{synapseml}, \texttt{onnxmltools}; Ch. 5 pool \\
+18 & Azure ML, Databricks & Python: \texttt{azure-ai-ml}; AML workspace + compute cluster \\
+19 & AML managed endpoints, monitoring & Ch. 18 registered model; Application Insights \\
+20 & AI Document Intelligence, AI Search, Functions & Azure Functions Core Tools; Python: \texttt{azure-ai-*} \\
+21 & Private Endpoints, Key Vault, Bastion & VNet + VM for tests; Key Vault; Event Grid \\
+22 & Purview, Azure Monitor, dbt & dbt installed; Log Analytics workspace \\
+23 & DDM, Always Encrypted, Defender, Policy & Ch. 2/5 databases; Key Vault for CMK \\
+24 & Terraform, Bicep, dbt, GitHub Actions & Terraform + Bicep; GitHub repo; OIDC app registration \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Chapters are cumulative by design: the Chapter 5 warehouse, Chapter 9 Databricks workspace, and
+Chapter 13 event hub are reused downstream, so tearing them down early forces rebuilds later.
+Pause rather than delete shared infrastructure until the part of the book that uses it is done.

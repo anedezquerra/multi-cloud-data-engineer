@@ -1,0 +1,99 @@
+\chapter{Production-Readiness Checklists}
+\index{production readiness}\index{checklist}%
+Checkbox-style gate lists distilled from the chapters' production notes, pitfalls, and acceptance
+criteria. Use them two ways: as a pre-launch review (every box ticked or consciously waived with a
+named owner) and as an audit script (each item names its evidence). Items cite the chapter that
+teaches the underlying reasoning.
+
+\section{Schema Design (Chapters 2--4)}
+\index{schema design!checklist}%
+\begin{itemize}
+    \item[$\square$] Every collection has a documented access-pattern inventory; no collection exists ``because the data arrived'' (Ch.~2).
+    \item[$\square$] Embed/reference decisions follow lifecycle, cardinality, and security boundaries; unbounded arrays are banned by policy (Ch.~2--3).
+    \item[$\square$] No document can approach the 16 MB BSON limit: hot arrays are bucketed, subsetted, or moved to child collections (Ch.~3).
+    \item[$\square$] JSON Schema validators protect required fields, types, enums, and array bounds at the database boundary (Ch.~3).
+    \item[$\square$] Schema version markers exist on versioned shapes; readers tolerate $n$ and $n-1$ during rolling migrations (Ch.~2, 21).
+    \item[$\square$] Migration targets follow access patterns, not source tables; one-table-to-one-collection mappings were explicitly rejected with reasons (Ch.~4).
+    \item[$\square$] TTL is used for expiry and Online Archive for retention; nobody treats TTL as an archive (Ch.~2, 20).
+\end{itemize}
+
+\section{Indexes and Query Performance (Chapters 9, 12)}
+\index{index!checklist}\index{performance!checklist}%
+\begin{itemize}
+    \item[$\square$] Compound indexes follow ESR (equality, sort, range); every new index ships with an \texttt{explain("executionStats")} transcript showing \texttt{totalDocsExamined} $\approx$ \texttt{nReturned} (Ch.~9).
+    \item[$\square$] No compound index contains two array fields; multikey behavior is documented where one array is indexed (Ch.~9).
+    \item[$\square$] Partial and TTL indexes carry their filter predicate in the name or a comment, so future queries know the contract (Ch.~9).
+    \item[$\square$] Index builds on large sets use the rolling procedure (secondaries first, step down, primary last) rehearsed in a lab (Ch.~9).
+    \item[$\square$] Slow queries are ranked by total cost (frequency $\times$ latency), not worst-case latency; the top offenders have owners (Ch.~12).
+    \item[$\square$] Index candidates are hidden and observed across a full business cycle (month-end, quarter-end) before being dropped (Ch.~12).
+    \item[$\square$] The profiler and \texttt{\$indexStats} baselines are captured on primaries \emph{and} secondaries; secondary-only analytical load is not invisible (Ch.~12).
+    \item[$\square$] Performance Advisor recommendations are treated as hypotheses and verified with \texttt{explain()} before adoption (Ch.~23).
+\end{itemize}
+
+\section{Replication and Durability (Chapter 5)}
+\index{replication!checklist}%
+\begin{itemize}
+    \item[$\square$] Production sets run three data-bearing members (PSS); PSA topologies carry a written durability-risk acceptance (Ch.~5).
+    \item[$\square$] Voting members span three fault domains so a majority survives any single-domain loss (Ch.~5, 8).
+    \item[$\square$] Write concern is explicit per workload: \texttt{\{w:"majority", j:true\}} for anything money-adjacent; \texttt{w:1} only with idempotent retry and a rollback-tolerance note (Ch.~5).
+    \item[$\square$] Read-your-writes paths pair \texttt{w:majority} writes with \texttt{readConcern:"majority"} reads (Ch.~5).
+    \item[$\square$] The oplog window exceeds the worst-case secondary outage plus the longest change-stream consumer pause; the window is an alertable metric (Ch.~5, 16).
+    \item[$\square$] Elections and failover were drilled: \texttt{rs.stepDown()}, node kill, and network partition, with write availability observed under \texttt{w:majority} (Ch.~5).
+    \item[$\square$] \texttt{priority:0} is set for analytics/DR members that must never become primary (Ch.~5).
+\end{itemize}
+
+\section{Sharding and Global Distribution (Chapters 6--8)}
+\index{sharding!checklist}\index{zone sharding!checklist}%
+\begin{itemize}
+    \item[$\square$] Each shard key passes the scoring rubric: high cardinality, low frequency concentration, non-monotonic inserts, and predicates matching the hot queries (Ch.~7).
+    \item[$\square$] Jumbo-chunk risk was tested with production-shaped data; low-cardinality prefixes were refined with suffix fields before launch (Ch.~6--7).
+    \item[$\square$] Balancer activity is restricted to a defined window; migration I/O cost during peak is a measured number, not a surprise (Ch.~6).
+    \item[$\square$] Scatter-gather queries are enumerated and budgeted; ``shards hit'' is a dashboard metric (Ch.~7).
+    \item[$\square$] Transactions are designed to be single-shard; cross-shard two-phase commit is the documented exception (Ch.~7).
+    \item[$\square$] Residency zones cover every legal value of the residency field; an automated chunk-map assertion runs on a schedule, and gaps page a human (Ch.~8).
+    \item[$\square$] \texttt{nearest} read preference is constrained by tag sets so ``nearest'' cannot leave the jurisdiction (Ch.~8).
+    \item[$\square$] \texttt{refineCollectionShardKey} and \texttt{reshardCollection} runbooks are rehearsed before they are needed (Ch.~7).
+\end{itemize}
+
+\section{Security (Chapters 17--19)}
+\index{security!checklist}%
+\begin{itemize}
+    \item[$\square$] Every identity---human, service, automation---authenticates with SSO/OIDC or x.509; no shared SCRAM passwords in production (Ch.~17).
+    \item[$\square$] Service roles are per-collection and per-action; \texttt{AnyDatabase} and admin roles on service accounts are zero (Ch.~17).
+    \item[$\square$] Role definitions live in reviewed code; \texttt{grantPrivilegesToRole} never runs in an ad-hoc shell session (Ch.~17, 21).
+    \item[$\square$] Queryable Encryption or CSFLE protects regulated fields; deterministic encryption is banned on low-cardinality fields; the KMS master key has backup, rotation, and destruction drills (Ch.~18).
+    \item[$\square$] Private endpoints (PrivateLink/Private Link/PSC) are the only network path; the IP access list does not contain \texttt{0.0.0.0/0} (Ch.~19).
+    \item[$\square$] TLS 1.3 with enterprise certificates is enforced; clients fail closed; certificate expiry is monitored (Ch.~19).
+    \item[$\square$] Audit filters capture identity events and scoped DML on sensitive collections; logs ship off-host to the SIEM; the audit pipeline's own health is an alertable signal (Ch.~19).
+    \item[$\square$] Authorization-failure spikes have a runbook that distinguishes a bad release from a probing attacker (Ch.~17).
+\end{itemize}
+
+\section{Backup, Archival, and Disaster Recovery (Chapters 20, 23)}
+\index{backup!checklist}\index{disaster recovery!checklist}%
+\begin{itemize}
+    \item[$\square$] RPO and RTO are written numbers per workload, and the chosen mechanisms (PITR window, snapshots, warm standby) provably meet them (Ch.~23).
+    \item[$\square$] Continuous backup with PITR is enabled; PITR granularity is understood to equal oplog retention, not snapshot interval (Ch.~20).
+    \item[$\square$] Restore drills restore to a \emph{new} cluster on a schedule; the last drill date and measured RTO are recorded (Ch.~20, 23).
+    \item[$\square$] Backup \emph{job failures} page immediately---backup decay is silent until restore day (Ch.~23).
+    \item[$\square$] Online Archive partitions on the query date key; federated queries over archive are cost-tested per byte scanned (Ch.~20).
+    \item[$\square$] Derived data whose source of truth is elsewhere is regenerated, not backed up; the regeneration pipeline is documented (Ch.~20).
+    \item[$\square$] Destruction (retention expiry, GDPR erasure) is scheduled, hold-gated, and writes an audit event per action; crypto-shredding covers copies in backups and streams (Ch.~18, 20).
+    \item[$\square$] Runbooks have numbered triage with expected outputs, mitigations ordered by reversibility, named escalation, and a drill by a non-author; postmortems are blameless and action items are tracked to closure (Ch.~23).
+\end{itemize}
+
+\section{Observability and Operations (Chapters 12, 23)}
+\index{observability!checklist}\index{alerting!checklist}%
+\begin{itemize}
+    \item[$\square$] The two anchor alerts are live: replication lag $> 10$ s and connections $> 80\%$ of maximum (Ch.~23).
+    \item[$\square$] \texttt{serverStatus} metrics---cache pressure, ticket queues (\texttt{qr/qw}), opcounters---feed dashboards with thresholds tied to symptoms, not vanity (Ch.~1, 12).
+    \item[$\square$] Oplog window, election events, and rollback occurrences are alertable signals with runbook links (Ch.~5).
+    \item[$\square$] Change-stream consumers persist resume tokens \emph{after} processing; consumer lag and token age are monitored against the oplog window (Ch.~16).
+    \item[$\square$] Alerts are drilled during business hours with the real on-call rotation; a drill nobody notices is a failed drill (Ch.~23).
+    \item[$\square$] SLOs exist per user-facing path; error budgets, not uptime folklore, gate risky change (Ch.~23).
+\end{itemize}
+
+\begin{notebox}
+A checklist item without evidence is a wish. Attach the transcript, the dashboard link, or the
+drill date to every ticked box---the certification exam (Chapter 24) and any competent auditor
+both grade the evidence, not the intention.
+\end{notebox}

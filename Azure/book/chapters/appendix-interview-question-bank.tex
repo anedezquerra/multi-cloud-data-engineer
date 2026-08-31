@@ -1,0 +1,256 @@
+\chapter{Interview Question Bank}
+\index{interview questions}\index{question bank}%
+This appendix consolidates the Interview Q\&A sections from all twenty-five chapters into one
+bank, reorganized by domain and tagged by difficulty: \textbf{[F]} foundational (definitions and
+core trade-offs), \textbf{[I]} intermediate (design judgment with constraints), and
+\textbf{[A]} advanced (failure modes, migration risk, and cost reasoning). Answers are
+abbreviated to interview length; the chapter cross-reference points to the full treatment.
+
+\begin{tipbox}
+Practice out loud with a timer: sixty seconds for foundational, two minutes for intermediate,
+and a whiteboard sketch for advanced. Interviewers score structure---state the constraint, name
+the options, choose, and say what would change your mind.
+\end{tipbox}
+
+\section{Storage and Databases (Chapters 1--4)}
+
+\begin{enumerate}
+    \item \textbf{[F, Ch.~1] Q: Why is ADLS Gen2 preferred for analytics lakes over a flat Blob Storage namespace?}\\
+    A: It adds a hierarchical namespace, atomic directory operations, and path-level ACLs while retaining Blob Storage scale and durability.
+    \item \textbf{[F, Ch.~1] Q: What does soft delete protect that versioning does not?}\\
+    A: Soft delete protects deleted blobs or containers during a retention window; versioning primarily protects prior object states after overwrite.
+    \item \textbf{[I, Ch.~1] Q: When would you choose ZRS instead of GZRS?}\\
+    A: When zone failure is in scope but cross-region replication cost or data-residency constraints make geo-replication unsuitable.
+    \item \textbf{[I, Ch.~1] Q: Why might the Archive tier be wrong for data that is rarely read?}\\
+    A: Rare reads may still be urgent. Archive requires rehydration, so RTO and operational approval can make Cool or Cold a better fit.
+    \item \textbf{[F, Ch.~2] Q: When would you choose vCore over DTU for Azure SQL Database?}\\
+    A: When you need explicit control over cores, hardware family, storage, reserved capacity, hybrid licensing, or enterprise capacity planning.
+    \item \textbf{[I, Ch.~2] Q: Why is Serverless not always cheaper?}\\
+    A: Always-active workloads may pay continuously, auto-pause may never trigger, and cold-start latency can force a minimum compute setting.
+    \item \textbf{[I, Ch.~2] Q: Why use an auto-failover group instead of only active geo-replication?}\\
+    A: A failover group provides listener endpoints and group-level failover for related databases, simplifying application connection management.
+    \item \textbf{[I, Ch.~2] Q: What does PostgreSQL Flexible Server HA protect against?}\\
+    A: Server or zone failures---not bad application writes; backups and PITR are still required.
+    \item \textbf{[A, Ch.~2] Q: What makes Hyperscale different from Business Critical?}\\
+    A: Hyperscale separates compute from distributed page and log storage for very large databases and fast restore; Business Critical focuses on local SSD replicas and low-latency IO.
+    \item \textbf{[A, Ch.~2] Q: What is the largest risk in a zero-downtime SQL Server migration?}\\
+    A: Unrehearsed cutover dependencies: compatibility gaps, logins, jobs, connection strings, downstream ETL, and rollback rules can break despite a successful data copy.
+    \item \textbf{[F, Ch.~3] Q: What is a Request Unit?}\\
+    A: Cosmos DB's normalized measure of CPU, memory, and IO used by reads, writes, queries, and maintenance operations.
+    \item \textbf{[F, Ch.~3] Q: What makes a good partition key?}\\
+    A: High cardinality, even distribution, alignment with common point reads and queries, and support for transaction boundaries within a logical partition.
+    \item \textbf{[I, Ch.~3] Q: Why is Session consistency common for global apps?}\\
+    A: It provides read-your-writes within a user session while allowing lower latency and more regional independence than Strong consistency.
+    \item \textbf{[I, Ch.~3] Q: When would you avoid multi-region writes?}\\
+    A: When the workload cannot tolerate conflict-resolution complexity, or when single-write failover meets latency and availability goals.
+    \item \textbf{[I, Ch.~3] Q: Why use the Change Feed for data engineering?}\\
+    A: It turns operational item changes into scalable downstream projections for functions, streams, lakes, caches, search, and materialized views.
+    \item \textbf{[A, Ch.~3] Q: What is the biggest risk in a high-scale leaderboard?}\\
+    A: A hot partition or global aggregation path can throttle the system even when total account RU/s appears sufficient.
+    \item \textbf{[F, Ch.~4] Q: What is the cache-aside pattern?}\\
+    A: The application checks the cache first, reads the origin on a miss, stores the result with a TTL, and returns the value.
+    \item \textbf{[F, Ch.~4] Q: Why is Redis not usually the system of record?}\\
+    A: It is optimized for in-memory speed; durable databases should own authoritative state unless the Redis tier and design explicitly meet durability requirements.
+    \item \textbf{[I, Ch.~4] Q: When should you prefer Cosmos DB Integrated Cache over Redis?}\\
+    A: When repeated Cosmos DB reads can use the dedicated gateway and accept a bounded staleness window without application-managed cache keys.
+    \item \textbf{[I, Ch.~4] Q: What causes a cache stampede?}\\
+    A: Many callers miss the same key at once and all query the origin, typically after a popular key expires or the cache is flushed.
+    \item \textbf{[I, Ch.~4] Q: What belongs in API Management for ingestion?}\\
+    A: Authentication, authorization, quotas, rate limits, validation, transformations, routing, timeout policy, and diagnostics at the API boundary.
+    \item \textbf{[A, Ch.~4] Q: What metric is more useful than cache hit ratio alone?}\\
+    A: Hit ratio combined with p95/p99 latency, origin load, stale-read incidents, errors, evictions, and business correctness metrics.
+\end{enumerate}
+
+\section{Warehousing and Analytics (Chapters 5--7)}
+
+\begin{enumerate}
+    \item \textbf{[F, Ch.~5] Q: Why must you declare the grain before designing a fact table?}\\
+    A: The grain defines what one row means; without it, joins fan out and aggregates double-count silently.
+    \item \textbf{[F, Ch.~5] Q: When is SCD Type 2 required instead of Type 1?}\\
+    A: When the business must reconstruct what was known at a past point in time, such as the customer's segment when an order was placed.
+    \item \textbf{[I, Ch.~5] Q: Which fact type models a process with milestones such as order, ship, deliver?}\\
+    A: An accumulating snapshot---one row per process instance, updated as each milestone completes.
+    \item \textbf{[I, Ch.~5] Q: When does a serverless SQL pool beat a dedicated pool on cost?}\\
+    A: When queries are infrequent or bursty, data is columnar and partition-pruned, and the bytes scanned per month cost less than keeping a provisioned pool running.
+    \item \textbf{[F, Ch.~6] Q: Why is clustered columnstore the default for large fact tables?}\\
+    A: Columnar compression cuts IO roughly 10$\times$, and analytics queries touch few columns, so a CCI reads only what is referenced.
+    \item \textbf{[I, Ch.~6] Q: What problem does hash distribution solve for large joins?}\\
+    A: It co-locates rows with equal keys on the same distribution, so joins execute locally without Data Movement Service shuffles.
+    \item \textbf{[I, Ch.~6] Q: What do workload classifiers map incoming queries to?}\\
+    A: Workload groups---based on login, role, label, or time---so each class of work gets reserved resources, caps, and importance.
+    \item \textbf{[I, Ch.~6] Q: When does a materialized view beat adding an index?}\\
+    A: When many queries repeat the same aggregation; a materialized view precomputes it, while an index only speeds row lookup and barely helps scans.
+    \item \textbf{[F, Ch.~7] Q: How is serverless SQL billed, and how do you cut that cost?}\\
+    A: Per TB of data processed. Use Parquet/Delta, partition pruning via \texttt{filepath()}, explicit schemas, and appropriately sized files.
+    \item \textbf{[F, Ch.~7] Q: What does CETAS do?}\\
+    A: CREATE EXTERNAL TABLE AS SELECT materializes a serverless query result back to the lake as Parquet or Delta---serverless ETL.
+    \item \textbf{[I, Ch.~7] Q: What is the logical data warehouse pattern?}\\
+    A: A serving layer of external tables and views over lake files, so BI queries a warehouse-shaped interface without copying data out of the lake.
+    \item \textbf{[I, Ch.~7] Q: What does Delta Lake add to plain files on ADLS Gen2?}\\
+    A: A transaction log that provides ACID commits, time travel, schema enforcement, and MERGE upserts over object storage.
+\end{enumerate}
+
+\section{Governance and Catalogs (Chapters 8 and 22)}
+
+\begin{enumerate}
+    \item \textbf{[F, Ch.~8] Q: What does a Purview scan automatically discover?}\\
+    A: Assets, schemas, and---via built-in and custom classifiers---sensitive data categories, organized into a searchable data map.
+    \item \textbf{[I, Ch.~8] Q: How does lineage help impact analysis before a schema change?}\\
+    A: The downstream query shows which views, models, and reports read a column, so you know exactly what breaks before you change it.
+    \item \textbf{[I, Ch.~8] Q: Why use Azure Data Share instead of copying files to a partner?}\\
+    A: Sharing in place keeps data governed: invitations, terms, snapshot schedules, and revocation replace an ungoverned copy in someone else's storage.
+    \item \textbf{[A, Ch.~8] Q: What is a data clean room, and what must it never expose?}\\
+    A: An architecture where parties match overlapping data via tokenized keys and exchange only aggregates; it must never expose row-level raw PII across the boundary.
+    \item \textbf{[I, Ch.~22] Q: How do sensitivity labels flow from Purview to Synapse and Power BI?}\\
+    A: Labels attach to classified columns and propagate with the data, so label-aware policies apply at the semantic-model and report layer.
+    \item \textbf{[I, Ch.~22] Q: Why run dbt tests or GE checkpoints before the load step?}\\
+    A: Bad data compounds through every downstream product; a gate before load quarantines failures while a gate after load only documents them.
+    \item \textbf{[I, Ch.~22] Q: What does Purview lineage show when a report suddenly breaks?}\\
+    A: The upstream chain---which dataset, pipeline, and job fed the report---turning impact analysis from archaeology into a query.
+    \item \textbf{[A, Ch.~22] Q: In a data mesh, what stays centralized?}\\
+    A: The rails: catalog, classification, label taxonomy, delivery templates, gate framework, access policy, and cost guardrails. Domains own products.
+\end{enumerate}
+
+\section{Batch Processing, ETL, and Orchestration (Chapters 9--12)}
+
+\begin{enumerate}
+    \item \textbf{[F, Ch.~9] Q: Why use job clusters instead of all-purpose clusters in production?}\\
+    A: They terminate on completion and bill 2--3$\times$ less per DBU; all-purpose clusters are priced for interactivity and keep billing while idle.
+    \item \textbf{[I, Ch.~9] Q: What does a Spark partition control during a shuffle?}\\
+    A: Parallelism and memory per task: each shuffle partition becomes one task; too few causes spill, too many floods the driver.
+    \item \textbf{[I, Ch.~9] Q: How do Delta Live Tables differ from plain Delta tables?}\\
+    A: DLT is a declarative pipeline framework---you define tables and expectations; the engine orchestrates computation, retries, and incremental refresh.
+    \item \textbf{[I, Ch.~9] Q: What is DBFS, and why should production data not live there?}\\
+    A: The workspace's root storage abstraction; production data belongs in governed ADLS accounts over ABFS, not workspace-scoped storage.
+    \item \textbf{[F, Ch.~10] Q: What is the difference between a linked service and a dataset?}\\
+    A: The linked service is the connection and credential to a system; the dataset is a parameterized pointer to specific data within it.
+    \item \textbf{[I, Ch.~10] Q: When do Mapping Data Flows beat hand-written Spark?}\\
+    A: For standard join/clean/conform transforms built by SQL-strong analysts; visual authoring and managed Spark beat code when the logic is boring.
+    \item \textbf{[I, Ch.~10] Q: What happens in ADF when no onFailure path is defined?}\\
+    A: The activity fails, the pipeline run fails, and nothing downstream runs---no notification unless external monitoring catches it.
+    \item \textbf{[I, Ch.~10] Q: How do you parameterize a pipeline for dev/test/prod promotion?}\\
+    A: Parameterize endpoints, paths, and environment names; keep one artifact set and swap parameter files per environment.
+    \item \textbf{[I, Ch.~11] Q: Why would you need a Self-Hosted Integration Runtime?}\\
+    A: When sources sit in private networks; the SHIR dials outbound to ADF, so no inbound firewall exposure is needed.
+    \item \textbf{[F, Ch.~11] Q: How does CDC differ from a nightly full extract?}\\
+    A: CDC streams deltas from the transaction log---minutes of latency, low source load, deletes representable---versus hours of latency and full table scans.
+    \item \textbf{[I, Ch.~11] Q: Is adding an optional field a breaking contract change?}\\
+    A: No---it is backward-compatible. Renaming a field or changing its type breaks existing consumers and requires a major version.
+    \item \textbf{[I, Ch.~11] Q: Who owns a data contract?}\\
+    A: The producer owns and versions it; consumers pin to versions, and breaking changes ship with a migration window.
+    \item \textbf{[I, Ch.~12] Q: When would you use an Until activity instead of a ForEach?}\\
+    A: Until waits on a predicate with a timeout (poll for a file or task state); ForEach iterates a known collection. Waiting is Until's job.
+    \item \textbf{[I, Ch.~12] Q: What problem does Managed Airflow in ADF solve?}\\
+    A: It runs existing Airflow DAG estates on managed infrastructure with Azure identity integration---no Airflow operations burden, no rewrite.
+    \item \textbf{[I, Ch.~12] Q: Why route failure notifications through a Logic App instead of plain email?}\\
+    A: Structured payloads become rich Teams cards with run links and runbook buttons, and one router workflow centralizes the notification logic.
+    \item \textbf{[A, Ch.~12] Q: What makes an orchestration layer self-healing?}\\
+    A: Arrival-driven triggers, isolated units of work, bounded retries for known faults, quarantine for data faults, and audit-driven reconciliation---with novel failures still paging humans.
+\end{enumerate}
+
+\section{Streaming and Real-Time (Chapters 13--15)}
+
+\begin{enumerate}
+    \item \textbf{[I, Ch.~13] Q: When do you choose Service Bus over Event Hubs?}\\
+    A: When messages are commands needing per-message settlement---complete, abandon, dead-letter---rather than a replayable event log.
+    \item \textbf{[I, Ch.~13] Q: Why does partition count cap consumer parallelism?}\\
+    A: One partition is read by at most one instance per consumer group; more instances than partitions leaves instances idle.
+    \item \textbf{[F, Ch.~13] Q: What does Event Hubs Capture automate?}\\
+    A: Batched delivery of stream traffic to ADLS Gen2 as Avro, on time/size windows, with no consumer code.
+    \item \textbf{[I, Ch.~13] Q: Why attach a unique eventId to every message?}\\
+    A: At-least-once delivery means duplicates; the eventId is the dedupe key that makes sink upserts idempotent.
+    \item \textbf{[F, Ch.~14] Q: Contrast tumbling and hopping windows with an example.}\\
+    A: Both are fixed-size; tumbling buckets are disjoint (five-minute counts), hopping overlap (ten-minute window every two minutes for a moving average).
+    \item \textbf{[I, Ch.~14] Q: What does the late-arrival tolerance control?}\\
+    A: How much older than the watermark an event may be; beyond it the event is adjusted to the tolerance edge or dropped, per policy.
+    \item \textbf{[A, Ch.~14] Q: Why does a silent input stall look like zero traffic?}\\
+    A: No events advance no watermark and emit no rows---identical to a genuinely empty period; only input and watermark metrics distinguish them.
+    \item \textbf{[A, Ch.~14] Q: How do you fix daily aggregates skewed by late mobile uploads?}\\
+    A: Raise and document the late-arrival tolerance for the reporting contract, and compute official dailies from the lake where late data reprocesses cleanly.
+    \item \textbf{[I, Ch.~15] Q: Micro-batch versus continuous processing---what is the trade-off?}\\
+    A: Micro-batch offers full operators and exactly-once at sub-second latency; continuous offers millisecond latency with a restricted operator set and at-least-once semantics.
+    \item \textbf{[I, Ch.~15] Q: Why does unbounded state kill a streaming job, and how do watermarks evict it?}\\
+    A: State per key accumulates until memory is exhausted; the watermark tells the engine it may evict state older than the tolerance behind the event-time frontier.
+    \item \textbf{[A, Ch.~15] Q: What must both sides of a stream-stream join declare?}\\
+    A: A watermark each, plus a time-range join condition, so join state retention is bounded on both sides.
+    \item \textbf{[A, Ch.~15] Q: Contrast checkpointing plus an idempotent Delta sink with at-least-once plus downstream dedup.}\\
+    A: The former pays the dedup cost once in the sink and gives consumers clean data; the latter pushes dedup to every consumer forever.
+\end{enumerate}
+
+\section{Business Intelligence and Serving (Chapter 16)}
+
+\begin{enumerate}
+    \item \textbf{[I, Ch.~16] Q: When does DirectQuery beat Import mode?}\\
+    A: When data must be current to the minute, when the dataset exceeds cache capacity, or when the warehouse is the governed source of truth and duplication adds risk.
+    \item \textbf{[I, Ch.~16] Q: How does RLS restrict what a regional sales manager sees?}\\
+    A: A role applies a DAX filter---ideally dynamic via \texttt{USERPRINCIPALNAME()} against a mapping table---that the engine applies to every query the user runs.
+    \item \textbf{[F, Ch.~16] Q: What is the difference between a measure and a calculated column?}\\
+    A: A column is computed at refresh and stored per row; a measure is computed at query time in the current filter context and responds to slicers.
+    \item \textbf{[F, Ch.~16] Q: Why mark a table as a date table?}\\
+    A: Time-intelligence functions like \texttt{SAMEPERIODLASTYEAR} require a contiguous, marked date table to compute correctly.
+\end{enumerate}
+
+\section{Machine Learning and Generative AI (Chapters 17--20)}
+
+\begin{enumerate}
+    \item \textbf{[F, Ch.~17] Q: What does T-SQL PREDICT eliminate from the scoring path?}\\
+    A: Data movement---no export jobs, no endpoints, no network round-trips; rows are scored where they already live.
+    \item \textbf{[I, Ch.~17] Q: When is in-database scoring preferable to a real-time endpoint?}\\
+    A: For batch or interactive scoring over warehouse-resident features, SQL-native operations teams, and data that must not leave the database perimeter.
+    \item \textbf{[F, Ch.~17] Q: In what format must a model be stored for Synapse PREDICT?}\\
+    A: ONNX, stored as varbinary in a table and referenced by the PREDICT function at scoring time.
+    \item \textbf{[I, Ch.~17] Q: What must be true of training and scoring feature schemas?}\\
+    A: They must match by name, type, and semantics---enforced by one shared feature view versioned with the model.
+    \item \textbf{[I, Ch.~18] Q: When would you choose AutoML over a custom training notebook?}\\
+    A: For baselines and well-structured tabular problems---AutoML sets the bar a custom model must beat to justify its complexity.
+    \item \textbf{[F, Ch.~18] Q: Why use AML compute clusters instead of compute instances for training?}\\
+    A: Clusters autoscale across nodes for training and scale to zero when idle; instances are single-node development desks.
+    \item \textbf{[I, Ch.~18] Q: How does AML securely access governed ADLS training data?}\\
+    A: Through a datastore bound to the workspace managed identity with lake RBAC---no keys, full audit trail.
+    \item \textbf{[I, Ch.~18] Q: What does model registration give you beyond saving a file?}\\
+    A: Versioned identity with lineage to data, environment, code, and metrics---the answer to ``what exactly produced this artifact.''
+    \item \textbf{[F, Ch.~19] Q: Real-time versus batch managed endpoints---which fits nightly scoring?}\\
+    A: Batch endpoints: millions of rows, minutes of latency tolerance, and compute that scales to zero between runs.
+    \item \textbf{[I, Ch.~19] Q: What is data drift, and how does AML detect it?}\\
+    A: Statistical divergence of production inputs from the training baseline; model monitoring compares collected production data against the baseline on a cadence.
+    \item \textbf{[A, Ch.~19] Q: What should trigger a retraining pipeline in a mature setup?}\\
+    A: Evidence---drift metrics crossing thresholds or quality decay on joined outcomes---not a calendar alone.
+    \item \textbf{[A, Ch.~19] Q: What should gate model promotion to production?}\\
+    A: A metric threshold on fresh data, shadow or canary comparison on live traffic, human approval, and a rollback plan.
+    \item \textbf{[F, Ch.~20] Q: Which service extracts key-value pairs from scanned invoices?}\\
+    A: Azure AI Document Intelligence---the prebuilt invoice model returns typed fields with confidence scores, no training needed.
+    \item \textbf{[I, Ch.~20] Q: Why trigger document processing with a Function on blob upload?}\\
+    A: Event-driven processing removes polling; the Function is right-sized because extraction latency lives in the service call, not local compute.
+    \item \textbf{[I, Ch.~20] Q: How do you make extracted document metadata searchable?}\\
+    A: Land structured JSON in the lake and index it in AI Search---keyword, vector, or hybrid depending on query patterns.
+    \item \textbf{[A, Ch.~20] Q: What PII risks arise when OCR-ing user-uploaded documents?}\\
+    A: OCR surfaces PII that structured schemas never declared; extracted text must be classified and redacted before it reaches searchable indexes.
+\end{enumerate}
+
+\section{Security, Privacy, and Compliance (Chapters 21 and 23)}
+
+\begin{enumerate}
+    \item \textbf{[F, Ch.~21] Q: Why prefer managed identities over service principal client secrets?}\\
+    A: Azure owns the credential lifecycle---no secret to store, rotate, or leak; tokens are issued to the resource on demand.
+    \item \textbf{[I, Ch.~21] Q: Private Endpoint versus Service Endpoint---what is the key difference?}\\
+    A: A private endpoint gives the resource a private IP in your VNet and enables disabling public access; a service endpoint only optimizes routing to the public IP.
+    \item \textbf{[I, Ch.~21] Q: What does the Key Vault SecretNearExpiry event enable?}\\
+    A: Automated rotation: an event-driven pipeline regenerates the credential at the source and publishes a new secret version with no code change.
+    \item \textbf{[A, Ch.~21] Q: What does VNet data-exfiltration protection in Synapse guard against?}\\
+    A: Outbound paths---notebooks or jobs copying data to endpoints outside the governed perimeter, even by credentialed users.
+    \item \textbf{[F, Ch.~23] Q: Who still sees unmasked values when Dynamic Data Masking is enabled?}\\
+    A: Users with the UNMASK permission---DDM is presentation-layer; the data and privileged access are unchanged.
+    \item \textbf{[I, Ch.~23] Q: Always Encrypted versus TDE---which protects data from database admins?}\\
+    A: Always Encrypted: keys are client-side in Key Vault and the engine holds only ciphertext; TDE decrypts transparently for anyone with query access.
+    \item \textbf{[I, Ch.~23] Q: Why tokenize PII before loading it into Synapse?}\\
+    A: So the analytics estate never holds raw PII---analysts work on tokens, and the mapping stays in a tightly controlled, separately encrypted store.
+    \item \textbf{[A, Ch.~23] Q: Why is a naive DELETE not GDPR erasure?}\\
+    A: Soft-delete windows, versioning, backups, Delta time travel, and stream retention all keep copies; crypto-shredding renders them unreadable by destroying the key.
+\end{enumerate}
+
+\begin{notebox}
+For system-design rounds, the capstones are the material: Chapter~5 (star schema with SCD2),
+Chapter~12 (event-driven orchestration), Chapter~15 (exactly-once streaming), Chapter~21
+(private-only perimeter), Chapter~23 (erasure-capable architecture), and Chapter~24 (the
+multi-subscription data mesh) each rehearse an end-to-end architecture you can draw and defend.
+\end{notebox}

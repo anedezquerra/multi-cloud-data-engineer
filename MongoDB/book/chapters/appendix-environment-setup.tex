@@ -1,0 +1,166 @@
+\chapter{Environment Setup Reference}
+\index{environment setup}\index{Atlas setup}\index{installation}%
+This appendix consolidates every setup decision the book makes into one reference: the Atlas
+hierarchy and cluster tiers, the local Community Server footprint, the client tools each chapter
+assumes, and the cost guardrails that keep a training environment free. Chapter~0 walks through
+each item with screenshots-level detail; use this appendix when you need the fact, not the tour.
+
+\section{The Atlas Hierarchy: Organization, Project, Cluster}
+\index{Atlas organization}\index{Atlas project}%
+Atlas nests resources in three levels, and every access-control and billing decision attaches to
+one of them.
+
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{2.6cm}p{4.6cm}p{5.6cm}@{}}
+\toprule
+\textbf{Level} & \textbf{Owns} & \textbf{Book convention} \\
+\midrule
+Organization & Billing, API keys, SSO/SCIM, all projects & One organization per learner or team \\
+Project & Clusters, database users, network access, alerts, integrations & One project: \texttt{MongoDB Book Labs} \\
+Cluster & Data, backups, tiers, regions & One M0 named \texttt{Cluster0} for cloud labs \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent Confirm the intended project is selected in the console before creating anything: most
+``where did my cluster go'' incidents are ``created in the wrong project'' incidents.
+
+\section{Cluster Tiers and When the Book Uses Each}
+\index{cluster tier}\index{M0}\index{Atlas tiers}%
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{2.2cm}p{3.4cm}p{6.2cm}@{}}
+\toprule
+\textbf{Tier} & \textbf{Cost posture} & \textbf{Characteristics and book usage} \\
+\midrule
+M0 (Free) & Free forever, no card & 512 MB storage, shared RAM, shared infrastructure. Chapters 0, 2--3, 9--11, 13--14 functional labs. Not for benchmarking. \\
+Flex & Low cost, capped & Up to 5 GB; bridging tier between M0 and dedicated. Optional for this book. \\
+M10+ (Dedicated) & Billed hourly & Dedicated RAM/CPU, storage autoscaling, backups with PITR, private endpoints, x.509, auditing, Online Archive. Required for Chapters 17--20's paid-feature labs. \\
+Serverless & Billed per read/write unit & Minimal configuration; auto-scaling. Alternative for Chapter 16's serverless exercises. \\
+Local Community & Free & Full engine access on Windows; required for Chapters 1, 5--8, 12 (storage files, replica sets, sharding, profiler). \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{pitfall}
+\textbf{Accidentally choosing a paid tier.} The cluster-creation screen places tiers near each
+other. Verify the tier reads \texttt{M0}, the price shows free, and no credit-card step appears.
+If the page asks about disk scaling, backup policy, or dedicated hardware, re-check the tier.
+\end{pitfall}
+
+\section{Local Community Server on Windows}
+\index{MongoDB Community Server}\index{mongod.cfg}\index{Windows service}%
+The MSI installer creates a Windows service named \texttt{MongoDB}, a YAML configuration file
+\texttt{mongod.cfg}, a data directory (\texttt{storage.dbPath}), and a log file
+(\texttt{systemLog.path}) under \texttt{C:\textbackslash Program Files\textbackslash
+MongoDB\textbackslash Server\textbackslash <version>\textbackslash}. The settings that matter for
+every local lab:
+
+\begin{itemize}
+    \item \texttt{net.bindIp: 127.0.0.1} --- localhost only; the correct default for all book labs.
+    \item \texttt{net.port: 27017} --- the default; replica-set labs use 28017--28019 (Chapter 5) and higher.
+    \item \texttt{storage.dbPath} --- where WiredTiger files live; inspect it in Chapter 1.
+    \item \texttt{systemLog.path} --- the first place to look when the service fails to start.
+\end{itemize}
+
+\noindent Manage the service from PowerShell: \texttt{Get-Service -Name MongoDB} to check,
+\texttt{Start-Service}/\texttt{Stop-Service -Name MongoDB} (elevated) to control. YAML indentation
+uses spaces, never tabs; a rejected config writes its reason to the log path.
+
+\section{Client and Data Tools}
+\index{mongosh}\index{MongoDB Compass}\index{Database Tools}\index{PyMongo}%
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{3.2cm}p{4.6cm}p{4.8cm}@{}}
+\toprule
+\textbf{Tool} & \textbf{Role in this book} & \textbf{Verify with} \\
+\midrule
+\texttt{mongosh} & Primary CLI for every chapter & \texttt{mongosh --version} \\
+MongoDB Compass & Visual inspection, schema sampling, index view & Connect with a saved lab URI \\
+Database Tools & \texttt{mongodump}, \texttt{mongorestore}, \texttt{mongoimport}, \texttt{mongoexport} & \texttt{mongodump --version} \\
+PyMongo & Python driver for migration, validation, and QE labs & \texttt{python -m pip show pymongo} \\
+Atlas CLI & Scriptable Atlas administration (Chapters 16, 20--21) & \texttt{atlas --version} \\
+Terraform + \texttt{mongodbatlas} provider & Declarative Atlas infrastructure (Chapter 21) & \texttt{terraform version} \\
+\texttt{kubectl} + Minikube & Operator labs (Chapter 22) & \texttt{minikube version} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent The Database Tools install separately from \texttt{mongosh}: installing the shell does
+not provide dump/restore/import/export. Add each tool's \texttt{bin} directory to \texttt{PATH}
+and verify before starting the chapter that needs it.
+
+\section{Drivers and Connection Hygiene}
+\index{driver}\index{connection string}%
+The Atlas \textbf{Connect} dialog emits per-target URIs (shell, Compass, driver). The SRV form,
+\texttt{mongodb+srv://user:<password>@cluster0.example.mongodb.net/db?retryWrites=true\&w=majority},
+discovers hosts through DNS. Rules the book enforces from Chapter 0 onward:
+
+\begin{itemize}
+    \item Never commit a URI containing credentials; inject secrets from environment variables or a CI secret store (Chapter 21).
+    \item URL-encode passwords containing \texttt{@}, \texttt{:}, \texttt{/}, \texttt{?}, or \texttt{\#}.
+    \item In PyMongo, construct one long-lived \texttt{MongoClient} per process with \texttt{serverSelectionTimeoutMS} set; ping before first use so configuration errors fail fast.
+    \item Serverless functions must warm-scope the client and bound \texttt{maxPoolSize}, or cold starts exhaust cluster connections (Chapter 16).
+\end{itemize}
+
+\section{Terraform Provider Quick Start}
+\index{Terraform}\index{mongodbatlas provider}%
+Chapter 21 manages Atlas declaratively. The minimal configuration: provider
+\texttt{mongodb/mongodbatlas} authenticated with an Atlas \emph{programmatic API key} (public and
+private key pair created at the organization or project level), resources
+\texttt{mongodbatlas\_project}, \texttt{mongodbatlas\_cluster},
+\texttt{mongodbatlas\_database\_user}, and \texttt{mongodbatlas\_project\_ip\_access\_list}. Keep
+the API private key in the CI secret store---never in a committed \texttt{.tfvars}---and run
+\texttt{terraform plan} as a pull-request gate before any \texttt{apply}
+\cite{mongodbTerraformDocs,terraformDocs}.
+
+\section{Cost Guardrails}
+\index{cost guardrails}\index{billing alerts}%
+\begin{itemize}
+    \item Create exactly one M0 cluster for the book; load only small synthetic datasets.
+    \item When M0 limits bite (512 MB storage, shared RAM), drop test data or move to the local server before considering an upgrade.
+    \item If any lab requires a paid tier (Chapters 17--20), document expected cost, duration, cleanup step, and owner \emph{before} enabling it; pause or terminate the cluster when the lab ends.
+    \item Configure Atlas billing alerts the moment a payment method exists; in an enterprise, wire the project into the organization's cost-management process.
+    \item Local labs have their own quota risks: a large import can fill the workstation disk, and noisy workloads grow log files. Use small datasets and clean up per chapter.
+\end{itemize}
+
+\section{Per-Chapter Tool Requirements}
+\index{tool requirements}%
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{1.2cm}p{5.2cm}p{6.0cm}@{}}
+\toprule
+\textbf{Ch.} & \textbf{Environment} & \textbf{Additional tools} \\
+\midrule
+0 & Atlas M0 + local Community Server & mongosh, Compass, Database Tools, PyMongo \\
+1 & Local server (WiredTiger files, config) & mongosh, PowerShell \\
+2--3 & Atlas M0 or local & mongosh, PyMongo (migration/validation scripts) \\
+4 & Local PostgreSQL + Atlas M0 & Relational Migrator (or mapping file), PyMongo \\
+5 & Three local \texttt{mongod} instances & mongosh, Windows firewall for partition drills \\
+6--7 & Local sharded cluster (mongos + CSRS + shards) & mongosh \\
+8 & Local sharded cluster or Atlas multi-region & mongosh \\
+9 & Local server or Atlas & mongosh, \texttt{explain()}, data generator \\
+10--11 & Atlas M0 or local & mongosh \\
+12 & Local server & mongosh, profiler, \texttt{serverStatus} \\
+13 & Atlas (Search supported from M0) & Atlas console or CLI for index definitions \\
+14 & Atlas (Vector Search from M0) & Embedding provider account, PyMongo \\
+15 & Atlas Stream Processing instance & Kafka (or Atlas-as-source), mongosh \\
+16 & Atlas & Atlas CLI/Triggers, Data API, function runtime \\
+17 & Local Enterprise or Atlas M10+ & OpenSSL for x.509 certificates \\
+18 & Atlas M10+ or Enterprise 7.0+ & PyMongo + QE shared library, AWS KMS (or local key provider for learning) \\
+19 & Atlas M10+ & Private endpoint-capable cloud account, SIEM or file sink \\
+20 & Atlas M10+ & Atlas CLI, Data Federation \\
+21 & Atlas + Git repository & Terraform, \texttt{mongodbatlas} provider, CI \\
+22 & Minikube on Windows & kubectl, MongoDB Community Operator manifests \\
+23 & Atlas (backups) or Ops Manager & mongodump/mongorestore, runbook template \\
+24 & All of the above & Timed-evaluation protocol from the chapter \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{tipbox}
+Re-run the Chapter 0 verification sequence---\texttt{db.runCommand(\{ ping: 1 \})}, insert, find,
+and \texttt{db.serverStatus().storageEngine}---after any OS update, Atlas maintenance event, or
+tool upgrade. A two-minute transcript beats a broken Thursday lab.
+\end{tipbox}

@@ -30,3 +30,8 @@ All notable changes to this repository are documented here.
 - New seventh platform: Databricks 24-week syllabus (`Databricks\main.tex`)
   and full book (`Databricks\book\`, chapters 0–24 + appendices), integrated
   into `build.ps1`.
+- Standardized appendix set across all seven books: cross-cloud equivalence
+  extended through Chapter 24 (now covering all seven platforms including
+  Databricks), environment setup, CLI/SQL quick reference, production and
+  governance checklists, lab/exercise solutions, certification exam-objective
+  mapping, and a consolidated interview question bank.

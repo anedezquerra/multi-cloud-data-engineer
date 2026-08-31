@@ -1,0 +1,355 @@
+\chapter{Lab Solutions and Solution Sketches}
+\index{lab solutions}\index{hands-on projects!solutions}%
+Solution sketches for every chapter's Thursday hands-on project (Chapters 1--24) and selected
+Chapter 0 exercises. Each entry gives the intended approach, the key commands or code shape, and
+the failure modes that cost students the most time. These are sketches, not the only correct
+answers: if your solution meets the chapter's acceptance criteria with different code, it counts.
+
+\section{Chapter 0: Setup Verification Exercises}
+\textbf{Approach.} Complete both paths---Atlas M0 and local Community Server---and capture the
+verification transcript for each: ping, insert, find, and (locally)
+\texttt{db.serverStatus().storageEngine} showing \texttt{wiredTiger}.
+
+\textbf{Key commands.}
+\begin{lstlisting}[language=bash, caption={Chapter 0 verification, both environments.}]
+mongosh "mongodb+srv://bookUser:<password>@cluster0.example.mongodb.net/booklabs"
+mongosh "mongodb://localhost:27017/booklabs"
+# inside mongosh, both targets:
+db.runCommand({ ping: 1 })
+db.chapter0.insertOne({ environment: "atlas" })   # or "local"
+db.chapter0.findOne({ environment: "atlas" })
+db.serverStatus().storageEngine                    # local only
+\end{lstlisting}
+
+\textbf{Common failure modes.} Authentication failure = wrong database user or an unencoded
+reserved character in the password; timeout = the IP access list no longer matches your current
+public IP; \texttt{mongodb+srv} DNS failure = blocked DNS or VPN intercept; local service down =
+read \texttt{mongod.cfg}'s log path before touching anything else.
+
+\section{Chapter 1: Configure and Observe WiredTiger}
+\textbf{Approach.} Run a local \texttt{mongod} with a development-only, explicitly small
+WiredTiger cache, generate a write workload larger than the cache, and watch
+\texttt{serverStatus().wiredTiger.cache} metrics move: bytes in cache, dirty bytes, eviction, and
+checkpoint counters.
+
+\textbf{Key commands.} Set \texttt{storage.wiredTiger.engineConfig.cacheSizeGB} in a lab
+\texttt{mongod.conf}; drive writes with a \texttt{mongosh} loop of
+\texttt{insertMany} batches; poll \texttt{db.serverStatus().wiredTiger.cache} and
+\texttt{.concurrentTransactions} between batches.
+
+\textbf{Common failure modes.} Editing the production service's \texttt{mongod.cfg} instead of a
+lab config; cache too small to start (keep $\geq$ 0.25 GB); reading averages instead of p99 and
+concluding ``no checkpoint effect''; forgetting that the OS page cache masks small datasets.
+
+\section{Chapter 2: Refactor a Product Catalog}
+\textbf{Approach.} Take the monolithic product document (sparse dynamic fields, unbounded
+reviews array) and split it: Attribute Pattern key-value array for specifications, Subset Pattern
+for the ten hottest reviews embedded, full reviews in a child collection. Migrate with a PyMongo
+script that writes the new shape and validates counts.
+
+\textbf{Key code shape.} \texttt{createIndex(\{"attrs.k": 1, "attrs.v": 1\})} for dynamic filters;
+migration loops \texttt{find()} batches, builds \texttt{bulkWrite} operations, and asserts
+\texttt{countDocuments} parity per source.
+
+\textbf{Common failure modes.} Migrating without a schema-version field so readers cannot tell
+old from new; embedding \emph{all} reviews (the unbounded-array bug returns); indexing each
+sparse spec field separately instead of the Attribute Pattern pair; no rollback script.
+
+\section{Chapter 3: Enterprise HR Validator}
+\textbf{Approach.} Create an \texttt{employees} collection with a \texttt{\$jsonSchema}
+validator covering required fields, types, enums, nested shapes, and array bounds; then insert
+valid and invalid documents from PyMongo and assert the rejection paths.
+
+\textbf{Key code shape.}
+\begin{lstlisting}[language=JavaScript, caption={Validator skeleton with strict rejection.}]
+db.createCollection("employees", { validator: { $jsonSchema: {
+  bsonType: "object", required: ["employeeId", "email", "roles"],
+  properties: {
+    email: { bsonType: "string", pattern: "^[^@]+@[^@]+$" },
+    roles: { bsonType: "array", maxItems: 5,
+             items: { enum: ["admin","editor","viewer"] } } } } },
+  validationLevel: "strict", validationAction: "error" })
+\end{lstlisting}
+
+\textbf{Common failure modes.} \texttt{validationAction: "warn"} left on, so bad documents
+silently land; pattern regexes that reject valid emails; testing only the happy path; forgetting
+that validators do not apply to pre-existing documents unless writes touch them.
+
+\section{Chapter 4: E-Commerce Relational Migrator Lab}
+\textbf{Approach.} Map twelve PostgreSQL tables into three MongoDB collections---orders with
+embedded line items, customers with embedded addresses, products---using Relational Migrator (or
+the provided mapping YAML); run initial sync, then CDC, then verify counts, document shape, and
+change propagation with a PyMongo script.
+
+\textbf{Key verification.} Per-table count reconciliation; spot-check embedded array cardinality
+against SQL \texttt{COUNT} grouped by parent; update a source row and time its appearance in Atlas.
+
+\textbf{Common failure modes.} One-table-to-one-collection mapping (the anti-pattern the chapter
+warns against); verifying counts while CDC is behind and declaring false divergence; cutover
+planned without a rollback authority (which system owns writes during reversal).
+
+\section{Chapter 5: Break a Replica Set on Purpose}
+\textbf{Approach.} Deploy three local \texttt{mongod} instances (ports 28017--28019) as
+\texttt{labrs}, then attack it: \texttt{rs.stepDown()}, kill a secondary, and partition the
+network with Windows firewall rules, writing continuously at \texttt{w:majority} throughout and
+recording availability windows.
+
+\textbf{Key commands.} \texttt{rs.initiate} with three members; a writer loop catching errors;
+\texttt{rs.status()} to watch term changes; \texttt{rs.printReplicationInfo()} for the oplog
+window; \texttt{New-NetFirewallRule -Block} to simulate the partition.
+
+\textbf{Common failure modes.} Forgetting \texttt{--oplogSize} so the default dwarfs the lab
+disk; reading \texttt{rs.status()} too late and missing the election; firewall rules left behind
+after the lab; concluding \texttt{w:1} is ``fine'' because rollback did not occur in a two-minute
+test.
+
+\section{Chapter 6: A Two-Shard Cluster on One Machine}
+\textbf{Approach.} Build the full topology locally: config server replica set, two shard
+\texttt{mongod} processes, and one \texttt{mongos}; enable sharding on a database, shard a
+collection with a hashed key, insert bulk data, and watch chunks form and distribute via
+\texttt{sh.status()} and the \texttt{config.chunks} collection.
+
+\textbf{Key commands.} \texttt{mongod --configsvr --replSet cfgrs}; \texttt{mongod --shardsvr};
+\texttt{mongos --configdb cfgrs/...}; then \texttt{sh.addShard(...)},
+\texttt{sh.enableSharding("booklabs")}, \texttt{sh.shardCollection("booklabs.events", \{userId: "hashed"\})}.
+
+\textbf{Common failure modes.} Starting \texttt{mongos} before the config server is initialized;
+querying a shard directly and concluding data ``disappeared'' (always query through
+\texttt{mongos}); undersized disks when four \texttt{mongod} processes share one drive.
+
+\section{Chapter 7: Break a Hot Shard, Then Refine It Live}
+\textbf{Approach.} Shard a collection on a low-cardinality region key, drive writes at one
+region until one shard is measurably hot and a jumbo chunk forms, then run
+\texttt{refineCollectionShardKey} to append a bucket suffix \emph{without downtime} and watch the
+balancer restore divisibility.
+
+\textbf{Key commands.} Generate documents with a \texttt{bucket} field cycling 0--63;
+\texttt{db.adminCommand(\{refineCollectionShardKey: "db.coll", key: \{region:1, \_id:1, bucket:1\}\})};
+observe with \texttt{sh.status()} and per-shard \texttt{serverStatus().opcounters}.
+
+\textbf{Common failure modes.} Attempting to change the key \emph{prefix} (requires
+\texttt{reshardCollection} or migration, not refinement); not backfilling the suffix field on
+existing documents; measuring ``hot'' by latency alone instead of shards-hit and per-shard ops.
+
+\section{Chapter 8: Zone-Pinned User Residency Lab}
+\textbf{Approach.} Tag shards as \texttt{EU} and \texttt{US}, map shard-key ranges of the
+country-code prefix to each zone, insert users with EU and US codes, and verify residency by
+reading the chunk map---not by trusting the insert path.
+
+\textbf{Key commands.} \texttt{sh.addShardToZone("shard0","EU")};
+\texttt{sh.updateZoneKeyRange("shop.users", \{cc:"A"\}, \{cc:"M"\}, "EU")}; verification loops
+\texttt{config.chunks} and asserts every EU-intersecting chunk lives on an EU-zoned shard.
+
+\textbf{Common failure modes.} Country codes not covered by any zone range floating anywhere
+(the silent violation); residency field not leading the shard key, so chunks straddle
+jurisdictions; proving residency once by hand instead of scheduling the assertion.
+
+\section{Chapter 9: Prove the ESR Rule on Five Million Documents}
+\textbf{Approach.} Generate five million orders, then benchmark the same query under three
+plans: no index, an ESR-violating compound index (range or sort first), and the correct
+equality--sort--range index, comparing \texttt{totalDocsExamined}, \texttt{nReturned}, and
+execution time. Finish with a rolling index build rehearsal.
+
+\textbf{Key commands.} \texttt{db.orders.explain("executionStats").find(\{status:"A"\}).sort(\{orderDate:-1\}).limit(50)};
+\texttt{createIndex(\{status:1, orderDate:-1\})} as the corrected version; rolling build by
+stopping one secondary as a standalone, building, rejoining, repeating, and stepping down last.
+
+\textbf{Common failure modes.} Datasets small enough to fit in cache so every plan looks fast;
+comparing cold-cache to warm-cache runs; \texttt{SORT\_KEY\_GENERATOR} missed in the plan tree;
+rolling build attempted on Atlas M0 (it hides the nodes---use the local set).
+
+\section{Chapter 10: Organizational Hierarchy Analytics}
+\textbf{Approach.} Generate a synthetic org chart, compute recursive headcount rollups with
+\texttt{\$graphLookup} (bounded by \texttt{maxDepth}, pruned by
+\texttt{restrictSearchWithMatch}), then join to budgets with \texttt{\$lookup} and reshape with
+\texttt{\$group}/\texttt{\$facet}.
+
+\textbf{Key code shape.} \texttt{\$graphLookup: \{from:"employees", startWith:"\$managerId",
+connectFromField:"managerId", connectToField:"\_id", as:"reports", maxDepth:10\}}; foreign side
+of every \texttt{\$lookup} indexed.
+
+\textbf{Common failure modes.} Unbounded \texttt{\$graphLookup} on cyclic data; \texttt{\$facet}
+output exceeding 16 MB; \texttt{\$match} placed after a reshaping stage, defeating pushdown.
+
+\section{Chapter 11: Financial Moving-Average Pipeline}
+\textbf{Approach.} Generate a ledger, then compute moving averages, ranks, and day-over-day
+derivatives with \texttt{\$setWindowFields} (\texttt{sortBy} on the date), and persist results
+with \texttt{\$merge} using a deterministic key so re-runs are idempotent. Add a lookback window
+to the incremental refresh so late events re-compute the frames they touch.
+
+\textbf{Key code shape.} \texttt{\$setWindowFields: \{partitionBy:"\$account", sortBy:\{date:1\},
+output:\{ma30:\{\$avg:"\$amount", window:\{range:[-30,"current"], unit:"day"\}\}\}\}}; then
+\texttt{\$merge: \{into:"daily\_stats", on:["account","date"], whenMatched:"replace"\}}.
+
+\textbf{Common failure modes.} Missing \texttt{sortBy} (nondeterministic frames);
+\texttt{\$rank} where the business wanted \texttt{\$denseRank}; refresh without lookback, so
+late-arriving ledger entries silently corrupt history; non-idempotent merge keys duplicating rows.
+
+\section{Chapter 12: The Un-Optimized Database Audit}
+\textbf{Approach.} Given a deliberately neglected database (redundant indexes, a spilling
+report, fat documents), run the audit sequence: profile to find slow operations, rank by total
+cost, \texttt{explain} the top offenders, fix ESR order, hide---then drop---unused indexes found
+via \texttt{\$indexStats}, and re-measure.
+
+\textbf{Key commands.} \texttt{db.setProfilingLevel(1, \{slowms:50\})};
+\texttt{db.system.profile.aggregate} grouped by query shape with \texttt{\$sum:"\$millis"};
+\texttt{db.coll.aggregate([\{\$indexStats:\{\}\}])}; \texttt{db.coll.hideIndex(...)} before any
+\texttt{dropIndex}.
+
+\textbf{Common failure modes.} Optimizing the worst-latency query instead of the
+highest-total-cost one; dropping an index inside its business cycle (month-end report breaks in
+three weeks); auditing only the primary while the analytics load runs on secondaries.
+
+\section{Chapter 13: Autocomplete Product Search}
+\textbf{Approach.} Define an Atlas Search index with an \texttt{autocomplete} (edge-ngram)
+mapping on the product title plus a token field for category, load the sample catalog, poll index
+status until caught up, and serve type-ahead queries through \texttt{\$search} as the first
+pipeline stage with facets for filters.
+
+\textbf{Key code shape.} Index JSON per the quick-reference appendix; query with
+\texttt{compound: \{must: [autocomplete], filter: [equals on category]\}}; \texttt{\$searchMeta}
+for facet counts.
+
+\textbf{Common failure modes.} Serving traffic before the index syncs (incomplete results, no
+error); leading-wildcard regex instead of edge-ngram tokenization; \texttt{\$search} not in first
+position; ngram fields ballooning index size on long text.
+
+\section{Chapter 14: The RAG Backend}
+\textbf{Approach.} Chunk the source documents, embed each chunk with the chosen provider, store
+chunks + vectors + tenant metadata in Atlas, define a vector index declaring every filter field,
+and answer questions by retrieving with \texttt{\$vectorSearch} (pre-filtered by tenant) and
+grounding the LLM prompt in the retrieved chunks.
+
+\textbf{Key code shape.} \texttt{\$vectorSearch: \{index:"vec", path:"embedding",
+queryVector:qvec, numCandidates:200, limit:10, filter:\{tenantId:\{\$eq:t\}\}\}}; score via
+\texttt{\$meta:"vectorSearchScore"}; hybrid variant fuses BM25 \texttt{\$search} and vector
+results with reciprocal rank fusion.
+
+\textbf{Common failure modes.} Filter fields undeclared in the index (over-fetch + cross-tenant
+risk); chunk sizes that break sentence semantics; Euclidean distance on text embeddings trained
+for cosine; no eval set, so prompt/index changes regress silently.
+
+\section{Chapter 15: Exactly-Once Kafka Windowed Pipeline}
+\textbf{Approach.} Wire a Kafka source into Atlas Stream Processing, compute tumbling-window
+aggregates with \texttt{\$group} over event-time windows, and sink with \texttt{\$merge} keyed
+deterministically on (window start, group key) so checkpoint replays re-emit harmlessly---
+at-least-once delivery absorbed by an idempotent sink.
+
+\textbf{Common failure modes.} Non-deterministic merge keys (duplicates on every restart);
+unbounded state from a high-cardinality group key; watermark too tight so late events are
+dropped silently; processor downtime longer than the oplog window invalidating resume state.
+
+\section{Chapter 16: Search-Index Sync Microservice}
+\textbf{Approach.} Consume a change stream, transform events, and upsert into a target
+collection or external index. Persist the resume token \emph{after} each successful sink write;
+on restart, resume with \texttt{resumeAfter}. Wrap the business write + event in an outbox where
+the consumer must not miss non-streamed writes.
+
+\textbf{Key code shape.} \texttt{coll.watch(pipeline, \{resumeAfter: savedToken\})}; token saved
+in a \texttt{consumer\_state} collection post-write; idempotent sink keyed on document
+\texttt{\_id} + operation time.
+
+\textbf{Common failure modes.} Saving the token before the sink write (event loss on crash);
+serverless consumers cold-starting unbounded connection pools; consumer paused past the oplog
+window (re-bootstrap from snapshot required); ``write then publish'' without an outbox.
+
+\section{Chapter 17: x.509 Cluster with Least-Privilege Roles}
+\textbf{Approach.} Stand up a local TLS-enabled cluster (or Atlas dedicated tier), issue client
+certificates from a lab CA with OpenSSL, authenticate services by certificate, and replace broad
+roles with custom roles granting per-collection, per-action privileges matching each service's
+documented access patterns.
+
+\textbf{Key commands.} \texttt{db.createRole(\{role:"ordersReader", privileges:[\{resource:
+\{db:"shop",collection:"orders"\}, actions:["find"]\}], roles:[]\})}; certificate login via
+\texttt{--tls --tlsCertificateKeyFile} and \texttt{\$external} users.
+
+\textbf{Common failure modes.} Certificate subject DN mismatch between user record and client
+cert; role edited in the shell and never captured in code; \texttt{AnyDatabase} roles creeping in
+``temporarily''; no alert on authorization-failure spikes after rollout.
+
+\section{Chapter 18: Queryable Encryption with AWS KMS}
+\textbf{Approach.} Configure a KMS customer master key, create data encryption keys per field,
+connect PyMongo with the QE shared library and \texttt{AutoEncryptionOpts}, insert a document,
+and query an encrypted equality field---verifying in the shell (without keys) that only
+ciphertext is stored.
+
+\textbf{Key code shape.} \texttt{ClientEncryption(kms\_providers=\{"aws":\{...\}\},
+key\_vault\_namespace="encryption.\_\_keyVault", ...)}; collection created with
+\texttt{encryptedFields} mapping field paths to DEK IDs; query with the QE-enabled client returns
+plaintext, a plain client returns ciphertext.
+
+\textbf{Common failure modes.} Querying with a client that lacks encryption config and seeing
+garbage; deterministic encryption on a low-cardinality field; underestimating the 2--4$\times$
+storage cost; no tested procedure for KMS key rotation and (for erasure) destruction.
+
+\section{Chapter 19: Auditing a Sensitive Collection}
+\textbf{Approach.} Enable Atlas auditing with a filter scoped to identity events plus DML on one
+sensitive collection, generate representative traffic (allowed and denied), ship logs off-host,
+and write the detection query that finds anomalous access---then verify the audit pipeline's own
+health is monitored.
+
+\textbf{Common failure modes.} Full-fidelity auditing drowning the signal and the disk; audit
+logs readable only on the host they describe; filter drift as new sensitive collections appear;
+alert rules tested against synthetic events but never against the real pipeline.
+
+\section{Chapter 20: Online Archive with a Federated Query}
+\textbf{Approach.} Create an Online Archive rule on a large time-series collection partitioned
+by the query date key, let aging data tier to object storage, and run an Atlas Data Federation
+query that unions live and archived data---measuring bytes scanned to confirm partition pruning
+works.
+
+\textbf{Common failure modes.} Partition key not matching the query predicate (unbounded scans,
+unbounded invoice); treating archive lag as replication lag; no documented path for
+\textbf{un}-archiving a mistaken rule; TTL and Online Archive rules fighting over the same data.
+
+\section{Chapter 21: The Three-Environment GitOps Pipeline}
+\textbf{Approach.} Structure a repository as \texttt{envs/dev}, \texttt{envs/stage},
+\texttt{envs/prod} Terraform roots sharing modules; CI runs \texttt{terraform plan} on pull
+requests and \texttt{apply} on merge, with remote state locked and Atlas API keys injected from
+the CI secret store. Bundle the schema-contract test (validators, indexes) into the same pipeline
+stage.
+
+\textbf{Common failure modes.} Local state committed to the repo; API keys in
+\texttt{.tfvars}; schema change and infrastructure change validated separately and shipped
+incompatibly; down-migrations attempted under pressure instead of forward-only fixes.
+
+\section{Chapter 22: Minikube Operator Lab}
+\textbf{Approach.} Start Minikube, install the MongoDB Community Operator via its manifests,
+apply a \texttt{MongoDBCommunity} custom resource describing a three-member replica set with
+TLS, then drill the reconciliation loop: delete a pod and watch it heal, roll an upgrade, and
+confirm members rejoin with health gates between steps.
+
+\textbf{Key commands.} \texttt{minikube start}; \texttt{kubectl apply -f
+mongodbcommunity.yaml}; \texttt{kubectl get pods -w}; \texttt{kubectl delete pod <member-1>} and
+observe; \texttt{kubectl describe mongodbcommunity} for status conditions.
+
+\textbf{Common failure modes.} Expecting the operator to choose shard keys or sizing (it
+reconciles; it does not design); PVCs left behind after \texttt{minikube delete} consuming disk;
+TLS secrets created in the wrong namespace; judging readiness by pod Running state instead of
+replica-set health.
+
+\section{Chapter 23: The PITR Restore Drill}
+\textbf{Approach.} Pick a target timestamp, restore the preceding snapshot to a \emph{new}
+cluster, replay retained oplog entries to the exact point, run the validation queries (counts,
+checksums, application smoke tests), and record measured RTO and RPO against their targets.
+Finish with the runbook update the drill revealed.
+
+\textbf{Common failure modes.} Restoring onto the production cluster; assuming PITR granularity
+equals snapshot interval rather than oplog retention; drills executed only by the runbook author;
+backup job failures unmonitored until restore day.
+
+\section{Chapter 24: The Timed Evaluation and Gap Sprints}
+\textbf{Approach.} Sit the chapter's timed self-evaluation under exam conditions, score it
+against the answer rubric, and convert every missed objective into a one-day gap sprint: rebuild
+the lab, re-derive the concept from the chapter, and re-test within 48 hours. Close with the
+Milestone 6 capstone: the full GitOps platform deployment defended with evidence.
+
+\textbf{Common failure modes.} Studying the evaluation instead of sitting it; gap ``review''
+without a rebuilt lab (recognition is not recall); the capstone demoed without its runbook,
+checklist evidence, or cost teardown.
+
+\begin{tipbox}
+For every lab, the transcript is the deliverable. Save the commands, the expected output, and the
+one thing that surprised you; that habit is what Chapters 23 and 24 later grade as
+production-grade judgment.
+\end{tipbox}

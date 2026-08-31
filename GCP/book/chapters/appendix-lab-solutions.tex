@@ -1,0 +1,375 @@
+\chapter{Lab Solutions and Solution Sketches}
+\index{lab solutions}\index{hands-on projects!solutions}%
+This appendix sketches a reference solution for every chapter's Thursday hands-on project plus
+selected exercises (Chapters~0--24). Each sketch gives the \textbf{approach}, the \textbf{key
+commands or code}, and the \textbf{common failure modes} that consume the most debugging time.
+These are sketches, not the only correct solutions---if your version satisfies the chapter's
+acceptance criteria differently, it is equally valid.
+
+\section{Chapter 0: Environment Verification}
+\textbf{Approach.} Prove the toolchain end-to-end before any service work: authenticate, set
+defaults, create/list/delete a temporary bucket.
+
+\textbf{Key commands.} \texttt{gcloud init}; \texttt{gcloud auth list}; \texttt{gcloud config
+list}; \texttt{gcloud storage buckets create gs://\$env:BUCKET -{}-location=us-central1};
+\texttt{gcloud storage ls}; \texttt{gcloud storage rm -r gs://\$env:BUCKET}.
+
+\textbf{Common failure modes.} API not enabled on the learner project (enable
+\texttt{storage.googleapis.com}); billing not linked (buckets cannot be created); wrong active
+configuration after switching projects; PowerShell quoting of \texttt{gs://} URIs (use single
+quotes or variables).
+
+\section{Chapter 1: Bucket, Lifecycle, Transfer, and Client Code}
+\textbf{Approach.} Create a regional bucket next to the compute; upload objects with
+\texttt{gcloud storage cp}; attach a lifecycle JSON transitioning to Nearline at 30 days and
+deleting at 365; run a Storage Transfer Service job from a second bucket; finish with the Python
+\texttt{google-cloud-storage} client listing and downloading via ADC.
+
+\textbf{Key commands.} \texttt{gcloud storage buckets update gs://B -{}-lifecycle-file=life.json};
+\texttt{gsutil versioning set on gs://B}; \texttt{gcloud transfer jobs create SRC gs://B}.
+
+\textbf{Common failure modes.} Lifecycle rules that never fire because the condition field name is
+wrong (\texttt{age} is days since creation, not modification); transfers validating nothing
+(bytes/counts/checksums are the acceptance evidence); client code failing on missing
+\texttt{application-default login}.
+
+\section{Chapter 2: HA Cloud SQL PostgreSQL, Read Replica, and Failover}
+\textbf{Approach.} Create a regional (HA) Cloud SQL PostgreSQL instance with private IP; add a
+cross-zone read replica; connect with \texttt{psql} over the private address; trigger failover from
+the console or CLI and time the promotion; verify the replica continues serving reads during
+primary failover.
+
+\textbf{Key commands.} \texttt{gcloud sql instances create pg -{}-region=us-central1
+-{}-availability-type=REGIONAL -{}-network=default -{}-no-assign-ip}; \texttt{gcloud sql instances
+create pg-replica -{}-master-instance-name=pg}; \texttt{gcloud sql instances failover pg}.
+
+\textbf{Common failure modes.} Private IP without allocated ranges/peering (allocate with
+\texttt{compute networks vpc-peerings}); confusing HA standby with read replica---the standby is
+not readable; testing read-after-write on the replica and hitting replication lag.
+
+\section{Chapter 3: Multi-Region Cart Lab}
+\textbf{Approach.} Create a multi-region Spanner instance, a \texttt{Carts} table keyed by a
+high-cardinality customer ID, and an interleaved \texttt{CartItems} child; write through the
+client library; inspect Key Visualizer for hotspotting after a load burst.
+
+\textbf{Key commands.} \texttt{gcloud spanner instances create cart -{}-config=nam3
+-{}-nodes=1}; DDL via \texttt{gcloud spanner databases ddl update} with \texttt{INTERLEAVE IN
+PARENT}.
+
+\textbf{Common failure modes.} Monotonically increasing keys (timestamps as leading key) creating
+one hot split; interleaving a child that is scanned independently; expecting Cloud-SQL-style
+replica semantics---Spanner's replicas are synchronous quorum members, not read copies.
+
+\section{Chapter 4: IoT Temperature Sensor Ingestion}
+\textbf{Approach.} Design a row key \texttt{device\_id\#reversed\_timestamp}; create the table
+with one column family; batch-write synthetic readings with the Python client or \texttt{cbt};
+read recent history with a small prefix range scan; confirm even load in Key Visualizer.
+
+\textbf{Key commands.} \texttt{gcloud bigtable instances create iot -{}-cluster=iot-c1
+-{}-cluster-zone=us-central1-a -{}-cluster-num-nodes=1}; \texttt{cbt createtable readings};
+\texttt{cbt set readings rowkey cf:temp=22.5}.
+
+\textbf{Common failure modes.} Lexicographic key mistakes (unpadded numbers sort wrong: zero-pad);
+forgotten reversed timestamp making ``latest'' reads scan the whole entity; salting applied without
+planning the read fan-out; leaving the one-node cluster running after the lab (it bills).
+
+\section{Chapter 5: GitHub Public Dataset Analytics}
+\textbf{Approach.} Query \texttt{bigquery-public-data.github\_repos.sample\_commits}: UNNEST the
+repeated \texttt{repo\_name}, aggregate daily commits per repository, and compute a seven-day
+rolling average with an explicit \texttt{ROWS BETWEEN 6 PRECEDING AND CURRENT ROW} frame. Verify
+one window by hand.
+
+\textbf{Key commands.} \texttt{bq show bigquery-public-data:github\_repos.sample\_commits};
+\texttt{bq query -{}-nouse\_legacy\_sql "SELECT ..."}; dry-run first with \texttt{-{}-dry\_run}.
+
+\textbf{Common failure modes.} Forgetting UNNEST and counting array rows instead of elements;
+window without PARTITION BY (one giant global average); legacy SQL syntax errors (the backtick
+identifier style); skipping the bytes-processed estimate and scanning the full table.
+
+\section{Chapter 6: Measuring Scan Strategies}
+\textbf{Approach.} Take one unpartitioned table and create three variants---partitioned,
+partitioned+clustered, and a materialized view over the hot aggregation. Run the same selective
+query against each, recording bytes billed from dry runs and execution plans; identify the skewed
+stage by per-slot output.
+
+\textbf{Key commands.} \texttt{bq query -{}-dry\_run} per variant; DDL with \texttt{PARTITION BY
+DATE(d) CLUSTER BY customer\_id}; \texttt{CREATE MATERIALIZED VIEW mv AS SELECT d, customer\_id,
+SUM(amount) ...}.
+
+\textbf{Common failure modes.} Comparing cached results (disable result cache for timing);
+partitioning on a high-cardinality column (partition explosion); expecting the materialized view to
+accelerate queries whose SQL it cannot match; clustering column chosen with low filter selectivity.
+
+\section{Chapter 7: External CSVs Joined with Native GIS Data}
+\textbf{Approach.} Define an external table over CSVs in Cloud Storage, join against a native
+table with \texttt{GEOGRAPHY} columns, and answer a containment question with \texttt{ST\_WITHIN}.
+Compare cost and latency against loading the CSVs natively.
+
+\textbf{Key commands.} \texttt{bq mkdef -{}-source\_format=CSV -{}-autodetect gs://B/sales/*.csv >
+def.json}; \texttt{bq mk -{}-external\_table\_definition=def.json DS.sales\_ext}; SQL with
+\texttt{ST\_GEOGRAPHYFROMTEXT} and \texttt{ST\_WITHIN}.
+
+\textbf{Common failure modes.} Header row parsed as data (\texttt{skip\_leading\_rows}); schema
+drift between CSV files (autodetect masks it until the join fails); assuming external tables
+prune---every query scans every file; point-in-polygon argument order swapped.
+
+\section{Chapter 8: BigLake Security and an Analytics Hub Listing}
+\textbf{Approach.} Create a BigLake connection and an external table over the lake bucket; attach
+policy tags to the sensitive column and a row access policy; publish the curated dataset as an
+Analytics Hub listing and subscribe from a second project or identity.
+
+\textbf{Key commands.} \texttt{bq mk -{}-connection -{}-location=US -{}-connection\_type=CLOUD\_RESOURCE
+lake\_conn}; \texttt{CREATE ROW ACCESS POLICY}; console/CLI Analytics Hub \texttt{create listing}
+and \texttt{subscribe}.
+
+\textbf{Common failure modes.} The connection's service account lacking \texttt{storage.objectViewer}
+on the bucket; testing security only with the owner identity (negative tests need a second
+identity); expecting subscribers to see updates to revoked listings.
+
+\section{Chapter 9: Ephemeral PySpark Sales Aggregation}
+\textbf{Approach.} Create a Dataproc cluster sized for one job (or use a serverless batch), submit
+a PySpark aggregation reading CSVs from Cloud Storage and writing Parquet back, then delete the
+cluster in the same session. Compare wall time and cost against Dataproc Serverless.
+
+\textbf{Key commands.} \texttt{gcloud dataproc clusters create spark9 -{}-max-idle=30m};
+\texttt{gcloud dataproc jobs submit pyspark agg.py -{}-cluster=spark9 -{}-region=us-central1};
+\texttt{gcloud dataproc clusters delete spark9}.
+
+\textbf{Common failure modes.} Reading via \texttt{file://} instead of \texttt{gs://} (workers see
+nothing); executor OOM on a skewed key (inspect Spark UI, fix skew before raising memory);
+forgetting teardown; version mismatch between local PySpark and the cluster image.
+
+\section{Chapter 10: No-Code Customer Cleansing to BigQuery}
+\textbf{Approach.} In a developer-edition Data Fusion instance, use Wrangler to clean a customer
+CSV sample (trim, case-normalize, parse dates, dedupe), promote the directives into a pipeline
+reading Cloud Storage and writing BigQuery, then schedule it and parameterize dates with macros.
+
+\textbf{Key commands.} Studio UI for Wrangler and pipeline deploy;
+\texttt{gcloud data-fusion instances stop I -{}-location=L} after the lab.
+
+\textbf{Common failure modes.} Public-IP instance unable to reach internal sources (use private
+IP); directives validated on a 100-row sample failing on full-scale edge cases; BigQuery sink
+schema mismatch rejecting rows silently into errors; leaving the instance running (bills hourly).
+
+\section{Chapter 11: PostgreSQL CDC to BigQuery with a Contract Test}
+\textbf{Approach.} Enable logical replication on a source Cloud SQL PostgreSQL
+(\texttt{cloudsql.logical\_decoding=on}), create Datastream connection profiles for source and
+BigQuery, start a stream with backfill, and add a contract test: apply a nullable-column addition
+(should pass) and a rename (should fail loudly).
+
+\textbf{Key commands.} \texttt{gcloud datastream connection-profiles create ... -{}-type=postgresql};
+\texttt{gcloud datastream streams create S -{}-source=CP1 -{}-destination=CP2};
+\texttt{gcloud datastream streams list} for freshness lag.
+
+\textbf{Common failure modes.} Logical decoding flag unset or replication role missing; publication
+not covering the migrated tables; BigQuery apply ordering issues when the merge key is ambiguous;
+renames treated as drop+add breaking downstream views.
+
+\section{Chapter 12: The File-Triggered ELT DAG}
+\textbf{Approach.} Build a Composer DAG that senses a partner file in Cloud Storage, loads it to a
+BigQuery staging table, merges into curated with idempotent partition overwrite, runs a Dataform
+assertion, and notifies with \texttt{trigger\_rule=all\_done}. Rerun a past date to prove
+idempotency.
+
+\textbf{Key commands.} \texttt{gcloud composer environments storage dags import -{}-source=elt.py};
+\texttt{gcloud composer environments run E -{}-location=L dags trigger -{}- file\_elt};
+\texttt{dataform compile} locally before upload.
+
+\textbf{Common failure modes.} Sensor timeout shorter than real arrival variance; non-idempotent
+INSERT duplicating rows on retry; XComs carrying row payloads (task failures on size); environment
+still building when the first DAG is uploaded (Composer creation takes 20+ minutes).
+
+\section{Chapter 13: Financial Transactions with a Dead-Letter Net}
+\textbf{Approach.} Create a transactions topic with an Avro schema, a subscription with a
+dead-letter topic at five delivery attempts, and a publisher sending both valid and malformed
+messages. Watch the malformed ones route to the DLQ with attempt metadata, then triage and republish.
+
+\textbf{Key commands.} \texttt{gcloud pubsub topics create txn -{}-schema=txn-schema};
+\texttt{gcloud pubsub subscriptions create txn-sub -{}-topic=txn -{}-dead-letter-topic=txn-dlq
+-{}-max-delivery-attempts=5}; \texttt{gcloud pubsub subscriptions pull txn-dlq-sub}.
+
+\textbf{Common failure modes.} Schema encoding mismatch (BINARY vs JSON) rejecting every publish;
+DLQ without its own subscription (messages accumulate unobserved); assuming ordering without
+ordering keys; alerting absent on \texttt{oldest\_unacked\_message\_age}.
+
+\section{Chapter 14: WordCount on the Dataflow Runner}
+\textbf{Approach.} Port the local DirectRunner WordCount to Dataflow: same Beam code, new runner
+flags. Then unit-test a custom ParDo with \texttt{TestPipeline} and \texttt{PAssert} in CI before
+any cloud run; package the result as a Flex Template.
+
+\textbf{Key commands.} \texttt{python wordcount.py -{}-runner=DataflowRunner -{}-project=P
+-{}-region=R -{}-temp\_location=gs://B/tmp -{}-staging\_location=gs://B/stg}; \texttt{gcloud
+dataflow flex-template build/run}.
+
+\textbf{Common failure modes.} Missing \texttt{temp\_location}/\texttt{staging\_location}; worker
+SDK version mismatch with the local Beam version; unserializable DoFn closures (module-level
+imports inside the DoFn); expecting Classic templates to accept runtime graph parameters (use
+Flex).
+
+\section{Chapter 15: Sessionized Clicks with Late Data}
+\textbf{Approach.} Extend streaming WordCount thinking to sessions: key clicks by user, apply
+session windows with a 30-minute gap, configure allowed lateness, and emit late arrivals to a side
+output. Land results in BigQuery via the Storage Write API; test windowing locally with
+\texttt{TestStream}.
+
+\textbf{Key commands.} Beam \texttt{Window.into(Sessions(gap\_duration=30*60))},
+\texttt{.with\_allowed\_lateness(...)}, \texttt{.accumulating\_fired\_panes()};
+\texttt{-{}-streaming -{}-enable\_streaming\_engine}.
+
+\textbf{Common failure modes.} Unbounded state from missing watermark GC; session gap too small
+(over-fragmented sessions); at-least-once sink without dedup double-counting after retries;
+cancelling instead of draining during redeploys (lost in-flight windows).
+
+\section{Chapter 16: Streaming Dashboard and Reverse-ETL Sync}
+\textbf{Approach.} Point Looker Studio (or Looker with a LookML model) at the streaming BigQuery
+table from Chapter~15 for a live dashboard; then build a reverse-ETL sync pushing a computed
+segment (for example high-value users) into a CRM-shaped table/file, with identity resolution
+validated first.
+
+\textbf{Key commands.} LookML \texttt{explore}/\texttt{measure} definitions in Git; scheduled query
+for the segment; \texttt{bq query} delta extraction keyed on \texttt{updated\_at}.
+
+\textbf{Common failure modes.} Dashboard re-implementing a metric that belongs in the semantic
+layer; syncing on warehouse IDs that do not match CRM identifiers (green pipeline, wrong people);
+sync frequency set tighter than the API rate limit and budget allow.
+
+\section{Chapter 17: Churn Prediction on Google Analytics Data}
+\textbf{Approach.} On the Google Analytics sample dataset in BigQuery, engineer per-user features
+in SQL, train \texttt{BOOSTED\_TREE\_CLASSIFIER} (after a logistic-regression baseline), evaluate
+with \texttt{ML.EVALUATE} on a time-held-out split, and serve predictions with
+\texttt{ML.PREDICT}.
+
+\textbf{Key commands.} \texttt{CREATE OR REPLACE MODEL ds.churn OPTIONS(model\_type='BOOSTED\_TREE\_CLASSIFIER',
+input\_label\_cols=['churned']) AS SELECT ...}; \texttt{SELECT * FROM ML.EVALUATE(MODEL ds.churn, ...)}.
+
+\textbf{Common failure modes.} Label leakage (features computed from events after the prediction
+date); reporting accuracy on a 5\% churn base rate; random split instead of time split inflating
+metrics; exporting the model to Vertex before the BQML baseline is even measured.
+
+\section{Chapter 18: AutoML Tabular from BigQuery to a Live Endpoint}
+\textbf{Approach.} Register the churn feature table as a Vertex AI dataset, launch an AutoML
+Tabular training job, review feature attributions, deploy the model to an endpoint, smoke-test
+with one prediction, then undeploy.
+
+\textbf{Key commands.} \texttt{gcloud ai endpoints create -{}-display-name=churn};
+\texttt{gcloud ai endpoints deploy-model E -{}-model=M -{}-region=R -{}-min-replica-count=1};
+\texttt{gcloud ai endpoints predict E -{}-json-request=req.json}; \texttt{gcloud ai endpoints
+undeploy-model} immediately after.
+
+\textbf{Common failure modes.} Endpoint left deployed (replica-hours bill); traffic split summing
+to less than 100\%; attributions misread as causal; requesting online latency for a nightly batch
+problem.
+
+\section{Chapter 19: Extract--Train--Deploy Pipeline}
+\textbf{Approach.} Compose a Kubeflow (Vertex Pipelines) DAG: a BigQuery extract component, a
+train component, an evaluation gate, and a conditional deploy component that registers the model
+only when metrics beat the incumbent. Compile with the KFP SDK and run on Vertex Pipelines.
+
+\textbf{Key commands.} \texttt{from google\_cloud\_aiplatform import pipeline\_jobs};
+\texttt{compiler.Compiler().compile(pipeline\_fn, 'pipeline.json')};
+\texttt{pipeline\_jobs.PipelineJob(...).run()}.
+
+\textbf{Common failure modes.} Components passing large data through parameters instead of
+artifact URIs; evaluation gate comparing against a stale incumbent metric; missing region match
+between pipeline job and staging bucket; triggering retraining on a schedule instead of on drift
+evidence.
+
+\section{Chapter 20: Streaming Review Sentiment to BigQuery}
+\textbf{Approach.} Stream synthetic product reviews through Pub/Sub into a Dataflow job that calls
+the Natural Language API (\texttt{analyzeSentiment}) with batching and bounded concurrency, writes
+annotated rows to BigQuery, and dead-letters permanent API failures.
+
+\textbf{Key commands.} Python client \texttt{language\_v1.LanguageServiceClient().analyze\_sentiment};
+pipeline options with \texttt{-{}-streaming}; DLQ subscription on the input topic.
+
+\textbf{Common failure modes.} One API call per element at full parallelism (quota errors and a
+linear bill---batch and throttle); retries without backoff hammering a 429; cost forecast skipped
+until the invoice; sentiment treated as per-entity when \texttt{analyzeEntitySentiment} was needed.
+
+\section{Chapter 21: Perimeter Around a BigQuery Dataset}
+\textbf{Approach.} Create a VPC Service Controls perimeter enclosing the analytics project, scoped
+to the BigQuery and Storage APIs; add an access level for the administrator's IP; then run the
+negative test from an outside identity holding valid credentials and confirm denial plus an
+audit-log alert.
+
+\textbf{Key commands.} \texttt{gcloud access-context-manager perimeters create P
+-{}-resources=projects/N -{}-restricted-services=bigquery.googleapis.com,storage.googleapis.com};
+\texttt{gcloud access-context-manager levels create}; negative test via a second gcloud
+configuration.
+
+\textbf{Common failure modes.} Testing only with the owner (control proves nothing); forgetting
+CI/orchestration identities in ingress rules (pipelines break at enforcement); dry-run perimeter
+left in dry-run forever; assuming IAM denial and perimeter denial are the same signal in logs.
+
+\section{Chapter 22: A Governed Lake with a Protected Salary Column}
+\textbf{Approach.} Create a Dataplex lake with raw and curated zones, attach the HR bucket and
+BigQuery dataset as assets, build a tag template (\texttt{owner}, \texttt{classification},
+\texttt{retention}), apply a policy tag to the salary column, schedule an AutoDQ scan on the
+curated table, and verify lineage from the dashboard table back to the raw file.
+
+\textbf{Key commands.} \texttt{gcloud dataplex lakes create hr -{}-location=L};
+\texttt{gcloud dataplex zones create curated -{}-lake=hr -{}-type=CURATED};
+\texttt{gcloud dataplex datascans create data-quality hr-dq -{}-data=//bigquery.../table}.
+
+\textbf{Common failure modes.} Zones created without an access posture decision (raw world-readable);
+tag templates conflated with policy tags (metadata vs enforcement); AutoDQ suggested rules accepted
+without declaring owned completeness/freshness rules; lineage gaps from jobs run under personal
+credentials.
+
+\section{Chapter 23: Inspect and De-identify Sensitive Files}
+\textbf{Approach.} Run a DLP inspection job over a bucket of synthetic customer files, land
+findings in BigQuery, then de-identify with masking for analytics and KMS-wrapped format-preserving
+tokenization where re-identification is a governed operation; finish with k-anonymity risk analysis
+on the ``safe'' output.
+
+\textbf{Key commands.} \texttt{gcloud dlp jobs triggers create -{}-storage-type=gcs ...}; DLP
+\texttt{deidentify} API with \texttt{CryptoReplaceFfxFpeConfig} referencing a KMS-wrapped key;
+risk-analysis job via the DLP API.
+
+\textbf{Common failure modes.} InfoTypes too broad (false-positive floods) or too narrow (missed
+formats); treating masking as reversible; token key stored unwrapped beside the data; assuming
+tokenization alone anonymizes---quasi-identifiers re-identify; inspecting only the lake while
+backups and replicas retain cleartext.
+
+\section{Chapter 24: Terraform + Dataform + CI with an Expand-Contract Drill}
+\textbf{Approach.} Provision the lab project (dataset, tables, schedules) with Terraform from a
+GCS-backend state; define the mart in Dataform SQLX with assertions; wire Cloud Build so every PR
+runs \texttt{terraform plan} + \texttt{dataform compile} and merges run apply; then perform one
+expand--contract column rename across four deployments without a red dashboard.
+
+\textbf{Key commands.} \texttt{terraform init/plan/apply}; \texttt{dataform compile};
+\texttt{gcloud builds triggers create github ...}; Workload Identity Federation pool and provider
+for keyless CI.
+
+\textbf{Common failure modes.} Local state drifting between runs; apply running on PR instead of
+post-merge; rename done in one release (views break at deploy time); CI authenticating with a
+committed service-account key (disqualifying); assertion written after the fact instead of gating
+the run.
+
+\section{Selected Exercises}
+\index{exercises!solutions}%
+\textbf{Chapter 0 (conceptual).} Why avoid daily use of Owner? Because every mistake and every
+compromise inherits Owner's blast radius; least privilege makes errors survivable.
+
+\textbf{Chapter 3 (design).} Choosing between Spanner and sharded Cloud SQL: pick Spanner when
+global strong consistency and horizontal scale are requirements; pick Cloud SQL when the workload
+is regional and relational features outweigh scale---the interview answer names the requirement
+first, the product second.
+
+\textbf{Chapter 5 (hands-on).} SCD2 MERGE correctness: match on business key \emph{and}
+\texttt{is\_current = TRUE}; close the current row (\texttt{valid\_to}, \texttt{is\_current=false})
+and insert the new version in one MERGE.
+
+\textbf{Chapter 13 (conceptual).} At-least-once is not a bug to fix but a guarantee to design
+around: idempotent consumers plus a dedup horizon sized to the replay window.
+
+\textbf{Chapter 17 (design).} Overfitting evidence: a large gap between \texttt{ML.EVALUATE} on
+training versus time-held-out data; remediation is simpler features and regularization, not more
+data of the same leaky kind.
+
+\textbf{Chapter 21 (hands-on).} The negative perimeter test is the deliverable, not an afterthought:
+without a denied request, the perimeter is a hope.
+
+\textbf{Chapter 24 (architecture).} Three-project mesh CI topology: one state prefix per project,
+applies ordered A (ingest) $\rightarrow$ C (governance) $\rightarrow$ B (analytics exposure), with
+cross-project outputs passed through remote state data sources---never hardcoded project numbers.

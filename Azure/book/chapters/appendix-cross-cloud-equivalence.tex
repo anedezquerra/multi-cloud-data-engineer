@@ -1,18 +1,51 @@
 \chapter{Cross-Cloud Service Equivalence}
 \index{cross-cloud equivalence}\index{service mapping}\index{multi-cloud}%
 This appendix is a living reference that maps conceptually equivalent services and
-ideas across the six platforms studied in this book series: Amazon Web Services
-(AWS), Microsoft Azure, Microsoft Fabric, Google Cloud Platform (GCP), MongoDB, and
-Snowflake. The names differ, but the underlying data-engineering concepts---durable
-object storage, tiered lifecycle economics, immutability, managed relational engines,
-elastic compute, and disciplined data organization---recur everywhere.
+ideas across the seven platforms studied in this book series: Amazon Web Services
+(AWS), Microsoft Azure, Microsoft Fabric, Google Cloud Platform (GCP), MongoDB,
+Snowflake, and Databricks. The names differ, but the underlying data-engineering
+concepts---durable object storage, tiered lifecycle economics, immutability, managed
+relational engines, elastic compute, governed lakehouse tables, and disciplined data
+organization---recur everywhere.
 
 \begin{notebox}
-This appendix grows with each chapter. Every new chapter contributes the equivalence
-tables introduced in its cross-cloud callout, so by the end of the book you will hold
-a single consolidated Rosetta Stone for moving fluently between clouds. Where a clean
-one-to-one mapping does not exist, the prose notes the closest analog and the caveat.
+This appendix grows with each chapter. Every chapter contributes the equivalence
+table introduced in its cross-cloud callout, so by the end of the book you hold a
+single consolidated Rosetta Stone for moving fluently between clouds. Databricks
+appears throughout as the lakehouse-platform column: it runs on AWS, Azure, and GCP
+alike, so its entries describe the platform layer rather than the underlying cloud.
+Where a clean one-to-one mapping does not exist, the prose notes the closest analog
+and the caveat.
 \end{notebox}
+
+\section{Free Tiers and Environment Setup}
+\index{free tier!equivalence}\index{environment setup!equivalence}%
+Chapter~0's account-and-tooling setup has a counterpart on every platform, and the
+guardrail pattern---separate the admin identity, set a budget on day one, name and
+tag everything for deletion---is identical everywhere.
+
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{2.9cm}p{3.0cm}p{3.0cm}p{3.0cm}@{}}
+\toprule
+\textbf{Setup step} & \textbf{AWS} & \textbf{Azure} & \textbf{GCP} \\
+\midrule
+Free offer & Free Tier (12 mo + always free) & Free account (\$200/30 days + always free) & Free trial (\$300/90 days + Always Free) \\
+Identity model & IAM / IAM Identity Center & Microsoft Entra ID + RBAC & Cloud IAM \\
+CLI & AWS CLI v2 & Azure CLI (\texttt{az login}) & gcloud CLI (\texttt{gcloud init}) \\
+Browser shell & AWS CloudShell & Azure Cloud Shell & Cloud Shell \\
+Cost guardrail & AWS Budgets + alerts & Cost Management budgets & Budgets \& alerts \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent \textbf{Microsoft Fabric} starts from a Microsoft 365/Power BI work account with a trial
+capacity; \textbf{Snowflake} offers a 30-day/\$400 trial guarded by Resource Monitors;
+\textbf{MongoDB Atlas} has a forever-free M0 cluster behind database users and an IP allowlist.
+\textbf{Databricks} offers a time-limited free trial on each cloud (plus the serverless free
+tier and the Community Edition for learning); the first-day disciplines are the same---create a
+workspace in its own resource group, attach cluster policies before users arrive, and route
+billing through tags or \texttt{system.billing.usage} from the start.
 
 \section{Object and Data-Lake Storage}
 \index{object storage!equivalence}\index{storage classes!equivalence}%
@@ -47,6 +80,10 @@ Encryption at rest & SSE-S3 / SSE-KMS & SSE + CMK (Key Vault) & Google-managed /
 immutable, columnar \emph{micro-partitions} that the service manages on your behalf.
 \textbf{MongoDB} persists documents through the \emph{WiredTiger} storage engine, balancing an
 internal cache against the operating-system page cache rather than exposing storage tiers.
+\textbf{Databricks} does not own a storage tier at all: it reads and writes the customer's S3,
+ADLS Gen2, or GCS buckets through Unity Catalog \emph{external locations} and \emph{volumes},
+with Delta Lake supplying the transactional table layer on top---proof that the lake and the
+compute plane are separable purchases.
 
 \section{Managed Relational Databases}
 \index{relational databases!equivalence}%
@@ -76,6 +113,9 @@ Migration service & DMS + SCT & Azure Database Migration Svc & Database Migratio
 engines, but they solve overlapping problems: Snowflake and Fabric provide SQL analytics over
 warehouse/lakehouse storage, while MongoDB provides a distributed document store whose schema
 design (Chapter~2) replaces rigid relational normalization with intentional, access-driven modeling.
+\textbf{Databricks} is likewise not an OLTP engine; its \emph{Lakehouse Federation} feature queries
+external relational systems (SQL Server, PostgreSQL, MySQL) in place so operational data can be
+joined or ingested without a separate ETL hop.
 
 \section{Elastic Compute and Analytical Warehouses}
 \index{elastic compute!equivalence}\index{virtual warehouse!equivalence}%
@@ -100,6 +140,9 @@ Result reuse & Result cache & Result cache & Result / BI cache \\
 \noindent \textbf{Microsoft Fabric} meters all workloads against a shared pool of Capacity Units
 (CU) on an F-SKU, an approach closer to a single elastic budget than to per-engine warehouses.
 \textbf{MongoDB Atlas} scales through cluster tiers with optional auto-scaling of compute and storage.
+\textbf{Databricks} bills Databricks Units (DBU) on top of VM cost: all-purpose clusters for
+interactive work, job clusters that terminate on completion for pipelines, and serverless SQL
+warehouses that scale to zero---the same pause-when-idle discipline with more explicit knobs.
 
 \section{Data Organization and the Medallion Pattern}
 \index{medallion architecture!equivalence}%
@@ -122,7 +165,10 @@ Storage format & Delta-Parquet & Parquet / Delta / Iceberg & Micro-partitions \\
 
 \noindent \textbf{MongoDB} realizes the same separation with distinct collections or databases
 (for example \texttt{raw\_events}, \texttt{validated}, \texttt{curated}) governed by schema-design
-patterns rather than a lake layout.
+patterns rather than a lake layout. \textbf{Databricks} is where the medallion vocabulary was
+popularized: \texttt{bronze}/\texttt{silver}/\texttt{gold} schemas of Delta tables under a Unity
+Catalog catalog, with expectations and quarantine as the quality gates between layers and Unity
+Catalog grants as the access boundary per layer.
 
 \section{Document Data Modeling}
 \index{document modeling!equivalence}%
@@ -146,6 +192,9 @@ Optional attributes & Attribute Pattern & Sparse attributes & Sparse properties 
 \noindent Google Cloud's closest analogs are \textbf{Firestore} and \textbf{Bigtable}. In
 \textbf{Snowflake} and \textbf{Fabric}, semi-structured documents are stored in \texttt{VARIANT}
 (Snowflake) or JSON columns and queried with path expressions rather than modeled as collections.
+\textbf{Databricks} follows the same lakehouse pattern: JSON payloads land as strings or
+\texttt{VARIANT} columns in Delta tables and are shredded with \texttt{from\_json} and schema
+hints during the bronze-to-silver pass.
 
 \section{Globally Distributed and NoSQL Databases}
 \index{NoSQL!equivalence}\index{distributed databases!equivalence}%
@@ -174,7 +223,9 @@ Consistency & Eventual / strong & 5 tunable levels & External (TrueTime) & Tunab
 \noindent \textbf{Snowflake} and \textbf{Fabric} are analytical platforms rather than OLTP key-value
 stores; they ingest from these operational databases and store semi-structured payloads in
 \texttt{VARIANT}/JSON columns. Google's dedicated NoSQL analogs are \textbf{Firestore} (document)
-and \textbf{Bigtable} (wide-column).
+and \textbf{Bigtable} (wide-column). \textbf{Databricks} deliberately stays out of operational
+NoSQL: it consumes change feeds from Cosmos DB, DynamoDB, and MongoDB into Delta tables, leaving
+point reads and sub-millisecond serving to the operational stores.
 
 \section{Managed Apache Spark}
 \index{Apache Spark!equivalence}%
@@ -196,7 +247,12 @@ Lake format & Delta on OneLake & Delta / Iceberg / Hudi & Delta; Delta / Iceberg
 \end{center}
 
 \noindent \textbf{Snowflake} offers \textbf{Snowpark} for DataFrame-style processing, and
-\textbf{MongoDB} integrates through the Spark Connector.
+\textbf{MongoDB} integrates through the Spark Connector. \textbf{Databricks} is the reference
+implementation this book uses in Chapter~9: the Databricks Runtime with the vectorized Photon
+engine, a built-in cluster manager (no YARN to run), autoscaling clusters plus serverless
+compute, and Delta as the default table format. The Spark API, Catalyst optimizer, and shuffle
+mechanics are identical on EMR, Dataproc, Fabric, and Databricks---only the operational wrapper
+and the billing unit change.
 
 \section{Query Acceleration and Materialized Views}
 \index{materialized views!equivalence}\index{query acceleration!equivalence}%
@@ -219,6 +275,9 @@ Ephemeral tables & Transient / temporary & Temp tables & Temp tables \\
 
 \noindent \textbf{Fabric} accelerates reads through Direct Lake and its Warehouse engine, while
 \textbf{MongoDB} relies on secondary and compound indexes plus the in-memory working set.
+\textbf{Databricks SQL} pairs materialized views and streaming tables with a result cache on
+serverless warehouses, and adds file-level acceleration---\texttt{OPTIMIZE}, Z-order and liquid
+clustering, bloom filters, and deletion vectors---that the next sections cover in detail.
 
 \section{In-Memory Caching and Hybrid Ingestion}
 \index{caching!equivalence}\index{in-memory cache!equivalence}%
@@ -241,7 +300,9 @@ Streaming intake & Kinesis / MSK & Event Hubs & Pub/Sub \\
 
 \noindent \textbf{Snowflake} and \textbf{Fabric} rely on result and Direct~Lake caches rather than a
 standalone Redis tier, while \textbf{MongoDB} serves hot data from its in-memory working set and
-Atlas can pair with an external cache.
+Atlas can pair with an external cache. \textbf{Databricks} caches at a different layer: the
+disk cache (formerly Delta cache) keeps hot Parquet blocks on cluster-local SSDs, and
+predictive I/O accelerates repeated scans without any application-managed cache keys.
 
 \section{Wide-Column and Key-Value NoSQL}
 \index{wide-column!equivalence}\index{Bigtable!equivalence}%
@@ -264,6 +325,8 @@ Best fit & Time-series, IoT, ad-tech & Serverless key-value & Global multi-model
 
 \noindent \textbf{Snowflake} and \textbf{Fabric} address these workloads analytically rather than as
 operational key-value stores; \textbf{MongoDB} covers the document end of the same NoSQL spectrum.
+\textbf{Databricks} likewise serves these workloads analytically: Bigtable and Cassandra estates
+are typically migrated by bulk export to Delta tables, not by replacing the serving path.
 
 \section{Data Protection: Cloning, Time Travel, and Migration}
 \index{cloning!equivalence}\index{time travel!equivalence}\index{point-in-time recovery!equivalence}%
@@ -286,10 +349,554 @@ Schema migration & --- & DMS / SCT & Database Migration Service \\
 
 \noindent \textbf{MongoDB} migrations use \textbf{Relational Migrator} plus the embed-vs-reference
 patterns from Chapter~4, and \textbf{Delta Lake} exposes historical versions through
-\texttt{VERSION AS OF} time-travel queries.
+\texttt{VERSION AS OF} time-travel queries. \textbf{Databricks} operationalizes the same
+protection set on Delta: \texttt{RESTORE} for point-in-time recovery, \texttt{VACUUM} as the
+retention safety-valve cutoff, and \emph{shallow clones} as the zero-copy clone analog for
+dev/test copies of production tables.
+
+\section{MPP Data Warehouses}
+\index{MPP warehouse!equivalence}\index{Redshift!equivalence}%
+Chapter~5's dedicated SQL pool is one of the most portable ideas in analytics engineering: a
+control node coordinates compute nodes over physically distributed tables. The same mental model
+applies to Redshift's ra3 clusters and BigQuery's slot-based execution.
+
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{3.0cm}p{2.9cm}p{3.1cm}p{3.2cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{AWS} & \textbf{Azure} & \textbf{GCP} \\
+\midrule
+MPP warehouse & Amazon Redshift & Synapse dedicated SQL pool & BigQuery (slot-based) \\
+Sizing unit & ra3 nodes / RPUs & cDWU (pauseable) & Slots / autoscaling editions \\
+Distribution & DISTKEY / DISTSTYLE & Hash / round-robin / replicated & Automatic (no user control) \\
+Bulk load from lake & COPY from S3 & COPY INTO from ADLS Gen2 & LOAD DATA from Cloud Storage \\
+Serverless SQL over lake & Athena / Redshift Spectrum & Synapse serverless SQL pool & BigQuery external tables \\
+\addlinespace
+\multicolumn{4}{@{}l@{}}{\textbf{Fabric}: T-SQL MPP warehouse on OneLake; \textbf{Snowflake}: virtual warehouses; \textbf{MongoDB}: Atlas SQL (not MPP);} \\
+\multicolumn{4}{@{}l@{}}{\textbf{Databricks}: SQL warehouses (serverless / pro / classic) with the Photon engine over Delta tables.} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent The Kimball discipline---grain declarations, conformed dimensions, slowly changing
+dimensions---is engine-neutral. A star schema designed well in Chapter~5 ports to Redshift,
+BigQuery, Snowflake, a Fabric warehouse, or a Databricks SQL warehouse with only dialect changes.
+
+\section{Warehouse Physical Design and Workload Isolation}
+\index{workload isolation!equivalence}\index{columnstore!equivalence}%
+Chapter~6's optimization levers---columnar storage, distribution, workload groups, precomputed
+results---exist on every warehouse; only the knobs differ. Synapse exposes physical design
+explicitly, while BigQuery and Snowflake automate more of it: the trade-off is control versus toil.
+
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{3.0cm}p{2.9cm}p{3.1cm}p{3.2cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{AWS (Redshift)} & \textbf{Azure (Synapse)} & \textbf{GCP (BigQuery)} \\
+\midrule
+Columnar storage & Columnar by default & Clustered columnstore index & Columnar by default \\
+Physical layout & Sort keys + dist keys & Distribution + partitioning & Clustering + partitioning \\
+Workload isolation & WLM queues & Workload groups + classifiers & Slot reservations \\
+Precomputed results & Materialized views & Materialized views + result-set cache & Materialized views + BI Engine \\
+Query cache & Result cache & Result-set cache & Cached query results \\
+\addlinespace
+\multicolumn{4}{@{}l@{}}{\textbf{Fabric}: warehouse with automatic tuning; \textbf{Snowflake}: micro-partition pruning + resource monitors;} \\
+\multicolumn{4}{@{}l@{}}{\textbf{MongoDB}: indexes + covered queries; \textbf{Databricks}: \texttt{OPTIMIZE}, Z-order, liquid clustering, predictive optimization.} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent Databricks' \emph{liquid clustering} deserves special attention: like Iceberg's sort-order
+evolution and BigQuery's clustering, it makes physical layout rewritable without rewriting the
+table, which removes the classic ``wrong distribution key'' lock-in that Chapter~6 warns about.
+
+\section{Serverless SQL over the Lake}
+\index{serverless SQL!equivalence}\index{Athena!equivalence}%
+Chapter~7's pattern---query the lake in place, pay per byte scanned, materialize back with
+CETAS---exists on every major cloud, and the billing model makes format and partitioning
+discipline a cross-cloud skill rather than a Synapse trick.
+
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{3.0cm}p{2.9cm}p{3.1cm}p{3.2cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{AWS} & \textbf{Azure} & \textbf{GCP} \\
+\midrule
+Serverless lake SQL & Amazon Athena & Synapse serverless SQL pool & BigQuery external tables \\
+Query-in-place API & S3 Select / Athena & OPENROWSET & External data sources \\
+Materialize to lake & CTAS into S3 & CETAS & Export / CREATE TABLE AS \\
+Open table format & Delta / Iceberg / Hudi on S3 & Delta Lake on ADLS Gen2 & BigLake tables / Iceberg \\
+Billing lever & Per TB scanned & Per TB scanned & Per TB scanned (on-demand) \\
+\addlinespace
+\multicolumn{4}{@{}l@{}}{\textbf{Fabric}: SQL analytics endpoint over OneLake; \textbf{Snowflake}: external tables / Iceberg;} \\
+\multicolumn{4}{@{}l@{}}{\textbf{MongoDB}: Atlas Data Federation over S3; \textbf{Databricks}: serverless SQL warehouses over UC Delta tables.} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent The lakehouse thesis---warehouse-class reliability on lake storage---originated with
+Delta Lake \cite{armbrust2020delta,armbrust2021lakehouse} and is now the default architecture
+vocabulary across all seven platforms in this series.
+
+\section{Data Catalogs and Governance Planes}
+\index{catalog!equivalence}\index{Purview!equivalence}%
+Chapter~8's governance plane---a metastore-backed catalog, automated classification, lineage, and
+in-place sharing---has a native equivalent on every cloud. Purview's distinction is scope: it
+catalogs Azure, AWS, GCP, and on-premises sources in one data map.
+
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{3.0cm}p{2.9cm}p{3.1cm}p{3.2cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{AWS} & \textbf{Azure} & \textbf{GCP} \\
+\midrule
+Catalog / data map & Glue Data Catalog + Lake Formation & Microsoft Purview & Dataplex \\
+PII discovery & Macie & Purview classifications & Sensitive Data Protection \\
+Lineage & Glue / CloudTrail analysis & Purview lineage & Dataplex lineage \\
+Cross-tenant sharing & AWS Data Exchange / S3 sharing & Azure Data Share & Analytics Hub / BigQuery sharing \\
+Clean room & AWS Clean Rooms & Data Share + confidential compute & BigQuery data clean rooms \\
+\addlinespace
+\multicolumn{4}{@{}l@{}}{\textbf{Fabric}: Purview hub + OneLake catalog; \textbf{Snowflake}: Horizon Catalog + listings;} \\
+\multicolumn{4}{@{}l@{}}{\textbf{MongoDB}: Atlas auditing; \textbf{Databricks}: Unity Catalog + Delta Sharing (open protocol).} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent Unity Catalog's distinctive move is one governance model---grants, row filters, column
+masks, lineage, audit---spanning tables, files, notebooks, models, and functions; the
+hyperscalers split the same job across a catalog plus a policy engine. Delta Sharing's
+distinction is the open protocol: recipients consume shares with pandas, Spark, or Power BI
+without any Databricks account.
+
+\section{Managed Visual ETL and Orchestration}
+\index{ETL service!equivalence}\index{AWS Glue!equivalence}%
+Chapter~10's four-part ADF object model---connection (linked service), data pointer (dataset),
+activity graph (pipeline), schedule (trigger)---has a direct analog in every managed ETL service.
+
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{3.0cm}p{2.9cm}p{3.1cm}p{3.2cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{AWS} & \textbf{Azure} & \textbf{GCP} \\
+\midrule
+Managed ETL service & AWS Glue & Azure Data Factory & Cloud Data Fusion \\
+Visual transform engine & Glue Studio / DataBrew & Mapping Data Flows & Data Fusion wrangler \\
+Orchestration & Step Functions / MWAA & ADF pipelines and triggers & Cloud Composer (Airflow) \\
+Serverless transform compute & Glue jobs (Spark) & Data Flows on managed Spark & Dataflow (Beam) \\
+Connection abstraction & Glue connections & Linked services & Data Fusion connections \\
+\addlinespace
+\multicolumn{4}{@{}l@{}}{\textbf{Fabric}: pipelines + dataflows gen2; \textbf{Snowflake}: tasks/streams + partner tools;} \\
+\multicolumn{4}{@{}l@{}}{\textbf{MongoDB}: Atlas Triggers; \textbf{Databricks}: Lakeflow Declarative Pipelines + Workflows.} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent Mapping Data Flows compile to Spark under the hood, so the execution concepts from
+Chapter~9 (partitions, shuffles) apply underneath the visual canvas---the abstraction leaks
+upward when performance matters. Databricks' declarative pipelines share the same philosophy:
+define datasets and quality expectations, let the platform handle execution, retries, and
+incremental refresh.
+
+\section{Change Data Capture, Migration, and Hybrid Connectivity}
+\index{CDC!equivalence}\index{data migration!equivalence}%
+Chapter~11's integration problems---reaching private networks and streaming database changes---are
+universal. Every cloud offers an agent/relay for private connectivity and a replication service
+for change data capture.
+
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{3.0cm}p{2.9cm}p{3.1cm}p{3.2cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{AWS} & \textbf{Azure} & \textbf{GCP} \\
+\midrule
+Private data movement agent & Glue connectors / DataSync agent & Self-Hosted Integration Runtime & VPN/Interconnect + remote agent \\
+Database migration & AWS DMS (+SCT) & Azure DMS (+DMA) & Database Migration Service \\
+CDC stream & DMS ongoing replication & Azure SQL CDC / DMS CDC & Datastream \\
+Event fabric & EventBridge & Event Grid & Eventarc \\
+Schema enforcement & Glue Schema Registry & Contract checks in ADF/Databricks & Dataflow / Dataplex validation \\
+\addlinespace
+\multicolumn{4}{@{}l@{}}{\textbf{Fabric}: on-premises data gateway; \textbf{Snowflake}: Snowpipe + connectors;} \\
+\multicolumn{4}{@{}l@{}}{\textbf{MongoDB}: change streams (CDC-native); \textbf{Databricks}: Lakeflow Connect, Auto Loader, \texttt{AUTO CDC}.} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent Data contracts---schema, versioning, quarantine---are platform-neutral governance.
+Databricks encodes them directly in the pipeline: Auto Loader's schema inference with hints and
+evolution, the \texttt{\_rescued\_data} column for malformed rows, and DLT expectations that warn,
+drop, or fail on contract violations.
+
+\section{Medallion Orchestration and Scheduling}
+\index{orchestration!equivalence}\index{Airflow!equivalence}%
+Chapter~12's medallion pipelines need a scheduler with dependency graphs and failure semantics on
+every platform. Bronze/silver/gold is the same idea whether the lake is S3, ADLS, or GCS.
+
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{3.0cm}p{2.9cm}p{3.1cm}p{3.2cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{AWS} & \textbf{Azure} & \textbf{GCP} \\
+\midrule
+Medallion zones & S3 raw/curated + Glue & ADLS Gen2 + Delta Lake & GCS + BigLake \\
+Managed Airflow & MWAA & Managed Airflow in ADF & Cloud Composer \\
+Control-flow orchestration & Step Functions & ADF pipeline activities & Workflows \\
+Event trigger & EventBridge $\rightarrow$ Lambda/Glue & Event Grid $\rightarrow$ ADF trigger & Eventarc $\rightarrow$ Workflows \\
+Notification workflows & SNS / Step Functions & Logic Apps & Cloud Functions + Workflows \\
+\addlinespace
+\multicolumn{4}{@{}l@{}}{\textbf{Fabric}: OneLake medallion + pipelines; \textbf{Snowflake}: tasks/streams DAGs;} \\
+\multicolumn{4}{@{}l@{}}{\textbf{MongoDB}: Atlas Triggers; \textbf{Databricks}: Workflows with repair-run partial recovery + job clusters.} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent Airflow's DAG model---tasks, dependencies, retries, backfills---is itself the cross-cloud
+skill: MWAA, Cloud Composer, and Managed Airflow in ADF all execute the same Python DAG files
+\cite{apache2025airflow}, and Databricks Workflows integrates with external orchestrators through
+the Jobs API when an estate standardizes on Airflow.
+
+\section{Event Streaming Backbones}
+\index{event streaming!equivalence}\index{Kafka!equivalence}%
+Chapter~13's partitioned, replayable event log is a cross-cloud primitive. Event Hubs'
+model---partitions, consumer groups, offsets, retention---is deliberately Kafka-shaped, and every
+cloud offers an equivalent.
+
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{3.0cm}p{2.9cm}p{3.1cm}p{3.2cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{AWS} & \textbf{Azure} & \textbf{GCP} \\
+\midrule
+Event streaming & Kinesis Data Streams / MSK & Event Hubs (+ Kafka endpoint) & Pub/Sub / Managed Kafka \\
+Message queue & SQS / Amazon MQ & Service Bus queues and topics & Pub/Sub (pull) \\
+Device ingestion & IoT Core & IoT Hub & (partner; IoT Core retired) \\
+Stream-to-lake export & Kinesis Firehose & Event Hubs Capture & Pub/Sub to GCS subscriptions \\
+Consumer isolation & Enhanced fan-out & Consumer groups & Subscriptions \\
+\addlinespace
+\multicolumn{4}{@{}l@{}}{\textbf{Fabric}: eventstreams into OneLake; \textbf{Snowflake}: Snowpipe Streaming;} \\
+\multicolumn{4}{@{}l@{}}{\textbf{MongoDB}: change streams as a source; \textbf{Databricks}: \texttt{kafka} format source against the Event Hubs Kafka endpoint.} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent Because Event Hubs speaks the Kafka protocol, producer and consumer skills transfer to
+Amazon MSK, Confluent, and self-managed clusters with only endpoint and credential changes
+\cite{apache2025kafka}---which is exactly how Chapter~15's Databricks consumer attaches.
+
+\section{Managed SQL over Streams}
+\index{stream SQL!equivalence}\index{windowing!equivalence}%
+Chapter~14's managed SQL-over-streams exists on every cloud, and the windowing
+vocabulary---tumbling, hopping, sliding, session---is identical everywhere; only the engine and
+billing unit differ.
+
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{3.0cm}p{2.9cm}p{3.1cm}p{3.2cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{AWS} & \textbf{Azure} & \textbf{GCP} \\
+\midrule
+Managed stream SQL & Managed Flink (Kinesis Data Analytics) & Azure Stream Analytics & Dataflow (Beam SQL) \\
+Billing unit & Kinesis Processing Units & Streaming Units (SUs) & Dataflow worker resources \\
+Event source & Kinesis / MSK & Event Hubs / IoT Hub & Pub/Sub \\
+Late-data control & Watermarks in Flink & Late/out-of-order policies & Watermarks + allowed lateness \\
+Stream to warehouse & Firehose $\rightarrow$ Redshift & ASA output $\rightarrow$ Synapse/SQL & Dataflow $\rightarrow$ BigQuery \\
+\addlinespace
+\multicolumn{4}{@{}l@{}}{\textbf{Fabric}: eventstreams + Activator; \textbf{Snowflake}: Snowpipe Streaming + dynamic tables;} \\
+\multicolumn{4}{@{}l@{}}{\textbf{MongoDB}: Atlas Stream Processing; \textbf{Databricks}: Structured Streaming / DLT streaming tables.} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent When a use case outgrows ASA---complex state, stream-stream joins at scale, custom
+code---Spark Structured Streaming (Chapter~15) is the escalation path, with the same windowing
+concepts at a lower level of abstraction. Databricks exposes the full state-design surface:
+\texttt{withWatermark}, \texttt{dropDuplicates}, and \texttt{flatMapGroupsWithState} with
+RocksDB-backed state.
+
+\section{Spark Structured Streaming}
+\index{Structured Streaming!equivalence}%
+Chapter~15's model---a stream as an unbounded table, micro-batches, watermarks,
+checkpoints---maps directly onto the streaming engines of the other platforms.
+
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{3.0cm}p{2.9cm}p{3.1cm}p{3.2cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{AWS} & \textbf{Azure} & \textbf{GCP} \\
+\midrule
+Spark streaming host & EMR / Glue streaming & Azure Databricks & Dataproc / Serverless Spark \\
+Stream source & Kinesis / MSK connector & Event Hubs (Kafka endpoint) & Pub/Sub / Kafka connector \\
+State store & RocksDB on EMR & Default or RocksDB provider & RocksDB on Dataproc \\
+Exactly-once sink & Delta/Iceberg merge & Delta Lake merge & BigQuery Storage Write API \\
+Checkpoint storage & S3 & ADLS Gen2 & GCS \\
+\addlinespace
+\multicolumn{4}{@{}l@{}}{\textbf{Fabric}: structured streaming on OneLake; \textbf{Snowflake}: Snowpipe Streaming + tasks;} \\
+\multicolumn{4}{@{}l@{}}{\textbf{MongoDB}: Atlas Stream Processing; \textbf{Databricks}: native---the reference implementation used in this chapter.} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent The Structured Streaming programming guide \cite{apache2025structuredStreaming} is
+platform-neutral reading; everything Chapter~15 teaches about watermarks and state applies
+identically on EMR and Dataproc. The batch-unification trigger (\texttt{availableNow}) is the
+same idea as Dataflow's unified batch/stream thesis and Flink's batch mode.
+
+\section{Business Intelligence and Semantic Models}
+\index{BI!equivalence}\index{semantic model!equivalence}%
+Chapter~16's BI layer is the least portable part of the stack---each cloud has a native analytics
+front end---but the underlying concepts (extracted versus live models, row-level security, measure
+semantics) transfer directly.
+
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{3.0cm}p{2.9cm}p{3.1cm}p{3.2cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{AWS} & \textbf{Azure} & \textbf{GCP} \\
+\midrule
+BI service & Amazon QuickSight & Power BI & Looker / Looker Studio \\
+Live query mode & Direct query to Redshift/Athena & DirectQuery & Live connection to BigQuery \\
+Extracted cache & SPICE & Import mode (in-memory) & Extracted data / BI Engine \\
+Row-level security & QuickSight RLS & Power BI RLS roles & Looker access filters \\
+Metrics layer & QuickSight datasets & Semantic model + DAX & LookML \\
+\addlinespace
+\multicolumn{4}{@{}l@{}}{\textbf{Fabric}: Power BI with DirectLake over OneLake; \textbf{Snowflake}: Snowsight + partner BI;} \\
+\multicolumn{4}{@{}l@{}}{\textbf{MongoDB}: Atlas Charts + BI Connector; \textbf{Databricks}: AI/BI dashboards + Genie natural-language spaces.} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent Power BI's \textbf{DirectLake} mode in Microsoft Fabric is the emerging fourth storage
+mode: the engine reads Delta tables in OneLake directly, combining Import-mode speed with
+DirectQuery freshness. Databricks' AI/BI makes the mirror-image bet: dashboards read governed
+Delta tables in place and inherit Unity Catalog lineage, so a tile traces back to the pipeline
+that produced it.
+
+\section{Feature Engineering and In-Database Machine Learning}
+\index{feature store!equivalence}\index{in-database ML!equivalence}%
+Chapter~17's in-database scoring---pushing the model to the data rather than shipping data to a
+model server---exists in every analytical engine, typically via ONNX or a native PREDICT-style
+function.
+
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{3.0cm}p{2.9cm}p{3.1cm}p{3.2cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{AWS} & \textbf{Azure} & \textbf{GCP} \\
+\midrule
+In-database scoring & Redshift ML (SageMaker) & Synapse T-SQL PREDICT (ONNX) & BigQuery ML \\
+Spark training & EMR + SageMaker & Synapse Spark / SynapseML & Dataproc + Vertex AI \\
+Feature store & SageMaker Feature Store & AML managed feature store & Vertex AI Feature Store \\
+Model format for SQL & (auto via SageMaker) & ONNX & Native BQML models \\
+Batch scoring & Redshift batch transform & PREDICT over pool tables & ML.PREDICT \\
+\addlinespace
+\multicolumn{4}{@{}l@{}}{\textbf{Fabric}: SynapseML + MLflow in notebooks; \textbf{Snowflake}: Snowpark ML + SQL inference;} \\
+\multicolumn{4}{@{}l@{}}{\textbf{MongoDB}: Atlas Vector Search scoring; \textbf{Databricks}: Feature Engineering in UC + Mosaic AI serving.} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent ONNX is the portable artifact: train in Spark, export once, score in SQL, in an AML
+endpoint (Chapter~19), or at the edge. Databricks' feature store makes the anti-skew contract
+explicit: one governed Delta definition feeds both training sets (via point-in-time joins) and
+online serving lookups.
+
+\section{Managed Machine Learning Platforms}
+\index{ML platform!equivalence}\index{SageMaker!equivalence}%
+Chapter~18's managed ML platforms share a universal anatomy: a workspace, versioned data
+references, reusable environments, pipeline components, and a model registry.
+
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{3.0cm}p{2.9cm}p{3.1cm}p{3.2cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{AWS} & \textbf{Azure} & \textbf{GCP} \\
+\midrule
+ML platform & SageMaker & Azure Machine Learning & Vertex AI \\
+AutoML & SageMaker Autopilot & Azure AutoML & Vertex AutoML \\
+Pipelines & SageMaker Pipelines & AML pipelines (components) & Vertex Pipelines (Kubeflow) \\
+Feature store & SageMaker Feature Store & AML managed feature store & Vertex AI Feature Store \\
+Model registry & SageMaker Model Registry & AML Model Registry & Vertex Model Registry \\
+\addlinespace
+\multicolumn{4}{@{}l@{}}{\textbf{Fabric}: built-in ML with MLflow on lakehouses; \textbf{Snowflake}: Snowpark ML;} \\
+\multicolumn{4}{@{}l@{}}{\textbf{MongoDB}: partner MLOps over Atlas; \textbf{Databricks}: managed MLflow + UC model registry.} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent MLflow is the lingua franca underneath: AML, Databricks, and Fabric all track experiments
+with it, so experiment-tracking skills transfer even where the platform does not. Databricks adds
+alias-based lifecycle (champion/challenger) and registry lineage from training data to deployed
+model inside Unity Catalog.
+
+\section{Model Serving, Monitoring, and Retraining}
+\index{model serving!equivalence}\index{drift monitoring!equivalence}%
+Chapter~19's serving splits everywhere into real-time endpoints and batch scoring, and monitoring
+splits into infrastructure health, data drift, and model quality.
+
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{3.0cm}p{2.9cm}p{3.1cm}p{3.2cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{AWS} & \textbf{Azure} & \textbf{GCP} \\
+\midrule
+Real-time serving & SageMaker endpoints & AML managed online endpoints & Vertex AI endpoints \\
+Batch scoring & SageMaker batch transform & AML batch endpoints & Vertex batch prediction \\
+Model monitoring & SageMaker Model Monitor & AML model monitoring / drift & Vertex Model Monitoring \\
+Registry stages & Registry + approval states & Registry + tags/stages & Registry + aliases \\
+Retrain trigger & EventBridge $\rightarrow$ pipeline & Event Grid $\rightarrow$ AML pipeline & Eventarc $\rightarrow$ pipeline \\
+\addlinespace
+\multicolumn{4}{@{}l@{}}{\textbf{Fabric}: MLflow models + SynapseML serving; \textbf{Snowflake}: Snowpark ML registry;} \\
+\multicolumn{4}{@{}l@{}}{\textbf{MongoDB}: in-app scoring over Atlas; \textbf{Databricks}: Model Serving + inference tables + Lakehouse Monitoring.} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent The MLOps loop---monitor, detect drift, retrain, gate, promote---is platform-neutral.
+The Databricks distinction: inference logs are Delta tables in your own catalog, so monitoring is
+a SQL/BI problem over data you already govern, not a separate observability silo.
+
+\section{Unstructured Data and Generative AI}
+\index{generative AI!equivalence}\index{vector search!equivalence}%
+Chapter~20's document AI, search, and managed foundation models exist on every cloud; the pipeline
+pattern---ingest, extract, index, retrieve, generate---is identical across vendors.
+
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{3.0cm}p{2.9cm}p{3.1cm}p{3.2cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{AWS} & \textbf{Azure} & \textbf{GCP} \\
+\midrule
+Document extraction & Textract & AI Document Intelligence & Document AI \\
+NLP / PII detection & Comprehend & AI Language & Cloud Natural Language \\
+Search / vectors & OpenSearch / Kendra & AI Search (vector + hybrid) & Vertex AI Search \\
+Foundation models & Bedrock & Azure OpenAI Service & Vertex AI (Gemini) \\
+Event-driven processing & Lambda & Azure Functions & Cloud Functions \\
+\addlinespace
+\multicolumn{4}{@{}l@{}}{\textbf{Fabric}: AI skills over OneLake; \textbf{Snowflake}: Cortex (LLM functions in SQL);} \\
+\multicolumn{4}{@{}l@{}}{\textbf{MongoDB}: Atlas Vector Search; \textbf{Databricks}: Foundation Model APIs + Mosaic AI Vector Search.} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent The RAG pattern taught in Chapter~20---chunk, embed, index, retrieve, ground the
+model---is the same architecture whether the vector store is AI Search, OpenSearch, pgvector,
+Atlas Vector Search, or Mosaic AI Vector Search; evaluation with LLM judges (MLflow evaluate,
+Bedrock evaluations, Azure AI eval) is likewise a shared discipline.
+
+\section{Zero-Trust Networking, Identity, and Secrets}
+\index{zero trust!equivalence}\index{managed identity!equivalence}%
+Chapter~21's architecture---private connectivity, no long-lived secrets, centralized keys---is
+cloud-universal; the product names differ, the design does not.
+
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{3.0cm}p{2.9cm}p{3.1cm}p{3.2cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{AWS} & \textbf{Azure} & \textbf{GCP} \\
+\midrule
+Identity plane & IAM & Microsoft Entra ID + Azure RBAC & Cloud IAM \\
+Workload identity & IAM roles for EC2/EKS & Managed identities & Service account impersonation \\
+Private service access & PrivateLink / VPC endpoints & Private Endpoints & Private Service Connect \\
+Secrets manager & Secrets Manager & Azure Key Vault & Secret Manager \\
+Key custody (CMK) & KMS & Key Vault / Managed HSM & Cloud KMS / HSM \\
+\addlinespace
+\multicolumn{4}{@{}l@{}}{\textbf{Fabric}: Entra ID + OneLake security; \textbf{Snowflake}: PrivateLink + Tri-Secret;} \\
+\multicolumn{4}{@{}l@{}}{\textbf{MongoDB}: Atlas private endpoints + CSFLE; \textbf{Databricks}: secret scopes, OAuth M2M, private connectivity.} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent The exam and interview favorite---``why is a managed identity better than a service
+principal secret?''---has the same answer on every cloud: no secret material exists to leak,
+rotate, or commit to git. Databricks' PAT tokens are the cautionary contrast: they are
+long-lived secrets, which is why cluster policies and OAuth machine-to-machine service
+principals are the production pattern.
+
+\section{Observability, FinOps, and Quality Gates}
+\index{observability!equivalence}\index{FinOps!equivalence}%
+Chapter~22's operating layer---catalogs, lineage, quality gates, and cost observability---pairs a
+native catalog with the same open quality tooling on every cloud.
+
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{3.0cm}p{2.9cm}p{3.1cm}p{3.2cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{AWS} & \textbf{Azure} & \textbf{GCP} \\
+\midrule
+Catalog and governance & Glue Data Catalog / Lake Formation & Microsoft Purview & Dataplex \\
+Data quality tests & dbt / Great Expectations / Deequ & dbt / Great Expectations in ADF or Databricks & dbt / Great Expectations / Dataplex rules \\
+Monitoring & CloudWatch & Azure Monitor + Log Analytics & Cloud Operations \\
+Cost management & Cost Explorer + budgets & Cost Management + budgets & Cloud Billing + budgets \\
+Sensitivity labels & Macie findings & Purview + MIP labels to Power BI & DLP inspection \\
+\addlinespace
+\multicolumn{4}{@{}l@{}}{\textbf{Fabric}: Purview hub + Capacity Metrics; \textbf{Snowflake}: Horizon + resource monitors;} \\
+\multicolumn{4}{@{}l@{}}{\textbf{MongoDB}: Atlas auditing; \textbf{Databricks}: \texttt{system.billing.usage} + \texttt{system.access.audit} + Lakehouse Monitoring.} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent dbt and Great Expectations are deliberately platform-neutral: the same \texttt{dbt test}
+or GE checkpoint runs against Synapse, Snowflake, BigQuery, Redshift, or Databricks SQL---quality
+tooling is the one layer you can learn once \cite{dbtlabs2025core,greatexpectations2025}.
+
+\section{Data Privacy and Compliance Primitives}
+\index{data privacy!equivalence}\index{masking!equivalence}%
+Chapter~23's privacy primitives---masking, client-side encryption, erasure, and policy
+audit---exist on every platform, and certification exams test them as a family.
+
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{3.0cm}p{2.9cm}p{3.1cm}p{3.2cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{AWS} & \textbf{Azure} & \textbf{GCP} \\
+\midrule
+Dynamic masking & Redshift dynamic masking & SQL/Synapse Dynamic Data Masking & BigQuery column-level + masking \\
+Client-side encryption & Client-side encryption SDKs & Always Encrypted & Client-side encryption / CSEK \\
+At-rest encryption & KMS-backed TDE equivalents & TDE (+ CMK via Key Vault) & Google-managed / CMEK \\
+Policy enforcement & AWS Config + SCPs & Azure Policy & Organization Policy \\
+Threat detection & GuardDuty / Security Hub & Microsoft Defender for Cloud & Security Command Center \\
+PII discovery & Macie & Purview classifications & Sensitive Data Protection \\
+\addlinespace
+\multicolumn{4}{@{}l@{}}{\textbf{Fabric}: OneLake security + MIP labels; \textbf{Snowflake}: masking policies + tags;} \\
+\multicolumn{4}{@{}l@{}}{\textbf{MongoDB}: client-side field-level encryption; \textbf{Databricks}: UC row filters + column masks.} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent Crypto-shredding---encrypt per data subject, erase by destroying the subject's key---is
+the cross-platform answer to ``delete everywhere, including backups,'' because backups become
+unreadable ciphertext when the key is gone.
+
+\section{DataOps: Infrastructure as Code and CI/CD}
+\index{infrastructure as code!equivalence}\index{CI/CD!equivalence}%
+Chapter~24's disciplines---declarative infrastructure, SQL-based transformation, reviewed
+pipelines---are the most portable skills in this book. The same Terraform workflow and the same
+dbt project structure run against every cloud.
+
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{3.0cm}p{2.9cm}p{3.1cm}p{3.2cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{AWS} & \textbf{Azure} & \textbf{GCP} \\
+\midrule
+Multi-cloud IaC & Terraform \texttt{aws} provider & Terraform \texttt{azurerm} provider & Terraform \texttt{google} provider \\
+Native IaC & CloudFormation / CDK & Bicep / ARM templates & Deployment Manager (legacy) \\
+Transform-as-code & dbt on Redshift/Athena & dbt on Synapse/Fabric & dbt on BigQuery \\
+CI/CD & CodePipeline / GitHub Actions & GitHub Actions / Azure DevOps & Cloud Build / GitHub Actions \\
+State backend & S3 + DynamoDB lock & Azure Storage + lease lock & GCS backend \\
+\addlinespace
+\multicolumn{4}{@{}l@{}}{\textbf{Fabric}: Git integration + deployment pipelines; \textbf{Snowflake}: dbt + Terraform provider;} \\
+\multicolumn{4}{@{}l@{}}{\textbf{MongoDB}: Atlas Terraform provider; \textbf{Databricks}: Asset Bundles (\texttt{databricks.yml}) + Terraform provider.} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent The lesson that transfers everywhere: \emph{the merge is the deploy, and the pipeline is
+the only writer to production}. Databricks Asset Bundles add a validate-before-deploy step
+(\texttt{databricks bundle validate}) that mirrors \texttt{terraform plan} and Bicep what-if---the
+same reviewed-plan discipline in native tooling.
 
 \begin{tipbox}
 Use this appendix as a study aid for the book's lockstep, cross-cloud approach: when you learn a
-concept on one platform, immediately locate its equivalent here and predict how the other five
-would express the same idea. That habit turns six separate vocabularies into one mental model.
+concept on one platform, immediately locate its equivalent here and predict how the other six
+would express the same idea. That habit turns seven separate vocabularies into one mental model.
 \end{tipbox}

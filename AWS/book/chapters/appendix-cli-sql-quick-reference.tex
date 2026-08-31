@@ -1,0 +1,316 @@
+\chapter{AWS CLI, SDK, and SQL Quick Reference}
+\index{quick reference}\index{AWS CLI!commands}\index{SQL!reference}%
+This appendix collects the commands used most often across the book, grouped by service, with a
+one-line purpose for each. All CLI commands accept \texttt{-{}-profile} and \texttt{-{}-region};
+all are shown without them for readability. Where a chapter prefers the console or an SDK, the
+table says so. Full syntax lives in the AWS CLI Command Reference \cite{awsCliV2UserGuide} and
+each service's developer guide (see the chapter's Further Reading).
+
+\section{Amazon S3 (Chapters 1, 7, 21)}
+\index{S3!commands}%
+
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{7.2cm}p{7.6cm}@{}}
+\toprule
+\textbf{Command} & \textbf{Purpose} \\
+\midrule
+\texttt{aws s3 mb s3://<bucket>} & Create a bucket (name must be globally unique) \\
+\texttt{aws s3 ls [--recursive] s3://<bucket>/<prefix>} & List buckets or objects \\
+\texttt{aws s3 cp <src> <dst>} & Copy one file to/from S3 \\
+\texttt{aws s3 sync <dir> s3://<bucket>/<prefix>} & Reconcile a local tree with a prefix (uploads only deltas) \\
+\texttt{aws s3 rm s3://<bucket>/<prefix> -{}-recursive} & Delete objects (add \texttt{-{}-exclude}/\texttt{-{}-include} to scope) \\
+\texttt{aws s3api put-bucket-versioning -{}-bucket B -{}-versioning-configuration Status=Enabled} & Turn on versioning \\
+\texttt{aws s3api put-bucket-lifecycle-configuration -{}-bucket B -{}-lifecycle-configuration file://lc.json} & Apply lifecycle transitions/expiration \\
+\texttt{aws s3api put-bucket-notification-configuration \dots} & Wire S3 events to SQS/SNS/Lambda \\
+\texttt{aws s3api put-object-lock-configuration \dots} & Enable default WORM retention (bucket creation opt-in) \\
+\texttt{aws s3 presign s3://<bucket>/<key>} & Generate a time-limited download URL \\
+\texttt{aws s3api head-object -{}-bucket B -{}-key K} & Read object metadata without downloading \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent\textbf{Boto3:} \texttt{s3.upload\_file} / \texttt{download\_file} for managed transfers,
+\texttt{list\_objects\_v2} with a paginator for listings, \texttt{put\_object} for generated
+content, \texttt{get\_object\_attributes} for inspection.
+
+\section{Amazon Athena (Chapter 7)}
+\index{Athena!commands}%
+
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{7.2cm}p{7.6cm}@{}}
+\toprule
+\textbf{Command / SQL} & \textbf{Purpose} \\
+\midrule
+\texttt{aws athena start-query-execution -{}-query-string "..." -{}-work-group W} & Submit a query; returns an execution ID \\
+\texttt{aws athena get-query-execution -{}-query-execution-id ID} & Poll status; read bytes-scanned for cost \\
+\texttt{aws athena get-query-results -{}-query-execution-id ID} & Fetch result rows \\
+\texttt{CREATE EXTERNAL TABLE ... LOCATION 's3://...'} & Define a table over lake files \\
+\texttt{MSCK REPAIR TABLE t;} & Register new partitions after files land \\
+\texttt{CREATE TABLE x WITH (format='PARQUET', partitioned\_by=...) AS SELECT ...} & CTAS: convert CSV to partitioned Parquet (the chapter's cost fix) \\
+\texttt{UNLOAD (SELECT ...) TO 's3://...' WITH (format='PARQUET')} & Export query results as files \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{Amazon Redshift and Redshift Serverless (Chapters 5, 6, 17)}
+\index{Redshift!commands}%
+
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{7.2cm}p{7.6cm}@{}}
+\toprule
+\textbf{Command / SQL} & \textbf{Purpose} \\
+\midrule
+\texttt{aws redshift-serverless create-namespace -{}-namespace-name N -{}-iam-roles ...} & Create the Serverless namespace with an attached role \\
+\texttt{aws redshift-serverless create-workgroup -{}-base-capacity 8 \dots} & Create the endpoint; base/max RPU bound cost \\
+\texttt{aws redshift-data execute-statement -{}-workgroup-name W -{}-sql "..."} & Run SQL without a persistent connection \\
+\texttt{aws redshift-data get-statement-result -{}-id ID} & Fetch rows for a finished statement \\
+\texttt{COPY t FROM 's3://...' IAM\_ROLE '...' FORMAT AS JSON 'auto';} & Parallel bulk load; one input file per slice ideal \\
+\texttt{MERGE INTO target USING stage ON ...} & Change-data upsert / SCD Type 2 maintenance \\
+\texttt{UNLOAD ('SELECT ...') TO 's3://...' IAM\_ROLE '...' PARQUET;} & Export warehouse data to the lake \\
+\texttt{CREATE MATERIALIZED VIEW mv AS SELECT ...} & Pre-compute a repeated aggregation \\
+\texttt{EXPLAIN <query>} & Inspect distribution moves (\texttt{DS\_DIST\_*}) before benchmarking \\
+\texttt{SELECT * FROM SVV\_TABLE\_INFO;} & Diagnose skew, sort-key effectiveness, table size \\
+\texttt{CREATE MODEL m FROM (SELECT ...) TARGET y FUNCTION f ... PROBLEM\_TYPE ... OBJECTIVE 'f1';} & Redshift ML: train via SageMaker Autopilot from SQL \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{AWS Glue (Chapters 7, 9, 10, 22)}
+\index{Glue!commands}%
+
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{7.2cm}p{7.6cm}@{}}
+\toprule
+\textbf{Command / code} & \textbf{Purpose} \\
+\midrule
+\texttt{aws glue create-crawler -{}-name C -{}-role R -{}-database-name D -{}-targets '{...}'} & Define a crawler over an S3 prefix \\
+\texttt{aws glue start-crawler -{}-name C} & Run inference; populate the Data Catalog \\
+\texttt{aws glue get-tables -{}-database-name D} & Inspect inferred schemas and partitions \\
+\texttt{aws glue create-job -{}-name J -{}-role R -{}-command '{...}' -{}-glue-version "4.0"} & Register an ETL job (script in S3) \\
+\texttt{aws glue start-job-run -{}-job-name J [-{}-arguments '{...}']} & Run the job; pass parameterized arguments \\
+\texttt{aws glue get-job-run -{}-job-name J -{}-run-id ID} & Check status and error detail \\
+\texttt{glueContext.create\_dynamic\_frame.from\_catalog(...)} & Job script: read a catalog table with bookmark support \\
+\texttt{.resolveChoice(...)} / \texttt{.applyMapping(...)} & DynamicFrame schema-resolution operators for messy data \\
+\texttt{EvaluateDataQuality.apply(frame, ruleset)} & In-job DQ gate (DQDL rules; Chapter~22) \\
+\texttt{job.init(...)} / \texttt{job.commit()} & Enable job bookmarks around the script body \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{Amazon EMR (Chapter 9)}
+\index{EMR!commands}%
+
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{7.2cm}p{7.6cm}@{}}
+\toprule
+\textbf{Command} & \textbf{Purpose} \\
+\midrule
+\texttt{aws emr create-cluster -{}-release-label emr-7.x -{}-instance-fleets file://f.json \dots} & Launch a cluster; instance fleets mix On-Demand core + Spot task nodes \\
+\texttt{aws emr add-steps -{}-cluster-id J-X -{}-steps file://step.json} & Submit a Spark step (e.g., \texttt{spark-submit s3://.../job.py}) \\
+\texttt{aws emr list-clusters -{}-active} & See what is running (and billing) \\
+\texttt{aws emr terminate-clusters -{}-cluster-ids J-X} & Tear down; EMRFS means the S3 data survives \\
+\texttt{aws emr-serverless create-application / start-job-run} & Same Spark job without managing nodes \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{Amazon Kinesis Data Streams (Chapter 13)}
+\index{Kinesis!commands}%
+
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{7.2cm}p{7.6cm}@{}}
+\toprule
+\textbf{Command / code} & \textbf{Purpose} \\
+\midrule
+\texttt{aws kinesis create-stream -{}-stream-name S -{}-shard-count N} & Create a stream (shard math from Chapter~13) \\
+\texttt{aws kinesis put-records -{}-stream-name S -{}-records file://batch.json} & Batch write; inspect \texttt{FailedRecordCount} and retry with backoff \\
+\texttt{aws kinesis get-shard-iterator -{}-shard-id ... -{}-shard-iterator-type TRIM\_HORIZON} & Position a consumer on a shard \\
+\texttt{aws kinesis get-records -{}-shard-iterator I} & Poll records; loop with the returned \texttt{NextShardIterator} \\
+\texttt{aws kinesis update-shard-count -{}-scaling-type UNIFORM\_SCALING \dots} & Reshard when throughput outgrows capacity \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent\textbf{Watch:} \texttt{IteratorAgeMilliseconds} (consumer lag) in CloudWatch; alarm well
+before the retention horizon. Production consumers use KCL, not raw iterators.
+
+\section{Amazon MSK (Chapter 14)}
+\index{MSK!commands}%
+
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{7.2cm}p{7.6cm}@{}}
+\toprule
+\textbf{Command} & \textbf{Purpose} \\
+\midrule
+\texttt{aws kafka create-cluster -{}-cluster-name C -{}-broker-node-group-info file://b.json \dots} & Provision a managed Kafka cluster \\
+\texttt{aws kafka get-bootstrap-brokers -{}-cluster-arn ARN} & Retrieve broker endpoints for producers/consumers \\
+\texttt{kafka-topics.sh -{}-create -{}-topic T -{}-partitions N} & Topic administration from a client host \\
+\texttt{aws kafka update-configuration / update-broker-count} & Change config or scale brokers in place \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{Amazon Data Firehose (Chapter 14)}
+\index{Firehose!commands}%
+
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{7.2cm}p{7.6cm}@{}}
+\toprule
+\textbf{Command} & \textbf{Purpose} \\
+\midrule
+\texttt{aws firehose create-delivery-stream -{}-delivery-stream-name D \dots} & Create the stream (source, transform, destination in one definition) \\
+\texttt{aws firehose put-record-batch -{}-delivery-stream-name D \dots} & Direct-write test records \\
+\texttt{aws firehose update-destination \dots} & Change buffering, conversion, or backup settings \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent Enable the S3 source-record backup prefix on every stream; JSON$\rightarrow$Parquet
+conversion requires a Glue catalog table describing the schema.
+
+\section{AWS Lambda (Chapters 14, 15, 20)}
+\index{Lambda!commands}%
+
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{7.2cm}p{7.6cm}@{}}
+\toprule
+\textbf{Command} & \textbf{Purpose} \\
+\midrule
+\texttt{aws lambda create-function -{}-function-name F -{}-runtime python3.12 -{}-role R -{}-handler h.lambda\_handler -{}-zip-file fileb://z.zip} & Deploy a function \\
+\texttt{aws lambda update-function-code -{}-function-name F -{}-zip-file fileb://z.zip} & Ship a new version of the code \\
+\texttt{aws lambda invoke -{}-function-name F out.json} & Synchronous test invocation \\
+\texttt{aws lambda create-event-source-mapping -{}-event-source-arn <kinesis-arn> -{}-function-name F} & Attach a stream trigger (batch size, failure destination here) \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{Managed Flink (Chapter 15)}
+\index{Flink!commands}%
+
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{7.2cm}p{7.6cm}@{}}
+\toprule
+\textbf{Command} & \textbf{Purpose} \\
+\midrule
+\texttt{aws kinesisanalyticsv2 create-application -{}-runtime-environment FLINK-1\_20 \dots} & Create the Flink application \\
+\texttt{aws kinesisanalyticsv2 start-application / stop-application} & Run or pause (savepoint on stop) \\
+\texttt{aws kinesisanalyticsv2 create-application-snapshot} & Manual savepoint before a redeploy \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent Flink SQL from Chapter~15: declare stream tables with \texttt{CREATE TABLE ... WITH
+('connector'='kinesis', ...)} and a \texttt{WATERMARK FOR click\_ts AS click\_ts - INTERVAL '1'
+MINUTE}, then \texttt{GROUP BY TUMBLE(click\_ts, INTERVAL '5' MINUTE)}.
+
+\section{Step Functions and Amazon MWAA (Chapter 12)}
+\index{Step Functions!commands}\index{MWAA!commands}%
+
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{7.2cm}p{7.6cm}@{}}
+\toprule
+\textbf{Command} & \textbf{Purpose} \\
+\midrule
+\texttt{aws stepfunctions create-state-machine -{}-name M -{}-definition file://asl.json -{}-role-arn R} & Deploy a state machine (ASL definition) \\
+\texttt{aws stepfunctions start-execution -{}-state-machine-arn ARN -{}-input '{...}'} & Trigger a run \\
+\texttt{aws stepfunctions describe-execution -{}-execution-arn ARN} & Inspect state-by-state results and failures \\
+\texttt{aws mwaa create-environment -{}-dag-s3-path dags/ \dots} & Provision a managed Airflow environment \\
+\texttt{aws s3 cp dag.py s3://<mwaa-bucket>/dags/} & Deploy a DAG (the S3 sync \emph{is} the deploy) \\
+\texttt{airflow dags trigger <dag\_id>} (via CLI plugin) & Manual run for testing \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{Amazon SageMaker (Chapters 17--20)}
+\index{SageMaker!commands}%
+
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{7.2cm}p{7.6cm}@{}}
+\toprule
+\textbf{Command / call} & \textbf{Purpose} \\
+\midrule
+\texttt{aws sagemaker create-training-job -{}-training-job-name J \dots} & Launch managed training (\texttt{EnableManagedSpotTraining} for the discount) \\
+\texttt{aws sagemaker create-auto-ml-job-v2 \dots} & Autopilot experiment over an S3 dataset \\
+\texttt{aws sagemaker create-endpoint-config / create-endpoint} & Deploy a model (\texttt{ServerlessConfig} for sporadic traffic) \\
+\texttt{aws sagemaker-runtime invoke-endpoint -{}-endpoint-name E -{}-body '{...}' out.json} & Score a payload \\
+\texttt{aws sagemaker create-pipeline / start-pipeline-execution} & Register and run a Preprocess$\rightarrow$Train$\rightarrow$Evaluate$\rightarrow$Register pipeline \\
+\texttt{aws sagemaker-featurestore-runtime put-record / get-record} & Write to the offline/online store; millisecond reads at inference \\
+\texttt{aws sagemaker update-model-package-approval-status} & Registry gate before deployment automation picks a version up \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{Amazon Textract, Comprehend, and Macie (Chapters 20, 23)}
+\index{Textract!commands}\index{Macie!commands}%
+
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{7.2cm}p{7.6cm}@{}}
+\toprule
+\textbf{Command} & \textbf{Purpose} \\
+\midrule
+\texttt{aws textract analyze-document -{}-document '{...}' -{}-feature-types '["FORMS"]'} & Sync key--value extraction (single-page) \\
+\texttt{aws textract start-document-analysis / get-document-analysis} & Async jobs for multi-page PDFs; SNS signals completion \\
+\texttt{aws comprehend detect-pii-entities -{}-text "..." -{}-language-code en} & PII entity detection over extracted text \\
+\texttt{aws macie2 enable-macie} & Turn on discovery for the account/Region \\
+\texttt{aws macie2 create-classification-job -{}-job-type ONE\_TIME \dots} & Scan a bucket/prefix for sensitive data \\
+\texttt{aws macie2 list-findings -{}-finding-criteria '{...}'} & Review findings (IDs feed the quarantine automation) \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{Lake Formation and Governance (Chapters 8, 21, 22)}
+\index{Lake Formation!commands}%
+
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{7.2cm}p{7.6cm}@{}}
+\toprule
+\textbf{Command} & \textbf{Purpose} \\
+\midrule
+\texttt{aws lakeformation put-data-lake-settings -{}-data-lake-admins '[...]'} & Designate data lake administrators \\
+\texttt{aws lakeformation register-resource -{}-resource-arn arn:aws:s3:::B/prefix/ -{}-role-arn R} & Register a lake location for governed access \\
+\texttt{aws lakeformation revoke-permissions ... IAMAllowedPrincipals} & Remove the default IAM-only grant so LF policies actually bind \\
+\texttt{aws lakeformation grant-permissions -{}-principal '{...}' -{}-resource '{...}' -{}-permissions SELECT} & Grant on databases, tables, or named column lists \\
+\texttt{aws lakeformation create-lf-tag / add-lf-tags-to-resource} & Define tags and tag resources for expression-based policy \\
+\texttt{aws lakeformation get-effective-permissions-for-path} & Debug who can read a location and why \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{Cross-Cutting: STS, IAM, Budgets (Chapter 0)}
+\index{STS!commands}%
+
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{7.2cm}p{7.6cm}@{}}
+\toprule
+\textbf{Command} & \textbf{Purpose} \\
+\midrule
+\texttt{aws sts get-caller-identity} & Prove which identity/account a profile acts as \\
+\texttt{aws configure sso} / \texttt{aws sso login -{}-profile P} & Identity Center setup and sign-in \\
+\texttt{aws iam create-role -{}-role-name R -{}-assume-role-policy-document file://trust.json} & Create a service role (trust policy) \\
+\texttt{aws iam put-role-policy -{}-role-name R -{}-policy-name P -{}-policy-document file://p.json} & Attach least-privilege permissions \\
+\texttt{aws budgets create-budget -{}-account-id ID -{}-budget file://b.json \dots} & Cost guardrail with alert thresholds \\
+\texttt{aws ce get-cost-and-usage -{}-time-period ... -{}-granularity MONTHLY -{}-metrics UnblendedCost} & Cost Explorer from the CLI \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{tipbox}
+Three commands debug most lab failures: \texttt{aws sts get-caller-identity} (am I the identity I
+think?), \texttt{aws configure list} (which profile and Region?), and the service's
+\texttt{describe-*} call (does the resource actually exist, in this Region, with the name I typed?).
+\end{tipbox}

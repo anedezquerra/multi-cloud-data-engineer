@@ -1,11 +1,12 @@
 \chapter{Cross-Cloud Service Equivalence}
 \index{cross-cloud equivalence}\index{service mapping}\index{multi-cloud}%
 This appendix is a living reference that maps conceptually equivalent services and
-ideas across the six platforms studied in this book series: Amazon Web Services
-(AWS), Microsoft Azure, Microsoft Fabric, Google Cloud Platform (GCP), MongoDB, and
-Snowflake. The names differ, but the underlying data-engineering concepts---durable
-object storage, tiered lifecycle economics, immutability, managed relational engines,
-elastic compute, and disciplined data organization---recur everywhere.
+ideas across the seven platforms studied in this book series: Amazon Web Services
+(AWS), Microsoft Azure, Databricks, Microsoft Fabric, Google Cloud Platform (GCP),
+MongoDB, and Snowflake. The names differ, but the underlying data-engineering
+concepts---durable object storage, tiered lifecycle economics, immutability, managed
+relational engines, elastic compute, and disciplined data organization---recur
+everywhere.
 
 \begin{notebox}
 This appendix grows with each chapter. Every new chapter contributes the equivalence
@@ -288,8 +289,611 @@ Schema migration & --- & DMS / SCT & Database Migration Service \\
 patterns from Chapter~4, and \textbf{Delta Lake} exposes historical versions through
 \texttt{VERSION AS OF} time-travel queries.
 
+\section{Account Setup and Free Tiers}
+\index{free tier!equivalence}\index{account setup!equivalence}%
+Chapter~0's setup decisions---identity, CLI, and cost guardrails---have the same shape on every
+cloud before a single byte is stored.
+
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{2.9cm}p{3.0cm}p{3.0cm}p{3.0cm}@{}}
+\toprule
+\textbf{Setup step} & \textbf{AWS} & \textbf{Azure} & \textbf{GCP} \\
+\midrule
+Free offer & Free Tier (12 mo + always free) & Free account (\$200/30 days + always free) & Free trial (\$300/90 days + Always Free) \\
+Sign-up guard & Card + root email & Card + Microsoft account & Card + Google account \\
+Identity model & IAM / IAM Identity Center & Microsoft Entra ID + RBAC & Cloud IAM \\
+Admin isolation & Never use root daily & Avoid Global Admin daily & Avoid Owner; least privilege \\
+CLI & AWS CLI v2 (\texttt{aws configure}) & Azure CLI (\texttt{az login}) & gcloud CLI (\texttt{gcloud init}) \\
+Browser shell & AWS CloudShell & Azure Cloud Shell & Cloud Shell \\
+Cost guardrail & AWS Budgets + alerts & Cost Management budgets & Budgets \& alerts \\
+Console & AWS Management Console & Azure Portal & Google Cloud Console \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent This book's platform, \textbf{MongoDB}, is used two ways---a forever-free Atlas M0
+cluster (no card) secured by a database user and an IP access list, and a local Community Server
+for storage-engine labs. \textbf{Microsoft Fabric} uses a Microsoft 365/Power BI work account plus
+a trial capacity (no card); \textbf{Snowflake} uses a 30-day/\$400 trial (no card) guarded by
+Resource Monitors; \textbf{Databricks} offers a free trial and a forever-free Community/Express
+edition, with serverless compute billed to the cloud account or Databricks depending on the model.
+
+\section{Consensus, Replication, and Durable Writes}
+\index{consensus!equivalence}\index{replication!equivalence}%
+Chapter~5's topic. Every managed database hides consensus behind a product name, but the
+trade-offs---quorum size, failover time, rollback risk---are identical.
+
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{2.9cm}p{3.0cm}p{3.0cm}p{3.0cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{AWS} & \textbf{Azure} & \textbf{GCP} \\
+\midrule
+Managed replication & RDS Multi-AZ & Azure SQL auto-failover groups & Cloud SQL HA \\
+Quorum/consensus & Aurora 6-copy quorum & Cosmos DB quorum & Spanner Paxos \\
+Multi-region reads & Aurora Global / ElastiCache & Cosmos DB multi-region & Spanner multi-region \\
+Failover control & Manual or auto promote & Priority-based failover & Automatic regional \\
+Durable-write analog & \texttt{synchronous} commit & Strong consistency bound & Commit quorum \\
+\addlinespace
+Snowflake / Fabric / Databricks & \multicolumn{3}{l}{Consensus invisible; durability delegated to cloud object storage (S3/ADLS/GCS) with cross-region replication as a DR feature} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent \textbf{MongoDB} exposes what the warehouses hide: you choose the quorum that
+acknowledges a write (write concern) and the consistency a read observes (read concern)
+\cite{mongodbReplicationDocs,ongaro2014raft}. \textbf{Databricks} sits with the warehouses here:
+its control plane is managed and the Delta transaction log on object storage is the durability
+boundary, so there is no user-tunable quorum.
+
+\section{Horizontal Partitioning and Shard Keys}
+\index{sharding!equivalence}\index{partitioning!equivalence}%
+Chapter~6's topic. Horizontal partitioning exists everywhere under different names; the shard-key
+decision is the same decision as a DynamoDB partition key, a Cosmos DB partition key, or a Bigtable
+row-key design.
+
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{2.9cm}p{3.0cm}p{3.0cm}p{3.0cm}@{}}
+\toprule
+\textbf{Concept} & \textbf{AWS} & \textbf{Azure} & \textbf{GCP} \\
+\midrule
+Partition unit & DynamoDB partition & Cosmos DB logical partition & Bigtable tablet \\
+Router & Client SDK (DynamoDB) & Gateway + partitions & Front end + tablet map \\
+Split metadata & Partition map & Partition map & Master tablet \\
+Hot-key risk & Hot partition throttling & 20 GB logical cap, hot RU & Hot tablet \\
+Even distribution tool & Hash of partition key & Hash of partition key & Salting / key design \\
+Rebalancing & Automatic split & Physical partition split & Tablet splits \\
+\addlinespace
+Snowflake / Fabric & \multicolumn{3}{l}{Micro-partitions replace user-visible sharding; clustering keys influence pruning, not routing} \\
+Databricks & \multicolumn{3}{l}{Liquid clustering replaces explicit partition keys; layout is physical optimization, never a routing decision} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent \textbf{MongoDB}'s difference is explicitness: you pick the shard key, you can refine it
+live, and you can mis-pick it badly enough to create a hot shard \cite{mongodbShardingDocs}. The
+lakehouse platforms deliberately removed that decision; MongoDB keeps it because operational
+routing---not just analytical pruning---depends on it.
+
+\section{Shard-Key Evolution and Hot-Key Mitigation}
+\index{shard key!evolution}\index{hot key!equivalence}%
+Chapter~7's topic. Shard-key optimization is the same discipline as partition-key tuning on the
+managed key-value stores: the key decides distribution, and a wrong key surfaces as throttling on
+one partition while the rest idle.
+
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{2.9cm}p{3.0cm}p{3.0cm}p{3.0cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{AWS} & \textbf{Azure} & \textbf{GCP} \\
+\midrule
+Key change after creation & Not possible (rebuild table) & Not possible (new container) & Not possible (new table) \\
+Hot-key mitigation & Adaptive capacity + DAX & RU redistribution, synthetic keys & Tablet splits + salting \\
+Skew observability & Contributor Insights & Partition-key-metrics logs & Key Visualizer \\
+Balancing & Automatic partition split & Physical partition split & Automatic tablet rebalance \\
+Cross-partition txn & TransactWrite (bounded) & Not supported across partitions & Spanner synchronous commit \\
+\addlinespace
+Snowflake / Fabric & \multicolumn{3}{l}{Clustering keys guide micro-partition layout; reclustering runs in background with credit cost} \\
+Databricks & \multicolumn{3}{l}{\texttt{ALTER TABLE ... CLUSTER BY} changes liquid-clustering keys online; \texttt{OPTIMIZE} rewrites layout in the background} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent \textbf{MongoDB} is uniquely forgiving among the operational stores:
+\texttt{refineCollectionShardKey} and \texttt{reshardCollection} allow online key evolution that
+DynamoDB and Cosmos DB simply do not offer \cite{mongodbShardKeyDocs}. Databricks matches that
+forgiveness on the analytical side by making layout rewritable without changing table identity.
+
+\section{Data Residency and Global Distribution}
+\index{data residency!equivalence}\index{global clusters!equivalence}%
+Chapter~8's topic. Data residency is a compliance requirement that every cloud implements as a
+routing primitive: data pinned to regions by policy.
+
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{2.9cm}p{3.0cm}p{3.0cm}p{3.0cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{AWS} & \textbf{Azure} & \textbf{GCP} \\
+\midrule
+Residency primitive & DynamoDB global tables + Regions & Cosmos DB multi-region + policies & Spanner placements / Firestore multi-region \\
+Local writes & Multi-region active-active & Multi-region writes & Multi-region configs \\
+Read locality & Global tables nearest region & Cosmos DB preferred regions & Spanner read-only replicas \\
+Residency enforcement & Region-scoped IAM + SCPs & Azure Policy + regions & Org policy constraints \\
+Conflict handling & Last-writer-wins & LWW / custom merge & Synchronous commit \\
+\addlinespace
+Snowflake / Fabric & \multicolumn{3}{l}{Database replication between regions; residency by account placement rather than row-level pinning} \\
+Databricks & \multicolumn{3}{l}{Workspace and Unity Catalog metastore pinned to a region; residency enforced at deployment boundary, not per row} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent \textbf{MongoDB}'s zone sharding pins \emph{ranges of data} to shards in named
+regions---row-level residency with auditable chunk evidence---a stronger and more provable
+guarantee than account-level regional placement \cite{mongodbZoneShardingDocs,mongodbGlobalClustersDocs}.
+
+\section{Indexing and Physical Data Layout}
+\index{indexing!equivalence}\index{physical layout!equivalence}%
+Chapter~9's topic. Every analytical and operational store has an equivalent of ``index design
+decides latency.''
+
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{2.9cm}p{3.0cm}p{3.0cm}p{3.0cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{AWS} & \textbf{Azure} & \textbf{GCP} \\
+\midrule
+Managed document DB & DocumentDB & Cosmos DB (Mongo API) & Firestore / Bigtable \\
+Index model & Manual indexes & Autopilot / manual policies & Composite indexes required \\
+Secondary indexes & B-tree indexes & Automatic indexing (default) & Automatic single-field \\
+Query plan insight & Profiler + explain & Diagnostic logs & Query explain stats \\
+Columnar analytics & Redshift sort/dist keys & Dedicated SQL pool indexes & BigQuery clustering \\
+Cloud data warehouse & Redshift distribution keys & Synapse distributions & BigQuery partitions \\
+\addlinespace
+Snowflake & \multicolumn{3}{l}{Micro-partition pruning, clustering keys, search optimization service} \\
+Databricks & \multicolumn{3}{l}{Liquid clustering + Z-order, Photon vectorized execution, file-level data skipping on Delta statistics} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent The mental model transfers directly: Snowflake's pruning, BigQuery's clustering,
+Redshift's sort keys, and Databricks' file skipping are all physical-data-layout decisions that
+replace per-query index lookup with zone-map elimination. \textbf{MongoDB}'s compound B+Tree index
+is the operational-system counterpart: created deliberately, charged to every write, and proven
+with \texttt{explain()} rather than assumed \cite{mongodbIndexesDocs,mongodbExplainDocs}.
+
+\section{Aggregation Pipelines and SQL Analytics}
+\index{aggregation pipeline!equivalence}%
+Chapter~10's topic. The aggregation pipeline is MongoDB's in-database analytics engine; its
+siblings are the SQL engines of the cloud warehouses and lakehouses.
+
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{2.9cm}p{3.0cm}p{3.0cm}p{3.0cm}@{}}
+\toprule
+\textbf{Pipeline concept} & \textbf{AWS (Redshift)} & \textbf{Azure (Synapse/Fabric)} & \textbf{GCP (BigQuery)} \\
+\midrule
+\texttt{\$match} & \texttt{WHERE} & \texttt{WHERE} & \texttt{WHERE} \\
+\texttt{\$group} & \texttt{GROUP BY} & \texttt{GROUP BY} & \texttt{GROUP BY} \\
+\texttt{\$lookup} & \texttt{LEFT JOIN} & \texttt{LEFT JOIN} & \texttt{LEFT JOIN} \\
+\texttt{\$facet} & Multiple CTEs in one scan & \texttt{UNION} of CTEs & Multi-branch subqueries \\
+\texttt{\$graphLookup} & Recursive CTE & Recursive CTE & Recursive CTE / \texttt{WITH RECURSIVE} \\
+\texttt{\$merge}/\texttt{\$out} & \texttt{INSERT INTO SELECT} & CTAS / \texttt{INSERT} & \texttt{CREATE TABLE AS} \\
+\texttt{allowDiskUse} & Disk-based spill & Spill to tempdb & Spill to disk (slots) \\
+\addlinespace
+Snowflake & \multicolumn{3}{l}{One SQL engine covers all of the above; pruning replaces the early-\texttt{\$match} discipline automatically} \\
+Databricks & \multicolumn{3}{l}{Spark SQL with the Catalyst optimizer and Photon; the optimizer, not the written order, owns the physical plan} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent The key difference is ownership: Snowflake, BigQuery, and Databricks optimize the
+physical plan for you, while \textbf{MongoDB} executes stages largely in written order. Stage
+order \emph{is} the physical plan, which makes pipeline literacy a first-class engineering skill
+\cite{mongodbAggregationDocs}.
+
+\section{Window Functions and Maintained Views}
+\index{window functions!equivalence}\index{materialized views!maintenance}%
+Chapter~11's topic. Window functions are the most portable analytical concept in this series:
+SQL \texttt{OVER (PARTITION BY ... ORDER BY ...)} exists verbatim in Redshift, Synapse, BigQuery,
+Snowflake, and Spark SQL. MongoDB's \texttt{\$setWindowFields} is the same mathematics with
+document semantics.
+
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{2.9cm}p{3.0cm}p{3.0cm}p{3.0cm}@{}}
+\toprule
+\textbf{Concept} & \textbf{AWS (Redshift)} & \textbf{Azure (Synapse)} & \textbf{GCP (BigQuery)} \\
+\midrule
+Window stage & \texttt{OVER()} clause & \texttt{OVER()} clause & \texttt{OVER()} clause \\
+Rank & \texttt{RANK}/\texttt{DENSE\_RANK} & Same & Same \\
+Moving average & \texttt{AVG() OVER (ROWS)} & Same & Same \\
+Derivative & \texttt{LAG()} arithmetic & Same & Same \\
+Materialized view & Redshift MVs (auto-refresh) & Indexed views / Spark SQL & BigQuery MVs (auto-refresh) \\
+Incremental refresh & Automatic & Manual / pipeline & Automatic, partition-aware \\
+\addlinespace
+Snowflake & \multicolumn{3}{l}{Window functions identical; materialized views auto-maintained; streams + tasks for incremental pipelines} \\
+Databricks & \multicolumn{3}{l}{Identical SQL windows; Delta Live Tables materialized views refresh incrementally on a declared schedule or trigger} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent \textbf{MongoDB}'s distinction is the manual refresh path: \texttt{\$merge} into a
+results collection is a materialized view you maintain yourself, so you own its freshness,
+idempotency, and backfill story \cite{mongodbSetWindowFieldsDocs,mongodbMergeDocs}.
+
+\section{Performance Diagnosis Instruments}
+\index{query plan!equivalence}\index{slow log!equivalence}%
+Chapter~12's topic. Every platform exposes the same four instruments---a query plan, a slow log,
+wait/queue metrics, and per-object usage statistics---with different names.
+
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{2.9cm}p{3.0cm}p{3.0cm}p{3.0cm}@{}}
+\toprule
+\textbf{Instrument} & \textbf{AWS (RDS/Redshift)} & \textbf{Azure (SQL/Cosmos)} & \textbf{GCP (SQL/BigQuery)} \\
+\midrule
+Query plan & EXPLAIN / Redshift plan & Query Store plans & EXPLAIN / dry-run slots \\
+Slow log & RDS slow query log & Azure SQL diagnostics & Cloud SQL insights \\
+Wait/queue metrics & Performance Insights waits & DMVs / wait stats & Query Insights \\
+Object usage stats & pg\_stat\_user\_indexes & sys.dm\_db\_index\_usage\_stats & INFORMATION\_SCHEMA \\
+\addlinespace
+Snowflake / Fabric & \multicolumn{3}{l}{\texttt{QUERY\_HISTORY}, query profile operator timings, warehouse load metrics replace per-index statistics} \\
+Databricks & \multicolumn{3}{l}{Spark UI stages/tasks, query profile, and \texttt{system.query.history} / system tables for fleet-wide usage} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent \textbf{MongoDB}'s distinctive contribution is that all four instruments are queryable
+data inside the database itself---\texttt{system.profile}, \texttt{explain()},
+\texttt{serverStatus}, \texttt{\$indexStats}---so diagnosis is a scripting exercise, not a console
+scavenger hunt \cite{mongodbProfilerDocs,mongodbExplainDocs}.
+
+\section{Full-Text Search Engines}
+\index{full-text search!equivalence}\index{Lucene!equivalence}%
+Chapter~13's topic. Full-text search as a managed engine beside the operational store is a
+universal pattern: each cloud pairs its database with a Lucene-descended search service.
+
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{2.9cm}p{3.0cm}p{3.0cm}p{3.0cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{AWS} & \textbf{Azure} & \textbf{GCP} \\
+\midrule
+Search service & OpenSearch & Azure AI Search & Vertex AI Search \\
+Engine lineage & Lucene & Lucene & Proprietary + vector \\
+Sync mechanism & DMS / streams / Lambda & Indexers / push API & Data connectors \\
+Analyzers/tokenizers & OpenSearch analyzers & Lucene + custom analyzers & Managed, less exposed \\
+Faceting & Aggregations & Facets & Built-in \\
+Typo tolerance & Fuzzy queries & Fuzzy + synonyms & Managed \\
+\addlinespace
+Snowflake / Fabric & \multicolumn{3}{l}{Snowflake Search Optimization + Cortex Search (managed hybrid); Fabric search via OneLake + AI Search} \\
+Databricks & \multicolumn{3}{l}{No standalone text engine; pairs Mosaic AI Vector Search with keyword pre-filtering, or integrates Azure AI Search / OpenSearch} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent Atlas Search's distinctive property is integration depth: the Lucene index lives inside
+the Atlas platform, syncs from the collection automatically via change streams, and is queried
+through the same aggregation pipeline as everything else \cite{mongodbAtlasSearchDocs,apacheLuceneRepo}.
+
+\section{Vector Search and Retrieval-Augmented Generation}
+\index{vector search!equivalence}\index{RAG!equivalence}%
+Chapter~14's topic. Vector search moved from specialty to commodity in two years; the
+differentiators are index algorithm, pre-filtering, and operational integration with the primary
+store.
+
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{2.9cm}p{3.0cm}p{3.0cm}p{3.0cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{AWS} & \textbf{Azure} & \textbf{GCP} \\
+\midrule
+Vector store & OpenSearch k-NN / pgvector on Aurora & Cosmos DB vector search / AI Search & Vertex AI Vector Search / AlloyDB \\
+Embedding service & Bedrock Titan & Azure OpenAI & Vertex AI embeddings \\
+Hybrid search & OpenSearch BM25 + k-NN & AI Search hybrid & Vertex hybrid ranking \\
+RAG framework & Bedrock Knowledge Bases & Azure OpenAI + AI Search & Vertex AI RAG Engine \\
+Co-located OLTP & Aurora pgvector & Cosmos DB (same doc) & AlloyDB (same row) \\
+\addlinespace
+Snowflake / Fabric & \multicolumn{3}{l}{Snowflake Cortex (embed + vector similarity in SQL); Fabric integrates with AI Search via OneLake} \\
+Databricks & \multicolumn{3}{l}{Mosaic AI Vector Search over Delta tables + Foundation Model APIs; governance through Unity Catalog} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent Atlas Vector Search's distinctive property is co-location: vectors, BM25 text indexes,
+and the operational documents live in one system, so hybrid retrieval and its filters execute in
+one aggregation pipeline without a second store to sync
+\cite{mongodbAtlasVectorSearch,mongodbAtlasSearchDocs,malkov2020hnsw}.
+
+\section{Stream Processing}
+\index{stream processing!equivalence}%
+Chapter~15's topic. Managed streaming with SQL-like or pipeline semantics over a broker backbone
+is a commodity layer; the differentiators are state management, exactly-once composition, and how
+tightly the sink integrates with the operational store.
+
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{2.9cm}p{3.0cm}p{3.0cm}p{3.0cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{AWS} & \textbf{Azure} & \textbf{GCP} \\
+\midrule
+Broker backbone & MSK / Kinesis & Event Hubs (Kafka API) & Pub/Sub / Managed Kafka \\
+Stream processor & Kinesis Data Analytics (Flink) & Stream Analytics / Fabric RTI & Dataflow (Beam) \\
+Windowing & Tumbling/hopping/session & Tumbling/hopping/session & Full Beam window model \\
+State/checkpointing & Flink state backends & Managed & Managed (streaming engine) \\
+Exactly-once sink & Idempotent/transactional sinks & Idempotent upserts & Idempotent writes \\
+DB-native option & DMS streams & Cosmos change feed + Functions & Firestore triggers + Dataflow \\
+\addlinespace
+Snowflake / Fabric & \multicolumn{3}{l}{Streams + Tasks for incremental CDC pipelines; Snowpipe Streaming; Fabric eventstreams with KQL windows} \\
+Databricks & \multicolumn{3}{l}{Structured Streaming (micro-batch) with checkpointed state and \texttt{MERGE} sinks into Delta; \texttt{availableNow} unifies batch and stream} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent Atlas Stream Processing's distinction is that the streaming tier speaks the aggregation
+pipeline and sinks directly into Atlas collections, so enrichment joins and materialized outputs
+stay on one platform \cite{mongodbStreamProcessingDocs,apacheKafkaRepo}.
+
+\section{Change Data Capture, Triggers, and Reverse ETL}
+\index{change data capture!equivalence}\index{reverse ETL!equivalence}%
+Chapter~16's topic. CDC, serverless triggers, and reverse ETL are the connective tissue of every
+modern data platform; the discipline---checkpoint, idempotency, replay---is identical everywhere.
+
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{2.9cm}p{3.0cm}p{3.0cm}p{3.0cm}@{}}
+\toprule
+\textbf{Concept} & \textbf{AWS} & \textbf{Azure} & \textbf{GCP} \\
+\midrule
+Database CDC & DynamoDB Streams / DMS CDC & Cosmos DB change feed & Firestore triggers / Datastream \\
+Serverless trigger & Lambda on streams & Functions on change feed & Cloud Functions / Run \\
+HTTPS data API & DynamoDB API / RDS Data API & Cosmos DB REST & Firestore REST \\
+Reverse ETL & AppFlow / custom & Synapse Link + Logic Apps & Datastream + Workflows \\
+Event backbone & Kinesis / EventBridge & Event Hubs / Event Grid & Pub/Sub \\
+\addlinespace
+Snowflake / Fabric & \multicolumn{3}{l}{Streams + Tasks for CDC; reverse ETL into operational stores via connectors; Fabric Activator for triggers} \\
+Databricks & \multicolumn{3}{l}{Lakeflow Connect for managed CDC ingestion; \texttt{MERGE} / DLT \texttt{AUTO CDC} to apply changes into Delta} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent \textbf{MongoDB} change streams are distinguished by what they ride on: the same oplog
+that powers replication, so CDC is a first-class, total-order-per-shard,
+transactional-integrity-preserving API rather than a bolt-on log scrape
+\cite{mongodbChangeStreamsDocs,mongodbOplogDocs}.
+
+\section{Identity, Authentication, and Authorization}
+\index{authentication!equivalence}\index{RBAC!equivalence}%
+Chapter~17's topic. Identity and access design is the same discipline on every cloud: central
+identity, least privilege, auditable grants.
+
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{2.9cm}p{3.0cm}p{3.0cm}p{3.0cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{AWS} & \textbf{Azure} & \textbf{GCP} \\
+\midrule
+Cloud identity & IAM users/roles & Microsoft Entra ID & Cloud IAM \\
+Workload identity & IAM roles for pods/EC2 & Managed identities & Workload Identity Federation \\
+DB-level RBAC & DocumentDB users / IAM DB auth & Cosmos DB RBAC & Firestore security rules \\
+Directory integration & AD Connector / LDAP & Native Entra & Cloud Identity \\
+Audit & CloudTrail + engine audit & Diagnostic settings & Cloud Audit Logs \\
+Certificate auth & ACM-issued client certs & Key Vault certs & Certificate Authority Service \\
+\addlinespace
+Snowflake / Fabric & \multicolumn{3}{l}{SCIM + SSO (SAML/OIDC), role hierarchy with inheritance, network policies; Fabric layers on Entra conditional access} \\
+Databricks & \multicolumn{3}{l}{Account-console identities with SCIM/SSO; Unity Catalog grants (catalog/schema/table/column) as the data-plane RBAC} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent \textbf{MongoDB}'s distinctive surface is its \emph{in-database} RBAC: privileges named
+by resource (database.collection) and action (down to pipeline-stage granularity), composable into
+custom roles---closer to Snowflake's role model and Databricks' Unity Catalog grants than to IAM
+policies \cite{mongodbSecurityChecklistDocs,mongodbRBACDocs}.
+
+\section{The Encryption Ladder}
+\index{encryption!equivalence}\index{key management!equivalence}%
+Chapter~18's topic. Every cloud offers the same ladder---at-rest keys, TLS, client-side field
+encryption---but the in-use layer is where vendors genuinely differ.
+
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{2.9cm}p{3.0cm}p{3.0cm}p{3.0cm}@{}}
+\toprule
+\textbf{Layer} & \textbf{AWS} & \textbf{Azure} & \textbf{GCP} \\
+\midrule
+Key management & KMS / CloudHSM & Key Vault / Managed HSM & Cloud KMS / HSM \\
+At-rest & EBS/S3 SSE, RDS TDE & Disk + TDE & Default + CMEK \\
+In transit & TLS everywhere & TLS + private endpoints & TLS + PSC \\
+In use & SDK client-side encryption & Always Encrypted (SQL) & Confidential computing \\
+Private connectivity & PrivateLink & Private Link & Private Service Connect \\
+Erasure primitive & KMS key deletion & Key Vault purge & Key destruction \\
+\addlinespace
+Snowflake / Fabric & \multicolumn{3}{l}{Tri-Secret Secure (composite keys), column-level policies; customer-managed keys for the account layer} \\
+Databricks & \multicolumn{3}{l}{Customer-managed keys for workspace storage and managed services; no field-level queryable encryption---pair with the operational store} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent \textbf{MongoDB}'s Queryable Encryption is the rare in-use implementation that keeps
+\emph{equality queries} server-side without the server ever seeing plaintext---the cryptographic
+boundary sits in the client driver, keyed by a KMS you control
+\cite{mongodbQueryableEncryptionDocs,mongodbCSFLEDocs}.
+
+\section{Private Networking and Audit Streaming}
+\index{private endpoint!equivalence}\index{audit log!equivalence}%
+Chapter~19's topic. Private connectivity and audit streaming are table stakes on every cloud; the
+vocabulary differs, the architecture does not.
+
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{2.9cm}p{3.0cm}p{3.0cm}p{3.0cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{AWS} & \textbf{Azure} & \textbf{GCP} \\
+\midrule
+Private endpoint & PrivateLink & Private Link & Private Service Connect \\
+Coarse network gate & Security groups / NACLs & NSGs / firewall rules & VPC firewall rules \\
+Peering & VPC peering / TGW & VNet peering & VPC Network Peering \\
+TLS policy & ACM + TLS policies & Key Vault + TLS policy & Certificate Manager \\
+Audit stream & CloudTrail + engine logs & Diagnostic settings + Entra logs & Cloud Audit Logs \\
+SIEM targets & Security Hub / Splunk & Microsoft Sentinel & Chronicle / Splunk \\
+\addlinespace
+Snowflake / Fabric & \multicolumn{3}{l}{Network policies + private connectivity; access history views for audit; Fabric routes through Entra and Purview} \\
+Databricks & \multicolumn{3}{l}{Private connectivity per cloud (PrivateLink/Private Link/PSC); audit logs delivered to storage and queryable via system tables} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent \textbf{MongoDB}'s specifics worth mastering: private endpoints into Atlas remove public
+exposure by construction, and the auditing framework emits filterable JSON events---identity, DDL,
+and scoped DML---that stream to your SIEM \cite{mongodbPrivateLinkDocs,mongodbAuditingDocs}.
+
+\section{Backup, Tiering, and Queryable Archives}
+\index{backup!equivalence}\index{archival!equivalence}%
+Chapter~20's topic. Backup and tiering are solved problems at every vendor---the differentiator
+is whether restores are drilled and whether the cold tier stays queryable.
+
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{2.9cm}p{3.0cm}p{3.0cm}p{3.0cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{AWS} & \textbf{Azure} & \textbf{GCP} \\
+\midrule
+Managed backup & RDS snapshots + PITR & Automated backups + PITR & Cloud SQL PITR \\
+Continuous/PITR & 35-day window & 7--35 days & 7--35 days \\
+Cold tiering & S3 Glacier & Blob Archive & Archive Storage \\
+Query over archive & Athena / Redshift Spectrum & Synapse / Fabric OneLake & BigQuery external tables \\
+Long-term retention & Glacier Deep Archive & Archive tier & Archive class \\
+Restore testing & Manual / scripted drills & Same & Same \\
+\addlinespace
+Snowflake / Fabric & \multicolumn{3}{l}{Time Travel + Fail-safe replace user-managed backups; Fabric OneLake shortcuts play the federated-query role} \\
+Databricks & \multicolumn{3}{l}{Delta time travel (\texttt{VERSION AS OF}) and \texttt{RESTORE} for short windows; durability inherited from object storage, deep archive delegated to it} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent Atlas's version of the pattern: continuous cloud backups with PITR granularity inside
+the oplog window, Online Archive tiering cold data to object storage as Parquet, and Atlas Data
+Federation querying live and archived data in one statement
+\cite{mongodbAtlasBackupDocs,mongodbOnlineArchiveDocs,mongodbDataFederationDocs}.
+
+\section{Infrastructure as Code and Schema Change Management}
+\index{infrastructure as code!equivalence}\index{Terraform!equivalence}%
+Chapter~21's topic. Terraform manages all seven platforms, and the GitOps discipline---plan in
+CI, apply on merge, state locked remotely---is identical everywhere.
+
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{2.9cm}p{3.0cm}p{3.0cm}p{3.0cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{AWS} & \textbf{Azure} & \textbf{GCP} \\
+\midrule
+Native IaC & CloudFormation / CDK & ARM / Bicep & Deployment Manager \\
+Terraform provider & \texttt{hashicorp/aws} & \texttt{azurerm} & \texttt{google} \\
+DB migration tools & Flyway / Liquibase / Alembic & Same & Same \\
+Plan-in-CI gate & \texttt{terraform plan} on PR & Same & Same \\
+State backend & S3 + DynamoDB lock & Azure Blob + lease & GCS + lock \\
+Secrets & Secrets Manager + CI vars & Key Vault + CI vars & Secret Manager + CI vars \\
+\addlinespace
+Snowflake / Fabric & \multicolumn{3}{l}{Snowflake provider for accounts/warehouses/grants; schemachange for migrations; Fabric via Terraform azapi and Git integration} \\
+Databricks & \multicolumn{3}{l}{\texttt{databricks} provider for workspaces/catalogs/jobs; Asset Bundles package code + infrastructure as one versioned unit} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent \textbf{MongoDB}'s distinctive gap and opportunity: schema is not enforced by the
+engine, so \emph{change management}---validators, indexes, migrations---is the mechanism that
+keeps forty services' implicit schemas from drifting apart \cite{mongodbTerraformDocs,terraformDocs}.
+
+\section{Kubernetes and Database Operators}
+\index{Kubernetes!equivalence}\index{operator pattern!equivalence}%
+Chapter~22's topic. Managed Kubernetes is commoditized across clouds; the
+database-on-Kubernetes question---operator versus managed service---is asked identically
+everywhere.
+
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{2.9cm}p{3.0cm}p{3.0cm}p{3.0cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{AWS} & \textbf{Azure} & \textbf{GCP} \\
+\midrule
+Managed K8s & EKS & AKS & GKE \\
+Operator hosting & EKS + operators & AKS + operators & GKE + operators (Autopilot caveats) \\
+Stateful workload primitive & EBS-backed PVCs & Azure Disk PVCs & PD-backed PVCs \\
+DBaaS alternative & DocumentDB / RDS & Cosmos DB & Atlas on GCP / Firestore \\
+Secrets & Secrets Manager + ESO & Key Vault CSI/ESO & Secret Manager + ESO \\
+\addlinespace
+Snowflake / Fabric & \multicolumn{3}{l}{N/A as SaaS---but Snowpark Container Services runs containerized services next to data, the inverse direction} \\
+Databricks & \multicolumn{3}{l}{N/A as SaaS---compute runs on the vendor-managed or customer-managed K8s underneath, invisible to the user by design} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent The operator pattern itself---declare desired state as a custom resource, let a
+controller reconcile---is the industry default for stateful software on Kubernetes
+\cite{mongodbK8sOperatorDocs,kubernetesDocs}. MongoDB is unusual in offering both poles: the
+self-managed Community/Enterprise Operators and Atlas, which removes the cluster you would operate.
+
+\section{Backup Services, Chaos, and Disaster Recovery}
+\index{disaster recovery!equivalence}%
+Chapter~23's topic. Every cloud sells regional redundancy, and every serious organization
+discovers that recovery is a practiced behavior, not a purchased feature.
+
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{2.9cm}p{3.0cm}p{3.0cm}p{3.0cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{AWS} & \textbf{Azure} & \textbf{GCP} \\
+\midrule
+Cross-region DB & Aurora Global / DDB global tables & Cosmos DB multi-region & Spanner multi-region \\
+Backup service & AWS Backup & Azure Backup & Backup and DR Service \\
+Chaos tooling & Fault Injection Service & Azure Chaos Studio & Third-party / Gremlin \\
+Pilot-light DR & Warm standby patterns & Same & Same \\
+Runbook automation & Systems Manager runbooks & Automation runbooks & Cloud Workflows \\
+\addlinespace
+Snowflake / Fabric & \multicolumn{3}{l}{Failover groups / database replication; RTO dominated by re-pointing clients and re-warming caches} \\
+Databricks & \multicolumn{3}{l}{Workspace-level DR is a customer runbook (IaC rebuild + Delta deep clone); no managed cross-region workspace failover} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent \textbf{MongoDB}'s distinctive position: replica sets and sharding (Part~II) already
+provide most of DR's mechanics---the chapter's work is measuring them under real failure and
+writing the procedures humans execute when automation runs out \cite{mongodbOpsManagerDocs,sreBook}.
+
+\section{The Whole Platform, End to End}
+\index{reference architecture!equivalence}%
+Chapter~24's synthesis. The final architecture is deliberately platform-shaped rather than
+vendor-shaped: the same skeleton---declarative infrastructure, versioned migrations, CDC-fed
+analytics, layered security, drilled recovery---rebuilds on any cloud with only control-plane
+names changing.
+
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{2.9cm}p{3.0cm}p{3.0cm}p{3.0cm}@{}}
+\toprule
+\textbf{Platform layer} & \textbf{AWS flavor} & \textbf{Azure flavor} & \textbf{GCP flavor} \\
+\midrule
+Operational store & DocumentDB / Atlas & Cosmos DB / Atlas & Firestore / Atlas \\
+IaC control plane & Terraform + AWS & Terraform + azurerm & Terraform + google \\
+K8s staging & EKS + operator & AKS + operator & GKE + operator \\
+CDC backbone & MSK / Kinesis & Event Hubs & Pub/Sub \\
+Analytics sink & Redshift / S3+Athena & Fabric / Synapse & BigQuery \\
+Governance & CloudTrail + Config & Purview + Policy & Dataplex + Audit Logs \\
+\addlinespace
+Databricks & \multicolumn{3}{l}{Plays the analytics-sink and AI layer on any row: Delta lakehouse + Unity Catalog + Mosaic AI, deployed on the same cloud's primitives} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent If you can defend the MongoDB version of this platform with evidence, you can rebuild it
+on any row of that table---which is precisely the competence the certification and the interview
+loop test for \cite{mongodbUniversityDocs,kleppmann2017ddia}.
+
 \begin{tipbox}
 Use this appendix as a study aid for the book's lockstep, cross-cloud approach: when you learn a
-concept on one platform, immediately locate its equivalent here and predict how the other five
-would express the same idea. That habit turns six separate vocabularies into one mental model.
+concept on one platform, immediately locate its equivalent here and predict how the other six
+would express the same idea. That habit turns seven separate vocabularies into one mental model.
 \end{tipbox}

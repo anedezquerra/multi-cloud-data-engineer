@@ -1,0 +1,186 @@
+\chapter{Production-Readiness and Governance Checklists}
+\index{production readiness}\index{governance!checklists}\index{checklists}%
+This appendix distills the book's operational guidance, production notes, and lab acceptance
+criteria into per-domain checklists. Use them at three moments: when a workload is first
+promoted to production, at quarterly reviews, and as the rubric when auditing someone else's
+estate. Every item traces back to a chapter; the cross-references point to the full reasoning.
+
+\begin{notebox}
+A checklist item is not satisfied by intention. Like the lab acceptance criteria in
+Appendix~C, each item requires \emph{evidence}: a screenshot, a query result, a ledger row, a
+tested failure drill. ``We plan to'' and ``it usually works'' are findings, not controls.
+\end{notebox}
+
+\section{OneLake and Lakehouse}
+\index{lakehouse!checklist}\index{OneLake!checklist}%
+\begin{itemize}
+    \item[$\square$] Every lakehouse has a named owner, a domain assignment, and a workspace
+    naming convention that encodes environment (dev/test/prod). (Ch.~1)
+    \item[$\square$] Shortcuts are used only where virtualization is deliberate; each shortcut
+    documents its source URI, authentication method, owner, and update frequency. (Ch.~1)
+    \item[$\square$] Bronze tables carry ingestion metadata (source path, batch ID, load
+    timestamp) sufficient to replay any batch. (Ch.~2)
+    \item[$\square$] Silver tables enforce schema, types, deduplication, and key
+    standardization; rejected rows land in quarantine with reasons, never silently dropped. (Ch.~2)
+    \item[$\square$] Gold tables are the only tables BI consumes; no report points at a raw
+    external shortcut or an uncertified table. (Ch.~1, 2)
+    \item[$\square$] \texttt{OPTIMIZE} (with V-Order where BI reads the table) runs on a
+    schedule for high-churn tables; Z-Ordering is applied only where query filters justify
+    it. (Ch.~4, 8)
+    \item[$\square$] \texttt{VACUUM} retention is set deliberately and never run before pending
+    time-travel recovery needs are validated. (Ch.~4)
+    \item[$\square$] Schema evolution goes through a reviewed contract change---never silent
+    \texttt{mergeSchema} acceptance in production. (Ch.~4, 9)
+    \item[$\square$] Spark jobs use explicit schemas (no inference on scheduled jobs) and are
+    parameterized by processing date so the retry unit is a batch window. (Ch.~3)
+    \item[$\square$] Custom pools and pinned environments---not interactive installs---define
+    production Spark dependencies. (Ch.~3)
+\end{itemize}
+
+\section{Warehouse}
+\index{warehouse!checklist}%
+\begin{itemize}
+    \item[$\square$] Bulk loads use \texttt{COPY INTO} from staged, date-partitioned paths with
+    one manifest/ledger row per batch. (Ch.~5)
+    \item[$\square$] Aggregates are reconciled against the source profile after every load;
+    row counts are evidence, not vibes. (Ch.~5)
+    \item[$\square$] SCD2 merges run expire-then-insert in the correct order and are
+    idempotent: a second run changes nothing. (Ch.~7)
+    \item[$\square$] Stored procedures and views---not ad hoc queries---own the transformation
+    logic in SQL-centric estates. (Ch.~5, 6)
+    \item[$\square$] Pay-as-you-go dev/test capacities pause on a schedule outside business
+    hours. (Ch.~5, 23)
+    \item[$\square$] The choice of Warehouse versus Lakehouse for each Gold product is written
+    down with its reason (SQL-first consumers, finance orientation, or open-format
+    multi-engine access). (Ch.~2)
+\end{itemize}
+
+\section{Pipelines and Dataflows}
+\index{pipelines!checklist}\index{Dataflows!checklist}%
+\begin{itemize}
+    \item[$\square$] Ingestion is metadata-driven: onboarding a new source is an
+    \texttt{INSERT} into the config table, not a new pipeline. (Ch.~9)
+    \item[$\square$] ForEach parallelism is bounded; unbounded fan-out against a source is a
+    reviewed exception. (Ch.~9)
+    \item[$\square$] A contract-validation gate rejects breaking schema changes (renames,
+    drops, tightened nullability) and allows additive ones; both paths are tested. (Ch.~9)
+    \item[$\square$] Watermarks advance only on success, so reruns replay exactly the missing
+    slice with no duplicates and no gaps. (Ch.~9, 11, 12)
+    \item[$\square$] Dataflow outputs stage first; quality-gate assertions run between staging
+    and Gold, and the gate is actually wired into the pipeline. (Ch.~10)
+    \item[$\square$] On Failure paths (not On Completion) carry alerts and compensating
+    actions; publishing waits for unambiguous success. (Ch.~12)
+    \item[$\square$] Every alert carries a runbook link: rerun steps, backfill path,
+    escalation owner. (Ch.~12)
+    \item[$\square$] Gateways are clustered (2+ nodes), run on managed hosts with an inventory
+    of driver versions, and authenticate with least-privilege identities. (Ch.~11)
+    \item[$\square$] The gateway-down drill has been executed and the rerun proven
+    duplicate-free. (Ch.~11)
+    \item[$\square$] One ledger row per pipeline outcome exists for forensics and audit. (Ch.~12)
+\end{itemize}
+
+\section{Real-Time Intelligence}
+\index{real-time!checklist}\index{Eventhouse!checklist}%
+\begin{itemize}
+    \item[$\square$] Producers stamp every event with a unique ID before the first send; the
+    connection string lives in Key Vault, never in code. (Ch.~13)
+    \item[$\square$] Deduplication (\texttt{arg\_max} by event ID or equivalent) runs at the
+    first queryable boundary, before any rule or aggregate consumes the stream. (Ch.~13, 14)
+    \item[$\square$] The replay window of the source exceeds the slowest realistic recovery;
+    the number is documented. (Ch.~13)
+    \item[$\square$] Every KQL query and materialized view is time-bounded; unbounded lookbacks
+    are rejected in review. (Ch.~14)
+    \item[$\square$] Late-arrival policy is stated in writing for every windowed join. (Ch.~14)
+    \item[$\square$] Reflex rules use sustained conditions (not single spikes), read deduped
+    data, and have cooldowns plus a resolved notification. (Ch.~15)
+    \item[$\square$] Every production dashboard shows a freshness indicator (last-event age).
+    (Ch.~16)
+    \item[$\square$] Refresh cadence follows decision cadence, not platform maximum; the cost
+    of wall monitors at the chosen cadence is computed. (Ch.~16)
+    \item[$\square$] Reverse-ETL syncs upsert on a stable alternate key and are idempotent on
+    rerun; freshness versus cost per entity is agreed with the business owner in writing. (Ch.~16)
+    \item[$\square$] The replay drill produces zero duplicate alerts. (Ch.~13, 15)
+\end{itemize}
+
+\section{Power BI and Semantic Models}
+\index{semantic model!checklist}\index{Power BI!checklist}%
+\begin{itemize}
+    \item[$\square$] The fact table grain is declared before any measure is written; two
+    reports cannot produce two ``correct'' revenue numbers. (Ch.~7)
+    \item[$\square$] Dimensions are conformed---shared keys, identical business meaning across
+    facts. (Ch.~7)
+    \item[$\square$] Storage mode (Import, Direct Lake, DirectQuery) is chosen per table with a
+    recorded rationale; fallback behavior is understood and monitored. (Ch.~8)
+    \item[$\square$] Direct Lake tables are V-Ordered; fallback events are watched in the
+    Capacity Metrics app, not discovered by users. (Ch.~8)
+    \item[$\square$] Relationships are surrogate-key one-to-many; circular dependencies are
+    factored through bridge tables. (Ch.~7)
+    \item[$\square$] RLS is tested with \texttt{EXECUTE AS USER} (or View As) for every persona
+    on every engine path---including the Spark path---never only as the owner. (Ch.~6, 21)
+    \item[$\square$] Certified semantic models are the only sources for executive reporting;
+    endorsement is visible to consumers. (Ch.~7, 22)
+\end{itemize}
+
+\section{Machine Learning}
+\index{machine learning!checklist}\index{MLOps!checklist}%
+\begin{itemize}
+    \item[$\square$] Features live in governed Delta tables with as-of dating; no training on
+    ad hoc CSV extracts. (Ch.~17)
+    \item[$\square$] Every feature is rebuildable for any historical date; leakage tests
+    (temporal, preprocessing, target) exist and run. (Ch.~17)
+    \item[$\square$] Every training run is tracked with parameters, metrics, dataset version or
+    as-of date, and code commit. (Ch.~18)
+    \item[$\square$] Run comparisons filter to a common dataset snapshot; cross-snapshot
+    ``improvements'' are discarded. (Ch.~18)
+    \item[$\square$] Models are consumed from the registry by alias; rollback is an alias move,
+    not a code change. (Ch.~18)
+    \item[$\square$] AI-service credentials resolve from Key Vault or managed identity at run
+    time---never literals in notebooks that Git will sync. (Ch.~19)
+    \item[$\square$] Enrichment calls are batched, with measured cost per thousand rows before
+    scale-up. (Ch.~19)
+    \item[$\square$] Every scored row carries \texttt{model\_version} and \texttt{scored\_ts};
+    scoring writes are partition-idempotent. (Ch.~19, 20)
+    \item[$\square$] A distribution gate (PSI/KS against training baselines) runs on every
+    scoring batch and is proven to catch injected skew. (Ch.~20)
+    \item[$\square$] Drift triggers retraining and evaluation automatically, but promotion
+    requires metric evidence and human review. (Ch.~20)
+\end{itemize}
+
+\section{Purview, Security, and Compliance}
+\index{Purview!checklist}\index{security!checklist}\index{GDPR!checklist}%
+\begin{itemize}
+    \item[$\square$] Workspace roles follow least privilege: Contributor for builders, Viewer
+    for consumers; item-level grants expose exactly the products needed. (Ch.~21)
+    \item[$\square$] OneLake data access roles close the storage-plane bypass so the Spark path
+    enforces what the SQL path enforces. (Ch.~21)
+    \item[$\square$] Service principals are scoped one-per-workload-family; no broad shared
+    automation identity. (Ch.~21)
+    \item[$\square$] Privilege-creep audits run quarterly: every grant maps to a ticket or
+    owner, and the unjustified are revoked. (Ch.~21)
+    \item[$\square$] Sensitivity labels are applied at the source and inheritance downstream is
+    verified, not assumed. (Ch.~22)
+    \item[$\square$] Lineage is captured and consulted for impact analysis before any schema
+    change or retirement. (Ch.~22)
+    \item[$\square$] GDPR erasure has a tested strategy per data class: coordinated
+    \texttt{DELETE} + \texttt{VACUUM} where history must die, or crypto-shredding with keys in
+    Key Vault where it must die everywhere at once. (Ch.~22)
+    \item[$\square$] Legal holds are recorded as documented exceptions with erasure executing
+    on release. (Ch.~22)
+    \item[$\square$] Dev workspaces are Git-bound; promotion flows only through deployment
+    pipelines with reviewed rules. (Ch.~23)
+    \item[$\square$] The clean-environment rehydration from Git has been executed or its exact
+    steps documented. (Ch.~23)
+    \item[$\square$] The DR plan names its mechanisms explicitly: Git rehydration for
+    definitions, Delta time travel for recent data, deliberate dual-region design where the
+    business requires it---with per-workload pricing. (Ch.~23)
+    \item[$\square$] Secret scans run on the connected repository and are clean. (Ch.~23)
+    \item[$\square$] Capacity throttling behavior (smoothing, delay, rejection) is monitored;
+    surge protection reserves interactive headroom. (Ch.~23)
+\end{itemize}
+
+\begin{tipbox}
+Turn these lists into your organization's promotion gate: a workload does not move to
+production until its domain's checklist is complete \emph{with evidence attached}. The
+checklist then doubles as the audit rubric and as the onboarding document for the next
+engineer who inherits the estate.
+\end{tipbox}

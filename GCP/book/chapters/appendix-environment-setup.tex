@@ -1,0 +1,201 @@
+\chapter{Environment Setup Reference}
+\index{environment setup}\index{gcloud CLI!installation}\index{cost guardrails}%
+This appendix consolidates, in one place, everything a workstation needs before any chapter's
+labs will run: the Google Cloud project and billing foundation, the gcloud CLI, language client
+libraries, Terraform, and the cost guardrails that keep a self-study budget intact. Each section
+is a checklist distilled from Chapter~0 and the setup steps scattered through the book; treat it
+as the page you revisit whenever a lab fails with an authentication, quota, or ``API not
+enabled'' error.
+
+\section{Project and Billing Foundation}
+\index{project setup}\index{billing account}%
+Every lab in this book assumes one dedicated learner project (Chapter~0 recommends a name such as
+\texttt{gcp-de-study-<your-initials>}) linked to a billing account protected by the free trial's
+\$300 / 90-day credit.
+
+\begin{itemize}
+    \item[$\square$] Google Cloud account created; free trial activated with a card (no charge
+    until the trial is manually upgraded).
+    \item[$\square$] One learner project created; nothing runs in an organization default project.
+    \item[$\square$] Billing account linked to the project (Billing console or
+    \texttt{gcloud billing projects link}).
+    \item[$\square$] Personal account holds \emph{Editor} (or narrower per-chapter roles) on the
+    learner project only---never \emph{Owner} as a daily-driver habit (Chapter~0).
+    \item[$\square$] 2-Step Verification enabled on the Google account before any resource exists.
+    \item[$\square$] Regions and zones chosen deliberately and recorded (the book standardizes on
+    \texttt{us-central1} / \texttt{us} multi-region unless a chapter says otherwise).
+\end{itemize}
+
+\noindent APIs are disabled by default; each chapter's first command fails until its services are
+enabled. Enable them per lab rather than all at once:
+
+\begin{lstlisting}[language=bash,caption={Enabling the most common service APIs used across the book.},label={lst:appB-enable-apis}]
+gcloud services enable storage.googleapis.com bigquery.googleapis.com `
+  dataflow.googleapis.com dataproc.googleapis.com composer.googleapis.com `
+  pubsub.googleapis.com datastream.googleapis.com datafusion.googleapis.com `
+  aiplatform.googleapis.com dataplex.googleapis.com dlp.googleapis.com
+\end{lstlisting}
+
+\section{The gcloud CLI}
+\index{gcloud CLI}\index{Cloud Shell}%
+Install the Google Cloud CLI on Windows via the interactive installer or
+\texttt{winget install Google.CloudSDK}, then initialize authentication and defaults once
+(Chapter~0):
+
+\begin{lstlisting}[language=PowerShell,caption={One-time CLI initialization from PowerShell.},label={lst:appB-gcloud-init}]
+gcloud init                                    # account, project, default region/zone
+gcloud auth application-default login          # credentials for client libraries
+gcloud config list                             # verify
+gcloud auth list                               # verify active account
+\end{lstlisting}
+
+\begin{itemize}
+    \item[$\square$] \texttt{gcloud init} completed; \texttt{gcloud config list} shows the
+    learner project and chosen region.
+    \item[$\square$] Application Default Credentials created---client libraries (Python, Java)
+    and Terraform read these when no explicit key is provided.
+    \item[$\square$] Cloud Shell verified as the zero-install fallback
+    (\texttt{shell.cloud.google.com}); it ships gcloud, bq, gsutil, Terraform, and an editor
+    pre-authenticated.
+    \item[$\square$] Components updated periodically: \texttt{gcloud components update}.
+\end{itemize}
+
+\begin{tipbox}
+When a command mysteriously acts on the wrong project, the active configuration is almost always
+the cause. \texttt{gcloud config configurations create/learn/activate} keeps separate named
+configurations per project---cheap insurance against writing to the wrong place.
+\end{tipbox}
+
+\section{Client Libraries and Local Development}
+\index{client libraries}\index{Python environment}%
+The book's code listings assume Python~3.10+ in a virtual environment, with per-chapter extras:
+
+\begin{lstlisting}[language=PowerShell,caption={Python environment with the libraries used across the book.},label={lst:appB-python-env}]
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install google-cloud-storage google-cloud-bigquery google-cloud-pubsub `
+  google-cloud-aiplatform apache-beam[gcp] dbt-bigquery
+\end{lstlisting}
+
+\noindent Key rules the chapters rely on:
+\begin{itemize}
+    \item Client libraries authenticate through Application Default Credentials; never download a
+    service-account JSON key for local work (Chapter~21 explains why keys are disqualifying in
+    production and a bad habit in study).
+    \item Apache Beam pipelines run locally with the DirectRunner before any Dataflow submission
+    (Chapter~14); the \texttt{apache-beam[gcp]} extra is required for GCP I/O connectors.
+    \item Keep one virtual environment per machine, not per chapter; dependency conflicts between
+    chapters are rare and a shared environment keeps disk use down.
+\end{itemize}
+
+\section{Terraform}
+\index{Terraform!setup}%
+Chapters~12 and~24 (and the Milestone~6 capstone) provision with Terraform. Setup is three steps:
+
+\begin{enumerate}
+    \item Install Terraform on Windows (\texttt{winget install Hashicorp.Terraform}) or use the
+    copy preinstalled in Cloud Shell.
+    \item Point Terraform at the same Application Default Credentials as the client libraries;
+    the \texttt{google} provider picks them up automatically.
+    \item For any team or CI scenario, move state to a locked GCS backend before the first shared
+    apply (Chapter~24):
+\end{enumerate}
+
+\begin{lstlisting}[language=bash,caption={Remote state backend block used from Chapter 24 onward.},label={lst:appB-tf-backend}]
+terraform {
+  backend "gcs" {
+    bucket = "gcp-de-study-tfstate"
+    prefix = "book/state"
+  }
+}
+\end{lstlisting}
+
+\begin{pitfall}
+Do not run Chapter~24's multi-project applies with local state: a laptop crash between
+\texttt{plan} and \texttt{apply} leaves orphaned resources the next run cannot see. The GCS
+backend takes five minutes and is the single highest-value setup step in this appendix.
+\end{pitfall}
+
+\section{Cost Guardrails}
+\index{budgets}\index{cost guardrails}\index{quotas}%
+Chapter~0 sets these before the first lab; they are repeated here because every expensive
+accident in self-study traces to a skipped guardrail.
+
+\begin{itemize}
+    \item[$\square$] A budget exists on the billing account with alerts at 50\%, 90\%, and 100\%
+    of a small monthly amount (for example \$25), emailed to you
+    (\texttt{gcloud billing budgets create} or the console).
+    \item[$\square$] Billing export to BigQuery is enabled once spend becomes non-trivial
+    (Chapter~8 and Chapter~23 analyze this export).
+    \item[$\square$] BigQuery custom query cost quotas are set per user and per project
+    (Chapter~5's Friday use case; dry-run bytes checks in CI per Chapter~24).
+    \item[$\square$] Every cluster, Composer environment, Data Fusion instance, and Vertex
+    endpoint created in a lab is deleted or stopped the same day---these are the services that
+    bill while idle.
+    \item[$\square$] A weekly five-minute review: Billing console reports grouped by service,
+    compared against the budget forecast.
+\end{itemize}
+
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{4.2cm}p{4.4cm}p{4.2cm}@{}}
+\toprule
+\textbf{Idle-cost offender} & \textbf{Bills while idle?} & \textbf{Shutdown habit} \\
+\midrule
+Dataproc cluster & Yes (VMs) & Ephemeral per job; delete after \\
+Composer environment & Yes (GKE + Cloud SQL) & Delete between weeks 11--12 labs \\
+Data Fusion instance & Yes (instance hours) & Stop/delete after each lab \\
+Vertex AI endpoint & Yes (replica hours) & Undeploy model, delete endpoint \\
+Bigtable cluster & Yes (node hours) & Delete node/cluster after lab \\
+Pub/Sub, Cloud Storage & Effectively no (usage-priced) & Lifecycle rules; delete test buckets \\
+BigQuery & No (storage only) & Delete datasets; watch bytes scanned \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{Per-Chapter Tool Requirements}
+\index{tool requirements}%
+The full matrix of what each chapter needs beyond the base setup (project, billing, gcloud,
+Python). Enable APIs and install extras the day you start the chapter, not before.
+
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{1.1cm}p{5.4cm}p{6.3cm}@{}}
+\toprule
+\textbf{Ch.} & \textbf{Services to enable} & \textbf{Local tools / notes} \\
+\midrule
+0 & Cloud Resource Manager, Billing, Storage & gcloud CLI, Cloud Shell fallback \\
+1 & Cloud Storage, Storage Transfer & \texttt{gcloud storage} / gsutil; Python storage client \\
+2 & Cloud SQL, AlloyDB, DMS & \texttt{psql} client; private IP networking \\
+3 & Cloud Spanner & Spanner client libs; Key Visualizer in console \\
+4 & Cloud Bigtable & \texttt{cbt} CLI; HBase shell optional \\
+5 & BigQuery & \texttt{bq} CLI; public datasets (free tier) \\
+6 & BigQuery (BI Engine) & Execution-plan reading; \texttt{INFORMATION\_SCHEMA} \\
+7 & BigQuery (external tables, Omni) & External CSVs; geography functions \\
+8 & BigLake, Analytics Hub, BI Engine & BigLake connection; Looker Studio (free) \\
+9 & Dataproc, Dataflow (Beam) & PySpark local optional; \texttt{apache-beam[gcp]} \\
+10 & Data Fusion (+ ephemeral Dataproc) & Wrangler UI; private IP instance for labs \\
+11 & Datastream, Composer & Source PostgreSQL with logical replication \\
+12 & Composer, Dataform, Dataplex & Airflow local optional; Terraform intro \\
+13 & Pub/Sub (+ Lite) & Python publisher/subscriber samples \\
+14 & Dataflow, Pub/Sub & Beam DirectRunner locally first \\
+15 & Dataflow (streaming), BigQuery & Storage Write API; windowing test harness \\
+16 & Looker / Looker Studio & LookML Git repo; reverse-ETL partner optional \\
+17 & BigQuery ML, Vertex AI & \texttt{google-cloud-aiplatform} \\
+18 & Vertex AI (AutoML, endpoints) & Endpoint teardown discipline (cost) \\
+19 & Vertex Pipelines, Feature Store & KFP SDK; pipeline compiler \\
+20 & Vision / NL / Translation APIs, Vertex & API keys not needed---use ADC \\
+21 & VPC SC, Cloud KMS, Audit Logs & Second test identity for negative tests \\
+22 & Dataplex, Data Catalog, AutoDQ & Tag templates; lake/zone planning worksheet \\
+23 & Sensitive Data Protection (DLP), KMS & Synthetic PII generator; risk-analysis jobs \\
+24 & Cloud Build, Dataform, Terraform & GCS state backend; GitHub repo for CI \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{notebox}
+If a lab fails at its first API call, debug in this order: (1)~active configuration and account
+(\texttt{gcloud config list}, \texttt{gcloud auth list}); (2)~API enabled on \emph{this} project;
+(3)~billing linked; (4)~quota; (5)~IAM role. In self-study the cause is (2) or (3) nine times out
+of ten.
+\end{notebox}

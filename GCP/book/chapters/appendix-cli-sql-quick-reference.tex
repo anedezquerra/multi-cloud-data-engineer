@@ -1,0 +1,282 @@
+\chapter{CLI and SQL Quick Reference}
+\index{quick reference}\index{gcloud CLI!commands}\index{bq CLI}\index{gsutil}%
+This appendix collects the commands the book's labs actually use, grouped by service, each with a
+one-line purpose. It is a lookup table, not a tutorial---each row is taught in context in the
+chapter shown in parentheses. All commands assume an authenticated gcloud CLI with the learner
+project set (Appendix on environment setup).
+
+\section{Core gcloud}
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{6.6cm}p{6.2cm}@{}}
+\toprule
+\textbf{Command} & \textbf{Purpose} \\
+\midrule
+\texttt{gcloud init} & Interactive login, project, region/zone defaults (Ch.~0) \\
+\texttt{gcloud auth application-default login} & Create ADC for client libraries and Terraform (Ch.~0) \\
+\texttt{gcloud config set project P} & Switch active project \\
+\texttt{gcloud config configurations activate NAME} & Swap between saved project/identity sets \\
+\texttt{gcloud services enable S.googleapis.com} & Enable an API before first use (Ch.~0) \\
+\texttt{gcloud projects list} & List visible projects \\
+\texttt{gcloud billing budgets create ...} & Create budget with alert thresholds (Ch.~0) \\
+\texttt{gcloud iam service-accounts create NAME} & Create a service account (Ch.~0, 21) \\
+\texttt{gcloud projects add-iam-policy-binding P \textbackslash} & Grant a role to a member (Ch.~0) \\
+\texttt{gcloud logging read "FILTER" -{}-limit=N} & Query Cloud Logging from the shell (Ch.~15, 21) \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{Cloud Storage (gcloud storage / gsutil)}
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{6.6cm}p{6.2cm}@{}}
+\toprule
+\textbf{Command} & \textbf{Purpose} \\
+\midrule
+\texttt{gcloud storage buckets create gs://B -{}-location=US} & Create a bucket (Ch.~0, 1) \\
+\texttt{gcloud storage cp LOCAL gs://B/} & Upload a file or object (Ch.~1) \\
+\texttt{gcloud storage cp -r gs://B/PREFIX . } & Download a prefix recursively \\
+\texttt{gcloud storage ls -r gs://B/} & List objects recursively \\
+\texttt{gcloud storage rm -r gs://B} & Delete objects and bucket (careful) \\
+\texttt{gcloud storage buckets update gs://B \textbackslash} & Set lifecycle, class, or labels on a bucket \\
+\texttt{gsutil versioning set on gs://B} & Enable object versioning (Ch.~1) \\
+\texttt{gsutil retention set 30d gs://B} & Apply a retention policy (Ch.~1) \\
+\texttt{gsutil -m cp -r SRC gs://B/} & Parallel multi-threaded copy of large trees \\
+\texttt{gcloud transfer jobs create ...} & Storage Transfer Service scheduled transfer (Ch.~1) \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent\texttt{gcloud storage} is the modern, parallel-by-default CLI; \texttt{gsutil} remains
+for versioning, retention, and a few legacy flags---the book uses both deliberately (Chapter~0).
+
+\section{BigQuery (bq and SQL)}
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{6.6cm}p{6.2cm}@{}}
+\toprule
+\textbf{Command} & \textbf{Purpose} \\
+\midrule
+\texttt{bq mk DATASET} & Create a dataset (Ch.~5) \\
+\texttt{bq show PROJECT:DATASET.TABLE} & Inspect schema and metadata (Ch.~5) \\
+\texttt{bq query -{}-nouse\_legacy\_sql "SQL"} & Run a query non-interactively (Ch.~5) \\
+\texttt{bq query -{}-dry\_run "SQL"} & Estimate bytes billed before running (Ch.~5, 6) \\
+\texttt{bq load -{}-autodetect DS.TBL gs://B/f.csv} & Load CSV from Cloud Storage (Ch.~7) \\
+\texttt{bq extract DS.TBL gs://B/out-*.csv} & Export a table to Cloud Storage \\
+\texttt{bq ls -{}-jobs -a} & List recent jobs for forensics (Ch.~6) \\
+\texttt{bq mk -{}-table DS.TBL schema.json} & Create a table with an explicit schema \\
+\texttt{bq update -{}-time\_partitioning\_field=D ...} & Convert/define partitioning (Ch.~6) \\
+\texttt{bq mkdef -{}-source\_format=CSV ...} & External table definition over GCS (Ch.~7) \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{6.6cm}p{6.2cm}@{}}
+\toprule
+\textbf{SQL pattern} & \textbf{Purpose} \\
+\midrule
+\texttt{FROM t, UNNEST(t.arr) AS x} & Flatten repeated fields (Ch.~5) \\
+\texttt{AVG(x) OVER (PARTITION BY k ORDER BY d \textbackslash} & Seven-row rolling window (Ch.~5) \\
+~~\texttt{ROWS BETWEEN 6 PRECEDING AND CURRENT ROW)} & \\
+\texttt{MERGE t USING s ON key AND is\_current ...} & SCD Type~2 upsert (Ch.~5) \\
+\texttt{CREATE TABLE ... PARTITION BY DATE(d) \textbackslash} & Partition + cluster in one DDL (Ch.~6) \\
+~~\texttt{CLUSTER BY customer\_id} & \\
+\texttt{CREATE MATERIALIZED VIEW ...} & Precompute a hot aggregation (Ch.~6) \\
+\texttt{ST\_WITHIN(point, polygon)} & Geospatial containment test (Ch.~7) \\
+\texttt{CREATE MODEL ... OPTIONS(model\_type=...)} & BigQuery ML training (Ch.~17) \\
+\texttt{ML.EVALUATE(MODEL m, ...)} & Model metrics on held-out data (Ch.~17) \\
+\texttt{ML.PREDICT(MODEL m, ...)} & In-warehouse inference (Ch.~17) \\
+\texttt{SELECT * FROM DS.INFORMATION\_SCHEMA.JOBS\_BY\_PROJECT} & Slot and bytes forensics (Ch.~6, 8) \\
+\texttt{CREATE ROW ACCESS POLICY ...} & Row-level security (Ch.~8) \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{Dataflow and Apache Beam}
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{6.6cm}p{6.2cm}@{}}
+\toprule
+\textbf{Command} & \textbf{Purpose} \\
+\midrule
+\texttt{python pipeline.py -{}-runner=DirectRunner} & Local test before cloud submission (Ch.~14) \\
+\texttt{python pipeline.py -{}-runner=DataflowRunner \textbackslash} & Submit to Dataflow (Ch.~14) \\
+~~\texttt{-{}-project=P -{}-region=R -{}-temp\_location=gs://B/tmp} & \\
+\texttt{-{}-streaming} & Run in streaming mode (Ch.~14, 15) \\
+\texttt{-{}-max\_num\_workers=N} & Cap autoscaling ramp (Ch.~14) \\
+\texttt{gcloud dataflow jobs list -{}-region=R} & List jobs and states \\
+\texttt{gcloud dataflow jobs cancel JOB\_ID} & Stop a streaming job \\
+\texttt{gcloud dataflow jobs drain JOB\_ID} & Stop gracefully, flushing in-flight data (Ch.~15) \\
+\texttt{gcloud dataflow flex-template run NAME \textbackslash} & Launch a packaged Flex Template (Ch.~14) \\
+~~\texttt{-{}-template-file-gcs-location=gs://B/t.json} & \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{Dataproc}
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{6.6cm}p{6.2cm}@{}}
+\toprule
+\textbf{Command} & \textbf{Purpose} \\
+\midrule
+\texttt{gcloud dataproc clusters create C \textbackslash} & Create a cluster (Ch.~9) \\
+~~\texttt{-{}-region=R -{}-num-workers=2} & \\
+\texttt{-{}-secondary-worker-type=preemptible} & Add cheap preemptible workers (Ch.~9) \\
+\texttt{gcloud dataproc jobs submit pyspark f.py \textbackslash} & Submit a Spark job (Ch.~9) \\
+~~\texttt{-{}-cluster=C -{}-region=R} & \\
+\texttt{gcloud dataproc clusters delete C} & Tear down the same day (cost) \\
+\texttt{-{}-max-idle=30m} & Auto-delete an idle cluster \\
+\texttt{gcloud dataproc batches submit pyspark f.py} & Serverless Spark, no cluster at all (Ch.~9) \\
+\texttt{-{}-properties spark.executor.memory=8g} & Override Spark configuration (Ch.~9) \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{Cloud Composer (Airflow)}
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{6.6cm}p{6.2cm}@{}}
+\toprule
+\textbf{Command} & \textbf{Purpose} \\
+\midrule
+\texttt{gcloud composer environments create E \textbackslash} & Create a Composer 2 environment (Ch.~12) \\
+~~\texttt{-{}-location=L -{}-image-version=...} & \\
+\texttt{gcloud composer environments storage dags \textbackslash} & Upload a DAG to the synced bucket \\
+~~\texttt{import -{}-environment=E -{}-location=L -{}-source=dag.py} & \\
+\texttt{gcloud composer environments run E \textbackslash} & Trigger a DAG manually \\
+~~\texttt{-{}-location=L dags trigger -{}- DAG\_ID} & \\
+\texttt{gcloud composer environments run E \textbackslash} & List task states for triage \\
+~~\texttt{-{}-location=L dags list-runs -{}- DAG\_ID} & \\
+\texttt{gcloud composer environments delete E} & Delete the environment (idle cost) \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{Pub/Sub}
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{6.6cm}p{6.2cm}@{}}
+\toprule
+\textbf{Command} & \textbf{Purpose} \\
+\midrule
+\texttt{gcloud pubsub topics create T} & Create a topic (Ch.~13) \\
+\texttt{gcloud pubsub topics create T \textbackslash} & Enforce an Avro/Proto schema (Ch.~13) \\
+~~\texttt{-{}-schema=SCHEMA -{}-message-encoding=BINARY} & \\
+\texttt{gcloud pubsub subscriptions create S -{}-topic=T} & Create a pull subscription \\
+\texttt{-{}-dead-letter-topic=DLT \textbackslash} & Attach a dead-letter topic (Ch.~13) \\
+~~\texttt{-{}-max-delivery-attempts=5} & \\
+\texttt{gcloud pubsub topics publish T -{}-message="..."} & Publish a test message \\
+\texttt{gcloud pubsub subscriptions pull S -{}-auto-ack} & Pull and acknowledge test messages \\
+\texttt{gcloud pubsub snapshots create SNAP \textbackslash} & Snapshot for later replay/seek (Ch.~13) \\
+~~\texttt{-{}-subscription=S} & \\
+\texttt{gcloud pubsub lite-topics create T -{}-zone=Z} & Provisioned zonal Lite topic (Ch.~13) \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{Datastream}
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{6.6cm}p{6.2cm}@{}}
+\toprule
+\textbf{Command} & \textbf{Purpose} \\
+\midrule
+\texttt{gcloud datastream connection-profiles create CP \textbackslash} & Define a source or destination (Ch.~11) \\
+~~\texttt{-{}-location=L -{}-type=postgresql ...} & \\
+\texttt{gcloud datastream streams create S \textbackslash} & Start CDC from source to target (Ch.~11) \\
+~~\texttt{-{}-location=L -{}-source=CP1 -{}-destination=CP2} & \\
+\texttt{gcloud datastream streams list -{}-location=L} & Check stream state and lag \\
+\texttt{gcloud datastream streams update S -{}-state=PAUSED} & Pause a stream for maintenance \\
+\texttt{gcloud datastream streams backfill S \textbackslash} & Re-run initial load for objects (Ch.~11) \\
+~~\texttt{-{}-objects=...} & \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{Cloud Data Fusion}
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{6.6cm}p{6.2cm}@{}}
+\toprule
+\textbf{Command} & \textbf{Purpose} \\
+\midrule
+\texttt{gcloud data-fusion instances create I \textbackslash} & Create an instance (Ch.~10) \\
+~~\texttt{-{}-location=L -{}-edition=developer} & \\
+\texttt{-{}-enable-private-ip} & Reach on-prem sources over private networking (Ch.~10) \\
+\texttt{gcloud data-fusion instances describe I -{}-location=L} & Get the Studio URL and state \\
+\texttt{gcloud data-fusion instances stop I -{}-location=L} & Stop instance billing between labs \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent Pipelines themselves are deployed and scheduled inside the Studio UI or via the REST/CDAP
+API; Wrangler directives are authored on samples and executed at scale by ephemeral Dataproc
+(Chapter~10).
+
+\section{Vertex AI}
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{6.6cm}p{6.2cm}@{}}
+\toprule
+\textbf{Command} & \textbf{Purpose} \\
+\midrule
+\texttt{gcloud ai models list -{}-region=R} & List registered models (Ch.~18) \\
+\texttt{gcloud ai endpoints create -{}-region=R \textbackslash} & Create a serving endpoint (Ch.~18) \\
+~~\texttt{-{}-display-name=N} & \\
+\texttt{gcloud ai endpoints deploy-model E \textbackslash} & Attach a model version with replicas (Ch.~18) \\
+~~\texttt{-{}-model=M -{}-region=R ...} & \\
+\texttt{gcloud ai endpoints predict E -{}-region=R \textbackslash} & Smoke-test online prediction \\
+~~\texttt{-{}-json-request=in.json} & \\
+\texttt{gcloud ai custom-jobs create -{}-region=R ...} & Submit a custom training job (Ch.~18) \\
+\texttt{gcloud ai endpoints undeploy-model E \textbackslash} & Stop replica billing (cost habit) \\
+~~\texttt{-{}-deployed-model-id=D -{}-region=R} & \\
+\texttt{gcloud ai index-endpoints list -{}-region=R} & Vector Search endpoints (Ch.~20) \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{Dataplex}
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{6.6cm}p{6.2cm}@{}}
+\toprule
+\textbf{Command} & \textbf{Purpose} \\
+\midrule
+\texttt{gcloud dataplex lakes create LAKE -{}-location=L} & Create a lake (Ch.~22) \\
+\texttt{gcloud dataplex zones create ZONE \textbackslash} & Add a raw or curated zone (Ch.~22) \\
+~~\texttt{-{}-lake=LAKE -{}-location=L -{}-type=RAW} & \\
+\texttt{gcloud dataplex assets create A \textbackslash} & Attach a bucket or dataset to a zone \\
+~~\texttt{-{}-lake=LAKE -{}-zone=ZONE -{}-location=L ...} & \\
+\texttt{gcloud dataplex datascans create data-quality \textbackslash} & Declare and schedule quality rules (Ch.~22) \\
+~~\texttt{SCAN -{}-location=L -{}-data=...} & \\
+\texttt{gcloud dataplex datascans run SCAN -{}-location=L} & Run a quality scan on demand \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{Sensitive Data Protection (DLP)}
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{6.6cm}p{6.2cm}@{}}
+\toprule
+\textbf{Command} & \textbf{Purpose} \\
+\midrule
+\texttt{gcloud dlp inspect-templates create ...} & Reusable inspection configuration (Ch.~23) \\
+\texttt{gcloud dlp deidentify-templates create ...} & Reusable de-identification config (Ch.~23) \\
+\texttt{gcloud dlp jobs triggers create \textbackslash} & Scheduled scan of BigQuery / GCS (Ch.~23) \\
+~~\texttt{-{}-storage-type=bigquery ...} & \\
+\texttt{gcloud dlp jobs list} & Inspect scan results and status \\
+\texttt{curl dlp.googleapis.com/v2/...:deidentify} & Inline tokenization from pipelines (Ch.~23) \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{tipbox}
+Every \texttt{gcloud} command accepts \texttt{-{}-format=json} and \texttt{-{}-filter=...};
+scripting the CLI with JSON output plus \texttt{jq} (or PowerShell's \texttt{ConvertFrom-Json})
+turns every lab step into an automatable check---which is exactly how Chapter~24's CI pipelines
+verify deployments.
+\end{tipbox}

@@ -1,0 +1,386 @@
+\chapter{Interview Question Bank}
+\index{interview questions}\index{question bank}%
+This appendix consolidates the Interview Q\&A sections of Chapters 1--24 into a single bank,
+organized by domain and difficulty. Answers are deliberately abbreviated to flash-card
+density---each cites its chapter, where the full reasoning, diagrams, and labs live. Use it in
+three passes: answer every \emph{Fundamentals} item cold, rehearse \emph{Intermediate} items
+with a whiteboard, and treat \emph{Advanced} items as prompts for hands-on reproduction.
+
+\section{Architecture, Storage, and Compute}
+\index{interview questions!architecture}
+
+\subsection{Fundamentals}
+\begin{enumerate}
+    \item \textbf{Q: What are Snowflake's three layers?}\\
+    A: Storage (compressed micro-partitions), Query Processing (virtual warehouses), Cloud Services (metadata, security, transactions). (Ch.~1)
+    \item \textbf{Q: What is a virtual warehouse?}\\
+    A: An independent compute cluster executing SQL over shared data---sized, suspended, resumed, and isolated per workload. (Ch.~2)
+    \item \textbf{Q: Are micro-partitions user-defined partitions?}\\
+    A: No---Snowflake creates them automatically; engineers influence pruning via load order, clustering keys, and schema design. (Ch.~1)
+    \item \textbf{Q: Result cache versus local SSD cache?}\\
+    A: Result cache returns identical query results without warehouse execution; local cache accelerates repeated reads on a running warehouse. (Ch.~2)
+    \item \textbf{Q: Standard view versus materialized view?}\\
+    A: A view stores a SQL definition evaluated at query time; a materialized view stores and maintains precomputed results. (Ch.~3)
+    \item \textbf{Q: Transient versus permanent table?}\\
+    A: Transient for rebuildable data (staging, intermediates) that does not need Fail-safe protection. (Ch.~3)
+    \item \textbf{Q: Why are temporary tables risky in orchestration?}\\
+    A: They live only in the creating session---a separate task or scheduler session cannot see them. (Ch.~3)
+\end{enumerate}
+
+\subsection{Intermediate}
+\begin{enumerate}
+    \item \textbf{Q: Why does separating compute from storage matter?}\\
+    A: Independent scaling, workload isolation, elastic suspend/resume, and shared access to one durable copy. (Ch.~1)
+    \item \textbf{Q: Is a clustering key an index?}\\
+    A: No---it guides micro-partition organization so metadata can prune; there is no row-level index seek. (Ch.~1)
+    \item \textbf{Q: Does a larger warehouse always reduce total cost?}\\
+    A: No---only when runtime improvement offsets the higher credit rate; benchmark representatively. (Ch.~2)
+    \item \textbf{Q: When should auto-suspend be short?}\\
+    A: Sporadic/exploratory workloads where idle cost outweighs warm-cache reuse and resume latency. (Ch.~2)
+    \item \textbf{Q: What problem does a multi-cluster warehouse solve?}\\
+    A: Concurrency queuing, by adding same-size clusters; it does not parallelize a single query. (Ch.~2)
+    \item \textbf{Q: When choose a secure view?}\\
+    A: When the view is a security or sharing boundary and its definition must be hidden. (Ch.~3)
+    \item \textbf{Q: Why can materialized views increase cost?}\\
+    A: Extra storage plus background maintenance on base-table change---justify with repeated query savings. (Ch.~3)
+    \item \textbf{Q: What workload are hybrid tables designed for?}\\
+    A: High-frequency, key-addressed point reads/writes with transactional integrity, beside analytics on the same data. (Ch.~21)
+    \item \textbf{Q: What is Unistore's core idea?}\\
+    A: One governed platform holding row-store (transactional) and columnar (analytical) data, queryable together, no replication. (Ch.~21)
+\end{enumerate}
+
+\subsection{Advanced}
+\begin{enumerate}
+    \item \textbf{Q: When enable Automatic Clustering?}\\
+    A: Large table, stable selective predicates, measured overlap causing excess scans---and saved query credits exceed reclustering credits. (Ch.~1)
+    \item \textbf{Q: Standard or Economy scaling for dashboards?}\\
+    A: Usually Standard (latency first); Economy when credit efficiency outweighs queue delay. (Ch.~2)
+    \item \textbf{Q: What workload fits Search Optimization?}\\
+    A: Highly selective point lookups on high-cardinality columns---one UUID in a large fact table. (Ch.~3)
+    \item \textbf{Q: Does Search Optimization replace clustering?}\\
+    A: No---SOS targets selective lookups; clustering improves pruning for range, join, and grouping patterns. (Ch.~3)
+    \item \textbf{Q: How do you validate an acceleration feature worked?}\\
+    A: Capture query IDs, disable cached results, compare before/after profiles on bytes scanned, partitions scanned, elapsed, and maintenance cost. (Ch.~3)
+    \item \textbf{Q: Which constraints do hybrid tables enforce?}\\
+    A: Primary keys, foreign keys, and unique constraints at write time; standard tables treat them as documentation/optimizer hints. (Ch.~21)
+    \item \textbf{Q: Why are point lookups fast on hybrid tables?}\\
+    A: A row-oriented storage layer with indexes serves key-addressed reads without scanning columnar micro-partitions. (Ch.~21)
+    \item \textbf{Q: When still choose a standard columnar table?}\\
+    A: Append-mostly, scan-heavy data---events, facts, history---where pruning and scan economics dominate. (Ch.~21)
+\end{enumerate}
+
+\section{Data Protection, Cloning, and Recovery}
+\index{interview questions!data protection}
+
+\subsection{Fundamentals}
+\begin{enumerate}
+    \item \textbf{Q: Time Travel versus Fail-safe?}\\
+    A: Time Travel is user-facing history (query, clone, undrop); Fail-safe is Snowflake's non-configurable 7-day recovery tier after Time Travel expires. (Ch.~4)
+    \item \textbf{Q: Why is a zero-copy clone fast?}\\
+    A: It copies metadata references to existing micro-partitions, not the data. (Ch.~4)
+    \item \textbf{Q: How do you recover an accidentally dropped table?}\\
+    A: \texttt{UNDROP TABLE} within Time Travel retention, then validate row counts and business totals. (Ch.~4)
+\end{enumerate}
+
+\subsection{Intermediate}
+\begin{enumerate}
+    \item \textbf{Q: \texttt{BEFORE} versus \texttt{AT}?}\\
+    A: \texttt{BEFORE} recovers state just before a known bad statement; \texttt{AT} targets a specific timestamp, offset, or statement. (Ch.~4)
+    \item \textbf{Q: When does a clone start consuming storage?}\\
+    A: When source or clone diverges---new writes allocate new micro-partitions (copy-on-write). (Ch.~4)
+    \item \textbf{Q: Biggest governance risk with clones?}\\
+    A: Production-like data leaking into lower environments when grants, masking, and row policies are not reviewed on the clone. (Ch.~4)
+\end{enumerate}
+
+\subsection{Advanced}
+\begin{enumerate}
+    \item \textbf{Q: Can Fail-safe be disabled for a permanent table?}\\
+    A: No---use transient tables only when data is reproducible and losing Fail-safe is acceptable. (Ch.~4)
+    \item \textbf{Q: How does Time Travel enable safer data repair?}\\
+    A: Clone the pre-error state, validate the clone, then repair the live table from it with controlled SQL. (Ch.~4)
+\end{enumerate}
+
+\section{Ingestion: Stages, COPY, and Snowpipe}
+\index{interview questions!ingestion}
+
+\subsection{Fundamentals}
+\begin{enumerate}
+    \item \textbf{Q: Named internal stage versus external stage?}\\
+    A: Internal for Snowflake-local artifacts (UDF files, small lookups); enterprise bulk data stays in customer storage behind an external stage. (Ch.~5)
+    \item \textbf{Q: Why is Parquet preferred for analytic ingestion?}\\
+    A: Columnar, compressed, self-describing---column projection by name, aggressive pruning, efficient storage. (Ch.~5)
+    \item \textbf{Q: What triggers Snowpipe auto-ingest on AWS?}\\
+    A: An S3 object-create event to the pipe's SQS channel; Snowflake's serverless fleet runs the pipe's \texttt{COPY INTO}. (Ch.~6)
+\end{enumerate}
+
+\subsection{Intermediate}
+\begin{enumerate}
+    \item \textbf{Q: Why is a storage integration safer than access keys?}\\
+    A: No long-lived secret in Snowflake; cloud identity plus scoped trust policy, rotation via trust update, locations constrained on the integration. (Ch.~5)
+    \item \textbf{Q: What does \texttt{ON\_ERROR = SKIP\_FILE\_3} do?}\\
+    A: Skips a file after three row errors and continues; skipped files appear in load history for retry or quarantine. (Ch.~5)
+    \item \textbf{Q: Snowpipe Streaming versus classic Snowpipe?}\\
+    A: Row batches via named channels, no files, seconds-level latency, exactly-once via offset tokens---versus file-triggered, at-least-once COPY. (Ch.~6)
+    \item \textbf{Q: Why is classic Snowpipe at-least-once, and how deduplicate?}\\
+    A: Queues can redeliver; per-table load history skips already-loaded files for 64 days, and unstable names need downstream key-based dedup. (Ch.~6)
+\end{enumerate}
+
+\subsection{Advanced}
+\begin{enumerate}
+    \item \textbf{Q: How does COPY INTO avoid double-loading files?}\\
+    A: Per-table load metadata skips files loaded within 64 days unless \texttt{FORCE = TRUE}. (Ch.~5)
+    \item \textbf{Q: How does a channel offset token give exactly-once ingestion?}\\
+    A: Client tags batches with monotonically increasing tokens; Snowflake persists the latest committed token and discards retried old tokens as duplicates. (Ch.~6)
+    \item \textbf{Q: What do you alert on to catch backlog growth?}\\
+    A: \texttt{pendingFileCount} from \texttt{SYSTEM\$PIPE\_STATUS} (and consumer lag for streaming)---a healthy-looking pipe can drown in queue depth. (Ch.~6)
+\end{enumerate}
+
+\section{CDC, Tasks, and Declarative Pipelines}
+\index{interview questions!pipelines}
+
+\subsection{Fundamentals}
+\begin{enumerate}
+    \item \textbf{Q: What does \texttt{METADATA\$ISUPDATE} indicate?}\\
+    A: The row is one half of an update expressed as DELETE+INSERT; consumers collapse the pair. (Ch.~7)
+    \item \textbf{Q: What is a stream's consumption state, and when does it advance?}\\
+    A: Its offset---a bookmark that advances only when a consuming transaction commits; failures leave it untouched. (Ch.~7)
+    \item \textbf{Q: Which two schedule types can a task use?}\\
+    A: A fixed interval (\texttt{'n MINUTE'}) or \texttt{USING CRON} with an explicit time zone. (Ch.~8)
+    \item \textbf{Q: What does \texttt{TARGET\_LAG} control?}\\
+    A: Maximum data staleness---the freshness contract Snowflake schedules refreshes to satisfy. (Ch.~11)
+    \item \textbf{Q: Which type stores arbitrary JSON, and why is it efficient?}\\
+    A: \texttt{VARIANT}---internally compressed columnar with per-path statistics, so path filters still prune. (Ch.~9)
+\end{enumerate}
+
+\subsection{Intermediate}
+\begin{enumerate}
+    \item \textbf{Q: How does a dedup key make a stream-consuming MERGE idempotent?}\\
+    A: Re-applied deltas match existing rows on a stable event id and change nothing; only genuinely new events insert. (Ch.~7)
+    \item \textbf{Q: How do child tasks declare dependencies?}\\
+    A: \texttt{AFTER <parent>}; a child runs only when all declared parents succeed in that graph run. (Ch.~8)
+    \item \textbf{Q: What is a serverless task and how is it billed?}\\
+    A: A task without a named warehouse on Snowflake-managed autosized compute, billed per second of task compute. (Ch.~8)
+    \item \textbf{Q: Dynamic tables versus materialized views?}\\
+    A: Dynamic tables allow broad multi-table SQL, declared lag, and automatic DAG derivation; MVs are restricted single-query accelerations. (Ch.~11)
+    \item \textbf{Q: Where do you check refresh history and failures?}\\
+    A: \texttt{INFORMATION\_SCHEMA.DYNAMIC\_TABLE\_REFRESH\_HISTORY}---type, duration, credits, status per run. (Ch.~11)
+    \item \textbf{Q: Why cast VARIANT fields explicitly at extraction?}\\
+    A: Types become deliberate, versioned decisions; hard casts turn schema drift into loud failures instead of silent NULLs. (Ch.~9)
+    \item \textbf{Q: What does LATERAL FLATTEN do that a join cannot?}\\
+    A: Changes cardinality---one output row per nested array element or object field, correlated to the source row. (Ch.~9)
+\end{enumerate}
+
+\subsection{Advanced}
+\begin{enumerate}
+    \item \textbf{Q: How absorb late-arriving dimension members in a stream-to-dimension join?}\\
+    A: Loosen the dimension layer's lag, keep merges idempotent, re-run so unmatched facts reconcile instead of dropping. (Ch.~7)
+    \item \textbf{Q: Why must every task step be idempotent?}\\
+    A: Retries after failure must not double-apply work; keyed MERGEs and INSERT OVERWRITE make re-runs no-ops. (Ch.~8)
+    \item \textbf{Q: How do you alert on a task-graph failure?}\\
+    A: \texttt{ERROR\_INTEGRATION} to SNS/email plus \texttt{SUSPEND\_TASK\_AFTER\_NUM\_FAILURES} to contain cascades. (Ch.~8)
+    \item \textbf{Q: When does a dynamic table degrade to full refresh?}\\
+    A: When the defining query uses constructs incremental refresh cannot track, or after base-table DDL invalidates the mapping. (Ch.~7, 11)
+    \item \textbf{Q: Why must downstream lag exceed upstream lag plus refresh time?}\\
+    A: A table cannot be fresher than its inputs; shorter lag wastes refreshes against stale data. (Ch.~11)
+    \item \textbf{Q: How do CHECK constraints enforce a data contract?}\\
+    A: Every inserted row is validated; violators are rejected at ingest and routed to quarantine. (Ch.~9)
+    \item \textbf{Q: Who owns a data contract and approves breaking changes?}\\
+    A: The producer defines it; consumers version and approve changes; breaking changes need coordinated rollout. (Ch.~9)
+\end{enumerate}
+
+\section{Performance Tuning and Analytical SQL}
+\index{interview questions!performance}
+
+\subsection{Fundamentals}
+\begin{enumerate}
+    \item \textbf{Q: What does QUALIFY filter without a subquery?}\\
+    A: Window-function results---rankings, row numbers, moving averages---in the same SELECT that computed them. (Ch.~12)
+    \item \textbf{Q: Name the three Kimball fact types.}\\
+    A: Transaction, periodic snapshot, accumulating snapshot. (Ch.~12)
+    \item \textbf{Q: Which Query Profile metric signals poor pruning?}\\
+    A: Partitions scanned near partitions total on the TableScan operator, usually with high bytes scanned. (Ch.~10)
+\end{enumerate}
+
+\subsection{Intermediate}
+\begin{enumerate}
+    \item \textbf{Q: Why does SELECT * hurt on wide columnar tables?}\\
+    A: Columnar engines read only referenced columns; \texttt{SELECT *} forces every column through decompression, memory, and spill. (Ch.~10)
+    \item \textbf{Q: Why declare the grain before building a fact table?}\\
+    A: The grain defines legal joins and aggregation semantics; late grain discovery causes fan-out and double-counting. (Ch.~12)
+    \item \textbf{Q: When does a snowflake schema beat a star in Snowflake?}\\
+    A: Rarely---only for very large shared dimensions where duplication is genuinely expensive; star prunes and joins better by default. (Ch.~12)
+    \item \textbf{Q: What physically changes under SCD Type 2?}\\
+    A: The current row closes (\texttt{is\_current = FALSE}, \texttt{valid\_to} set) and a new versioned row opens. (Ch.~12)
+\end{enumerate}
+
+\subsection{Advanced}
+\begin{enumerate}
+    \item \textbf{Q: Spilling to remote storage---first move?}\\
+    A: Verify the working set is honestly that large; after exhausting refactors (early filters, pre-aggregation), upsize---remote spill is the clearest resize signal. (Ch.~10)
+    \item \textbf{Q: How do you eliminate an accidental Cartesian join?}\\
+    A: Restore the missing equijoin predicate; the profile shows output rows equal to the product of inputs. (Ch.~10)
+    \item \textbf{Q: When is upsizing better than rewriting SQL?}\\
+    A: When the working set genuinely exceeds memory with clean SQL, or the query is CPU-bound and well-pruned already. (Ch.~10)
+\end{enumerate}
+
+\section{Snowpark and Programmability}
+\index{interview questions!Snowpark}
+
+\subsection{Fundamentals}
+\begin{enumerate}
+    \item \textbf{Q: What does lazy evaluation mean for Snowpark DataFrames?}\\
+    A: Transformations accumulate client-side into a plan; an action (\texttt{collect()}, \texttt{save\_as\_table()}) compiles it to SQL. (Ch.~13)
+    \item \textbf{Q: Stored procedure versus UDF?}\\
+    A: A UDF computes values inside queries without side effects; a procedure is \texttt{CALL}ed, runs multi-statement control flow, and manages transactions. (Ch.~15)
+    \item \textbf{Q: When a UDTF over a scalar UDF?}\\
+    A: When one input row must produce zero or many output rows---parsers, expanders, generators. (Ch.~14)
+    \item \textbf{Q: Why is a vectorized UDF faster than a scalar UDF?}\\
+    A: Batching via Arrow: pandas DataFrames cross the sandbox once per batch, with vectorized NumPy/pandas operations inside. (Ch.~14)
+    \item \textbf{Q: What serialization carries batches into Python UDFs?}\\
+    A: Apache Arrow columnar format, surfaced to the handler as pandas DataFrames. (Ch.~14)
+    \item \textbf{Q: Where do Python UDF dependencies come from?}\\
+    A: Snowflake's curated Anaconda channel, declared in \texttt{PACKAGES} and pinned for reproducibility. (Ch.~14)
+    \item \textbf{Q: How verify a Snowpark transformation was pushed down?}\\
+    A: \texttt{df.explain()} should show a single SQL statement executed on the warehouse, not fragmented local execution. (Ch.~13)
+\end{enumerate}
+
+\subsection{Intermediate}
+\begin{enumerate}
+    \item \textbf{Q: When does collect() become dangerous?}\\
+    A: On large results it materializes everything into client memory; persist with \texttt{save\_as\_table} and sample with \texttt{limit()}. (Ch.~13)
+    \item \textbf{Q: Why pin the Snowpark client to the server package channel?}\\
+    A: Version skew causes serialization and API mismatches; pinning plus CI testing prevents environment-dependent failures. (Ch.~13)
+    \item \textbf{Q: Which auth for Snowpark client code in CI?}\\
+    A: Key-pair authentication with the private key injected as a secret---never passwords in code or CI variables. (Ch.~13)
+    \item \textbf{Q: Why can a SQL UDF beat a Python UDF?}\\
+    A: The optimizer inlines SQL UDFs with no serialization or sandbox overhead; Python UDFs pay both per invocation. (Ch.~14)
+    \item \textbf{Q: Why parameterize a procedure with a table name?}\\
+    A: One tested procedure serves many datasets---but identifiers must be whitelisted against injection. (Ch.~15)
+    \item \textbf{Q: How make scikit-learn available to a Python procedure?}\\
+    A: Declare it in the \texttt{PACKAGES} clause, resolved from the Anaconda channel. (Ch.~15)
+    \item \textbf{Q: Which two objects does an external function need to reach an API?}\\
+    A: An API integration (endpoint whitelist plus cloud role---the trust boundary) and the external function object itself. (Ch.~16)
+    \item \textbf{Q: What is reverse ETL, and which objects drive it natively?}\\
+    A: Syncing curated results back to operational tools: a Gold table, a stream for changed members, and a task calling an external function. (Ch.~16)
+\end{enumerate}
+
+\subsection{Advanced}
+\begin{enumerate}
+    \item \textbf{Q: Owner's-rights versus caller's-rights procedures?}\\
+    A: Owner's rights let a controlled procedure act on privileged data for low-privilege callers (pipelines); caller's rights restrict it to the caller's privileges (shared utilities). (Ch.~15)
+    \item \textbf{Q: How do procedures fit into a task DAG?}\\
+    A: Task bodies should be procedure calls---the graph schedules; the procedure encapsulates testable, transactional logic. (Ch.~15)
+    \item \textbf{Q: Why batch multiple rows per external function call?}\\
+    A: Calls are synchronous and billed per invocation; batching amortizes cost and latency. (Ch.~16)
+    \item \textbf{Q: How avoid re-paying for repeated identical API lookups?}\\
+    A: Cache results keyed by normalized-input hash; resolve only cache misses through the API. (Ch.~16)
+    \item \textbf{Q: What trade-off does higher reverse-ETL sync frequency impose?}\\
+    A: Fresher operational data versus more credits and third-party API quota---match frequency to the business decision fed. (Ch.~16)
+\end{enumerate}
+
+\section{Governance, Security, and Sharing}
+\index{interview questions!governance}
+
+\subsection{Fundamentals}
+\begin{enumerate}
+    \item \textbf{Q: Which system role must never run daily workloads?}\\
+    A: \texttt{ACCOUNTADMIN}---it inherits everything, maximizing blast radius and destroying attribution. (Ch.~17)
+    \item \textbf{Q: Why grant privileges to roles, never directly to users?}\\
+    A: Access review, offboarding, and recertification become graph operations on a small role set instead of per-user archaeology. (Ch.~17)
+    \item \textbf{Q: Why is secure data sharing called zero-copy?}\\
+    A: The share is metadata (grants); consumers query the provider's micro-partitions in place---nothing is replicated or exported. (Ch.~19)
+    \item \textbf{Q: When do you need a reader account?}\\
+    A: When the consumer is not a Snowflake customer---the provider provisions and pays for a managed account. (Ch.~19)
+\end{enumerate}
+
+\subsection{Intermediate}
+\begin{enumerate}
+    \item \textbf{Q: Access roles versus functional roles?}\\
+    A: Access roles own object privileges (\texttt{READ\_GOLD}); functional roles describe jobs (\texttt{ANALYST}) and aggregate access roles; users hold functional roles only. (Ch.~17)
+    \item \textbf{Q: What do secondary roles change in a session?}\\
+    A: The session exercises additional roles' privileges simultaneously; object creation still belongs to the primary role. (Ch.~17)
+    \item \textbf{Q: What session context does a masking policy evaluate?}\\
+    A: \texttt{CURRENT\_ROLE()}, \texttt{IS\_ROLE\_IN\_SESSION()} and friends, evaluated per query at runtime against the stored value. (Ch.~18)
+    \item \textbf{Q: How does tag-based masking scale to hundreds of columns?}\\
+    A: The policy binds to the tag once; every tagged column---including future ones---is protected automatically. (Ch.~18)
+    \item \textbf{Q: What do row access policies typically filter on?}\\
+    A: Caller context (role, user) joined to an entitlements mapping table---access changes become data changes, not redeploys. (Ch.~18)
+    \item \textbf{Q: Which object types can be added to a share?}\\
+    A: Databases, schemas, tables, and---as the correct payload---secure views and secure UDFs. (Ch.~19)
+    \item \textbf{Q: Why share secure views instead of base tables?}\\
+    A: Secure views hide definitions and expose only curated, masked columns; a shared base table bypasses serving-layer governance. (Ch.~19)
+    \item \textbf{Q: Marketplace listing versus direct share?}\\
+    A: A listing wraps the share in a discoverable product with documentation, terms, pricing, and regions; a direct share is point-to-point between known accounts. (Ch.~19)
+    \item \textbf{Q: What problem does a data clean room solve?}\\
+    A: Multi-party analytics where no participant may see another's raw data---approved computations with privacy controls on outputs. (Ch.~20)
+    \item \textbf{Q: Why hash emails before an overlap analysis?}\\
+    A: Hashing pseudonymizes identifiers; keyed hashing resists dictionary reversal and composes with aggregate-only outputs. (Ch.~20)
+\end{enumerate}
+
+\subsection{Advanced}
+\begin{enumerate}
+    \item \textbf{Q: Which ACCOUNT\_USAGE views audit who can access a table?}\\
+    A: \texttt{GRANTS\_TO\_ROLES} and \texttt{GRANTS\_TO\_USERS} (expanded through inheritance), with \texttt{ACCESS\_HISTORY} and \texttt{LOGIN\_HISTORY} for actual usage. (Ch.~17)
+    \item \textbf{Q: Why doesn't a plain DELETE satisfy a GDPR erasure request?}\\
+    A: Deleted rows persist in Time Travel, Fail-safe, pre-delete clones, unconsumed stream offsets, and shared views. (Ch.~18)
+    \item \textbf{Q: How does crypto-shredding erase data in clones and Fail-safe?}\\
+    A: PII is encrypted per subject with external KMS keys; destroying the key makes every copy of the ciphertext permanently unreadable. (Ch.~18)
+    \item \textbf{Q: What can a Native App ship to consumers?}\\
+    A: A versioned application---tables, views, procedures, Streamlit UI---installed into the consumer's account on their compute. (Ch.~20)
+    \item \textbf{Q: Why must clean-room analyses enforce minimum group sizes?}\\
+    A: Small cells re-identify individuals; a cohort floor suppresses results under $k$ subjects so aggregates cannot become lookups. (Ch.~20)
+    \item \textbf{Q: What does differential privacy add to query results?}\\
+    A: Calibrated noise that provably bounds any individual's influence on the output---defeating differencing and membership-probe attacks. (Ch.~20)
+\end{enumerate}
+
+\section{Operations, Cost, AI, and Exam Readiness}
+\index{interview questions!operations}
+
+\subsection{Fundamentals}
+\begin{enumerate}
+    \item \textbf{Q: Name two Cortex serverless LLM functions.}\\
+    A: \texttt{CORTEX.COMPLETE} (generation/classification) and \texttt{CORTEX.EXTRACT\_ANSWER}; also summarization, sentiment, \texttt{EMBED\_TEXT\_768}. (Ch.~22)
+    \item \textbf{Q: What does \texttt{CORTEX.EMBED\_TEXT\_768} produce?}\\
+    A: A 768-dimensional float embedding stored in a \texttt{VECTOR(FLOAT, 768)} column for similarity search. (Ch.~22)
+    \item \textbf{Q: Which four dbt generic tests should every model carry?}\\
+    A: \texttt{unique}, \texttt{not\_null}, \texttt{accepted\_values}, \texttt{relationships}. (Ch.~23)
+    \item \textbf{Q: Which SnowPro Advanced domains carry the most weight?}\\
+    A: Data Movement and Performance Tuning at 30\% each; Storage/Protection and Security/Governance at 20\% each. (Ch.~24)
+\end{enumerate}
+
+\subsection{Intermediate}
+\begin{enumerate}
+    \item \textbf{Q: How find similar documents with a VECTOR column?}\\
+    A: Embed the query, rank chunks by \texttt{VECTOR\_COSINE\_SIMILARITY} against stored embeddings, take top-$k$. (Ch.~22)
+    \item \textbf{Q: How is Cortex billed, and how do you cap spend?}\\
+    A: Per token/row processed; cap with resource monitors, aggressive pre-filtering, and \texttt{CORTEX\_FUNCTIONS\_USAGE\_HISTORY} monitoring. (Ch.~22)
+    \item \textbf{Q: What does a Data Metric Function monitor?}\\
+    A: Table-attached freshness, volume, null counts, uniqueness---evaluated on schedule, results in \texttt{DATA\_METRIC\_FUNCTION\_RESULTS}. (Ch.~23)
+    \item \textbf{Q: Why manage Snowflake objects with Terraform instead of UI clicks?}\\
+    A: Declarative state in git gives review (plan), audit (apply logs), repeatability, and drift detection; click-ops has none. (Ch.~23)
+    \item \textbf{Q: How does schemachange apply migrations safely?}\\
+    A: Versioned scripts apply in order exactly once per environment, tracked in a change-history table; repeatables reapply only on content change. (Ch.~23)
+\end{enumerate}
+
+\subsection{Advanced}
+\begin{enumerate}
+    \item \textbf{Q: What does PARSE\_DOCUMENT extract from PDFs?}\\
+    A: Structured text from staged documents, feeding chunking and extraction stages of a document-intelligence pipeline. (Ch.~22)
+    \item \textbf{Q: Walk through expand-contract for renaming a column.}\\
+    A: Add the new column in release one; dual-write, backfill, migrate consumers behind a compatibility view; drop the old column in a later release after CI proves zero references. (Ch.~23)
+    \item \textbf{Q: How does clustering depth relate to pruning efficiency?}\\
+    A: Higher average depth and overlap mean more partitions scanned per selective predicate; reclustering lowers depth and bytes scanned. (Ch.~24)
+    \item \textbf{Q: When does the Economy scaling policy delay adding clusters?}\\
+    A: It adds clusters only after queued load justifies them past a delay window, conserving credits; Standard favors responsiveness. (Ch.~24)
+    \item \textbf{Q: What is a good elimination strategy for scenario questions?}\\
+    A: Read the final question first, extract constraints, and eliminate options violating edition, semantics, or stated requirements before judging survivors. (Ch.~24)
+    \item \textbf{Q: How should you review a missed practice-exam question?}\\
+    A: Error-log it---topic, misread signal, correct rule, book section---then rebuild the behavior hands-on where a lab exists. (Ch.~24)
+\end{enumerate}
+
+\begin{tipbox}
+Interviewers probe past the first answer. For every item above, prepare the follow-up: a number
+(retention windows, 64-day load metadata, credit rates), a failure mode (stale stream, remote
+spill, broken deploy), and a war story from your own labs. Appendix~B's checklists and
+Appendix~C's lab solutions are the fastest way to convert a memorized answer into a defended one.
+\end{tipbox}

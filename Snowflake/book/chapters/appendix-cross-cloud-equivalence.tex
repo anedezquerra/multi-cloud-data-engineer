@@ -1,11 +1,12 @@
 \chapter{Cross-Cloud Service Equivalence}
 \index{cross-cloud equivalence}\index{service mapping}\index{multi-cloud}%
 This appendix is a living reference that maps conceptually equivalent services and
-ideas across the six platforms studied in this book series: Amazon Web Services
-(AWS), Microsoft Azure, Microsoft Fabric, Google Cloud Platform (GCP), MongoDB, and
-Snowflake. The names differ, but the underlying data-engineering concepts---durable
-object storage, tiered lifecycle economics, immutability, managed relational engines,
-elastic compute, and disciplined data organization---recur everywhere.
+ideas across the seven platforms studied in this book series: Amazon Web Services
+(AWS), Microsoft Azure, Microsoft Fabric, Google Cloud Platform (GCP), MongoDB,
+Snowflake, and Databricks. The names differ, but the underlying data-engineering
+concepts---durable object storage, tiered lifecycle economics, immutability, managed
+relational engines, elastic compute, and disciplined data organization---recur
+everywhere.
 
 \begin{notebox}
 This appendix grows with each chapter. Every new chapter contributes the equivalence
@@ -288,8 +289,550 @@ Schema migration & --- & DMS / SCT & Database Migration Service \\
 patterns from Chapter~4, and \textbf{Delta Lake} exposes historical versions through
 \texttt{VERSION AS OF} time-travel queries.
 
+% ---------------------------------------------------------------------------
+% Chapters 5--24: each section below harvests the cross-cloud callout of the
+% named Snowflake chapter and adds the Databricks column from the companion
+% Databricks book's cross-cloud boxes.
+% ---------------------------------------------------------------------------
+
+\section{Stages and Bulk File Ingestion}
+\index{stage!equivalence}\index{bulk ingestion!equivalence}%
+Snowflake's Chapter~5 topic---named, governed pointers to cloud object storage---rests on
+primitives every provider offers: a bucket or container, an identity mechanism for a service to
+read it, and an event channel that announces new files.
+
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{2.5cm}p{2.9cm}p{2.7cm}p{2.9cm}p{2.9cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{Snowflake} & \textbf{AWS} & \textbf{Azure / GCP} & \textbf{Databricks} \\
+\midrule
+File location & External stage & S3 prefix & ADLS / GCS path & Volume / external location \\
+Service credential & Storage integration & IAM role trust policy & Managed identity / service account & Storage credential + external location \\
+Cloud-side grant & Integration-scoped locations & Bucket policy + role & RBAC / IAM binding & Unity Catalog grants on locations \\
+New-file event & SQS / Event Grid / PubSub $\rightarrow$ Snowpipe & S3 event $\rightarrow$ SQS & Event Grid / Pub/Sub & OneLake events / file notifications \\
+Bulk load & \texttt{COPY INTO} & Glue / Athena & ADF / BigQuery load & Auto Loader / \texttt{COPY INTO} \\
+Offline transfer & Provider appliances & Snow Family & Data Box / Transfer Appliance & Same provider appliances \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent \textbf{Microsoft Fabric} shortcuts virtualize ADLS Gen2, S3, and GCS inside OneLake
+without copying---the same ``reference, do not duplicate'' idea as an external stage.
+\textbf{MongoDB} has no object-stage concept; ingestion flows through drivers,
+\texttt{mongoimport}, or Atlas Data Federation. The Databricks analog differs in one important
+way: volumes and external locations are governed by Unity Catalog, so the pointer and its
+permissions live in the same catalog as the tables the files become.
+
+\section{Event-Driven and Streaming Ingestion}
+\index{streaming ingestion!equivalence}\index{Snowpipe!equivalence}%
+Snowflake's Chapter~6 pattern---an object lands, an event fires, a serverless loader reacts---is
+universal; only the service names change.
+
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{2.5cm}p{2.9cm}p{2.7cm}p{2.9cm}p{2.9cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{Snowflake} & \textbf{AWS} & \textbf{Azure / GCP} & \textbf{Databricks} \\
+\midrule
+Serverless file loader & Snowpipe auto-ingest & Lambda / Glue bookmarks & Function / Dataflow & Auto Loader (cloudFiles) \\
+Managed streaming bus & (downstream consumer) & Kinesis / MSK & Event Hubs / Pub/Sub & Kafka connectors; Lakeflow \\
+Row-streaming ingest & Snowpipe Streaming API & Firehose $\rightarrow$ Redshift & Event Hubs capture / Storage Write API & Structured Streaming sinks \\
+Exactly-once mechanism & Channel offset tokens & Transactional sinks & Checkpointing / offsets & Checkpoint + write-ahead offsets \\
+Malformed rows & \texttt{ON\_ERROR} modes & Dead-letter patterns & Error outputs / DLQ & \texttt{\_rescued\_data} column \\
+Schema drift & File-format options / schema evolution & Glue schema detection & ADF mapping drift & Inference + hints + evolution \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent \textbf{Microsoft Fabric} routes events through Eventstream into KQL databases or
+lakehouse tables; \textbf{MongoDB} ingests through drivers and change streams rather than file
+events. Snowflake's distinctive move is that the pipe is serverless---no cluster to size, billed
+per second of pipe compute plus per-file notifications---while Databricks' Auto Loader trades
+that serverless simplicity for checkpointed, schema-evolving streams on its own compute.
+
+\section{Change Data Capture with Streams}
+\index{change data capture!equivalence}\index{stream!equivalence}%
+Snowflake's Chapter~7 idea---read the database's change journal once, replay it everywhere---is
+one of the most portable concepts in data engineering.
+
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{2.5cm}p{2.9cm}p{2.7cm}p{2.9cm}p{2.9cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{Snowflake} & \textbf{AWS} & \textbf{Azure / GCP} & \textbf{Databricks} \\
+\midrule
+Change journal object & Streams (standard / append-only / insert-only) & Kinesis Data Streams & Event Hubs / Pub/Sub & Delta change data feed \\
+Managed CDC replication & (consumes via connectors) & AWS DMS & ADF CDC / Datastream & Lakeflow Connect, partner tools \\
+Offset / checkpoint & Transactional stream offset & Kinesis sequence numbers & Checkpoints / subscriptions & Checkpointed stream offsets \\
+CDC application & Stream + \texttt{MERGE} task & Glue/EMR \texttt{MERGE} & T-SQL / BigQuery \texttt{MERGE} & \texttt{MERGE} / DLT \texttt{AUTO CDC} \\
+Staleness limit & 14-day stream retention & Stream retention windows & Retention per service & Log retention / \texttt{VACUUM} window \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent \textbf{Microsoft Fabric} offers mirroring and event-driven pipelines; \textbf{MongoDB}
+change streams on the oplog are the closest conceptual sibling to a Snowflake stream. Snowflake's
+distinctive contribution is that the CDC journal is a queryable SQL object with a transactional
+offset: consuming a stream and merging its deltas commit or roll back as one unit, whereas the
+lakehouse family separates the change feed (Delta metadata) from the application step (a job).
+
+\section{In-Database Scheduling and Task DAGs}
+\index{task!equivalence}\index{orchestration!equivalence}%
+Snowflake's Chapter~8 topic---scheduling and dependency graphs inside the database---is the
+in-warehouse member of a family every cloud grew: a cron scheduler, a DAG engine, and a
+serverless variant.
+
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{2.5cm}p{2.9cm}p{2.7cm}p{2.9cm}p{2.9cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{Snowflake} & \textbf{AWS} & \textbf{Azure / GCP} & \textbf{Databricks} \\
+\midrule
+Cron scheduler & Tasks (\texttt{USING CRON}) & EventBridge Scheduler & Functions timer / Cloud Scheduler & Job schedules (cron) \\
+DAG orchestrator & Task graphs via \texttt{AFTER} & Step Functions / MWAA & Data Factory / Cloud Composer & Workflows (jobs + tasks) \\
+Conditional flow & \texttt{WHEN} predicates & Choice states & If Condition activities & if/else, for-each tasks \\
+Serverless billing & Serverless tasks (per-second) & Lambda per invocation & Consumption plans / per-request & Serverless job compute \\
+Partial recovery & Retry + \texttt{SUSPEND\_TASK\_AFTER\_NUM\_FAILURES} & Redrive / Airflow retries & Rerun from activity & Repair run (failed + downstream) \\
+Failure notification & \texttt{ERROR\_INTEGRATION} & SNS & Azure Monitor / Pub/Sub & Job notifications / webhooks \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent \textbf{Microsoft Fabric} orchestrates with Data Factory pipelines and notebook
+scheduling; \textbf{MongoDB} relies on Atlas triggers and external schedulers. Snowflake's edge
+is proximity: when the transformation is already SQL, orchestrating inside the database removes
+an entire external system---its credentials, networking, and failure modes. Databricks'
+Workflows keeps the orchestrator colocated with clusters and lineage, but it still schedules
+external compute rather than warehouse-resident statements.
+
+\section{Semi-Structured Data and Data Contracts}
+\index{semi-structured data!equivalence}\index{data contract!equivalence}%
+Snowflake's Chapter~9 answers three questions every platform faces: what type holds the document,
+how do you project paths out of it, and where do you validate its shape.
+
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{2.5cm}p{2.9cm}p{2.7cm}p{2.9cm}p{2.9cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{Snowflake} & \textbf{AWS} & \textbf{Azure / GCP} & \textbf{Databricks} \\
+\midrule
+Document column type & \texttt{VARIANT} / \texttt{OBJECT} / \texttt{ARRAY} & Redshift SUPER & OPENJSON / BigQuery JSON & \texttt{VARIANT} type; Delta JSON \\
+Path extraction & Colon path notation & PartiQL dot/bracket & \texttt{JSON\_VALUE} / \texttt{JSON\_QUERY} & \texttt{get\_json\_object}, \texttt{:} operator \\
+Array unnesting & \texttt{LATERAL FLATTEN} & PartiQL UNNEST & OPENJSON / UNNEST & \texttt{explode} / \texttt{inline} \\
+Schema-on-read lake & External tables & Glue crawlers + Athena & Synapse serverless / external tables & Auto Loader inference; UC external tables \\
+Contract enforcement & CHECK constraints, quarantine & Glue Schema Registry & Purview / Pub/Sub schemas & Delta constraints, DLT expectations \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent \textbf{Microsoft Fabric} stores JSON in Delta/Parquet lakehouse files and explores it
+with Spark or KQL; \textbf{MongoDB} \emph{is} the document model---its \texttt{\$jsonSchema}
+validators are the closest analog to this chapter's contract checks. The shared lesson: one
+flexible column or file type absorbs arbitrary payloads, while extracted attributes are cast,
+constrained, and governed like relational columns.
+
+\section{Query Profiling and Performance Tuning}
+\index{query profiling!equivalence}\index{performance tuning!equivalence}%
+Snowflake's Chapter~10 discipline---scan less, spill never, join carefully---is identical
+everywhere; each platform exposes it through a different explain plan.
+
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{2.5cm}p{2.9cm}p{2.7cm}p{2.9cm}p{2.9cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{Snowflake} & \textbf{AWS (Redshift)} & \textbf{Azure / GCP} & \textbf{Databricks} \\
+\midrule
+Plan inspection & Query Profile operators & EXPLAIN + monitoring views & DMVs / query plan + slot timeline & Spark UI + query profile \\
+Data skipping & Micro-partition pruning metadata & Zone maps on sort keys & Partition pruning + clustering & File stats, ZORDER, liquid clustering \\
+Spill signal & Local vs.\ remote spill bytes & Disk-based query steps & TempDB spill / bytes shuffled & Spill metrics in Spark UI \\
+Adaptive execution & Automatic (engine-internal) & Auto WLM & Autoscale / managed & AQE on by default; Photon \\
+Compute remedy & Warehouse resize & Resize / concurrency scaling & Scale DWUs / more slots & Cluster size, serverless, Photon \\
+Result reuse & Persisted result cache & Result cache & Result-set / BI cache & Result cache, disk cache \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent \textbf{MongoDB} answers the same questions through
+\texttt{explain('executionStats')} and index design. Snowflake's twist is that there are no
+indexes to build: the levers are pruning, warehouse size, caching, and SQL shape. Databricks
+exposes the most knobs---AQE, join hints, Photon, shuffle partitions---and therefore the largest
+tuning surface; BigQuery exposes the fewest, trading control for simplicity.
+
+\section{Declarative Incremental Pipelines}
+\index{dynamic tables!equivalence}\index{declarative pipelines!equivalence}%
+Snowflake's Chapter~11 topic---declare freshness, let the platform schedule and refresh---is the
+industry's answer to hand-built DAG sprawl.
+
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{2.5cm}p{2.9cm}p{2.7cm}p{2.9cm}p{2.9cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{Snowflake} & \textbf{AWS} & \textbf{Azure / GCP} & \textbf{Databricks} \\
+\midrule
+Declarative refresh object & Dynamic tables (\texttt{TARGET\_LAG}) & Redshift MVs (auto-refresh) & Fabric pipelines / BigQuery MVs + scheduled queries & Lakeflow Declarative Pipelines (DLT) \\
+Streaming dataset & (via dynamic table refresh cadence) & Redshift streaming MVs & Fabric Real-Time / continuous queries & DLT streaming tables \\
+Quality rules & DMFs, tests downstream & Glue Data Quality (Deequ) & Great Expectations / dbt tests & DLT expectations (warn/drop/fail) \\
+DAG derivation & Automatic from query text & Glue workflows (explicit) & Dataform dependency graph & Automatic from dataset definitions \\
+Ops telemetry & \texttt{DYNAMIC\_TABLE\_REFRESH\_HISTORY} & CloudWatch + job metrics & ADF / Dataflow monitoring & DLT event log (Delta table) \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent \textbf{MongoDB} offers on-demand materialized views via \texttt{\$merge}. dbt users
+recognize the philosophy immediately: a dynamic table or DLT dataset is a dbt model whose
+scheduler, dependency graph, and incremental state live inside the platform. The cross-cloud
+lesson is that \emph{declared freshness} (target lag) is replacing \emph{declared schedule}
+(cron) as the pipeline contract.
+
+\section{Window Functions and Dimensional Modeling}
+\index{window functions!equivalence}\index{dimensional modeling!equivalence}%
+Snowflake's Chapter~12 skills are the most portable in the book: ISO SQL window semantics and the
+Kimball method travel unchanged; only convenience clauses differ.
+
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{2.5cm}p{2.9cm}p{2.7cm}p{2.9cm}p{2.9cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{Snowflake} & \textbf{AWS (Redshift)} & \textbf{Azure / GCP} & \textbf{Databricks} \\
+\midrule
+Window functions & Full ISO support & Full ISO support & Full ISO support & Full ISO support (Spark SQL) \\
+Filter window output & \texttt{QUALIFY} & Subquery wrapper & Subquery / BigQuery \texttt{QUALIFY} & Subquery wrapper \\
+Multi-grain aggregation & GROUPING SETS / CUBE / ROLLUP & Same & Same & Same \\
+Pivot & PIVOT / UNPIVOT & CASE / PIVOT variants & PIVOT operators & PIVOT (Spark SQL) \\
+Dimensional physical design & Pruning on fact filters & Sort/dist keys & Distribution + partition / partition + cluster & ZORDER / liquid clustering on dims \\
+Slowly changing dims & \texttt{MERGE}-driven Type 2 & \texttt{MERGE} / staging & \texttt{MERGE} variants & \texttt{MERGE INTO} + change feed \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent \textbf{MongoDB} expresses the same analytics in aggregation pipelines
+(\texttt{\$group}, \texttt{\$setWindowFields}). The durable insight: star schemas remain the
+serving layer of choice because denormalized dimensions match how columnar engines---warehouse
+or lakehouse alike---prune and join.
+
+\section{DataFrame APIs and Pushdown Execution}
+\index{DataFrame API!equivalence}\index{Snowpark!equivalence}%
+Snowflake's Chapter~13 topic---a client DataFrame API that compiles to the engine's native
+execution---exists on every cloud; the API is the portable skill, the pushdown target is the
+vendor's edge.
+
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{2.5cm}p{2.9cm}p{2.7cm}p{2.9cm}p{2.9cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{Snowflake} & \textbf{AWS} & \textbf{Azure / GCP} & \textbf{Databricks} \\
+\midrule
+DataFrame API & Snowpark (Python/Scala/Java) & Spark on EMR / Glue & Spark on Synapse/Fabric; BigFrames & Apache Spark (reference implementation) \\
+Pushdown target & Virtual warehouse (SQL) & Redshift Spectrum / Athena & Fabric SQL endpoint / BigQuery SQL & Photon / Spark on Delta \\
+Lazy plan inspection & \texttt{df.explain()} & Spark explain & Spark explain & Spark explain / query profile \\
+Pandas interop & Snowpark pandas, \texttt{to\_pandas} & pandas on SageMaker & pandas in notebooks & pandas API on Spark \\
+Cluster management & None (warehouse size only) & EMR/Glue cluster sizing & Pool sizing & Cluster policies, autoscaling, serverless \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent \textbf{MongoDB} exposes aggregation pipelines through language drivers---a different
+algebra, the same client-side-builder pattern. Snowpark's defining property is that the data
+never leaves Snowflake: the client builds an expression tree and the warehouse executes it as
+SQL beside the data. Databricks is the reference implementation of the Spark API the others
+host; Snowpark is the same client-side philosophy pointed at a warehouse instead of a cluster.
+
+\section{User-Defined Functions and In-Engine Code}
+\index{UDF!equivalence}\index{in-database code!equivalence}%
+Snowflake's Chapter~14 topic---running user code where the data lives---is the great warehouse
+convergence of recent years.
+
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{2.5cm}p{2.9cm}p{2.7cm}p{2.9cm}p{2.9cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{Snowflake} & \textbf{AWS (Redshift)} & \textbf{Azure / GCP} & \textbf{Databricks} \\
+\midrule
+Scalar UDF & SQL / Python UDFs & SQL / Python UDFs & SQL-CLR lineage / BigQuery SQL \& JS UDFs & Spark UDFs (SQL/Python/Scala) \\
+Vectorized UDF & Vectorized pandas UDFs (Arrow) & Lambda UDFs & Spark pandas UDFs / remote functions & pandas UDFs over Arrow \\
+Table function & UDTFs & SQL UDFs returning tables & OPENJSON-style TVFs / table functions & Table-valued functions, generators \\
+Package ecosystem & Curated Anaconda channel & Limited library imports & Spark environment packages / containers & Full PyPI on clusters; serverless environments \\
+Runtime sandbox & Per-warehouse sandboxed runtime & Lambda sandbox & Spark executor / remote container & Spark executors / serverless \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent \textbf{MongoDB} runs server-side JavaScript functions (legacy) and Atlas triggers.
+Snowflake's differentiator is the sandboxed Python runtime with a curated Anaconda channel
+inside the warehouse---no cluster to manage, and RBAC on the function itself. Databricks offers
+the full PyPI ecosystem but makes you own the cluster the code runs on.
+
+\section{Stored Procedures and In-Warehouse ML}
+\index{stored procedure!equivalence}\index{ML in-database!equivalence}%
+Snowflake's Chapter~15 modernizes the oldest in-database programmability---procedures---and its
+ML variant trains models where the features already live.
+
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{2.5cm}p{2.9cm}p{2.7cm}p{2.9cm}p{2.9cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{Snowflake} & \textbf{AWS (Redshift)} & \textbf{Azure / GCP} & \textbf{Databricks} \\
+\midrule
+Procedure language & SQL / Python procedures & PL/pgSQL & T-SQL / BigQuery scripting & Notebooks, SQL scripts, jobs \\
+ML training in-engine & Snowpark ML (scikit-learn et al.) & Redshift ML (SageMaker) & Fabric notebooks / BigQuery ML & Full ML stack on Spark clusters \\
+Experiment tracking & (external / registry hooks) & SageMaker Experiments & Azure ML / Vertex & Managed MLflow \\
+Model registry & Snowflake Model Registry & SageMaker Model Registry & Azure ML / Vertex registries & Unity Catalog model registry \\
+Feature store & Snowflake Feature Store & SageMaker Feature Store & Azure ML / Vertex feature stores & Feature Engineering in UC \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent \textbf{MongoDB} runs server-side logic via Atlas triggers and functions. Snowflake's
+proposition for ML teams: scikit-learn trains where the features already are, governed by the
+same RBAC as the tables, with zero export pipeline to secure. Databricks answers with the
+broader MLOps surface---MLflow, feature store, serving---at the cost of managing compute;
+Snowflake answers with governed simplicity inside the warehouse.
+
+\section{External Functions and Reverse ETL}
+\index{external function!equivalence}\index{reverse ETL!equivalence}%
+Snowflake's Chapter~16 integration pair---calling HTTP services from inside the warehouse, and
+pushing warehouse results back to operational tools---exists in both directions on every cloud.
+
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{2.5cm}p{2.9cm}p{2.7cm}p{2.9cm}p{2.9cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{Snowflake} & \textbf{AWS} & \textbf{Azure} & \textbf{GCP / Databricks} \\
+\midrule
+API front door & API integration & API Gateway & API Management & API Gateway / Endpoints \\
+Compute behind API & External function $\rightarrow$ remote service & Lambda & Azure Functions & Cloud Run / Functions \\
+Warehouse-to-API call & External functions & Redshift Lambda UDFs & Synapse + Logic Apps & BigQuery remote functions; Databricks SQL UDFs calling endpoints \\
+Reverse ETL & Task + stream + external function & Census/Hightouch + EventBridge & Census/Hightouch + ADF & Census/Hightouch + Functions; Databricks jobs + webhooks \\
+Third-party auth & Secrets + network rules & IAM + secrets in API layer & Managed identity + Key Vault & Service accounts + Secret Manager; Databricks secret scopes \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent \textbf{MongoDB} reaches outward via Atlas triggers and HTTPS endpoints;
+\textbf{Fabric} via notebooks and pipelines. The Snowflake constraint to remember: external
+functions are synchronous and billed per call---the architecture must batch and cache, or the
+API bill becomes the story. The same cost shape applies anywhere a query engine synchronously
+invokes a metered endpoint.
+
+\section{RBAC, Networking, and Secrets}
+\index{RBAC!equivalence}\index{network security!equivalence}\index{secrets management!equivalence}%
+Snowflake's Chapter~17 concentrates identity, role hierarchies, and network perimeters inside
+the data platform; the disciplines themselves are cloud-native.
+
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{2.5cm}p{2.9cm}p{2.7cm}p{2.9cm}p{2.9cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{Snowflake} & \textbf{AWS} & \textbf{Azure / GCP} & \textbf{Databricks} \\
+\midrule
+Workforce identity & SSO/SCIM, MFA, key-pair auth & IAM Identity Center & Entra ID / Cloud Identity & SSO + SCIM from IdP \\
+Privilege grouping & Role hierarchy (access vs.\ functional) & IAM policies \& roles & RBAC / IAM roles \& groups & UC grants + account groups \\
+Machine identity & Service users + key pairs & IAM roles & Managed identity / service accounts & Service principal + OAuth M2M \\
+Long-lived secret & (discouraged; key rotation) & Access keys & Client secrets / SA keys & PAT (policy-controlled) \\
+Network perimeter & Network policies, private connectivity & VPC endpoints, SCPs & Private Link / VPC Service Controls & Private connectivity, IP access lists \\
+Secrets store & External (cloud KMS/vault) & Secrets Manager & Key Vault / Secret Manager & Secret scopes (DB- or vault-backed) \\
+Audit & \texttt{ACCOUNT\_USAGE} views & CloudTrail & Activity Log / Cloud Audit Logs & \texttt{system.access.audit} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent \textbf{Microsoft Fabric} layers workspace roles over OneLake security;
+\textbf{MongoDB} uses database roles and Atlas IP access lists. Snowflake's distinctive rule:
+privileges are granted to roles, roles to roles, and roles to users---never privileges directly
+to users---so access review becomes a graph query. Unity Catalog's distinctive move is one
+governance model spanning tables, files, notebooks, models, and functions.
+
+\section{Masking, Row Access, and Classification Tags}
+\index{masking policy!equivalence}\index{row access policy!equivalence}\index{data classification!equivalence}%
+Snowflake's Chapter~18 pattern---tag the data once, let policies follow the tags---is the
+industry's classification-driven enforcement model.
+
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{2.5cm}p{2.9cm}p{2.7cm}p{2.9cm}p{2.9cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{Snowflake} & \textbf{AWS} & \textbf{Azure / GCP} & \textbf{Databricks (UC)} \\
+\midrule
+Classification & Object tags + discovery & Macie + resource tags & Purview labels / Sensitive Data Protection & Tags + PII discovery \\
+Column masking & Masking policies (tag-based) & Redshift dynamic masking / Lake Formation & Fabric masking / BigQuery policy tags & Column masks \\
+Row-level security & Row access policies & Lake Formation row filters & Synapse RLS / BigQuery row access & Row filters \\
+Policy-tag binding & Tag $\rightarrow$ policy once & LF tag expressions & Label-inherited protection / policy taxonomy & Tag-driven ABAC policies \\
+Erasure support & Crypto-shredding (per-subject keys) & KMS shred / Object Lock exceptions & CMK shredding / CMEK destruction & CMK + GDPR deletes on Delta \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent \textbf{MongoDB} offers client-side field-level encryption; \textbf{Fabric} inherits
+Purview labels into OneLake. Snowflake's distinctive leverage: tags attach to columns and
+policies attach to tags, so classifying a column once protects it in every query, clone, and
+share that touches it. Databricks reaches the same outcome through Unity Catalog attribute-based
+access control over its catalogs.
+
+\section{Secure Data Sharing and Marketplaces}
+\index{data sharing!equivalence}\index{marketplace!equivalence}%
+Snowflake's Chapter~19 idea---sharing analytics data without copying it---is warehouse-native;
+other platforms approximate it with exports, replicas, or open sharing protocols.
+
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{2.5cm}p{2.9cm}p{2.7cm}p{2.9cm}p{2.9cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{Snowflake} & \textbf{AWS} & \textbf{Azure / GCP} & \textbf{Databricks} \\
+\midrule
+In-platform sharing & Secure shares (metadata only) & Redshift data sharing & Fabric shortcuts / BigQuery Analytics Hub & Delta Sharing (open protocol) \\
+Non-customer access & Reader accounts & S3 presigned / Spectrum & Data Share invitations / authorized views & Any recipient (pandas, Spark, Power BI) \\
+Data marketplace & Snowflake Marketplace & AWS Data Exchange & Azure Marketplace / Analytics Hub & Databricks Marketplace \\
+Consumer pays compute & Consumer account or reader account & Redshift consumer cluster & Fabric capacity / consumer slots & Recipient's own compute \\
+Shared payload & Secure views, tables, UDFs & Datashares & Shortcuts / listings & Tables, volumes, notebooks, models \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent \textbf{MongoDB} shares via Atlas exports and API layers. Snowflake's distinction is
+that sharing is \emph{metadata}: the consumer queries the provider's micro-partitions live with
+the provider's governance attached. Delta Sharing's distinction is the \emph{open} protocol:
+recipients consume without any Databricks account. Both replace the export file; they differ on
+who must run whose platform.
+
+\section{Data Clean Rooms and Native Applications}
+\index{clean room!equivalence}\index{native app!equivalence}%
+Snowflake's Chapter~20 topics---privacy-preserving collaboration and shipping applications to
+consumers---have been productized by every hyperscaler with different seams.
+
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{2.5cm}p{2.9cm}p{2.7cm}p{2.9cm}p{2.9cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{Snowflake} & \textbf{AWS} & \textbf{Azure / GCP} & \textbf{Databricks} \\
+\midrule
+Clean room service & Snowflake Data Clean Rooms & AWS Clean Rooms & Confidential computing / BigQuery clean rooms & Delta Sharing clean rooms \\
+Identifier protection & Hashed/keyed join keys & Hashed/normalized keys & Enclaves / confidential space & Hashed keys over shared tables \\
+Aggregate thresholds & Minimum cohort rules & Minimum cohort rules & Policy / analysis rules & Policy-enforced in clean room \\
+Differential privacy & Clean-room DP options & AWS Clean Rooms DP & SmartNoise / BigQuery DP & (partner / library-based) \\
+App distribution & Native App Framework & Marketplace AMIs/SaaS & Azure / GCP Marketplaces & Marketplace + apps (limited) \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent \textbf{MongoDB} and \textbf{Fabric} rely on partner architectures rather than native
+clean-room products. Snowflake's compounding advantage: clean rooms build on zero-copy sharing,
+so multi-party analysis never moves anyone's data, and Native Apps ship not just data but the
+code that consumes it---installed into the consumer's account and run on their compute.
+
+\section{HTAP and Hybrid Tables}
+\index{HTAP!equivalence}\index{hybrid tables!equivalence}%
+Snowflake's Chapter~21 question---can one store serve both transactional and analytical
+workloads?---has an answer on every cloud.
+
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{2.5cm}p{2.9cm}p{2.7cm}p{2.9cm}p{2.9cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{Snowflake} & \textbf{AWS} & \textbf{Azure / GCP} & \textbf{Databricks} \\
+\midrule
+HTAP offering & Hybrid tables (Unistore) & Aurora $\rightarrow$ Redshift zero-ETL & Cosmos + Synapse Link / AlloyDB columnar & Lakebase (managed OLTP on Postgres) \\
+Row-store + analytics & One platform, both engines & OLTP + zero-ETL replica & Analytical store replicas & Delta for analytics; Lakebase for OLTP \\
+Constraint enforcement & Enforced PK/FK/unique on hybrid tables & Full relational DDL & Full relational DDL & Delta constraints (limited); Lakebase full \\
+Point-read latency & Millisecond (row store) & Millisecond (OLTP engine) & Millisecond & Millisecond (Lakebase) / seconds (Delta) \\
+Serving layer & Hybrid tables + same SQL & Aurora/RDS serving & Cosmos/Spanner serving & Online tables / feature serving \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent \textbf{MongoDB} is the original operational/analytics hybrid discussion (replica-set
+analytics nodes); \textbf{Fabric} separates KQL/warehouse engines from operational stores.
+Snowflake's Unistore move: the transactional table lives inside the analytical database, so
+joining orders to the warehouse mart is a same-platform query, not a replication pipeline.
+Databricks answers with a managed Postgres (Lakebase) beside the lakehouse rather than a second
+table type inside it.
+
+\section{Managed AI Functions, Vectors, and Document Intelligence}
+\index{Cortex!equivalence}\index{vector search!equivalence}\index{LLM functions!equivalence}%
+Snowflake's Chapter~22 topic---LLM and embedding functions inside the data platform---is now
+table stakes; the differences are model catalogs, billing shape, and how natively vectors live
+in the engine.
+
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{2.5cm}p{2.9cm}p{2.7cm}p{2.9cm}p{2.9cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{Snowflake} & \textbf{AWS} & \textbf{Azure / GCP} & \textbf{Databricks} \\
+\midrule
+Managed LLM service & \texttt{CORTEX.*} functions & Bedrock & Azure OpenAI / Vertex AI & Foundation Model APIs \\
+In-database LLM call & SQL functions on columns & Redshift ML $\rightarrow$ Bedrock & Notebooks + AOAI / BigQuery ML remote models & \texttt{ai\_query} in SQL/Spark \\
+Embeddings & \texttt{EMBED\_TEXT\_768} & Bedrock Titan embeddings & AOAI / Vertex embeddings & Hosted embedding endpoints \\
+Vector search & \texttt{VECTOR} type + similarity functions & OpenSearch / pgvector & AI Search / Vertex Vector Search & Mosaic AI Vector Search \\
+Document parsing & \texttt{PARSE\_DOCUMENT} & Textract & Document Intelligence / Document AI & \texttt{ai\_parse\_document} \\
+RAG orchestration & Cortex Search / custom SQL & Bedrock Knowledge Bases & Azure AI RAG / Vertex RAG Engine & LangChain + MLflow, Agent Bricks \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent \textbf{MongoDB} Atlas Vector Search pairs operational documents with embeddings;
+\textbf{Fabric} routes through Azure OpenAI. Snowflake's distinction is governance continuity:
+documents, embeddings, prompts, and answers live under the same RBAC and masking as every other
+table---no extracts to a side vector database. Databricks' distinction is openness: any model,
+any framework, governed by Unity Catalog over chunks and endpoints.
+
+\section{DataOps: IaC, Testing, and Observability}
+\index{DataOps!equivalence}\index{infrastructure as code!equivalence}\index{observability!equivalence}%
+Snowflake's Chapter~23 is the most cloud-portable chapter in the book: Terraform, dbt, and
+GitHub Actions are the same tools on every platform; only the provider plugin and the
+warehouse-specific monitors differ.
+
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{2.5cm}p{2.9cm}p{2.7cm}p{2.9cm}p{2.9cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{Snowflake} & \textbf{AWS} & \textbf{Azure / GCP} & \textbf{Databricks} \\
+\midrule
+Cross-platform IaC & terraform-provider-snowflake & Terraform AWS provider & azurerm / google providers & Terraform databricks provider \\
+Native IaC & (SQL DDL, git-managed) & CloudFormation / CDK & Bicep / Deployment Manager & Asset Bundles (\texttt{databricks.yml}) \\
+Transformation + tests & dbt-snowflake & dbt-redshift & dbt-fabric / dbt-bigquery & dbt-databricks / dbt-spark \\
+Migration runner & schemachange / Flyway & Flyway / Liquibase & Flyway / DbUp & Asset Bundles / notebooks in CI \\
+Quality monitors & DMFs, alerts, resource monitors & Glue DQ + CloudWatch & Purview / Dataplex monitors & Lakehouse Monitoring \\
+Spend telemetry & \texttt{ACCOUNT\_USAGE}, monitors & CUR 2.0 + Cost Explorer & Cost Management / billing export & \texttt{system.billing.usage} \\
+CI authentication & Key-pair secrets & OIDC $\rightarrow$ IAM role & OIDC $\rightarrow$ workload identity & Service principal + OAuth M2M \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent \textbf{MongoDB} uses the same Terraform discipline with Atlas providers;
+\textbf{Fabric} adds workspace deployment pipelines. The lesson that transfers everywhere:
+\emph{the merge is the deploy, and the pipeline is the only writer to production}. The
+Snowflake-specific craft is platform-native observability---resource monitors, alerts, DMFs, and
+\texttt{ACCOUNT\_USAGE} as the telemetry source of truth.
+
+\section{Certification and Career Capstone}
+\index{certification!equivalence}%
+Every platform book in this series ends at a professional certification, and the preparation
+method---domains mapped to labs, timed mocks, error-driven remediation---is identical across
+vendors.
+
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{2.5cm}p{2.9cm}p{2.7cm}p{2.9cm}p{2.9cm}@{}}
+\toprule
+\textbf{Dimension} & \textbf{Snowflake} & \textbf{AWS} & \textbf{Azure / GCP} & \textbf{Databricks} \\
+\midrule
+Entry certification & SnowPro Core & Cloud Practitioner / Data Engineer Assoc. & DP-900 / Cloud Digital Leader & Data Engineer Associate \\
+Advanced certification & SnowPro Advanced: Data Engineer & Data Engineer Associate & DP-203/DP-600 / Professional Data Engineer & Data Engineer Professional \\
+Exam style & Scenario MCQ & Scenario MCQ & Case studies / scenario MCQ & Scenario MCQ + hands-on fluency \\
+Heaviest domains & Data movement, performance & Ingestion, storage, processing & Design + implementation / processing & Delta Lake, Spark ETL, pipelines \\
+Mock standard & 80\%+, no domain weak & Same & Same & 80\%+, no domain $<$70\% \\
+Hands-on evidence & Portfolio of capstones & Portfolio projects & Portfolio projects & Architecture review with cost numbers \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent The durable artifact is never the badge: it is the portfolio of measured labs,
+architecture diagrams, and cost models built across the program. If you can defend the
+Snowflake capstone \emph{and} sketch its Databricks or AWS equivalent from the tables in this
+appendix, you have learned data engineering, not one console.
+
 \begin{tipbox}
 Use this appendix as a study aid for the book's lockstep, cross-cloud approach: when you learn a
-concept on one platform, immediately locate its equivalent here and predict how the other five
-would express the same idea. That habit turns six separate vocabularies into one mental model.
+concept on one platform, immediately locate its equivalent here and predict how the other six
+would express the same idea. That habit turns seven separate vocabularies into one mental model.
 \end{tipbox}

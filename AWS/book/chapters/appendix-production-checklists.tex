@@ -1,0 +1,151 @@
+\chapter{Production-Readiness and Governance Checklists}
+\index{production readiness}\index{checklists}\index{governance!checklist}%
+This appendix distills the chapters' production notes, acceptance criteria, and operational
+guidance into pre-launch checklists, one per domain. They are written as review artifacts: walk
+the relevant list with the team before a workload is declared production, and tick items with
+evidence, not intention. Chapter references point to the source material.
+
+\providecommand{\chk}{\item[$\square$]}
+
+\section{Storage and Data Lake (S3, Chapter 1)}
+\index{checklist!storage}%
+\begin{itemize}
+\chk Versioning enabled on every bucket that holds data you cannot regenerate.
+\chk Lifecycle rules transition and expire per the data's retention class; the cost model was
+validated with the actual object-size distribution (small objects can cost \emph{more} after a
+Glacier transition).
+\chk Object Lock mode chosen deliberately: governance mode only when an administrative bypass
+process is documented; compliance mode only when retention is certain.
+\chk Default encryption is SSE-KMS with a key policy that names the allowed principals; public
+access blocked at the account level.
+\chk Replication (CRR/SRR) configured where the RPO demands it, with a replication-time alarm.
+\chk Zone naming convention (\texttt{raw/}, \texttt{validated/}, \texttt{curated/}) enforced by
+bucket or prefix policy, and every prefix has an owner tag.
+\chk Event notifications (SQS/SNS/EventBridge) tested end-to-end with a poison-message path.
+\chk Deletion runbook exists and has been rehearsed; nothing relies on ``we will remember.''
+\end{itemize}
+
+\section{Warehousing and Databases (RDS/Aurora, DynamoDB, Redshift; Chapters 2, 3, 5, 6)}
+\index{checklist!warehousing}%
+\begin{itemize}
+\chk Multi-AZ for the primary; failover rehearsed, not just configured (Chapter~2 lab pattern).
+\chk PITR window matches the recovery objective; cross-region posture (Aurora Global Database,
+global tables) justified by a written RPO/RTO.
+\chk DynamoDB: access patterns enumerated \emph{before} keys were chosen; on-demand vs.\
+provisioned decided from measured traffic; GSIs sparse where possible; TTL understood as
+asynchronous.
+\chk Redshift: grain declared for every fact table; distribution and sort keys validated with
+\texttt{EXPLAIN} and \texttt{SVV\_TABLE\_INFO} against production-shaped data volumes.
+\chk WLM configured with queue monitoring rules; concurrency scaling enabled for bursty BI.
+\chk COPY loads use manifests and multiple input files; MERGE-based upserts are idempotent under
+re-run.
+\chk Serverless capacity bounds (max RPU, max ACU) set so a runaway query cannot run away with
+the budget.
+\chk Materialized views have an owner and a refresh cadence; stale-MV staleness is visible to
+consumers.
+\end{itemize}
+
+\section{ETL and Orchestration (Glue, EMR, MWAA, Step Functions; Chapters 9--12)}
+\index{checklist!ETL}%
+\begin{itemize}
+\chk Every job re-runnable without duplicates: bookmarks, watermarks, or idempotent MERGE writes.
+\chk EMR clusters are transient for recurring batch; Spot only on task nodes; durable state lives
+in S3 via EMRFS, never on cluster HDFS.
+\chk Glue jobs parameterized (no hardcoded dates or bucket names); Flex execution for non-urgent
+jobs.
+\chk DAGs deployed with \texttt{catchup=False} unless a backfill is intended; every alert task has
+\texttt{trigger\_rule="one\_failed"} (or the state-machine equivalent).
+\chk Sensors tuned: \texttt{poke\_interval} sized to the expected arrival cadence.
+\chk Large data moves through S3, never through XComs or state-machine payloads.
+\chk Failure path proven, not assumed: a forced failure fires the alert and pages the right queue.
+\chk Schema contracts enforced at ingestion (registry compatibility checks), not at query time.
+\chk CDC lag monitored on \texttt{CDCLatencySource}/\texttt{CDCLatencyTarget}, not on task status.
+\end{itemize}
+
+\section{Streaming (Kinesis, Firehose, MSK, Flink, Lambda; Chapters 13--15)}
+\index{checklist!streaming}%
+\begin{itemize}
+\chk Shard/partition count derived from both throughput limits (bytes \emph{and} records per
+second) plus headroom; hot-key risk assessed in partition-key choice.
+\chk \texttt{IteratorAgeMilliseconds} (or consumer-lag equivalent) alarmed well before retention
+expiry.
+\chk Consumers idempotent: dedup on a unique event ID or upsert by key; poison records route to a
+DLQ that someone watches.
+\chk Firehose streams have source-record backup enabled and an alarm on
+\texttt{DeliveryToRedshift.Success} (or destination equivalent); the intermediate S3 prefix has
+lifecycle rules.
+\chk Lambda transforms are stateless; anything needing windows, dedup, or joins runs in Flink,
+not in a delivery transform.
+\chk Flink jobs: every stateful operator bounded (window end, join interval, TTL); savepoint taken
+before any redeploy; RocksDB state size trended.
+\chk Watermark policy stated in one sentence (``no event older than X'') and agreed with
+downstream consumers.
+\chk Replay drill performed: reprocess from a checkpoint/savepoint without double-landing output.
+\end{itemize}
+
+\section{Machine Learning and MLOps (Chapters 16--20)}
+\index{checklist!ML}%
+\begin{itemize}
+\chk Training datasets built through governed access (Lake Formation grants), so PII masks apply
+to extraction; no broad S3 policies on ML roles.
+\chk Training query reviewed column-by-column for target leakage (``is this knowable before the
+outcome?'').
+\chk Objective metric matches the business cost (e.g., F1 for imbalanced churn), not accuracy by
+default.
+\chk One feature-group definition feeds both offline training and online serving---the skew
+defense.
+\chk Deployment gated on Model Registry approval; every production model is versioned, attributable,
+and rollback-ready.
+\chk Model Monitor baselines refreshed on a cadence tied to retraining; drift alerts triaged by a
+human before any automatic retrain.
+\chk Managed Spot training used with checkpointing to S3 so interruption resumes, not restarts.
+\chk AI-API pipelines (Textract/Comprehend) idempotent on object identity so retries never
+re-bill; raw OCR/PII output lives in a restricted zone with field-level redaction downstream.
+\end{itemize}
+
+\section{Security, Governance, and Compliance (Chapters 8, 21--23)}
+\index{checklist!security}%
+\begin{itemize}
+\chk Root user: MFA on, no access keys, no daily use; all operations through Identity Center or
+roles.
+\chk \texttt{IAMAllowedPrincipals} revoked on every governed database and table; Lake Formation
+grants verified from a consumer role, not the admin role.
+\chk Permissions boundaries on delegated role creation; SCPs cap what any account---including its
+admins---may do.
+\chk Private connectivity: gateway endpoints for S3/DynamoDB, interface endpoints with endpoint
+policies elsewhere; no public route for data-plane traffic.
+\chk KMS key policies restrict decryption to organization principals, closing the exfiltration
+path that survives network controls.
+\chk CloudTrail data events enabled for lake buckets and delivered to an independent log-archive
+account.
+\chk Secrets in Secrets Manager with automatic rotation; zero long-lived keys in CI (OIDC
+federation instead).
+\chk Data-quality gates halt the pipeline on hard failures and report on thresholds
+(\texttt{Completeness >= 0.95 with threshold 0.9} pattern); quality metrics trended in CloudWatch.
+\chk Lineage consultable per dataset: given a bad batch, you can name its consumers and its
+origin change in minutes.
+\chk Macie findings feed an automated quarantine (Object-Locked bucket), with an audit record
+linking finding ID to action; custom identifiers tuned for precision before rollout.
+\chk Erasure designed, not improvised: crypto-shredding keys per subject where re-identification
+is not required, or an enumerated-deletion runbook that includes replicas, snapshots, and streams.
+\end{itemize}
+
+\section{Cost and Operations (Chapters 0, 23, 24)}
+\index{checklist!cost}%
+\begin{itemize}
+\chk Budgets with 50/80/100\% and forecast alerts on every account that can spend money.
+\chk Every resource tagged (\texttt{Environment}, \texttt{Project}, \texttt{Owner}); untagged
+spend reviewed weekly.
+\chk Per-TB-scanned workloads (Athena, Spectrum) enforced through partitioning + Parquet;
+bytes-scanned reported per query in reviews.
+\chk Idle-cost audit automated: running clusters, attached-but-stopped databases, NAT gateways,
+old snapshots, and high base-capacity Serverless endpoints.
+\chk Terraform state remote (S3 + DynamoDB locking); \texttt{main} always deployable; PR checks
+prove \texttt{plan} + \texttt{dbt build} before merge; Prod deploys require named approval.
+\chk Schema changes follow expand-contract with a compatibility shim and a deferred drop.
+\end{itemize}
+
+\begin{tipbox}
+A checklist item is done when you can point to the evidence---a config output, a metric graph, a
+drill log. If the honest answer is ``we believe so,'' the box stays empty.
+\end{tipbox}

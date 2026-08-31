@@ -1,0 +1,312 @@
+\chapter{Lab Solution Sketches}
+\index{lab solutions}\index{hands-on lab!solutions}%
+This appendix gives a compact solution sketch for every chapter's Thursday hands-on project
+(Chapters 0--24): the approach, the key commands or code shape, and the failure modes that
+actually occur. These are reference solutions, not the only solutions---any design that meets the
+chapter's rubric and acceptance criteria is valid.
+
+\begin{notebox}
+Attempt each lab before reading its sketch. The learning value is in the debugging; the sketch
+exists to unblock you after a genuine attempt and to model what ``done'' looks like. All sketches
+assume the Chapter 0 environment: signed-in Azure CLI, the book's naming conventions, and a
+sandbox subscription with a budget.
+\end{notebox}
+
+\section{Part I: Core Data Infrastructure and Storage}
+
+\subsection*{Chapter 0: Verify the Setup}
+\textbf{Approach.} Chapter 0 has no Thursday project; its deliverable is a verified environment:
+a free account, MFA on a non-admin daily identity, Azure CLI and the Az module authenticated to
+the correct subscription, a monthly budget with alerts, and a tagged resource group created,
+listed, and deleted from PowerShell.
+
+\textbf{Key commands.} \texttt{az login}; \texttt{az account set --subscription <id>};
+\texttt{az group create -n rg-de-azbook-ch00-dev -l eastus --tags ...};
+\texttt{az consumption budget create ...}; \texttt{az group delete -n <rg> --yes --no-wait}.
+
+\textbf{Common failure modes.} Signing in with the wrong tenant (personal vs.\ work account with
+the same email); CLI and Az module pointing at different subscriptions; forgetting that the
+budget alerts rather than blocks; deleting the wrong resource group because naming was ad hoc.
+
+\subsection*{Chapter 1: Deploy ADLS Gen2 with Lifecycle Management}
+\textbf{Approach.} Create a StorageV2 account with \texttt{--hns true}, create the
+\texttt{raw}/\texttt{validated}/\texttt{curated} file systems, enable soft delete and versioning,
+then apply a lifecycle management policy that archives blobs prefixed for cold data after 30
+days. Upload sample files with \texttt{az storage fs file upload --auth-mode login} and verify
+POSIX-style ACLs on a directory.
+
+\textbf{Common failure modes.} Forgetting \texttt{--hns true} (cannot be enabled later without
+recreating); \texttt{AuthorizationPermissionMismatch} because the caller has Contributor but not
+\texttt{Storage Blob Data Contributor}; a lifecycle policy that never fires because the
+\texttt{prefixMatch} does not match the uploaded paths; globally-duplicate account names.
+
+\subsection*{Chapter 2: Serverless Azure SQL with Geo-Replica and Failover}
+\textbf{Approach.} Deploy a logical server and a Serverless database, open a firewall rule for
+the client IP only, create a secondary server in a paired region, and add an active
+geo-replica. Drive a small Python workload (inserts and point reads) against the primary,
+fail over manually, and confirm the workload reconnects through the secondary.
+
+\textbf{Common failure modes.} Firewall rule missing so \texttt{pyodbc} times out; geo-replica
+created with a different admin login so post-failover authentication fails; expecting the
+failover to be free of application change---without a failover group, connection strings must
+point at the new server; auto-pause making the first query after idle look like an outage.
+
+\subsection*{Chapter 3: Forum Container with Python Writes and Multi-Region Writes}
+\textbf{Approach.} Create a Cosmos DB for NoSQL account (Session consistency), one database, and
+one container partitioned by \texttt{/postId} holding posts, comments, and reactions as
+discriminated item types. Write items with the Python SDK using
+\texttt{DefaultAzureCredential} or a key from Key Vault, then add a second write region and
+observe conflict behavior with last-writer-wins.
+
+\textbf{Common failure modes.} Choosing a low-cardinality partition key and throttling at 429s
+despite spare account RU/s; cross-partition queries where a point read was intended; forgetting
+that multi-region writes make conflicts possible---no conflict logic means silent LWW; committing
+the account key to source control.
+
+\subsection*{Chapter 4: Redis Cache-Aside for Azure SQL Query Results}
+\textbf{Approach.} Deploy Azure Cache for Redis (Basic/Standard is enough), then write a Python
+read path: check Redis for a key derived from the query, on miss read Azure SQL, serialize the
+result with a TTL, and return it. Measure p95 latency for cache hit versus miss, then delete a
+key and watch the origin query reappear.
+
+\textbf{Common failure modes.} Caching without a TTL so stale results survive writes; using the
+access keys in code instead of Key Vault or managed identity; non-SSL port 6379 blocked by
+policy---use 6380; mistaking a cache stampede after flush for a database outage.
+
+\section{Part II: Data Warehousing and Analytics}
+
+\subsection*{Chapter 5: Ten Million Rows into a Star Schema}
+\textbf{Approach.} Provision a Synapse workspace plus a DW100c dedicated pool, grant the
+workspace managed identity \texttt{Storage Blob Data Contributor} on the lake, generate 10M
+synthetic order rows as partitioned Parquet with \texttt{faker}/\texttt{pyarrow}, COPY into a
+round-robin staging table, CTAS into a hash-distributed clustered-columnstore fact with
+replicated dimensions, then run the SCD2 MERGE and verify a two-version customer. Pause the pool.
+
+\textbf{Common failure modes.} COPY authorization errors---managed identity missing the
+data-plane role; \texttt{MAXERRORS} rejects clustering on one folder (schema drift in one file);
+SCD2 MERGE producing duplicate current rows because the close-and-insert ran twice; leaving the
+pool running and discovering it on the bill.
+
+\subsection*{Chapter 6: Benchmarking Distribution Types}
+\textbf{Approach.} Create three copies of a 50M-row orders table---hash on the join key, hash on
+an unrelated key, and round-robin---then run the same join-heavy query against each and record
+elapsed time and \texttt{sys.dm\_pdw\_request\_steps} data-movement operations. The correct hash
+key wins because joins execute locally without shuffle moves.
+
+\textbf{Common failure modes.} Benchmarking once and trusting it---run warm and cold; comparing
+tables with different rowgroup quality (small loads leave open rowgroups); drawing conclusions at
+DW100c that invert at DW1000c; forgetting the result-set cache and measuring a cached answer.
+
+\subsection*{Chapter 7: CSV In, Parquet Out with CETAS}
+\textbf{Approach.} Against the Chapter 5 workspace's serverless pool: define an external data
+source and file format, profile the raw CSVs with \texttt{OPENROWSET}, write typed, cleaned rows
+back to the lake as partitioned Parquet with CETAS, then build external tables and views over the
+result as the logical-warehouse serving layer. Compare bytes scanned for CSV versus Parquet.
+
+\textbf{Common failure modes.} Schema inference misreading types---declare columns explicitly;
+unfiltered scans burning the per-TB budget (use \texttt{filepath()} partition filters); CETAS
+failing because the target folder already exists; managed identity lacking lake write access.
+
+\subsection*{Chapter 8: Scan, Classify, Trace (Purview)}
+\textbf{Approach.} Register the lab ADLS Gen2 account and Synapse workspace in Purview, grant
+the Purview managed identity read access, run a scan, and confirm built-in classifiers tag
+\texttt{PII\_Email}-style columns. Trigger an ADF copy and trace lineage from lake file through
+pipeline to dataset. Finish by creating a Data Share snapshot for a synthetic partner.
+
+\textbf{Common failure modes.} Scan finds nothing because the managed identity lacks storage
+data-plane read; classifications missed because the data does not resemble the built-in patterns
+(custom classifiers are Chapter 22); lineage gaps when assets were registered after the pipeline
+ran; expecting scans to be instant on first registration.
+
+\section{Part III: Batch Processing and ETL Orchestration}
+
+\subsection*{Chapter 9: Distributed Aggregation to Delta (Databricks)}
+\textbf{Approach.} Deploy a Databricks workspace, create an all-purpose cluster (small, autoterminate
+at 20 minutes), read the governed lake over ABFS using the cluster's credential passthrough or a
+service principal secret from a secret scope, run a grouped aggregation in PySpark, and write the
+result as a Delta table. Repeat as a job on a job cluster and compare cost and startup behavior.
+
+\textbf{Common failure modes.} Writing to DBFS root instead of the governed ADLS account;
+\texttt{AnalysisException} on path because the storage credential is wrong, not the path;
+all-purpose cluster left running---autotermination unset; confusion between table created in the
+workspace metastore versus data files actually in the lake.
+
+\subsection*{Chapter 10: Join, Clean, and Load with Mapping Data Flows}
+\textbf{Approach.} In ADF, create linked services for the lake and the Synapse pool, datasets for
+orders and customers, then a Mapping Data Flow: join on \texttt{customer\_id}, filter nulls,
+normalize timestamps with derived columns, and sink into the pool. Orchestrate with a pipeline
+that runs the data flow activity with an onFailure path to a notification.
+
+\textbf{Common failure modes.} Debug session never started so the data preview is empty; join
+skew making the flow crawl---broadcast the small side; no onFailure path so the pipeline fails
+silently overnight; staging settings pointing at storage the IR cannot reach.
+
+\subsection*{Chapter 11: DMS CDC with a Contract Gate}
+\textbf{Approach.} Enable CDC on a source Azure SQL table, configure an Azure DMS task streaming
+changes to ADLS Gen2 as JSON/Parquet deltas, then land a validation step (Databricks notebook or
+ADF data flow) that checks each batch against a versioned JSON contract and routes violations to
+a \texttt{quarantine/} prefix with the reason attached.
+
+\textbf{Common failure modes.} CDC not enabled at the database level so the task captures nothing;
+clock skew between source and landing making ordering look wrong; contract checks treating
+optional-field additions as failures (they are backward-compatible); quarantine with no alerting,
+so violations accumulate invisibly.
+
+\subsection*{Chapter 12: Event-Driven Databricks Orchestration with Failure Notification}
+\textbf{Approach.} Wire the canonical pipeline: an Event Grid blob-created event on the raw zone
+fires an ADF storage-event trigger; the pipeline runs a Databricks notebook activity with the
+file path as a parameter; an onFailure path calls a Logic App that posts a rich card with the run
+link to Teams. Test success, a data failure (bad schema), and a platform failure (stopped
+cluster).
+
+\textbf{Common failure modes.} Trigger filtering too broad (every blob in the account fires it);
+Event Grid subscription created but the ADF trigger unpublished; notebook activity failing on
+authentication because the linked service uses an expiring PAT instead of a managed identity;
+Logic App card with no run URL, forcing portal archaeology during an incident.
+
+\section{Part IV: Streaming and Real-Time Analytics}
+
+\subsection*{Chapter 13: IoT Telemetry Producer with Capture}
+\textbf{Approach.} Create an Event Hubs namespace and hub (4 partitions), enable Capture to ADLS
+Gen2 on a 5-minute/300~MB window, then run a Python asyncio producer sending temperature events
+with a unique \texttt{eventId}, partition key, and \texttt{event\_time}. Verify captured Avro
+files appear in the lake and that consumer group offsets advance.
+
+\textbf{Common failure modes.} SAS policy with Send-only rights used by a consumer; batch send
+failing on the 1~MB message-size cap; Capture writing nothing because the window had not elapsed
+or the identity lacked lake write; more consumer instances than partitions, leaving readers idle.
+
+\subsection*{Chapter 14: Five-Minute Click Aggregates to Azure SQL}
+\textbf{Approach.} Build an ASA job: input from the Chapter 13 hub, query counting clicks per
+page in five-minute tumbling windows with a documented late-arrival policy, output to an Azure
+SQL table with a unique key on (window end, page) so restarts upsert idempotently. Start the job,
+produce events, and chart the aggregates.
+
+\textbf{Common failure modes.} Interpreting zero output rows as zero traffic when the input has
+stalled---watch watermark and input metrics; output primary-key violations because the sink is
+not idempotent; SU autoscale lagging a burst so late data piles up; timestamp by arrival time
+instead of the event's own \texttt{event\_time}.
+
+\subsection*{Chapter 15: Event Hubs to Delta with Windowed Aggregation}
+\textbf{Approach.} In Databricks, read the hub through its Kafka endpoint
+(\texttt{org.apache.kafka.common.security.plain.PlainLoginModule} with the connection string),
+parse JSON with an explicit schema, aggregate with \texttt{window(col("event\_time"), "5 minutes")}
+plus \texttt{withWatermark("event\_time", "10 minutes")}, and write to a Delta table with a
+checkpoint location in the lake. Kill and restart the stream to prove exactly-once replay.
+
+\textbf{Common failure modes.} Missing or shared checkpoint directory corrupting state across
+query versions; watermark omitted so state grows until the executor dies; reading with the
+Event Hubs SDK connector config but Kafka-protocol options (or vice versa); micro-batch latency
+blamed on the engine when the trigger interval was the default.
+
+\subsection*{Chapter 16: DirectQuery Dashboard with RLS}
+\textbf{Approach.} Connect Power BI Desktop to the Chapter 5 pool in DirectQuery mode, build a
+sales monitoring page (KPI cards, trend, by-region matrix) with measures rather than calculated
+columns, mark the date table, then define a dynamic RLS role filtering a region mapping table by
+\texttt{USERPRINCIPALNAME()}. Publish and validate with ``View as role'' and a test account.
+
+\textbf{Common failure modes.} Import mode chosen by habit, breaking the freshness requirement;
+calculated columns where measures were needed (static at refresh, ignore slicers);
+time-intelligence functions returning blanks because the date table is not marked; RLS tested
+only with the author's admin account, which bypasses nothing in Desktop but everything in service
+if workspace roles are wrong.
+
+\section{Part V: Machine Learning and MLOps}
+
+\subsection*{Chapter 17: Churn Model from Spark to SQL}
+\textbf{Approach.} In Synapse Spark, assemble churn features, train logistic regression, export
+the model to ONNX with \texttt{onnxmltools}, load it as \texttt{varbinary} into a models table in
+the dedicated pool, and score customers with T-SQL \texttt{PREDICT}. Verify scores match the
+Spark-side predictions on a sample.
+
+\textbf{Common failure modes.} Feature schema drift between training and \texttt{PREDICT} (name,
+type, order must match exactly); unsupported operator in the ONNX conversion---stick to the
+documented model types; model stored as hex string instead of binary; scoring wrong rows because
+the feature view joined on an unversioned snapshot.
+
+\subsection*{Chapter 18: Preprocess, Train, Evaluate, Register (AML Pipeline)}
+\textbf{Approach.} From the Python SDK, define an AML pipeline with preprocess, train, and
+evaluate components on a compute cluster; wire a condition so registration happens only when the
+metric gate (for example AUC $\geq$ 0.80) passes; submit from a notebook and inspect the run in
+AML studio. Data access goes through a datastore bound to the workspace managed identity.
+
+\textbf{Common failure modes.} Training on a compute instance that cannot autoscale or scale to
+zero; datastore using account keys instead of identity, defeating the audit trail; environment
+image rebuilt on every run because dependencies were not pinned; metric gate comparing against a
+hardcoded value with no recorded rationale.
+
+\subsection*{Chapter 19: Deploy, Watch, Drift, Retrain}
+\textbf{Approach.} Deploy the Chapter 18 registered model to an AML managed online endpoint,
+score with a REST payload, enable data collection, and configure model monitoring with the
+training data as baseline. Inject synthetic drift (shift a feature distribution), watch the
+monitor flag it, and trigger the retraining pipeline from the alert.
+
+\textbf{Common failure modes.} Endpoint deployed with no data collection, so drift is
+undetectable; baseline set from stale training data; retraining triggered on a calendar rather
+than evidence; promotion without a rollback plan---always keep the previous version deployable.
+
+\subsection*{Chapter 20: Invoice Extraction Function}
+\textbf{Approach.} Create an event-driven Azure Function triggered by blob uploads to an
+\texttt{invoices/} prefix; the Function calls AI Document Intelligence's prebuilt invoice model,
+writes typed key-value JSON to the lake, flags fields below a confidence threshold for review,
+and indexes the results in AI Search for the retrieval demo.
+
+\textbf{Common failure modes.} Polling instead of event trigger, adding minutes of latency;
+treating OCR confidence as uniform---low-confidence fields need a human review path; indexing raw
+OCR text containing PII without classification and redaction; Function scaling bill surprising
+you because the trigger filter matched every blob in the account.
+
+\section{Part VI: Security, Governance, and Exam Prep}
+
+\subsection*{Chapter 21: A Private-Only Storage Account}
+\textbf{Approach.} Deploy an ADLS Gen2 account with \texttt{--allow-blob-public-access false}
+and public network access disabled, attach a private endpoint in a lab VNet with private DNS zone
+integration, and prove the access pattern: from a VM inside the VNet, \texttt{az storage fs file
+list} succeeds; from your laptop, it fails. Access uses managed identity or RBAC, never keys.
+
+\textbf{Common failure modes.} Private endpoint created but DNS resolves to the public IP (missing
+\texttt{privatelink.dfs.core.windows.net} zone link); disabling public access before the private
+path works, locking everyone out; service endpoints mistaken for private endpoints---the public
+IP is still reachable; Key Vault firewall forgetting the Function/VM identity.
+
+\subsection*{Chapter 22: Custom Classification and a Quality Gate}
+\textbf{Approach.} Extend Chapter 8's Purview estate with a custom classification rule for a
+proprietary employee-ID format (regex plus column-name hints), rescan, and confirm automatic
+tagging. Then add a dbt (or Great Expectations) quality gate before the load step of a pipeline
+and prove a bad batch is blocked and quarantined while a good batch passes.
+
+\textbf{Common failure modes.} Custom rule too broad, tagging everything (test against known
+negatives); quality gate placed after the load, documenting failure instead of preventing it;
+gate failures with no notification path; scan schedule never re-run so new columns stay
+unclassified.
+
+\subsection*{Chapter 23: Masking and a Crypto-Shredding Erasure Drill}
+\textbf{Approach.} Drill 1: apply Dynamic Data Masking to email and phone columns, create a
+read-only test user, and verify masked output; then grant \texttt{UNMASK} to a privileged role
+and verify the difference. Drill 2: pick one synthetic data subject, enumerate every copy of
+their data (tables, lake files, Delta history, backups), and execute erasure by destroying the
+subject-specific encryption key---crypto-shredding---then prove the copies are unreadable.
+
+\textbf{Common failure modes.} Believing DDM protects data from admins (it is presentation-layer
+only); \texttt{DELETE} declared as erasure while soft delete, versioning, backups, and Delta time
+travel retain copies; per-subject keys not actually separated, so one key destroys many subjects;
+no audit evidence of the erasure for the regulator.
+
+\subsection*{Chapter 24: Terraform + dbt + GitHub Actions}
+\textbf{Approach.} One repository: Terraform (azurerm provider, storage-account backend with
+lease locking) provisioning an ADLS Gen2 account and an ADF instance; a dbt project with three
+models (staging, intermediate, mart) and five tests; a GitHub Actions workflow using OIDC
+workload identity that runs \texttt{terraform fmt -check}, \texttt{terraform validate},
+\texttt{terraform plan} on pull requests and \texttt{dbt build} against a dev target.
+
+\textbf{Common failure modes.} Storing a service principal secret in repository secrets instead
+of OIDC federation; state backend without locking so two runs corrupt state; pipeline deploying
+to prod from any branch---protect the environment with reviewers; dbt tests running against the
+wrong target because profiles were parameterized per environment incorrectly.
+
+\begin{tipbox}
+When a lab fails, debug in this order: identity (am I in the right subscription and tenant?),
+authorization (management-plane role \emph{and} data-plane role?), network (firewall, private
+endpoint, DNS), then the service itself. That sequence resolves the large majority of lab
+failures in this book without touching the code.
+\end{tipbox}

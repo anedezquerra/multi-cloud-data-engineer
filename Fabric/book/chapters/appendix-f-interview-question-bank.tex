@@ -1,0 +1,350 @@
+\chapter{Interview Question Bank}
+\index{interview questions}\index{question bank}%
+This appendix consolidates the Interview Q\&A sections of Chapters~1--24 into one categorized
+bank, organized by domain and difficulty. Answers are abbreviated to the defensible core; the
+chapter cross-reference after each answer points to the full treatment. Drill them out loud:
+the exam and the interview both reward the candidate who reasons from trade-offs, not the one
+who recites features.
+
+\begin{tipbox}
+Difficulty legend: \textbf{F} = foundational (vocabulary and first principles), \textbf{I} =
+intermediate (design choices and trade-offs), \textbf{A} = advanced (failure modes, governance,
+and judgment under ambiguity).
+\end{tipbox}
+
+\section{Core Infrastructure: OneLake, Medallion, Spark, Delta (Chapters 1--4)}
+
+\subsection*{Foundational}
+\begin{enumerate}
+    \item \textbf{Q (F): Why is OneLake described as OneDrive for Data?}\\
+    A: A single logical tenant-wide namespace with shared platform controls, instead of
+    per-team storage accounts. (Ch.~1)
+    \item \textbf{Q (F): What is the relationship between Parquet and Delta Lake?}\\
+    A: Parquet stores columnar files; Delta adds the transaction log and metadata that make
+    them behave like reliable tables for concurrent engines. (Ch.~1)
+    \item \textbf{Q (F): What are the two major physical components of a Delta table?}\\
+    A: Parquet data files plus the \texttt{\_delta\_log} transaction log recording versions,
+    add/remove actions, and schema metadata. (Ch.~4)
+    \item \textbf{Q (F): Starter pool versus Custom pool in Fabric Spark?}\\
+    A: Starter: fast, managed notebook startup with minimal configuration. Custom: explicit
+    control of node family, size, and scale for repeatable workloads. (Ch.~3)
+    \item \textbf{Q (F): What belongs in Bronze?}\\
+    A: Raw source data plus ingestion metadata---paths, batch IDs---sufficient to replay or
+    audit ingestion. (Ch.~2)
+\end{enumerate}
+
+\subsection*{Intermediate}
+\begin{enumerate}
+    \item \textbf{Q (I): When would you use a shortcut instead of copying data?}\\
+    A: When the source is large, externally owned, or frequently reused; copy when you need
+    curated quality, stable schemas, and certified consumption. (Ch.~1)
+    \item \textbf{Q (I): What makes Silver different from Bronze, and Gold from Silver?}\\
+    A: Silver adds schema enforcement, typing, dedup, and quality checks; Gold adds business
+    definitions, aggregations, dimensional models, and certification. (Ch.~2)
+    \item \textbf{Q (I): When should you avoid schema inference?}\\
+    A: In large or scheduled jobs---it adds scan cost and lets unexpected files shift inferred
+    types. (Ch.~3)
+    \item \textbf{Q (I): How is V-Order different from Z-Ordering?}\\
+    A: V-Order is Fabric's write-time Parquet layout optimization for analytical reads;
+    Z-Ordering clusters rows by chosen columns to improve data skipping on filtered queries.
+    (Ch.~4)
+    \item \textbf{Q (I): Why should a BI report never point directly at a raw shortcut?}\\
+    A: Raw data lacks semantic standardization, quality checks, privacy treatment, and
+    performance guarantees---reports consume certified Gold. (Ch.~1)
+\end{enumerate}
+
+\subsection*{Advanced}
+\begin{enumerate}
+    \item \textbf{Q (A): What risk does \texttt{VACUUM} introduce?}\\
+    A: It permanently removes unreferenced files, destroying the versions time travel or
+    recovery might still need---never vacuum before validating recovery. (Ch.~4)
+    \item \textbf{Q (A): What is the safest retry unit for a daily pipeline?}\\
+    A: A specific processing date or batch window: the job rereads the same Bronze files and
+    replaces only the corresponding Silver scope. (Ch.~3)
+    \item \textbf{Q (A): How should schema evolution be governed?}\\
+    A: As an intentional contract change---review the new field, test downstream impact,
+    document the schema; never silently accept drift. (Ch.~4)
+    \item \textbf{Q (A): Why might a bank split medallion layers across workspaces?}\\
+    A: Stronger access boundaries, limited raw-data exposure, smaller blast radius, and audited
+    promotion from raw logs to curated reports. (Ch.~2)
+\end{enumerate}
+
+\section{Warehousing and BI: Warehouse, SQL Endpoint, Modeling, Direct Lake (Chapters 5--8)}
+
+\subsection*{Foundational}
+\begin{enumerate}
+    \item \textbf{Q (F): What is the unit of Fabric capacity billing?}\\
+    A: The capacity unit (CU); consumption is metered in CU-seconds across all workloads
+    sharing the capacity. (Ch.~5)
+    \item \textbf{Q (F): What does the Fabric warehouse store physically?}\\
+    A: Delta-Parquet files in OneLake, in a managed area owned by the warehouse item---open
+    storage other engines can also read. (Ch.~5)
+    \item \textbf{Q (F): Name the three Kimball fact table types.}\\
+    A: Transaction facts, periodic snapshots, and accumulating snapshots. (Ch.~7)
+    \item \textbf{Q (F): How does RLS differ from object-level security?}\\
+    A: Object-level controls \emph{which objects} a user sees; RLS controls \emph{which rows}
+    within a permitted object, via a filter predicate. (Ch.~6)
+\end{enumerate}
+
+\subsection*{Intermediate}
+\begin{enumerate}
+    \item \textbf{Q (I): When is \texttt{COPY INTO} preferable to a pipeline Copy activity?}\\
+    A: When files are already staged and the team wants set-based, versionable, idempotent SQL
+    loads---classic for stored-procedure estates. (Ch.~5)
+    \item \textbf{Q (I): When is SCD Type 2 required instead of Type 1?}\\
+    A: When the business must answer ``as it was'' questions---attribution, audit, any report
+    reflecting attribute values in effect when the fact occurred. (Ch.~7)
+    \item \textbf{Q (I): What triggers a Direct Lake fallback to DirectQuery?}\\
+    A: Row-count guardrails for the capacity, unsupported column types or query shapes, queries
+    on views, or memory pressure---each silently reroutes that query. (Ch.~8)
+    \item \textbf{Q (I): When is Import mode still preferable to Direct Lake?}\\
+    A: When the source lives outside OneLake, is too slow for live column reads, or the model
+    needs Import-only DAX features. (Ch.~8)
+    \item \textbf{Q (I): Which object reuses a join across reports?}\\
+    A: A view---it names the join once and becomes the stabilizing contract for every consumer.
+    (Ch.~6)
+\end{enumerate}
+
+\subsection*{Advanced}
+\begin{enumerate}
+    \item \textbf{Q (A): Why does compute--storage separation matter for a warehouse?}\\
+    A: Storage scales with OneLake while compute scales with SKUs; data survives paused
+    compute; the same Delta files open to other engines without export pipelines. (Ch.~5)
+    \item \textbf{Q (A): How does Direct Lake achieve freshness without refresh?}\\
+    A: It reads the same Delta files pipelines write; framing re-points the model at new
+    committed versions---freshness after the next frame, not the next import window. (Ch.~8)
+    \item \textbf{Q (A): Which telemetry reveals fallback events in production?}\\
+    A: The Capacity Metrics app---DirectQuery-mode query load where lake reads were expected.
+    Fallback is silent in the report but visible in telemetry. (Ch.~8, 24)
+    \item \textbf{Q (A): What is a logical data warehouse?}\\
+    A: Querying lake data in place through a governed SQL object layer---views, TVFs,
+    RLS---without physically moving data into a separate warehouse store. (Ch.~6)
+    \item \textbf{Q (A): How does a bridge table resolve a circular dependency?}\\
+    A: It factors the many-to-many heart of the loop into its own table, converting every
+    filter path into composable one-to-many hops. (Ch.~7)
+\end{enumerate}
+
+\section{ETL and Orchestration: Pipelines, Dataflows, Connectivity, Monitoring (Chapters 9--12)}
+
+\subsection*{Foundational}
+\begin{enumerate}
+    \item \textbf{Q (F): What makes an ingestion framework metadata-driven?}\\
+    A: Work items come from a config table a parameterized pipeline reads at run
+    time---onboarding a source is an \texttt{INSERT}, not a new pipeline. (Ch.~9)
+    \item \textbf{Q (F): Which activity iterates over a Lookup result set?}\\
+    A: ForEach over the Lookup's \texttt{output.value}; parallelism is opt-in and should be
+    bounded. (Ch.~9)
+    \item \textbf{Q (F): What is an output destination in Dataflows Gen2?}\\
+    A: The setting that publishes a query's result into lakehouse, warehouse, or Azure
+    SQL---turning the dataflow into a general ingestion and transformation tool. (Ch.~10)
+    \item \textbf{Q (F): Why cluster gateway nodes for production?}\\
+    A: A single node is a single point of failure for every hybrid pipeline; clusters add HA
+    during patches plus load distribution. (Ch.~11)
+\end{enumerate}
+
+\subsection*{Intermediate}
+\begin{enumerate}
+    \item \textbf{Q (I): What distinguishes a breaking from a non-breaking schema change?}\\
+    A: Breaking removes or renames what consumers depend on; non-breaking only adds. The
+    contract gate rejects the first, allows the second. (Ch.~9)
+    \item \textbf{Q (I): Why stage data before writing to a destination?}\\
+    A: Staging separates computation from publication so quality gates can run between them; a
+    direct-to-Gold flow has no point at which bad rows can be stopped. (Ch.~10)
+    \item \textbf{Q (I): Why quarantine bad rows instead of failing the batch?}\\
+    A: A handful of bad rows should not break the SLA for millions of good ones; quarantine
+    preserves the batch, records violations, keeps Gold clean. (Ch.~10)
+    \item \textbf{Q (I): On Failure versus On Completion paths?}\\
+    A: On Failure fires only on predecessor failure (alerts, compensation); On Completion fires
+    either way (unconditional cleanup). Publishing on On Completion propagates partial
+    failures. (Ch.~12)
+    \item \textbf{Q (I): When do you need a VNet gateway instead of an on-premises gateway?}\\
+    A: When sources live inside an Azure VNet and you want Microsoft-managed gateway compute
+    without maintaining a Windows host. (Ch.~11)
+\end{enumerate}
+
+\subsection*{Advanced}
+\begin{enumerate}
+    \item \textbf{Q (A): Why should watermarks advance only on success?}\\
+    A: The watermark defines what the next run reads; advancing on failure silently skips
+    uncommitted data, advancing on success makes rerun safe and duplicates impossible. (Ch.~9)
+    \item \textbf{Q (A): How do you make a rerun of a failed batch idempotent?}\\
+    A: Watermarks advance only on success, writes are merge- or partition-scoped, and the batch
+    re-executes exactly its missing slice. (Ch.~12)
+    \item \textbf{Q (A): How does a gateway keep data inside the network perimeter?}\\
+    A: It initiates every connection outbound over TLS to the Azure relay---only outbound 443
+    traffic, no inbound rule or public endpoint. (Ch.~11)
+    \item \textbf{Q (A): Why attach a runbook link to every alert?}\\
+    A: The alert reaches a half-awake human at 3 a.m.; the runbook turns investigation into
+    procedure---rerun steps, backfill path, escalation owner. (Ch.~12)
+    \item \textbf{Q (A): Why are dependencies better than wall-clock schedules?}\\
+    A: Clocks encode duration assumptions that fail on slow nights; completion conditions
+    encode actual readiness, so the graph self-adjusts. (Ch.~12)
+\end{enumerate}
+
+\section{Real-Time Intelligence: Eventstreams, KQL, Reflex, Dashboards (Chapters 13--16)}
+
+\subsection*{Foundational}
+\begin{enumerate}
+    \item \textbf{Q (F): Name two Eventstream sources and one destination.}\\
+    A: Azure Event Hubs and custom app endpoints as sources; KQL databases, lakehouses, and
+    Reflex items as destinations. (Ch.~13)
+    \item \textbf{Q (F): Which three parts define a Data Activator trigger?}\\
+    A: The data watched (with identity granularity), the condition evaluated, and the action
+    fired. (Ch.~15)
+    \item \textbf{Q (F): What is reverse ETL?}\\
+    A: Writing curated analytical outputs---segments, scores---back into operational systems
+    where people act. (Ch.~16)
+    \item \textbf{Q (F): What does the Event Hubs retention (replay) window control?}\\
+    A: How far back a consumer can reprocess after failure; recovery beyond the window loses
+    data, so size it beyond your slowest realistic recovery. (Ch.~13)
+\end{enumerate}
+
+\subsection*{Intermediate}
+\begin{enumerate}
+    \item \textbf{Q (I): Why stamp every event with a unique ID?}\\
+    A: At-least-once delivery means duplicates; the producer-stamped ID is the only trustworthy
+    dedup key---IDs minted mid-pipeline cannot distinguish a retry from a new event. (Ch.~13)
+    \item \textbf{Q (I): When route events to KQL versus a lakehouse?}\\
+    A: KQL for live analytics and Reflex (queryable in seconds); lakehouse for durable open
+    storage and batch integration. Most architectures fan out to both. (Ch.~13)
+    \item \textbf{Q (I): Why require ``3 consecutive minutes'' instead of a single spike?}\\
+    A: Sustained conditions filter transient noise, converting a flapping siren into a signal
+    humans keep answering. (Ch.~15)
+    \item \textbf{Q (I): What does \texttt{arg\_max(ingestion\_time(), *) by EventId} do?}\\
+    A: Collapses at-least-once redeliveries to the latest-arrived row per logical event, keyed
+    by the producer-stamped ID. (Ch.~14)
+    \item \textbf{Q (I): Why does every real-time dashboard need a freshness indicator?}\\
+    A: A frozen dashboard is indistinguishable from a healthy system; last-event age separates
+    ``all quiet'' from ``all broken.'' (Ch.~16)
+\end{enumerate}
+
+\subsection*{Advanced}
+\begin{enumerate}
+    \item \textbf{Q (A): What does at-least-once delivery imply for consumers?}\\
+    A: Every consumer must be idempotent: dedupe on the producer-stamped ID at the first
+    queryable boundary and checkpoint progress so restarts resume instead of replay. (Ch.~13)
+    \item \textbf{Q (A): Why do unbounded lookback windows degrade performance?}\\
+    A: They abandon incremental state---every query and view update re-scans ever-growing
+    history, so cost grows with data age rather than workload. (Ch.~14)
+    \item \textbf{Q (A): How do late arrivals affect a time-windowed stream join?}\\
+    A: Events arriving after the window closes never match; the window must reflect measured
+    lateness, with a written policy for unmatched events. (Ch.~14)
+    \item \textbf{Q (A): Why must Reflex rules read deduplicated data?}\\
+    A: A rule over raw duplicate events double-fires---paging humans twice for one event.
+    (Ch.~15)
+    \item \textbf{Q (A): What does automatic page refresh cost in DirectQuery mode?}\\
+    A: Real query load per refresh per open report instance---forty wall monitors at ten
+    seconds is four queries per second forever. Cadence follows decision cadence. (Ch.~16)
+\end{enumerate}
+
+\section{Data Science and ML: Foundations, MLflow, SynapseML, MLOps (Chapters 17--20)}
+
+\subsection*{Foundational}
+\begin{enumerate}
+    \item \textbf{Q (F): What does Data Wrangler generate from visual cleaning steps?}\\
+    A: Executable PySpark/Pandas code---the visual session is exploration; the exported,
+    parameterized code is the engineering artifact. (Ch.~17)
+    \item \textbf{Q (F): What does \texttt{mlflow.autolog()} capture per run?}\\
+    A: Framework-specific parameters, metrics, and the model artifact, automatically; you add
+    business metrics and metadata tags explicitly. (Ch.~18)
+    \item \textbf{Q (F): What does SynapseML add on top of Spark MLlib?}\\
+    A: Distributed transformers for Azure AI services (OpenAI, Cognitive Services), learners
+    such as LightGBM, and serving utilities. (Ch.~19)
+    \item \textbf{Q (F): What does the Spark \texttt{PREDICT}/UDF pattern do?}\\
+    A: Applies a registered model as a distributed function over a DataFrame---set-based
+    inference with results stamped and written back to Delta. (Ch.~20)
+\end{enumerate}
+
+\subsection*{Intermediate}
+\begin{enumerate}
+    \item \textbf{Q (I): Name two leakage risks in feature engineering.}\\
+    A: Temporal leakage (windows computed past the as-of date) and preprocessing leakage
+    (scalers fit before the train/test split). (Ch.~17)
+    \item \textbf{Q (I): Why register a model instead of referencing run artifacts?}\\
+    A: The registry makes versions immutable, decouples consumers through aliases, and
+    centralizes the promotion audit trail. (Ch.~18)
+    \item \textbf{Q (I): Why batch AI-service calls instead of row-by-row?}\\
+    A: Per-call latency and per-request pricing amortize across rows; bounded concurrency
+    respects rate limits without serializing the cluster. (Ch.~19)
+    \item \textbf{Q (I): Which signal indicates data drift in production?}\\
+    A: Distribution shift---PSI or KS statistics on production features versus training
+    baselines---plus slower-arriving outcome decay. (Ch.~20)
+\end{enumerate}
+
+\subsection*{Advanced}
+\begin{enumerate}
+    \item \textbf{Q (A): Why must training features be rebuildable for any historical date?}\\
+    A: A feature computed ``as of now'' for a historical row trains on the future; explicit
+    as-of dating makes backtests honest and leakage testable. (Ch.~17)
+    \item \textbf{Q (A): Why must run comparisons filter to a common dataset snapshot?}\\
+    A: Runs on different snapshots differ in model and data; without a fixed snapshot you
+    measure data drift and call it model quality. (Ch.~18)
+    \item \textbf{Q (A): How do you avoid hardcoding Azure OpenAI keys in a notebook?}\\
+    A: Managed identity where supported, otherwise Key Vault references resolved at run
+    time---Git integration will eventually sync the notebook verbatim. (Ch.~19)
+    \item \textbf{Q (A): Why does drift trigger retraining but not promotion?}\\
+    A: Drift can signal a broken upstream feed as easily as a changed world; retraining is
+    automated, but promotion waits for metric evidence and human review. (Ch.~20)
+    \item \textbf{Q (A): Which schema contract must scoring output honor?}\\
+    A: Entity key, score, \texttt{model\_version}, \texttt{scored\_ts}---the published columns
+    reports and reverse ETL depend on. (Ch.~20)
+\end{enumerate}
+
+\section{Governance, Security, Administration, and Certification (Chapters 21--24)}
+
+\subsection*{Foundational}
+\begin{enumerate}
+    \item \textbf{Q (F): Contributor versus Viewer workspace roles?}\\
+    A: Contributors create and modify items; Viewers consume without altering definitions. The
+    distinction is change authority, not seniority. (Ch.~21)
+    \item \textbf{Q (F): Promoted versus Certified endorsement?}\\
+    A: Promoted is the owner's vouch; Certified is the organization's official approval against
+    published criteria. (Ch.~22)
+    \item \textbf{Q (F): Why pause non-production capacities on a schedule?}\\
+    A: Per-second pay-as-you-go billing makes idle capacity pure waste; schedules remove human
+    memory from the loop. (Ch.~23)
+    \item \textbf{Q (F): Which DP-600 domains weigh most?}\\
+    A: Planning/managing the analytics solution, preparing and serving data, and semantic
+    modeling---verify current weights against the live skills outline. (Ch.~24)
+\end{enumerate}
+
+\subsection*{Intermediate}
+\begin{enumerate}
+    \item \textbf{Q (I): Why prefer item-level permissions over workspace-level grants?}\\
+    A: A workspace grant exposes every item---drafts, staging, experiments; item-level grants
+    expose exactly the product the consumer needs. (Ch.~21)
+    \item \textbf{Q (I): What does a sensitivity label pass downstream?}\\
+    A: The classification itself---labels inherit through lineage to models and reports;
+    inheritance is audited, not assumed. (Ch.~22)
+    \item \textbf{Q (I): Why is Git integration the recovery mechanism for workspace items?}\\
+    A: Fabric has no traditional backup of workspace metadata; the repository holds item
+    definitions, so reconnecting rehydrates the estate. (Ch.~23)
+    \item \textbf{Q (I): When does Direct Lake beat Import in exam scenarios?}\\
+    A: Data in OneLake Delta, near-real-time freshness without refresh windows, volumes within
+    capacity guardrails; Import wins for external/slow sources. (Ch.~24)
+    \item \textbf{Q (I): What does surge protection guard against?}\\
+    A: Background storms consuming interactive capacity---a runaway job degrading the
+    dashboards executives watch. (Ch.~23)
+\end{enumerate}
+
+\subsection*{Advanced}
+\begin{enumerate}
+    \item \textbf{Q (A): Why is row-level DELETE insufficient for GDPR erasure in Fabric?}\\
+    A: Delta history keeps rows until \texttt{VACUUM}, KQL retains per policy, caches hold
+    copies, backups restore them---DELETE touches one layer's current state only. (Ch.~22)
+    \item \textbf{Q (A): How does crypto-shredding sidestep that?}\\
+    A: PII encrypted per subject with keys in Key Vault; deleting the key renders every
+    copy---current, history, cache, backup---unreadable in one auditable act. (Ch.~22)
+    \item \textbf{Q (A): What is privilege creep, and how do you audit it?}\\
+    A: Accumulation of broader-than-needed grants over time. Quarterly: enumerate grants, map
+    each to a ticket or owner, revoke the unjustified. (Ch.~21)
+    \item \textbf{Q (A): Why no automatic cross-region failover for OneLake?}\\
+    A: OneLake data is not automatically replicated; continuity requires deliberate
+    dual-workspace/dual-capacity designs, chosen and priced per workload. (Ch.~23)
+    \item \textbf{Q (A): Walk through expand--migrate--contract for renaming a column.}\\
+    A: Add the new nullable column (expand); dual-write and backfill with view shims (migrate);
+    switch consumers, then drop the old column after a full release cycle (contract). (Ch.~23)
+    \item \textbf{Q (A): Why remediate exam weaknesses by building rather than rereading?}\\
+    A: The exam tests scenario decisions; muscle memory from labs produces the reasoning, while
+    recognition memory produces confidence without capability. (Ch.~24)
+\end{enumerate}

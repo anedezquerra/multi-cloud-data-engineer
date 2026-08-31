@@ -1,0 +1,201 @@
+\chapter{Production-Readiness and Governance Checklists}
+\index{production readiness}\index{checklists}\index{governance!checklists}%
+This appendix distills the book's production notes and lab acceptance criteria into
+checkbox-style checklists, one per platform domain. Use them as pre-merge review gates,
+go-live criteria, or audit preparation: an unchecked box is either work remaining or a
+documented, accepted risk. Each item names the chapter that teaches it.
+
+\begin{notebox}
+A checklist item is satisfied by \emph{evidence}, not assertion: a query result, a history
+entry, a drill log, a passing negative test. If the evidence cannot be produced on demand,
+the box is not checked---however confident the team feels.
+\end{notebox}
+
+\section{Workspace and Unity Catalog (Chapters 0, 1, 8)}
+\index{Unity Catalog!checklist}%
+\begin{itemize}
+    \item[$\square$] Unity Catalog metastore attached and verified; no production assets left
+    in \texttt{hive\_metastore}.
+    \item[$\square$] One catalog per environment (dev/staging/prod); environment separation by
+    catalog, not by convention.
+    \item[$\square$] Medallion schemas (\texttt{bronze}/\texttt{silver}/\texttt{gold}) named and
+    governed per catalog; naming conventions documented and followed.
+    \item[$\square$] Managed tables are the default; every external table carries a stated reason.
+    \item[$\square$] Grants assigned to groups at the highest level that expresses intent
+    (schema for ``analysts read Gold''); individual and table-level grants are documented
+    exceptions.
+    \item[$\square$] Row filters and column masks applied on the table for declarative policy;
+    dynamic views reserved for compound or shared masking logic.
+    \item[$\square$] Every grant validated by a negative test executed as a restricted principal
+    (never as the object owner).
+    \item[$\square$] Cluster policies enforce auto-termination ceilings, node restrictions, and
+    mandatory cost tags; unattributed compute is structurally impossible.
+    \item[$\square$] Production code lives in Git folders; workspace folders hold exploration only.
+    \item[$\square$] Storage credentials scoped to single containers, rotation scheduled, no
+    wildcard storage rights.
+\end{itemize}
+
+\section{Delta Lake and Storage (Chapters 2, 3, 5)}
+\index{Delta Lake!checklist}%
+\begin{itemize}
+    \item[$\square$] Every transition between layers is idempotent (keyed \texttt{MERGE} or
+    \texttt{replaceWhere}); a same-day rerun changes zero Gold counts.
+    \item[$\square$] Reconciliation arithmetic per run: input $=$ accepted $+$ quarantined,
+    asserted in the pipeline and logged to a run ledger.
+    \item[$\square$] Quarantine tables have a named steward and a review cadence.
+    \item[$\square$] \texttt{VACUUM} retention exceeds the recovery objective and the longest
+    query duration; retention changes are change-controlled.
+    \item[$\square$] \texttt{RESTORE} drill executed and evidenced in \texttt{DESCRIBE HISTORY}
+    before go-live.
+    \item[$\square$] Schema evolution is deliberate: \texttt{mergeSchema} only where drift is
+    tolerated; breaking changes halt the pipeline for review.
+    \item[$\square$] Layout decisions (liquid clustering keys, partitioning, Z-ORDER) made from
+    measured query patterns, with a benchmark table of file counts and timings as evidence.
+    \item[$\square$] Deletion vectors understood: readers pay a merge cost until the next
+    \texttt{OPTIMIZE}; compaction scheduled accordingly.
+    \item[$\square$] Small-file posture monitored; \texttt{OPTIMIZE} (or predictive optimization)
+    scheduled in bands that do not fight active writers.
+\end{itemize}
+
+\section{SQL Warehouses and BI (Chapters 6, 7)}
+\index{SQL warehouse!checklist}%
+\begin{itemize}
+    \item[$\square$] Warehouse tier chosen from requirements (serverless for BI by default);
+    auto-stop configured; max clusters sized for the known burst window.
+    \item[$\square$] Certified views are the single contract for metrics; dashboards and Genie
+    spaces point at them, never at Bronze.
+    \item[$\square$] Materialized views used for stable derived shapes; versioned business logic
+    lives in tested, scheduled pipelines.
+    \item[$\square$] Query profiles captured for the critical dashboards; dataset SQL reads
+    MVs/certified views, not raw fact scans.
+    \item[$\square$] Published dashboards run as a service identity whose data access equals
+    what subscribers may see.
+    \item[$\square$] Genie spaces scoped per domain with instructions, example queries, and a
+    measured first-try accuracy on a fixed question set.
+    \item[$\square$] Cost attribution live: \texttt{system.billing.usage} joined to warehouse and
+    user identity, reviewed monthly.
+\end{itemize}
+
+\section{DLT and Batch Pipelines (Chapters 9--12)}
+\index{Delta Live Tables!checklist}\index{orchestration!checklist}%
+\begin{itemize}
+    \item[$\square$] Every expectation has a deliberate severity: warn, drop (with quarantine
+    visibility), or fail (protecting downstream consumers).
+    \item[$\square$] The DLT event log is queried, alerted on, and retained as quality
+    evidence---not just viewed in the UI.
+    \item[$\square$] Full-refresh requirements known per dataset before deployment.
+    \item[$\square$] Auto Loader checkpoints governed (one per stream, durable location); rescued
+    data column monitored and stewarded.
+    \item[$\square$] CDC flows carry a \texttt{SEQUENCE BY} guard whose column is unique and
+    monotonic per key.
+    \item[$\square$] Ingestion contracts with producers specify schema/compatibility rules, key
+    and sequence semantics, arrival SLA, and the malformed-data policy.
+    \item[$\square$] Tuning evidence table exists: isolated before/after metrics per change, no
+    confounded experiments.
+    \item[$\square$] Every job task is idempotent, so repair runs re-execute only the failed
+    subtree safely.
+    \item[$\square$] Quality gates actually block Gold publish; conditional alerts wired and
+    tested with a forced failure.
+    \item[$\square$] Job parameters and task values used for their distinct purposes; no dates
+    hardcoded into task code.
+    \item[$\square$] SLA alerting fires on trajectory (elapsed $+$ remaining-p50), not only on
+    breach.
+\end{itemize}
+
+\section{Streaming and Real-Time (Chapters 13--16)}
+\index{streaming!checklist}%
+\begin{itemize}
+    \item[$\square$] Exactly-once argued end to end: checkpointed offsets, deterministic state,
+    idempotent sink---all three, per pipeline.
+    \item[$\square$] One checkpoint per query; incompatible changes deploy with a new checkpoint,
+    a replay, and a reconciliation before cutover.
+    \item[$\square$] Restart drill executed mid-stream: post-restart counts prove no loss and no
+    duplication.
+    \item[$\square$] Every stateful operator has a watermark; watermark sized from a measured
+    lateness histogram (p99 plus margin), never guessed.
+    \item[$\square$] RocksDB state store enabled when state size exceeds comfortable executor
+    memory, with before/after latency measured.
+    \item[$\square$] \texttt{maxOffsetsPerTrigger} (or equivalent) caps micro-batch size;
+    partition count sized for peak rate with headroom.
+    \item[$\square$] Message schemas registered with compatibility rules; inference confined to
+    the sandbox.
+    \item[$\square$] Connection strings and broker credentials come from secret scopes; none
+    appear in code or source control.
+    \item[$\square$] Input rate versus processing rate graphed per stream; freshness indicator on
+    every real-time dashboard.
+    \item[$\square$] A nightly batch tier reconciles the streaming tier; replay drills produce
+    zero duplicates.
+\end{itemize}
+
+\section{ML and Mosaic AI (Chapters 17--20)}
+\index{MLOps!checklist}\index{Mosaic AI!checklist}%
+\begin{itemize}
+    \item[$\square$] Every training run carries git SHA, dataset snapshot/version, parameters,
+    and environment; nine-month-old runs are reproducible.
+    \item[$\square$] Models registered in Unity Catalog; production code resolves aliases
+    (\texttt{@champion}), never pinned versions.
+    \item[$\square$] Feature tables are the single definition feeding training (timestamp
+    lookups) and serving; point-in-time rebuilds verified for historical as-of dates.
+    \item[$\square$] Leakage audit performed before any drift investigation: offline/online gap
+    checked against as-of correctness.
+    \item[$\square$] Every endpoint has inference logging, an owner, and a health dashboard.
+    \item[$\square$] Promotion is human-gated at the alias move; retraining is drift-triggered,
+    never alarm-triggered.
+    \item[$\square$] Rollback is an alias re-point, drilled on a schedule.
+    \item[$\square$] RAG systems keep chunks in governed Delta with the index as a rebuildable
+    projection; a golden evaluation set gates every retrieval or prompt change.
+    \item[$\square$] Batch and endpoint scoring paths reconciled against the same registry
+    version.
+\end{itemize}
+
+\section{Security and Networking (Chapters 21, 22)}
+\index{security!checklist}\index{networking!checklist}%
+\begin{itemize}
+    \item[$\square$] SSO binds the account to the IdP; SCIM syncs group membership; no one-off
+    local users.
+    \item[$\square$] No production workload runs as a person: least-privilege service principals
+    with OAuth M2M, per-grant justification, and audit sampling.
+    \item[$\square$] PAT creation governed by workspace policy (lifetime and scope limits).
+    \item[$\square$] All secrets in secret scopes (vault-backed where rotation SLAs apply);
+    notebooks call \texttt{dbutils.secrets.get}---zero literal credentials.
+    \item[$\square$] Network posture layered: private connectivity, IP access lists, SSO/MFA,
+    short-lived tokens---with each control's blind spot documented.
+    \item[$\square$] Time-boxed access implemented as expiring IdP group membership, never
+    ``temporary admin.''
+    \item[$\square$] Negative tests run as code on a schedule: principals attempt what they must
+    not do; results logged as evidence.
+    \item[$\square$] PII classified with tags at table creation; a scheduled audit query pages
+    the steward on non-approved reads.
+    \item[$\square$] Delta Sharing shares scoped to the agreed tables; the revocation drill
+    (grant, read, revoke, failed read) executed and logged quarterly.
+    \item[$\square$] Erasure requests handled as a pipeline: targeted deletes, provenance query
+    for every copy, \texttt{VACUUM} timing understood.
+\end{itemize}
+
+\section{CI/CD and FinOps (Chapters 23, 24)}
+\index{CI/CD!checklist}\index{FinOps!checklist}%
+\begin{itemize}
+    \item[$\square$] Production is a build artifact: bundles plus Terraform in Git, deployed by
+    CI, gated by staging. Nobody clicks in prod.
+    \item[$\square$] \texttt{bundle validate} runs on every pull request; targets and modes make
+    dev collisions and prod schedules structurally distinct.
+    \item[$\square$] Terraform state is remote, locked, and access-controlled.
+    \item[$\square$] CI authenticates as a service principal (OAuth M2M / OIDC), never with a
+    personal token.
+    \item[$\square$] Hotfixes ride the same pipeline with an expedited approval gate---never a
+    different process.
+    \item[$\square$] A drift job compares deployed state against the bundle registry; manual
+    changes are caught, not debated.
+    \item[$\square$] The clean-clone drill (\texttt{terraform apply} $+$
+    \texttt{bundle deploy -t prod} into a fresh workspace) succeeds and is timed.
+    \item[$\square$] Chargeback runs monthly from \texttt{system.billing.usage} plus
+    policy-enforced tags; the review ends with two implemented optimizations.
+    \item[$\square$] Every repo README leads with problem, diagram, setup, evidence, cost, and
+    lessons learned.
+\end{itemize}
+
+\begin{tipbox}
+Run these checklists as a standing review: pick one domain per month, produce the evidence
+for every box, and file the gaps as tickets. The first pass always finds unchecked boxes; the
+discipline is that the second pass finds fewer.
+\end{tipbox}

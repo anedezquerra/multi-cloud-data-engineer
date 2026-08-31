@@ -1,0 +1,240 @@
+\chapter{Shell and Command Quick Reference}
+\index{quick reference}\index{mongosh!commands}\index{Atlas CLI}%
+One-page-per-domain tables of the commands this book uses repeatedly. Every entry appears in
+context in the chapter noted in parentheses; this appendix is the memory aid, not the lesson.
+All \texttt{db.*} examples assume \texttt{mongosh}; substitute your database and collection names.
+
+\section{CRUD and Query Operators}
+\index{CRUD}%
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{4.6cm}p{8.2cm}@{}}
+\toprule
+\textbf{Task} & \textbf{Command} \\
+\midrule
+Insert one / many & \texttt{db.coll.insertOne(\{...\})} / \texttt{insertMany([...])} \\
+Find with projection & \texttt{db.coll.find(\{status: "A"\}, \{name: 1, \_id: 0\})} \\
+Update first / all matches & \texttt{updateOne(\{q\}, \{\$set: \{...\}\})} / \texttt{updateMany(...)} \\
+Increment / push / unset & \texttt{\$inc}, \texttt{\$push}, \texttt{\$unset} in the update document \\
+Upsert & \texttt{updateOne(\{q\}, \{\$set: ...\}, \{upsert: true\})} \\
+Delete & \texttt{deleteOne(\{q\})} / \texttt{deleteMany(\{q\})} \\
+Replace whole document & \texttt{replaceOne(\{q\}, \{newDoc\})} \\
+Find-and-modify atomically & \texttt{findOneAndUpdate(\{q\}, \{u\}, \{returnDocument: "after"\})} \\
+Bulk mixed writes & \texttt{bulkWrite([ \{insertOne: ...\}, \{updateOne: ...\} ], \{ordered: false\})} \\
+Count / distinct & \texttt{countDocuments(\{q\})} / \texttt{distinct("field", \{q\})} \\
+Cursor control & \texttt{.sort(\{k: -1\}).skip(n).limit(m)} \\
+Comparison / logic & \texttt{\$eq \$ne \$gt \$gte \$lt \$lte \$in \$nin \$and \$or \$not \$nor} \\
+Element / evaluation & \texttt{\$exists \$type \$regex \$expr \$elemMatch} \\
+Array / projection & \texttt{\$all \$size \$slice \$ (positional) \$elemMatch} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{Aggregation Pipeline Stages and Operators}
+\index{aggregation pipeline!stages}%
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{3.4cm}p{9.4cm}@{}}
+\toprule
+\textbf{Stage} & \textbf{Purpose (chapter)} \\
+\midrule
+\texttt{\$match} & Filter early; indexes apply only to a leading \$match (Ch.~10) \\
+\texttt{\$project} / \texttt{\$unset} & Shape documents; drop fields to cut memory \\
+\texttt{\$group} & Bucket by \texttt{\_id} with \$sum/\$avg/\$push/\$addToSet (Ch.~10) \\
+\texttt{\$sort} / \texttt{\$limit} / \texttt{\$skip} & Order and window; sort can spill (use \texttt{allowDiskUse}) \\
+\texttt{\$lookup} & Left join; index the foreign field (Ch.~10) \\
+\texttt{\$graphLookup} & Recursive traversal; bound with \texttt{maxDepth}, prune with \texttt{restrictSearchWithMatch} (Ch.~10) \\
+\texttt{\$facet} & Many pipelines over one input scan; output $\le$ 16 MB (Ch.~10) \\
+\texttt{\$setWindowFields} & Window functions: \texttt{\$rank}, \texttt{\$denseRank}, \texttt{\$derivative}, \texttt{\$avg} over frames; requires \texttt{sortBy} (Ch.~11) \\
+\texttt{\$merge} / \texttt{\$out} & Persist results; \texttt{\$merge} with a deterministic key is the idempotent refresh primitive (Ch.~11) \\
+\texttt{\$search} / \texttt{\$searchMeta} & Atlas Search; must be the first stage (Ch.~13) \\
+\texttt{\$vectorSearch} & ANN retrieval with \texttt{filter} pre-filtering; first stage (Ch.~14) \\
+\texttt{\$indexStats} & Per-index usage counters; the drop-candidate evidence (Ch.~12) \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{Indexes and Query Plans}
+\index{index!commands}\index{explain}%
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{5.4cm}p{7.4cm}@{}}
+\toprule
+\textbf{Task} & \textbf{Command} \\
+\midrule
+List indexes & \texttt{db.coll.getIndexes()} \\
+Create compound (ESR order) & \texttt{createIndex(\{ status: 1, orderDate: -1, total: 1 \})} \\
+Text / wildcard & \texttt{createIndex(\{desc: "text"\})} / \texttt{createIndex(\{ "\$**": 1 \})} \\
+Partial index & \texttt{createIndex(\{k:1\}, \{partialFilterExpression: \{active: true\}\})} \\
+TTL index & \texttt{createIndex(\{ts:1\}, \{expireAfterSeconds: 2592000\})} \\
+Unique / sparse & \texttt{createIndex(\{email:1\}, \{unique: true\})} \\
+Hide before dropping & \texttt{db.coll.hideIndex("idx\_name")} / \texttt{unhideIndex(...)} \\
+Drop & \texttt{db.coll.dropIndex("idx\_name")} \\
+Explain a query & \texttt{db.coll.find(\{q\}).explain("executionStats")} \\
+Explain an aggregation & \texttt{db.coll.explain("executionStats").aggregate([...])} \\
+Key metrics & \texttt{totalDocsExamined} vs.\ \texttt{nReturned}; \texttt{stage} tree; \texttt{SORT\_KEY\_GENERATOR} = in-memory sort \\
+Rolling build & Build on secondaries, step down primary, build last (Ch.~9) \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{Replica Set Operations}
+\index{replica set!commands}%
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{5.4cm}p{7.4cm}@{}}
+\toprule
+\textbf{Task} & \textbf{Command} \\
+\midrule
+Initialize & \texttt{rs.initiate(\{\_id:"labrs", members:[...]\})} \\
+Status / config & \texttt{rs.status()} / \texttt{rs.conf()} \\
+Add / remove member & \texttt{rs.add("host:port")} / \texttt{rs.remove("host:port")} \\
+Force election & \texttt{rs.stepDown()} \\
+Replication info & \texttt{rs.printReplicationInfo()} (oplog window) \\
+Lag per member & \texttt{rs.printSecondaryReplicationInfo()} \\
+Freeze a member & \texttt{rs.freeze(seconds)} \\
+Reconfigure & \texttt{cfg = rs.conf(); cfg.members[1].priority = 0; rs.reconfig(cfg)} \\
+Write concern per op & \texttt{insertOne(doc, \{writeConcern: \{w: "majority", j: true\}\})} \\
+Read concern / preference & \texttt{.readConcern("majority")} / \texttt{.readPref("nearest", [\{dc: "eu"\}])} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{Sharding Operations}
+\index{sharding!commands}%
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{5.6cm}p{7.2cm}@{}}
+\toprule
+\textbf{Task} & \textbf{Command} \\
+\midrule
+Cluster status & \texttt{sh.status()} \\
+Add shard & \texttt{sh.addShard("shardRS/host:port")} \\
+Enable sharding (DB) & \texttt{sh.enableSharding("booklabs")} \\
+Shard a collection & \texttt{sh.shardCollection("db.coll", \{ region: 1, \_id: 1 \})} \\
+Hashed key & \texttt{sh.shardCollection("db.coll", \{ userId: "hashed" \})} \\
+Zone: define / assign & \texttt{sh.addShardToZone("shard0", "EU")} \\
+Zone: map key range & \texttt{sh.updateZoneKeyRange("db.coll", \{cc:"DE"\}, \{cc:"DF"\}, "EU")} \\
+Refine key (suffix) & \texttt{db.adminCommand(\{refineCollectionShardKey: "db.coll", key: \{region:1, \_id:1, bucket:1\}\})} \\
+Reshard online & \texttt{db.adminCommand(\{reshardCollection: "db.coll", key: \{newKey: 1\}\})} \\
+Chunk map & \texttt{db.getSiblingDB("config").chunks.find(\{uuid: ...\})} \\
+Balancer window & \texttt{sh.setBalancerState(true)}; \texttt{sh.startBalancing(...)} window via \texttt{sh.setBalancerState} and \texttt{bulkWrite} on \texttt{config.settings} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{Administration and Diagnostics}
+\index{serverStatus}\index{profiler}%
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{5.4cm}p{7.4cm}@{}}
+\toprule
+\textbf{Task} & \textbf{Command} \\
+\midrule
+Health ping & \texttt{db.runCommand(\{ ping: 1 \})} \\
+Server metrics & \texttt{db.serverStatus()} --- \texttt{wiredTiger.cache}, \texttt{opcounters}, \texttt{connections}, \texttt{queues} (\texttt{qr/qw}) \\
+Storage engine & \texttt{db.serverStatus().storageEngine} $\to$ \texttt{wiredTiger} \\
+Collection stats & \texttt{db.coll.stats()} / \texttt{db.stats()} \\
+In-flight operations & \texttt{db.currentOp(\{secsRunning: \{\$gt: 5\}\})}; kill with \texttt{db.killOp(opid)} \\
+Enable profiler & \texttt{db.setProfilingLevel(1, \{slowms: 100\})} (per-node, unreplicated) \\
+Read the slow log & \texttt{db.system.profile.find().sort(\{ts:-1\}).limit(20)} \\
+Users / roles & \texttt{db.createUser(\{user, pwd, roles\})}; \texttt{db.createRole(\{role, privileges, roles\})} \\
+Role privileges & \texttt{db.grantPrivilegesToRole("role", [\{resource:\{db,collection\}, actions:["find"]\}])} \\
+Server parameter & \texttt{db.adminCommand(\{setParameter: 1, ...\})} \\
+Change stream & \texttt{const cs = db.coll.watch([], \{resumeAfter: token\})} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{Backup, Restore, and Data Movement}
+\index{mongodump}\index{mongorestore}\index{mongoimport}%
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{5.6cm}p{7.2cm}@{}}
+\toprule
+\textbf{Task} & \textbf{Command (PowerShell)} \\
+\midrule
+Logical backup & \texttt{mongodump --uri="..." --db=booklabs --out=. \textbackslash dump} \\
+Point-in-time capture & \texttt{mongodump --oplog} (replica sets; replay with \texttt{--oplogReplay}) \\
+Restore & \texttt{mongorestore --uri="..." --drop .\textbackslash dump} \\
+Export JSON/CSV & \texttt{mongoexport --db=booklabs --collection=orders --type=csv --fields=a,b --out=orders.csv} \\
+Import & \texttt{mongoimport --db=booklabs --collection=orders --file=orders.json} \\
+Atlas snapshot & Atlas console $\to$ Backup $\to$ snapshot / continuous with PITR (Ch.~20, 23) \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{Atlas CLI Essentials}
+\index{Atlas CLI!commands}%
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{5.6cm}p{7.2cm}@{}}
+\toprule
+\textbf{Task} & \textbf{Command} \\
+\midrule
+Authenticate & \texttt{atlas auth login} \\
+List clusters & \texttt{atlas clusters list --projectId <id>} \\
+Create M0 & \texttt{atlas clusters create book-m0 --provider AWS --region us-east-1 --tier M0 --projectId <id>} \\
+Watch deployment & \texttt{atlas clusters watch book-m0 --projectId <id>} \\
+Connection string & \texttt{atlas clusters connectionStrings describe book-m0 --projectId <id>} \\
+DB user & \texttt{atlas dbusers create --username bookUser --role readWrite@booklabs --projectId <id>} \\
+IP access list & \texttt{atlas accessLists create 203.0.113.10/32 --comment "home" --projectId <id>} \\
+Search index & \texttt{atlas clusters search indexes create --clusterName book-m0 --file idx.json} \\
+Online Archive & \texttt{atlas dataFederation create ...} / console Online Archive wizard (Ch.~20) \\
+Backup snapshot & \texttt{atlas backups snapshots list --clusterName book-m0} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{Atlas Search and Vector Search Definitions}
+\index{Atlas Search!index definition}\index{Vector Search!index definition}%
+\begin{lstlisting}[language=JavaScript, caption={Atlas Search index: dynamic mapping plus an autocomplete field.}]
+{
+  "mappings": {
+    "dynamic": false,
+    "fields": {
+      "title": [
+        { "type": "string", "analyzer": "lucene.standard" },
+        { "type": "autocomplete", "analyzer": "lucene.standard",
+          "tokenization": "edgeGram", "minGrams": 3, "maxGrams": 15 }
+      ],
+      "category": { "type": "token" }
+    }
+  }
+}
+\end{lstlisting}
+
+\begin{lstlisting}[language=JavaScript, caption={Atlas Vector Search index: declare every filter field or filters post-apply.}]
+{
+  "fields": [
+    { "type": "vector", "path": "embedding", "numDimensions": 1536,
+      "similarity": "cosine" },
+    { "type": "filter", "path": "tenantId" },
+    { "type": "filter", "path": "publishedAt" }
+  ]
+}
+\end{lstlisting}
+
+\begin{lstlisting}[language=JavaScript, caption={Query stages that consume those indexes (both must lead the pipeline).}]
+// Full-text with facet metadata
+db.products.aggregate([
+  { $search: { index: "default", compound: {
+      must: [{ autocomplete: { query: "lap", path: "title" } }],
+      filter: [{ equals: { path: "category", value: "computers" } }] } } },
+  { $limit: 20 }
+])
+
+// Vector retrieval with pre-filtering
+db.chunks.aggregate([
+  { $vectorSearch: { index: "vec", path: "embedding",
+      queryVector: qvec, numCandidates: 200, limit: 10,
+      filter: { tenantId: { $eq: "t-42" } } } },
+  { $project: { text: 1, score: { $meta: "vectorSearchScore" } } }
+])
+\end{lstlisting}
+
+\begin{tipbox}
+When a command's syntax escapes you, prefer \texttt{db.coll.find(...).explain("queryPlanner")}
+over a search engine: the server itself is the ground truth for what it accepts and how it will
+execute.
+\end{tipbox}

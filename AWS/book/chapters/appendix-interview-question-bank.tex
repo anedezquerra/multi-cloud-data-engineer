@@ -1,0 +1,463 @@
+\chapter{Interview Question Bank}
+\index{interview questions}\index{question bank}%
+This appendix consolidates the Interview Q\&A sections of Chapters~1--24 into one bank, grouped
+by domain and tagged by difficulty: \textbf{(F)} foundational, \textbf{(I)} intermediate,
+\textbf{(A)} advanced. Answers are abbreviated to the key points an interviewer listens for; the
+chapter reference points to the full discussion. Practice out loud---a correct answer you cannot
+say in ninety seconds is not yet an interview answer.
+
+\section{Storage and the Data Lake}
+\begin{enumerate}
+    \item \textbf{(F)} \textbf{Why is S3 a better data-lake foundation than cluster-attached disks?}
+    Decouples durable storage from ephemeral compute; many engines read the same data; lifecycle,
+    replication, encryption, and policy are independent of any cluster. (Ch.~1)
+    \item \textbf{(F)} \textbf{When would you avoid One Zone-IA?}
+    For the only copy of critical or regulated data---single-AZ storage suits re-creatable
+    derivatives and secondary copies. (Ch.~1)
+    \item \textbf{(I)} \textbf{What does S3 strong consistency solve---and not solve?}
+    Immediate visibility of completed writes and lists. It is not multi-object transactions and
+    does not repair partial job output. (Ch.~1)
+    \item \textbf{(I)} \textbf{Object Lock: governance or compliance mode?}
+    Governance when a documented administrative bypass exists; compliance for certain, immutable
+    WORM retention. (Ch.~1)
+    \item \textbf{(I)} \textbf{DataSync or Snowball for 10 PB?}
+    Snow Family for the initial bulk transfer; DataSync for ongoing deltas. (Ch.~1)
+\end{enumerate}
+
+\section{Databases and Caching}
+\begin{enumerate}
+    \item \textbf{(F)} \textbf{RDS Multi-AZ versus a Read Replica?}
+    Multi-AZ: synchronous standby for HA/failover. Read replica: asynchronous, for read scaling
+    and migration staging; can lag. (Ch.~2)
+    \item \textbf{(I)} \textbf{Why can Aurora fail over faster than traditional databases?}
+    Compute separates from a shared, replicated cluster volume---promotion needs no volume copy.
+    (Ch.~2)
+    \item \textbf{(I)} \textbf{When is Aurora Global Database justified?}
+    Low-latency cross-region reads or regional DR beyond backups; still needs application failover
+    planning. (Ch.~2)
+    \item \textbf{(I)} \textbf{What does Aurora Serverless v2 not solve?}
+    Schema tuning, connection management, transaction design, maximum-capacity planning.
+    (Ch.~2)
+    \item \textbf{(I)} \textbf{SCT's role in an Oracle$\rightarrow$Aurora PostgreSQL migration?}
+    Assess and convert schema; flag manual remediation for incompatible SQL, procedures, types.
+    (Ch.~2)
+    \item \textbf{(A)} \textbf{Why does CDC enable near-zero-downtime migration?}
+    The target stays current while the source serves traffic; cutover waits only for lag and
+    validation thresholds. (Ch.~2)
+    \item \textbf{(F)} \textbf{How is DynamoDB different from a relational database?}
+    Managed key-value/document store modeled around known access patterns; no joins or ad hoc
+    relational queries. (Ch.~3)
+    \item \textbf{(F)} \textbf{What makes a good DynamoDB partition key?}
+    High cardinality, even traffic distribution, groups items queried together; avoids hot keys.
+    (Ch.~3)
+    \item \textbf{(F)} \textbf{When choose on-demand capacity?}
+    Unknown, bursty, early-stage traffic; provisioned + autoscaling for predictable steady load.
+    (Ch.~3)
+    \item \textbf{(I)} \textbf{LSI versus GSI?}
+    LSI shares the partition key, alternate sort key, created with the table. GSI has its own key
+    schema, can be added later, supports new access patterns. (Ch.~3)
+    \item \textbf{(I)} \textbf{Why are sparse GSIs useful?}
+    Only items with the index key appear---efficient queues, status views, entity-type slices.
+    (Ch.~3)
+    \item \textbf{(F)} \textbf{What are DynamoDB Streams for?}
+    Item-level change feed: cache invalidation, materialized views, search indexing, audit, lake
+    ingestion. (Ch.~3)
+    \item \textbf{(I)} \textbf{DynamoDB TTL caveat?}
+    Expiration is asynchronous---fine for cleanup, wrong for exact-time deletion deadlines.
+    (Ch.~3)
+    \item \textbf{(A)} \textbf{What extra design do Global Tables require?}
+    Conflict-aware write rules, regional observability, idempotent consumers, multi-region-aware
+    routing. (Ch.~3)
+    \item \textbf{(F)} \textbf{What problem does ElastiCache solve?}
+    Serves repeated reads from memory so databases/APIs see fewer requests at lower latency.
+    (Ch.~4)
+    \item \textbf{(I)} \textbf{Redis-compatible ElastiCache versus Memcached?}
+    Redis: rich structures, replication, clustering, persistence. Memcached: simple ephemeral
+    key-value caching. (Ch.~4)
+    \item \textbf{(F)} \textbf{What is cache-aside?}
+    Check cache, on miss load from the database, store with TTL; the database remains the source
+    of truth. (Ch.~4)
+    \item \textbf{(A)} \textbf{Why is cache invalidation hard?}
+    Must track every write affecting a key and race readers, writers, retries, and TTL expiry.
+    (Ch.~4)
+    \item \textbf{(I)} \textbf{DAX versus ElastiCache?}
+    DAX: DynamoDB-specific, API-compatible read cache. ElastiCache: general Redis/Valkey/Memcached
+    for many sources. (Ch.~4)
+    \item \textbf{(I)} \textbf{Can DAX serve strongly consistent reads?}
+    No---strong reads bypass DAX to DynamoDB; design read-after-write paths explicitly. (Ch.~4)
+    \item \textbf{(I)} \textbf{AppSync versus API Gateway?}
+    AppSync: GraphQL with typed schemas and subscriptions. API Gateway: REST/HTTP/webhook
+    ingestion. (Ch.~4)
+    \item \textbf{(I)} \textbf{Which metrics show cache health?}
+    Hit ratio, latency, evictions, memory pressure, CPU, connections, replication lag, error rate,
+    downstream database load. (Ch.~4)
+\end{enumerate}
+
+\section{Warehousing and Lakehouse Analytics}
+\begin{enumerate}
+    \item \textbf{(I)} \textbf{Why declare the grain before adding fact columns?}
+    Every measure must be true at exactly one row of the fact; mixed grains double-count. (Ch.~5)
+    \item \textbf{(I)} \textbf{Periodic versus accumulating snapshot facts?}
+    Periodic: state at intervals, never updated. Accumulating: one workflow instance, milestone
+    columns updated as it advances. (Ch.~5)
+    \item \textbf{(F)} \textbf{When is SCD Type 2 required over Type 1?}
+    When the question depends on the attribute value at event time; pure corrections use Type 1.
+    (Ch.~5)
+    \item \textbf{(I)} \textbf{COPY versus Auto-Copy for micro-batch loads?}
+    Auto-Copy monitors a prefix and loads on arrival; manual COPY for controlled, manifest-driven
+    bulk loads. (Ch.~5)
+    \item \textbf{(I)} \textbf{When does Redshift Serverless beat provisioned RA3 on cost?}
+    Spiky/intermittent utilization where idle hours dominate; steady 24/7 amortizes provisioned
+    better. (Ch.~5)
+    \item \textbf{(A)} \textbf{What does the leader node do during COPY?}
+    Plans and assigns input files to compute nodes, which ingest into their slices in parallel;
+    stores no user data. (Ch.~5)
+    \item \textbf{(I)} \textbf{Which distribution style avoids data movement on large joins?}
+    KEY on the join column for both tables---collocated join, nothing crosses the interconnect.
+    (Ch.~6)
+    \item \textbf{(A)} \textbf{Compound versus interleaved sort keys?}
+    Interleaved for varied filter-column combinations; compound for prefix-ordered (typically
+    date-first) access. (Ch.~6)
+    \item \textbf{(I)} \textbf{What does concurrency scaling solve?}
+    Bursty read demand (dashboard refresh storms) with transient read-only clusters, billed per
+    second. (Ch.~6)
+    \item \textbf{(F)} \textbf{When does a materialized view beat a plain view?}
+    Repeated expensive aggregations tolerating a refresh cadence---classic dashboards. (Ch.~6)
+    \item \textbf{(A)} \textbf{Rising WLM queue wait time tells you to change what?}
+    Capacity: concurrency scaling, service-class memory, cheaper queries, or throttled
+    demand---wait time is demand exceeding supply, not a query bug. (Ch.~6)
+    \item \textbf{(I)} \textbf{Why is ALL distribution dangerous for large tables?}
+    Full copy per node: storage multiplies, loads rewrite every copy; justified only for small
+    dimensions. (Ch.~6)
+    \item \textbf{(I)} \textbf{Why does Parquet lower Athena cost versus CSV?}
+    Per-byte-scanned billing; columnar + compressed reads only referenced column blocks---often
+    10--100$\times$ fewer bytes. (Ch.~7)
+    \item \textbf{(I)} \textbf{What does a Glue crawler infer, and when does it infer wrong?}
+    Columns, types, partitions by sampling. Fails on mixed schemas in one prefix or
+    unrepresentative samples. (Ch.~7)
+    \item \textbf{(I)} \textbf{Spectrum versus Athena over the same S3 data?}
+    Spectrum when joining lake with warehouse tables in one statement; Athena for lake-only ad hoc
+    with no cluster. (Ch.~7)
+    \item \textbf{(F)} \textbf{How does partition pruning cut bytes scanned?}
+    Engine skips files outside the partition filter---seven day-partitions instead of five years.
+    (Ch.~7)
+    \item \textbf{(A)} \textbf{What makes Iceberg a lakehouse format beyond Parquet files?}
+    Metadata layer: atomic commits, schema/partition evolution, hidden partitioning, snapshot time
+    travel. (Ch.~7)
+    \item \textbf{(I)} \textbf{Why crawl the curated zone, not the raw zone?}
+    Inference assumes uniform layout; curated is compacted/typed/partitioned. Raw deserves
+    hand-written DDL. (Ch.~7)
+    \item \textbf{(I)} \textbf{What does \texttt{IAMAllowedPrincipals} do, and why revoke it?}
+    Makes new catalog objects IAM-governed, bypassing Lake Formation; until revoked, LF filters do
+    not bind. (Ch.~8)
+    \item \textbf{(I)} \textbf{LF-Tags versus named-resource grants?}
+    Tags bind policy to expressions---every correctly tagged table inherits it; names scale with
+    table count, tags with data classes. (Ch.~8)
+    \item \textbf{(I)} \textbf{What does column-level security protect that table grants cannot?}
+    Sensitive attributes on shareable tables---segments visible, \texttt{pii\_email} absent, no
+    view or copy. (Ch.~8)
+    \item \textbf{(A)} \textbf{How does Redshift data sharing avoid copies?}
+    Consumers query producer managed storage live and read-only---no ETL, no duplicate storage, no
+    drift. (Ch.~8)
+    \item \textbf{(I)} \textbf{Why is a clean room safer than exchanging CSV exports?}
+    No party receives raw records; approved aggregates only, minimum group sizes, full query logs.
+    (Ch.~8)
+    \item \textbf{(A)} \textbf{Why must both IAM and Lake Formation allow a lake query?}
+    Grants are additive gates: IAM governs API calls, LF governs catalog objects; effective
+    permission is the intersection. (Ch.~8)
+    \item \textbf{(F)} \textbf{What does SPICE accelerate, and its limits?}
+    Dashboard dataset queries via in-memory snapshots; bounded by SPICE allocation and refresh
+    schedule. (Ch.~16)
+    \item \textbf{(I)} \textbf{How does QuickSight row-level security work?}
+    A rules dataset maps users/groups to allowed values, applied at query time---one dataset, many
+    audiences. (Ch.~16)
+    \item \textbf{(F)} \textbf{What is reverse ETL and what does it feed?}
+    Syncs curated warehouse results (segments, scores) back into CRMs, marketing, support systems.
+    (Ch.~16)
+    \item \textbf{(A)} \textbf{Why must identity resolution precede CRM audience syncs?}
+    Warehouse keys must map to the right person; uncontrolled identifiers create mis-targeted
+    outreach. (Ch.~16)
+    \item \textbf{(I)} \textbf{Hourly versus daily reverse-ETL sync?}
+    Weigh API rate limits and cost against freshness value; engineer to the loosest cadence that
+    meets the stated requirement. (Ch.~16)
+    \item \textbf{(I)} \textbf{When is direct query justified over SPICE?}
+    Freshness in minutes and a source that bears per-interaction load---operational monitors, not
+    company-wide dashboards. (Ch.~16)
+\end{enumerate}
+
+\section{ETL, CDC, and Orchestration}
+\begin{enumerate}
+    \item \textbf{(I)} \textbf{Core versus task nodes: which can run on Spot?}
+    Task nodes---no HDFS data, interruption only reschedules tasks. Core/master on Spot risks job
+    or cluster failure. (Ch.~9)
+    \item \textbf{(F)} \textbf{How does EMRFS decouple storage from compute?}
+    S3 as the cluster file system; clusters become disposable compute over durable objects. (Ch.~9)
+    \item \textbf{(I)} \textbf{When EMR on EKS over EMR on EC2?}
+    When Kubernetes is the org's compute standard and Spark should share its scheduling, quotas,
+    networking. (Ch.~9)
+    \item \textbf{(F)} \textbf{What are bootstrap actions for?}
+    Setup scripts on every node at provisioning---reproducible transient clusters from code.
+    (Ch.~9)
+    \item \textbf{(I)} \textbf{Why prefer transient clusters for recurring batch?}
+    Cluster-hours track job-hours; a 2-hour daily job bills 2 node-hours/day, not 24. (Ch.~9)
+    \item \textbf{(I)} \textbf{What stays on local HDFS in a well-designed EMR job?}
+    Job-local scratch (shuffle, spill); all durable inputs/outputs live in S3. (Ch.~9)
+    \item \textbf{(A)} \textbf{What does a DynamicFrame offer over a DataFrame?}
+    Self-describing records with \texttt{resolveChoice}/\texttt{applyMapping}/
+    \texttt{relationalize} for messy, evolving schemas and catalog-aware sinks. (Ch.~10)
+    \item \textbf{(I)} \textbf{What do job bookmarks guarantee?}
+    Inputs already processed are not reprocessed. They do not make the sink idempotent. (Ch.~10)
+    \item \textbf{(I)} \textbf{When is Flex execution cheaper?}
+    Non-urgent jobs (backfills, slack-heavy overnight batch) that tolerate delayed starts. (Ch.~10)
+    \item \textbf{(F)} \textbf{Why Glue over EMR for analyst-built pipelines?}
+    No clusters, visual designer generating real code, catalog integration, per-second billing.
+    (Ch.~10)
+    \item \textbf{(F)} \textbf{What compute is one DPU?}
+    4 vCPU + 16 GB, billed per second with a one-minute minimum. (Ch.~10)
+    \item \textbf{(I)} \textbf{DataBrew's best use?}
+    Interactive profiling and recipe prototyping; also a schedulable quality gate inside a
+    pipeline. (Ch.~10)
+    \item \textbf{(I)} \textbf{Which CloudWatch metrics reveal CDC lag on a ``running'' task?}
+    \texttt{CDCLatencySource} and \texttt{CDCLatencyTarget}; task status says nothing about
+    freshness. (Ch.~11)
+    \item \textbf{(A)} \textbf{BACKWARD versus FULL compatibility: which permits field deletion?}
+    BACKWARD (new reads old). FULL forbids deletions old consumers cannot tolerate. (Ch.~11)
+    \item \textbf{(I)} \textbf{Who owns a data contract?}
+    Producer owns and versions the schema; consumers sign off; the registry enforces mechanics,
+    the workflow enforces intent. (Ch.~11)
+    \item \textbf{(I)} \textbf{Why enforce schema at ingestion, not query time?}
+    By query time bad data is durable---and possibly replicated and transformed downstream.
+    (Ch.~11)
+    \item \textbf{(F)} \textbf{One breaking and one non-breaking schema change?}
+    Breaking: delete/rename/retype a field. Non-breaking: add an optional field with a default.
+    (Ch.~11)
+    \item \textbf{(A)} \textbf{Why stage DMS output in S3 before Redshift?}
+    Replayable change log decouples replication from warehouse availability; MERGEs re-runnable
+    and auditable. (Ch.~11)
+    \item \textbf{(I)} \textbf{What does \texttt{catchup=False} prevent?}
+    Backfill storms---every missed historical run launching on deploy against production. (Ch.~12)
+    \item \textbf{(I)} \textbf{When are Step Functions better than Airflow?}
+    Event-driven, high-rate workflows of AWS service calls where per-transition billing beats an
+    always-on scheduler. (Ch.~12)
+    \item \textbf{(F)} \textbf{What do retries with backoff protect against?}
+    Transient failures (throttling, brief hiccups). Deterministic failures need the failure path.
+    (Ch.~12)
+    \item \textbf{(I)} \textbf{Why tune a sensor's \texttt{poke\_interval}?}
+    Each poll is billed LIST requests; match the interval to the expected arrival cadence. (Ch.~12)
+    \item \textbf{(I)} \textbf{When should data move through S3 instead of XComs?}
+    Always, for datasets; XComs (and the 256 KB state-machine payload) suit small signals only.
+    (Ch.~12)
+    \item \textbf{(A)} \textbf{Why does the alert task need \texttt{trigger\_rule="one\_failed"}?}
+    Default rules skip the alert on upstream skip---exactly the runs it exists for. (Ch.~12)
+\end{enumerate}
+
+\section{Streaming}
+\begin{enumerate}
+    \item \textbf{(I)} \textbf{Which two throughput limits size a Kinesis stream?}
+    Per-shard 1 MB/s ingress \emph{and} 1{,}000 records/s; shard count is the max plus headroom.
+    (Ch.~13)
+    \item \textbf{(I)} \textbf{Why does partition-key choice control per-entity ordering?}
+    The key hashes to a shard; a shard is the ordered unit. Skewed keys concentrate load. (Ch.~13)
+    \item \textbf{(I)} \textbf{What does rising \texttt{IteratorAgeMilliseconds} warn of?}
+    Consumers falling behind finite retention---alarm before the retention horizon. (Ch.~13)
+    \item \textbf{(A)} \textbf{How do you build exactly-once effects on at-least-once delivery?}
+    Idempotent consumers: dedup on event ID or upsert by key; poison records to a DLQ. (Ch.~13)
+    \item \textbf{(I)} \textbf{Kinesis versus MSK billing models?}
+    Kinesis: shard-hours + record volume (capacity). MSK: broker instance-hours + storage (a
+    fleet). (Ch.~13)
+    \item \textbf{(I)} \textbf{When does SQS FIFO suffice and Kinesis is overkill?}
+    One consumer per message, no replay, throughput within FIFO quotas. (Ch.~13)
+    \item \textbf{(F)} \textbf{Name three native Firehose destinations.}
+    S3, Redshift (via intermediate S3 COPY), OpenSearch---plus Splunk and HTTP endpoints. (Ch.~14)
+    \item \textbf{(I)} \textbf{Why enable source-record backup on a delivery stream?}
+    Pre-transformation originals preserved regardless of delivery success: replay, audit,
+    recovery. (Ch.~14)
+    \item \textbf{(I)} \textbf{What do inline Lambda transformations add?}
+    Execution latency per batch plus Lambda GB-seconds and the per-GB surcharge; per-record network
+    calls explode both. (Ch.~14)
+    \item \textbf{(I)} \textbf{Why convert JSON to Parquet during Firehose delivery?}
+    No separate conversion job; the lake is columnar at landing, so scanned-bytes savings apply
+    from the first query. (Ch.~14)
+    \item \textbf{(I)} \textbf{Where does data land when Redshift delivery keeps failing?}
+    The intermediate S3 staging prefix---needs lifecycle rules and a
+    \texttt{DeliveryToRedshift.Success} alarm. (Ch.~14)
+    \item \textbf{(A)} \textbf{What can a Firehose Lambda transform never correctly do?}
+    Cross-record state: dedup windows, joins, aggregations---stream-processor work. (Ch.~14)
+    \item \textbf{(A)} \textbf{Why does unbounded keyed state kill a streaming job?}
+    Checkpoints grow until they cannot complete; restores take hours; RocksDB spills. Every
+    stateful operator needs a bound. (Ch.~15)
+    \item \textbf{(I)} \textbf{Checkpoint versus savepoint before redeployment?}
+    Savepoint---manual, stable, portable across graph changes; checkpoints serve automatic
+    recovery. (Ch.~15)
+    \item \textbf{(A)} \textbf{What bounds join-state retention in a stream--stream interval join?}
+    The interval predicate plus watermarks on both inputs; past the watermark's reach, state is
+    dropped. (Ch.~15)
+    \item \textbf{(A)} \textbf{Which two components give end-to-end exactly-once to Kafka or S3?}
+    Checkpointing plus a two-phase-commit sink---or an idempotent-by-key sink achieving the same
+    effect. (Ch.~15)
+    \item \textbf{(I)} \textbf{When prefer at-least-once plus downstream dedup?}
+    Non-transactional sinks, throughput over strictness, or a natural dedup key---simpler, faster,
+    honest. (Ch.~15)
+    \item \textbf{(I)} \textbf{What does a watermark assert?}
+    ``No event older than this timestamp will arrive''---a heuristic trading result latency against
+    late-data tolerance. (Ch.~15)
+\end{enumerate}
+
+\section{Machine Learning and MLOps}
+\begin{enumerate}
+    \item \textbf{(I)} \textbf{What does Redshift ML delegate to SageMaker?}
+    Everything past export: unload to S3, Autopilot training/selection, winner compiled back into a
+    SQL function. (Ch.~17)
+    \item \textbf{(F)} \textbf{Why is in-database ML attractive for SQL-only pipelines?}
+    Features, training, scoring live where the data is---no extraction pipelines, no endpoints, no
+    new operational surface. (Ch.~17)
+    \item \textbf{(I)} \textbf{What does \texttt{CREATE MODEL}'s \texttt{FUNCTION} clause define?}
+    The scoring function's name and signature, mapping arguments to the training query's feature
+    columns. (Ch.~17)
+    \item \textbf{(I)} \textbf{Why F1 over accuracy for imbalanced churn?}
+    5\% positives: always-negative scores 95\% while detecting nothing; F1 balances precision and
+    recall on the minority class. (Ch.~17)
+    \item \textbf{(A)} \textbf{When graduate from Redshift ML to full SageMaker?}
+    Custom architectures, fine hyperparameter control, formal explainability, low-latency
+    real-time inference. (Ch.~17)
+    \item \textbf{(A)} \textbf{What is target leakage and how do you catch it?}
+    A feature unknowable at prediction time in training; review the training query column-by-column
+    against ``knowable before the outcome?'' (Ch.~17)
+    \item \textbf{(I)} \textbf{Real-time vs.\ serverless vs.\ Batch Transform for sporadic traffic?}
+    Serverless: scale to zero, pay per request, accept cold starts. Real-time for steady SLAs;
+    Batch Transform for bulk offline. (Ch.~18)
+    \item \textbf{(F)} \textbf{What does Data Wrangler export?}
+    A repeatable artifact---Processing Job script, pipeline step, or notebook---not a one-off
+    session. (Ch.~18)
+    \item \textbf{(I)} \textbf{When do you need a custom container over built-in XGBoost?}
+    Framework/architecture/dependencies with no managed equivalent; otherwise stay on maintained
+    images. (Ch.~18)
+    \item \textbf{(I)} \textbf{How does Autopilot pick its final model?}
+    Explores preprocessors, algorithms, hyperparameters; evaluates on validation splits against
+    the objective; ranks a winner with inspectable candidate notebooks. (Ch.~18)
+    \item \textbf{(A)} \textbf{Why route training-data access through Lake Formation?}
+    Column masks apply to extraction; PII never reaches staging; every training set is governed
+    and reproducible. (Ch.~18)
+    \item \textbf{(I)} \textbf{What is managed Spot training and its code requirement?}
+    Spare capacity at a steep discount with interruption---requires checkpointing to S3 to resume
+    rather than restart. (Ch.~18)
+    \item \textbf{(I)} \textbf{Online versus offline Feature Store?}
+    Offline (S3, point-in-time joins) builds training sets; online (millisecond
+    \texttt{GetRecord}) serves inference; one definition feeds both---the skew defense. (Ch.~19)
+    \item \textbf{(F)} \textbf{What does the Model Registry gate?}
+    Approval: deployment keys on the \texttt{Approved} state of a versioned, metrics-carrying
+    package. (Ch.~19)
+    \item \textbf{(A)} \textbf{Data drift versus concept drift?}
+    Data: input distributions change (features alone detect). Concept: input$\rightarrow$outcome
+    relationship changes (needs delayed ground truth). (Ch.~19)
+    \item \textbf{(A)} \textbf{Why gate automatic retraining behind human approval?}
+    Drift may mean the world changed \emph{or} ingestion broke; auto-retraining on corrupt data
+    automates worse models. (Ch.~19)
+    \item \textbf{(I)} \textbf{What baseline does Model Monitor need?}
+    Per-feature statistics and constraints from training data, refreshed on a retraining cadence.
+    (Ch.~19)
+    \item \textbf{(I)} \textbf{What does pipeline step caching buy?}
+    Reruns with unchanged inputs reuse outputs---cheaper iteration with input-fingerprint
+    correctness. (Ch.~19)
+    \item \textbf{(F)} \textbf{Textract versus Comprehend for scanned-form key--value pairs?}
+    Textract \texttt{AnalyzeDocument FORMS}; Comprehend works on already-digital text downstream.
+    (Ch.~20)
+    \item \textbf{(F)} \textbf{Why trigger AI APIs from S3 events via Lambda?}
+    Arrival-driven, no polling, per-object scale-out matching spiky uploads. (Ch.~20)
+    \item \textbf{(I)} \textbf{When switch from sync to async Textract?}
+    Multi-page PDFs/TIFFs; async signals completion via SNS. (Ch.~20)
+    \item \textbf{(I)} \textbf{How make extracted document metadata searchable?}
+    Persist normalized JSON, index into OpenSearch, register results in the catalog for SQL.
+    (Ch.~20)
+    \item \textbf{(A)} \textbf{PII risks of persisting raw OCR output?}
+    OCR is faithful---IDs and addresses land in the JSON; restricted zone, field-level redaction,
+    at-rest discovery scanning. (Ch.~20)
+    \item \textbf{(I)} \textbf{How keep retried pipelines from re-billing API calls?}
+    Idempotency keyed on object identity (etag/version); skip already-processed inputs. (Ch.~20)
+\end{enumerate}
+
+\section{Security, Governance, and Compliance}
+\begin{enumerate}
+    \item \textbf{(I)} \textbf{Gateway versus interface VPC endpoint for S3?}
+    Gateway: free route-table entry for S3/DynamoDB. Interface (PrivateLink): other services, billed
+    per AZ-hour plus data. (Ch.~21)
+    \item \textbf{(I)} \textbf{What does a permissions boundary limit?}
+    A role's maximum permissions regardless of identity policies---the intersection is effective;
+    makes delegated role creation safe. (Ch.~21)
+    \item \textbf{(F)} \textbf{Why is automatic Secrets Manager rotation better than static keys?}
+    A leaked credential's value is bounded to the rotation window; static keys leak forever.
+    (Ch.~21)
+    \item \textbf{(I)} \textbf{How do SCPs differ from IAM policies?}
+    SCPs cap what any account---including its admins---may do; IAM policies grant within an
+    account. (Ch.~21)
+    \item \textbf{(A)} \textbf{What exfiltration path does PrivateLink close that security groups
+    cannot?}
+    Endpoint policies restrict the \emph{service destinations} themselves---your network cannot
+    write to a stranger's bucket. (Ch.~21)
+    \item \textbf{(A)} \textbf{Why does KMS complete the perimeter?}
+    Key policies restrict decryption to org principals; copied data arrives as unusable ciphertext.
+    (Ch.~21)
+    \item \textbf{(I)} \textbf{How do LF-Tags simplify cross-account sharing?}
+    Grants bind to tag expressions; correctly tagged shared tables inherit policy in every account.
+    (Ch.~22)
+    \item \textbf{(I)} \textbf{Why consult lineage when a quality check fails?}
+    Names what consumed the bad batch and which upstream change introduced it---a directed fix, not
+    a two-day hunt. (Ch.~22)
+    \item \textbf{(I)} \textbf{\texttt{ColumnExists} versus \texttt{Completeness}?}
+    Structure versus content; a production ruleset needs both families. (Ch.~22)
+    \item \textbf{(F)} \textbf{In a data mesh, who owns a data product's quality?}
+    The publishing domain; the center provides platform, taxonomy, audit. (Ch.~22)
+    \item \textbf{(I)} \textbf{What does a DQ rule's threshold clause buy?}
+    Distinguishes a mild dip (report) from a cliff (fail)---monitoring without halting on noise.
+    (Ch.~22)
+    \item \textbf{(A)} \textbf{Why enforce contracts at registration, not query time?}
+    Registration declares producer intent; query time means violations are already durable bad
+    data. (Ch.~22)
+    \item \textbf{(I)} \textbf{What does Macie detect beyond regex patterns?}
+    Checksums (Luhn), proximity keywords, format validation; also bucket posture inventory.
+    (Ch.~23)
+    \item \textbf{(I)} \textbf{Why quarantine suspect files with Object Lock instead of deleting?}
+    Preserves immutable evidence for investigation and audit; deletion can violate retention.
+    (Ch.~23)
+    \item \textbf{(A)} \textbf{Tokenization versus hashing: which is reversible?}
+    Tokenization, via the controlled vault. Low-entropy hashes are effectively reversible to
+    attackers---use real tokenization when re-identification is required. (Ch.~23)
+    \item \textbf{(I)} \textbf{What do CloudTrail data events record for S3?}
+    Object-level API activity per principal and object---the lake's access ledger, delivered to an
+    independent log-archive account. (Ch.~23)
+    \item \textbf{(I)} \textbf{Why tune Macie custom identifiers before rollout?}
+    False-positive economics: over-broad identifiers train teams to ignore alerts. Tune on samples;
+    review precision monthly. (Ch.~23)
+    \item \textbf{(A)} \textbf{Why is crypto-shredding superior to enumerated deletion?}
+    One key deletion renders every copy---versions, replicas, snapshots, archives---unrecoverable in
+    a single auditable act. (Ch.~23)
+\end{enumerate}
+
+\section{DataOps and Delivery}
+\begin{enumerate}
+    \item \textbf{(I)} \textbf{Why store Terraform state remotely with locking?}
+    Shared state is the source of truth; locking prevents divergent applies; local state is lost
+    with laptops and leaks attribute values. (Ch.~24)
+    \item \textbf{(I)} \textbf{What do dbt tests validate that schemas cannot?}
+    Semantics: uniqueness, referential integrity, accepted ranges, freshness. Schema guarantees
+    shape; tests guarantee the data is right. (Ch.~24)
+    \item \textbf{(I)} \textbf{Why promote dbt runs Dev$\rightarrow$Prod instead of one shared
+    workspace?}
+    Every change is rehearsed against a real environment; one shared workspace makes production
+    the rehearsal. (Ch.~24)
+    \item \textbf{(A)} \textbf{Why prefer OIDC federation over long-lived AWS keys in CI?}
+    Short-lived, audience-scoped credentials per run---nothing stored to leak, nothing to rotate.
+    (Ch.~24)
+    \item \textbf{(I)} \textbf{What must the PR-check workflow prove before merge?}
+    Reviewable \texttt{terraform plan}, \texttt{dbt build} passing against CI data, policy checks
+    green---\texttt{main} is always deployable. (Ch.~24)
+    \item \textbf{(A)} \textbf{Summarize expand-contract in one breath.}
+    Add new alongside old; dual-write and backfill while reads stay old; switch reads behind a
+    shim; verify consumers; drop the old column in a later release. (Ch.~24)
+\end{enumerate}
+
+\begin{tipbox}
+Interviewers score the \emph{reasoning}, not the product name. Answer in the pattern this book
+teaches: state the constraint, name the trade-off, then choose---and mention what you would
+monitor to know the choice was wrong.
+\end{tipbox}
