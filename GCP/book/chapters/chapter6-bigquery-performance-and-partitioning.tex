@@ -1,0 +1,271 @@
+\chapter{BigQuery Performance: Partitioning, Clustering, and Cost Optimization}
+\index{BigQuery!partitioning}\index{BigQuery!clustering}\index{materialized views}\index{BI Engine}\index{query execution plan}\index{bytes billed}
+
+\begin{objectives}
+\begin{itemize}
+    \item Design partitioned tables using ingestion-time, time-unit column, and integer-range partitioning.
+    \item Apply clustering to sort data for selective filters and explain how it complements partitioning.
+    \item Decide when materialized views and BI Engine justify their cost, and recognize their restrictions.
+    \item Read a BigQuery query execution plan to find skewed stages, broadcast joins, and expensive scans.
+    \item Measure the bytes-billed difference between full, partitioned, and clustered scans on a large synthetic table.
+    \item Re-architect a multi-petabyte security-log table that is generating uncontrolled query costs.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+Every analytical platform offers the same two levers---eliminating data before it is read, and pre-computing what is read often---under different names.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{2.8cm}p{3.0cm}p{3.0cm}p{3.0cm}@{}} \\
+\toprule
+\textbf{Capability} & \textbf{GCP BigQuery} & \textbf{AWS Redshift} & \textbf{Snowflake} \\
+\midrule
+Coarse pruning & Partitioning & Sort keys / dist keys & Micro-partition pruning \\
+Fine-grained ordering & Clustering (up to 4 columns) & Compound/interleaved sort keys & Clustering keys, auto reclustering \\
+Pre-aggregation & Materialized views & Materialized views & Materialized views \\
+In-memory acceleration & BI Engine & AQUA / result cache & Result and warehouse cache \\
+Cost lever & Bytes billed / slots & RPU-seconds / nodes & Credits per warehouse-second \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+\textbf{Microsoft Fabric} applies the same logic to OneLake Delta tables (partitioning plus file-level statistics and V-Order optimization), and \textbf{MongoDB} answers the same question with indexes and covered queries rather than partition pruning---different mechanism, identical goal: touch less data per query.
+\end{crosscloud}
+
+\begin{keyterms}
+\textbf{Partitioning}: dividing a table into date-, time-, or integer-range segments so queries prune unneeded segments.
+\textbf{Clustering}: co-locating rows with similar values in up to four columns inside each partition for fine-grained block skipping.
+\textbf{Materialized view}: a precomputed query result that BigQuery maintains incrementally and transparently substitutes into queries.
+\textbf{BI Engine}: an in-memory analysis layer that accelerates dashboard queries against BigQuery tables.
+\textbf{Bytes billed}: the column bytes a query reads; the fundamental on-demand cost and the best proxy for compute effort.
+\textbf{Skew}: uneven distribution of work across execution slots or shuffle partitions, visible in query plans.
+\end{keyterms}
+
+\section{Week 6 Roadmap}
+Week~6 turns BigQuery from a correct tool into an economical one. The levers are few but powerful: partitioning prunes whole segments, clustering skips blocks inside segments, materialized views precompute repeated aggregations, BI Engine serves dashboards from memory, and execution plans reveal where the bytes and slots actually went. Monday covers partitioning strategies. Tuesday covers clustering. Wednesday covers materialized views, BI Engine, and plan analysis. Thursday measures the bytes-billed difference between scan strategies on a synthetic billion-row table. Friday re-architects a runaway security-log workload.
+
+\begin{definitionbox}
+\textbf{Pruning} is the act of proving, before execution, that some portion of a table cannot contain relevant rows and therefore need not be read. Partitioning prunes by segment; clustering prunes by sorted block within segments; both reduce bytes billed directly \cite{googlecloudbigquerypartitioning,googlecloudbigqueryclustering}.
+\end{definitionbox}
+
+\section{Monday: Partitioning Strategies}
+\index{partitioning!ingestion-time}\index{partitioning!time-unit column}\index{partitioning!integer-range}
+
+\subsection{The Three Partitioning Models}
+BigQuery supports three partitioning schemes. \textbf{Ingestion-time partitioning} segments data by arrival date (or hour), exposed through the \texttt{\_PARTITIONTIME} pseudo-column---ideal for logs and events where arrival order is the query axis. \textbf{Time-unit column partitioning} segments by a \texttt{DATE}, \texttt{TIMESTAMP}, or \texttt{DATETIME} column you control, at hourly, daily, monthly, or yearly granularity---ideal when the business time differs from arrival time, such as late-arriving financial events keyed by trade date. \textbf{Integer-range partitioning} buckets an integer column into named ranges---useful for sharded identifiers such as \texttt{customer\_id} ranges.
+
+\begin{lstlisting}[language=SQL,caption={Creating a daily time-partitioned, clustered table with an expiration.}]
+CREATE TABLE analytics.events
+PARTITION BY DATE(event_ts)
+CLUSTER BY customer_id, event_type
+OPTIONS (
+  partition_expiration_days = 395,
+  require_partition_filter = TRUE,
+  description = 'Customer events, partitioned by event date')
+AS SELECT * FROM staging.raw_events WHERE FALSE;
+\end{lstlisting}
+
+\subsection{Partition Design Rules}
+Partition on the column your selective filters actually use---almost always a time column. Keep partitions reasonably sized: thousands of tiny partitions degrade metadata performance more than a handful of giant ones help pruning. Set \texttt{require\_partition\_filter = TRUE} on large tables; it converts the silent full-scan mistake into a loud error. Use partition expiration as lifecycle management: expiring old partitions is free and immediate compared to \texttt{DELETE} statements that scan and rewrite.
+
+\begin{pitfall}
+Partitioning by a high-cardinality or wrong-axis column (for example, \texttt{customer\_id} when every query filters by date) prunes nothing and complicates every load. Pruning only works when query predicates align with the partition column.
+\end{pitfall}
+
+\begin{notebox}
+Ingestion-time and column-time partitioning diverge when data arrives late. An event from Monday arriving Wednesday lands in Wednesday's ingestion partition but belongs to Monday's business partition. Choose the axis your analysts filter by, and monitor the gap.
+\end{notebox}
+
+\section{Tuesday: Clustering for Selective Filters}
+\index{clustering}\index{block pruning}
+
+\subsection{How Clustering Works}
+Within each partition, clustering sorts rows by up to four columns and tracks min/max statistics per block. A query filtering \texttt{WHERE customer\_id = 42} on a table clustered by \texttt{customer\_id} skips every block whose statistics exclude 42. Unlike partition pruning, clustering works on high-cardinality columns and on queries that filter multiple columns---and its cost estimates improve automatically as data settles, because BigQuery re-clusters in the background for free.
+
+\subsection{Choosing Clustering Columns}
+Choose columns that appear in selective equality or range filters, ordered from coarse to fine granularity. Clustering on a low-cardinality column (a boolean \texttt{is\_active}) yields no pruning because nearly every block contains both values. Combine partitioning and clustering: partition by date to bound the scan in time, cluster by the tenant or entity column to bound it within each date.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{4.2cm}p{4.6cm}p{4.6cm}@{}} \\
+\toprule
+\textbf{Query pattern} & \textbf{Partitioning alone} & \textbf{Partitioning + clustering} \\
+\midrule
+Last 7 days, all tenants & Excellent pruning & Same; clustering adds little \\
+One tenant, last 7 days & Reads whole 7 partitions & Reads only that tenant's blocks \\
+High-cardinality ID lookup & No help unless ID is partition column & Strong block skipping \\
+Low-cardinality flag filter & No help & No help---do not cluster on it \\
+\bottomrule
+\end{tabular}
+\caption{When clustering pays off beyond partitioning \cite{googlecloudbigqueryclustering}.}
+\label{tab:ch6-clustering-payoff}
+\end{table}
+
+\begin{tipbox}
+Clustering costs nothing extra at query time and its maintenance is automatic, so for large fact tables the question is rarely ``whether'' but ``which columns.'' Profile your top twenty queries' \texttt{WHERE} clauses and let them choose the clustering key order.
+\end{tipbox}
+
+\section{Wednesday: Materialized Views, BI Engine, and Plan Analysis}
+\index{materialized views}\index{BI Engine}\index{query execution plan}\index{skew}
+
+\subsection{Materialized Views}
+A materialized view precomputes a query result and keeps it fresh incrementally as base tables change. BigQuery's smart tuning transparently rewrites eligible queries against the view even when the query text names the base table \cite{googlecloudbigquerymv}. The restrictions matter: a limited SQL subset (no arbitrary joins, no UDFs, no nested/repeated aggregation), so treat materialized views as simple, high-value pre-aggregations---daily KPIs per region, not general-purpose caching.
+
+\subsection{BI Engine}
+BI Engine is a reserved, in-memory analysis layer that accelerates interactive dashboard queries, especially from Looker and Looker Studio \cite{googlecloudbiengine}. It is wasted on batch ELT and one-off forensic queries; it pays off when hundreds of analysts hit the same sub-second latency expectations against the same tables. Size the reservation to the working set you want resident, and measure cache-hit rates before expanding it.
+
+\subsection{Reading the Execution Plan}
+The query plan graph shows stages with rows read, rows shuffled, slot time, and wait time. Three signatures dominate real troubleshooting: a \textbf{huge first stage} means a missing partition filter or a full scan; a \textbf{stage where one slot dwarfs the others} means skew---one key value holds a disproportionate share of a join or group-by; a \textbf{broadcast} annotation on a large input means the engine replicated a table it expected to be small. Fix skew by filtering the hot key separately, pre-aggregating before the join, or salting the skewed key and aggregating twice.
+
+\begin{pitfall}
+A query can be ``fast'' and ruinously expensive at the same time---slots are elastic, so a petabyte scan finishes quickly while the bill records every byte. Optimize for bytes billed and slot-milliseconds, not wall-clock speed.
+\end{pitfall}
+
+\section{Thursday Hands-On Project: Measuring Scan Strategies}
+\index{hands-on project}\index{dry run}\index{bytes billed!measurement}
+This lab creates a large synthetic table, then compares bytes billed and execution time across a full scan, a partition-pruned scan, and a clustered scan. Use dry runs to record bytes before executing anything expensive.
+
+\subsection{Build the Synthetic Table}
+\begin{lstlisting}[language=SQL,caption={Generating a partitioned, clustered synthetic events table (~100M rows).}]
+CREATE OR REPLACE TABLE lab.events
+PARTITION BY DATE(event_ts)
+CLUSTER BY customer_id
+OPTIONS(require_partition_filter = TRUE)
+AS
+SELECT
+  TIMESTAMP_ADD('2026-01-01 00:00:00 UTC',
+                INTERVAL CAST(FLOOR(RAND() * 180 * 86400) AS INT64) SECOND) AS event_ts,
+  CAST(FLOOR(RAND() * 100000) AS INT64)          AS customer_id,
+  CAST(FLOOR(RAND() * 50) AS INT64)              AS event_type,
+  RAND() * 1000                                  AS amount
+FROM UNNEST(GENERATE_ARRAY(1, 100000000)) AS n;
+\end{lstlisting}
+
+\subsection{Compare Scan Strategies}
+Run each query first with \texttt{--dry\_run} to capture bytes billed, then execute and record slot time from the plan.
+
+\begin{lstlisting}[language=bash,caption={Dry-run comparison of full, partitioned, and clustered scans.}]
+# Full-range scan (all partitions): expect bytes ~= whole table
+bq query --nouse_legacy_sql --dry_run `
+  "SELECT event_type, SUM(amount)
+   FROM lab.events
+   GROUP BY event_type"
+
+# Partition-pruned scan: 7 of 180 days
+bq query --nouse_legacy_sql --dry_run `
+  "SELECT event_type, SUM(amount)
+   FROM lab.events
+   WHERE DATE(event_ts) BETWEEN '2026-06-01' AND '2026-06-07'
+   GROUP BY event_type"
+
+# Partition + cluster pruned: 7 days, one customer
+bq query --nouse_legacy_sql --dry_run `
+  "SELECT SUM(amount)
+   FROM lab.events
+   WHERE DATE(event_ts) BETWEEN '2026-06-01' AND '2026-06-07'
+     AND customer_id = 4242"
+\end{lstlisting}
+
+Tabulate the three dry-run byte counts and the executed slot-milliseconds. A healthy result shows pruning cutting bytes by roughly the date ratio (7/180) and clustering cutting the second query by another one to two orders of magnitude.
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item The three dry-run byte counts and executed slot-milliseconds in a small results table.
+    \item A screenshot of the execution plan for the slowest query, annotated with the dominant stage.
+    \item A one-paragraph explanation of why clustering did or did not help each query shape.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item The synthetic table is partitioned with \texttt{require\_partition\_filter = TRUE} and clustered by a selective column.
+    \item Bytes billed are captured via dry run before any expensive execution.
+    \item The partitioned scan reads materially fewer bytes than the full scan, and the clustered scan fewer still.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Recreate the table without clustering and quantify the clustering delta on the third query.
+    \item Add a materialized view for \texttt{event\_type} daily totals and verify transparent rewrite in the plan.
+    \item Introduce a deliberately skewed \texttt{customer\_id} (90\% of rows one value), rerun, and diagnose the skewed stage in the plan.
+\end{itemize}
+
+\section{Friday Use Case: Re-Architecting a Multi-Petabyte Security Log Table}
+\index{security logs}\index{cost optimization}\index{re-architecture}
+
+\subsection{Scenario}
+A security team queries a 4~PB log-analysis table for incident investigations. The table is unpartitioned, analysts routinely scan months of history, and the monthly BigQuery bill has tripled in a year. Queries are interactive: investigators filter by time window, source IP, host, and severity.
+
+\subsection{Diagnosis}
+The plan review shows full scans on every query, a 90-day hot path that accounts for 95\% of investigations, and heavy filters on \texttt{source\_ip} and \texttt{host\_name}---both high-cardinality, both ignored by any physical layout. One forensic query pattern joins the log table to a small asset inventory, and the plan shows the inventory broadcasting correctly while the log side scans entirely.
+
+\subsection{Re-Architecture}
+Partition by \texttt{DATE(event\_ts)} with \texttt{require\_partition\_filter = TRUE}; cluster by \texttt{source\_ip, host\_name}; set partition expiration at the compliance boundary (for example 400 days) and export older partitions to Archive-class Cloud Storage before expiry for legal-hold retention at a fraction of warehouse cost. Add a materialized view for the daily severity-by-host summary that feeds the SOC dashboard, and put the dashboard behind a BI Engine reservation sized to the 90-day hot window. Set per-user custom query quotas so one unbounded forensic query cannot consume the day's budget.
+
+\begin{figure}[H]
+    \centering
+    \resizebox{0.95\textwidth}{!}{%
+    \begin{tikzpicture}[
+        before/.style={rectangle, rounded corners, draw=red!60!black, thick, fill=red!6, text width=5.2cm, minimum height=1.0cm, align=center, font=\small\bfseries},
+        after/.style={rectangle, rounded corners, draw=codegreen!60!black, thick, fill=green!7, text width=5.2cm, minimum height=1.0cm, align=center, font=\small\bfseries},
+        arrow/.style={-{Stealth[length=2.5mm]}, draw=primary, thick}
+    ]
+        \node[before] (b1) at (0,0) {4 PB unpartitioned table\\full scans every query};
+        \node[after] (a1) at (8.5,2.0) {Partitioned by event date\\require\_partition\_filter};
+        \node[after] (a2) at (8.5,0) {Clustered by source\_ip, host\\block-level pruning};
+        \node[after] (a3) at (8.5,-2.0) {MV + BI Engine dashboards\\Archive export past 400 days};
+        \draw[arrow] (b1) -- (a1);
+        \draw[arrow] (b1) -- (a2);
+        \draw[arrow] (b1) -- (a3);
+    \end{tikzpicture}%
+    }
+    \caption{Re-architecting the security log table: partition, cluster, pre-aggregate, and expire.}
+    \label{fig:ch6-security-log-rearch}
+\end{figure}
+
+\begin{tipbox}
+Govern the change with numbers, not vibes: capture the pre-change p50/p95 bytes billed and slot time per query pattern, deploy the new layout behind a view with the old name, and publish the delta. Cost reviews fund the next optimization when the last one has a receipt.
+\end{tipbox}
+
+\section{Interview Q\&A}
+\subsection{Concepts and Trade-offs}
+\begin{enumerate}
+    \item \textbf{Q: How do partitioning and clustering reduce bytes billed differently?}\\
+    A: Partitioning skips entire segments when the filter matches the partition column; clustering skips blocks inside partitions using sorted-column statistics, even on high-cardinality columns.
+
+    \item \textbf{Q: When does clustering beat partitioning for selective filters?}\\
+    A: When the filter column is high-cardinality or non-temporal (customer ID, IP address), or when the table is already partitioned by date and queries need a second selective axis.
+
+    \item \textbf{Q: What does a materialized view precompute, and what does it cost?}\\
+    A: A fixed aggregation over a base table, maintained incrementally; it costs stored bytes plus background refresh slots, and it restricts the SQL you can use.
+
+    \item \textbf{Q: Where in the execution plan do you spot a skewed stage?}\\
+    A: A stage whose per-slot output rows or slot time is dominated by one or few workers, usually on a join or group-by over a hot key.
+
+    \item \textbf{Q: What does BI Engine accelerate, and when is it wasted?}\\
+    A: Interactive, repeated dashboard queries over hot tables; it is wasted on batch ELT and one-off ad hoc forensics.
+\end{enumerate}
+
+\section{Further Reading}
+Read the partitioned and clustered table guides for syntax, limits, and best practices \cite{googlecloudbigquerypartitioning,googlecloudbigqueryclustering}. Review materialized-view restrictions before designing around them \cite{googlecloudbigquerymv}, and the BI Engine documentation for reservation sizing \cite{googlecloudbiengine}. The performance best-practices guide ties these levers together \cite{googlecloudbigquerydocs}, and Cloud Monitoring documentation covers the slot-utilization alerting referenced throughout \cite{googlecloudmonitoringdocs}.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item Partition by the column selective filters actually use---usually time---and enforce it with \texttt{require\_partition\_filter}.
+    \item Cluster on selective, high-cardinality filter columns ordered coarse to fine; skip low-cardinality flags.
+    \item Materialized views are simple, transparently-rewritten pre-aggregations, not general caches; BI Engine serves interactive dashboards only.
+    \item Optimize for bytes billed and slot-milliseconds; wall-clock speed on a serverless engine hides cost.
+    \item Diagnose with the execution plan: big first stage means missing pruning, lopsided stage means skew.
+    \item Re-architecture is an evidence exercise: measure before, change the layout, publish the delta.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} A table is partitioned by \texttt{customer\_id} range but all queries filter by date. Explain the cost consequence and the migration plan to fix it without downtime.
+    \item \textbf{(Conceptual)} Why does clustering on a boolean column provide no pruning, and what would you cluster on instead for a ``flag plus customer'' filter pattern?
+    \item \textbf{(Hands-on)} Reproduce the Thursday lab, then add integer-range partitioning experiments on a separate table and compare dry-run bytes.
+    \item \textbf{(Hands-on)} Create a materialized view over your synthetic table and confirm in the query plan that a base-table query is rewritten to use it.
+    \item \textbf{(Analysis)} Given an execution plan showing stage 2 with one slot writing 80\% of shuffle output, name the likely cause and two fixes.
+    \item \textbf{(Design)} Produce a one-page cost-reduction proposal for the 4~PB security table, including estimated bytes-billed deltas, risks, and a rollback plan.
+\end{enumerate}

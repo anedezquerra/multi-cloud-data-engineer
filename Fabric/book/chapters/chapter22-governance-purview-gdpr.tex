@@ -1,0 +1,326 @@
+\chapter{Governance, Purview, and GDPR Erasure}
+\index{Purview}\index{governance}\index{sensitivity labels}\index{lineage}\index{endorsement}\index{GDPR}\index{right to erasure}\index{crypto-shredding}\index{data mesh}\index{legal hold}%
+
+\begin{objectives}
+\begin{itemize}
+    \item Use the Purview hub and tenant administration surfaces for Fabric governance.
+    \item Apply sensitivity labels to Fabric items and reason about downstream inheritance and legal-hold interaction.
+    \item Trace end-to-end lineage and use impact analysis before making changes.
+    \item Execute a GDPR right-to-erasure request across Delta tables, history files, KQL retention, caches, and backups.
+    \item Implement crypto-shredding with per-subject keys in Azure Key Vault, and contrast it with row-level \texttt{DELETE}.
+    \item Architect a five-domain data mesh with centralized Purview governance and per-domain erasure runbooks.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+Metadata governance---catalog, classification, lineage, and compliance workflows---is a distinct platform layer in every cloud, increasingly unified across the estate rather than per-service.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{2.8cm}p{3.2cm}p{3.2cm}p{3.2cm}p{3.2cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{Fabric} & \textbf{AWS} & \textbf{GCP} & \textbf{Snowflake} \\
+\midrule
+Catalog/governance & Microsoft Purview & DataZone / Glue Catalog + Macie & Dataplex & Horizon Catalog \\
+Sensitivity labels & Microsoft Information Protection labels on items & Macie classifications & Sensitive Data Protection / policy tags & Object tagging, masking policies \\
+Lineage & Fabric lineage view + Purview & Glue/DataZone lineage & Dataplex lineage & Access history / lineage \\
+Endorsement & Promoted / Certified & Business glossary approvals & Data product annotations & Listing certification \\
+Erasure mechanics & Crypto-shredding, Delta VACUUM coordination & S3 object deletion + Glacier waits & TTLs, crypto-shredding (CMEK) & Time Travel/Fail-safe windows \\
+Legal hold & Purview eDiscovery/holds & Legal holds (S3 Object Lock) & Vault holds & Retention + legal processes \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+Databricks governs through Unity Catalog with Purview or Unity lineage; MongoDB through Atlas auditing and field-level encryption. The hard, portable lesson: \emph{erasure is a propagation problem across caches, history, and backups---row deletes alone never satisfy it}.
+\end{crosscloud}
+
+\begin{keyterms}
+\textbf{Purview hub}: Fabric's integrated governance surface for insights, sensitivity, and lineage. \quad
+\textbf{Sensitivity label}: a classification (for example \emph{Highly Confidential}) applied to an item, traveling downstream. \quad
+\textbf{Endorsement}: Promoted (vouched) or Certified (officially approved) status on a data product. \quad
+\textbf{Lineage}: the item-to-item graph of data flow used for impact analysis. \quad
+\textbf{Crypto-shredding}: erasing a data subject by destroying their encryption key, rendering every encrypted copy unreadable. \quad
+\textbf{Legal hold}: a preservation obligation that overrides erasure until released, recorded as a documented exception.
+\end{keyterms}
+
+\section{Week 22 Roadmap}
+Week~22 governs the estate. Monday covers the Purview hub and tenant administration. Tuesday covers sensitivity labels and their downstream inheritance---including the legal-hold interaction. Wednesday is the heavyweight: lineage, endorsement, impact analysis, and the GDPR erasure propagation path, comparing crypto-shredding against row-level \texttt{DELETE}. Thursday is the hands-on project: label a lakehouse, trace lineage to a Power BI report, and execute a crypto-shredding erasure. Friday architects the five-domain data mesh with centralized governance.
+
+Everything before this week built capability; this week builds accountability. Regulators, auditors, and---most importantly---data subjects do not care how elegant the pipelines are; they care whether the organization can prove what it holds and delete what it must \cite{microsoftPurviewFabric,microsoftFabricLineage}.
+
+\begin{notebox}
+The week's hard truth, stated early: naive \texttt{DELETE} is insufficient for GDPR erasure in Fabric. Delta time travel keeps deleted rows readable in history until \texttt{VACUUM} expires them; KQL data persists per retention; semantic-model caches hold copies; clones and backups re-create erased rows on restore. Erasure is a cross-layer propagation design, not a SQL statement.
+\end{notebox}
+
+\section{Monday: Purview Hub and Tenant Administration}
+\index{Purview hub}\index{tenant administration}
+The Purview hub inside Fabric surfaces governance posture to those who own it: sensitivity-label coverage, endorsement distribution, item inventory, and usage insights across the tenant \cite{microsoftPurviewFabric}. Tenant administration (the admin portal) sets the guardrails within which all workspaces operate: which features are enabled, which capacities exist, which export and sharing behaviors are permitted \cite{microsoftFabricTenantSettings}.
+
+\begin{definitionbox}
+The \textbf{Purview hub} is Fabric's integrated governance surface: it aggregates label coverage, endorsement, inventory, and usage signals so governance is observed continuously rather than audited annually.
+\end{definitionbox}
+
+The data engineer's Monday skill is reading the hub as a work queue: unlabeled items containing personal data, unendorsed tables feeding executive reports, domains without owners. Governance at scale is not a policy PDF; it is these queues trending toward zero.
+
+\section{Tuesday: Sensitivity Labels and Inheritance}
+\index{sensitivity labels}\index{label inheritance}\index{legal hold}
+Sensitivity labels from Microsoft Information Protection apply to Fabric items---lakehouses, warehouses, semantic models, reports---and classify the data they contain \cite{microsoftPurviewFabric}. Two behaviors matter most:
+
+\textbf{Downstream inheritance.} When a labeled item feeds another---a labeled lakehouse feeding a semantic model feeding a report---the label flows downstream, so classification follows the data through the serving layers. Inheritance is a default to be audited, not a guarantee to be assumed: verify in the hub that every downstream item of a \emph{Highly Confidential} source carries the label.
+
+\textbf{Legal-hold interaction.} A retention or legal-hold policy overrides an erasure request: data under hold must not be deleted, even for a valid GDPR request. The resolution is procedural, not technical---the hold is recorded as a documented exception in the audit register, the erasure executes when the hold releases, and the register proves both the obligation and its handling \cite{microsoftPurviewFabric}.
+
+\begin{pitfall}
+Labels classify; they do not by themselves enforce. A \emph{Highly Confidential} label without matching access control (Chapter~21) and without export restrictions is a red sticker on an open door. Label, then verify the enforcement chain behind the label.
+\end{pitfall}
+
+\section{Wednesday: Lineage, Endorsement, and the Erasure Path}
+\index{lineage}\index{endorsement}\index{GDPR!erasure path}\index{crypto-shredding}
+\subsection{Lineage and Impact Analysis}
+Fabric records item-to-item lineage: this pipeline feeds that lakehouse, which feeds that semantic model, which feeds that report \cite{microsoftFabricLineage}. Lineage's daily value is \emph{impact analysis}: before changing a table's schema, renaming a column (Chapter~9's contract break), or retiring an item, the lineage view lists every downstream consumer who will feel it. Endorsement completes the signal: \emph{Promoted} means the owner vouches; \emph{Certified} means the organization certifies---and certification is what tells an analyst which of the fourteen \texttt{sales} tables is the real one.
+
+\subsection{The GDPR Erasure Propagation Path}
+A right-to-erasure request must reach every copy \cite{microsoftPurviewFabric}:
+
+\begin{enumerate}
+    \item OneLake raw zones (\texttt{Files} folders, landed extracts).
+    \item Bronze/Silver/Gold Delta tables---\emph{including time-travel history files}, which keep deleted rows readable until \texttt{VACUUM} expires them.
+    \item Eventstream/KQL retention windows---telemetry ages out per policy, not per request.
+    \item Downstream derived tables and aggregates containing the subject's data.
+    \item Semantic-model caches holding rows in memory.
+    \item Clones and backups, which re-create erased rows on restore.
+\end{enumerate}
+
+\subsection{Crypto-Shredding versus Row-Level DELETE}
+\textbf{Row-level DELETE} removes current rows but leaves history, caches, and backups readable---erasure becomes a multi-week coordination of \texttt{VACUUM} schedules, retention windows, and cache clears, each with its own failure mode. \textbf{Crypto-shredding} encrypts each subject's PII columns with a per-subject key in Azure Key Vault; deleting the key renders every copy---current, historical, cached, backed-up---permanently unreadable in one auditable act \cite{microsoftFabricSecurity}. The trade-off: crypto-shredding must be designed in from the start (you cannot shred what you never encrypted per subject), and it makes the key vault a compliance-critical system.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.6cm}p{5.0cm}p{5.0cm}@{}}
+\toprule
+\textbf{Property} & \textbf{Row-level DELETE} & \textbf{Crypto-shredding} \\
+\midrule
+History files & Readable until VACUUM & Unreadable instantly \\
+Caches/backups & Persist until cleared/rotated & Unreadable instantly \\
+Design cost & Low, retrofit-able & High, must be designed in \\
+Auditability & Multi-step evidence chain & One key-deletion event \\
+Key vault criticality & None & Compliance-critical system \\
+\bottomrule
+\end{tabular}
+\caption{Two erasure strategies, honestly compared.}
+\label{tab:chapter22-erasure}
+\end{table}
+
+\begin{pitfall}
+Crypto-shredding without key-vault hygiene is a single point of catastrophic data loss: accidental or malicious bulk key deletion is unrecoverable by design. Key lifecycle---creation, rotation policy, deletion approval workflow, soft-delete windows---is the governance object that makes shredding safe.
+\end{pitfall}
+
+\section{Thursday: Hands-on Project}
+\index{hands-on lab}\index{crypto-shredding!hands-on}
+The Week~22 lab applies a \emph{Highly Confidential} label to a lakehouse, traces lineage from lakehouse through pipeline to Power BI report, and then implements crypto-shredding: per-subject keys in Key Vault, PII encrypted in a notebook, and an erasure request executed by deleting one subject's key---verifying the data is unrecoverable in current tables and Delta history alike, while a row-level \texttt{DELETE} leaves rows readable via time travel until \texttt{VACUUM}.
+
+\subsection{Goal and Architecture}
+Workspace \texttt{fabric-de-week22} with lakehouse \texttt{lh\_pii} containing \texttt{customers\_pii}, a pipeline and report consuming it, and an Azure Key Vault. The lab proves both erasure strategies and their asymmetry.
+
+\subsection{Step-by-Step Actions}
+\begin{enumerate}
+    \item Apply the \emph{Highly Confidential} label to \texttt{lh\_pii}; verify inheritance to the downstream model and report in the Purview hub.
+    \item Open the lineage view; capture the path lakehouse $\rightarrow$ pipeline $\rightarrow$ model $\rightarrow$ report.
+    \item Generate per-subject AES keys in Key Vault for a small synthetic subject set.
+    \item Encrypt the PII columns per subject in a notebook; store ciphertext in the table, keys only in the vault.
+    \item Erasure by \texttt{DELETE}: remove subject A's rows; prove they remain readable via \texttt{VERSION AS OF}.
+    \item Erasure by shredding: delete subject B's key; prove their ciphertext is undecryptable in current tables \emph{and} history.
+    \item Record both operations in an audit register, including any legal-hold check performed first.
+\end{enumerate}
+
+\begin{lstlisting}[language=Python,caption={Per-subject encryption pattern (key resolution from Key Vault only).},label={lst:chapter22-shred}]
+from pyspark.sql import functions as F
+from cryptography.fernet import Fernet
+
+# Keys live ONLY in Azure Key Vault; resolved per subject at run time.
+def encrypt_with_subject_key(subject_id: str, plaintext: str) -> str:
+    key = keyvault.get_secret(f"pii-key-{subject_id}")   # vault reference, never literal
+    return Fernet(key.encode()).encrypt(plaintext.encode()).decode()
+
+encrypt_udf = F.udf(encrypt_with_subject_key, "string")
+
+df = spark.read.table("customers_pii_raw")
+(df.withColumn("email_enc", encrypt_udf("customer_id", "email"))
+   .drop("email")
+   .write.format("delta").mode("overwrite")
+   .saveAsTable("customers_pii"))
+
+# Erasure = delete the key in Key Vault: every copy, including
+# Delta history and backups, becomes permanently undecryptable.
+\end{lstlisting}
+
+\subsection{Validation Checklist}
+\begin{itemize}
+    \item The label appears on the lakehouse and inherited downstream items.
+    \item The lineage graph is captured and matches the intended flow.
+    \item \texttt{DELETE}+time-travel demonstrates the residual-history problem.
+    \item Key deletion demonstrates complete, instant erasure including history.
+    \item Keys never appear in code, logs, or tables---only vault references.
+    \item The audit register records both operations and the legal-hold check.
+\end{itemize}
+
+\section{Friday: Use Case and Architecture}
+\index{data mesh}\index{governance!federated}
+A global conglomerate operates five independent business domains---Retail, Logistics, Finance, Health, Media---each owning its data products in separate Fabric workspaces. The mandate: data-mesh autonomy with centralized governance through Purview.
+
+\subsection{The Mesh Design}
+\begin{itemize}
+    \item \textbf{Domains as Fabric domains}: each business unit's workspaces grouped under a domain with a named owner---autonomy with accountability \cite{microsoftDomains}.
+    \item \textbf{Federated computation, centralized policy}: domains build their own pipelines and products; Purview supplies the shared catalog, label taxonomy, lineage, and endorsement standards.
+    \item \textbf{Contracts between domains}: cross-domain data sharing happens through endorsed data products with Week~9-style contracts, never through ad hoc lakehouse grants.
+    \item \textbf{The per-domain erasure runbook}: each domain implements the Wednesday propagation path for its own Bronze/Silver/Gold lakehouses and KQL databases---a subject request fans out to five domains, and each domain's runbook executes the same steps against its own estate, with the central register collecting completion evidence.
+\end{itemize}
+
+\begin{figure}[H]
+    \centering
+    \begin{tikzpicture}[node distance=7mm and 8mm]
+        \node[stage, minimum width=2.2cm] (d1) at (0,2.2) {Retail\\domain};
+        \node[stage, minimum width=2.2cm] (d2) at (0,0) {Logistics\\domain};
+        \node[stage, minimum width=2.2cm] (d3) at (0,-2.2) {Finance\\+ 2 more};
+        \node[stage, fill=orange!10, minimum width=3.0cm] (pur) at (5.4,0) {Microsoft Purview\\catalog, labels,\\lineage, register};
+        \node[doc, minimum width=2.8cm, minimum height=1.2cm] (dpo) at (10.4,0) {Erasure\\request\\(DPO)};
+
+        \draw[biarrow] (d1) -- (pur);
+        \draw[biarrow] (d2) -- (pur);
+        \draw[biarrow] (d3) -- (pur);
+        \draw[arrow] (dpo) -- (pur);
+
+        \node[note, text width=11.5cm, align=center] at (5.2,-3.4) {Central catalog and register; per-domain runbooks execute the propagation path locally.};
+    \end{tikzpicture}
+    \caption{Five-domain data mesh with centralized Purview governance.}
+    \label{fig:chapter22-mesh}
+\end{figure}
+
+\begin{pitfall}
+Centralized governance with centralized execution recreates the bottleneck the mesh was designed to break. Purview centralizes \emph{policy and visibility}; domains keep \emph{execution}. The erasure runbook is the test case: centrally defined, domain-executed, centrally evidenced.
+\end{pitfall}
+
+\section{Operational Guidance for Week 22}
+Governance fails at the edges: unlabeled new items, unowned domains, untested erasure. Schedule the hub review, the inheritance audit, and---annually at minimum---an erasure fire drill on a synthetic subject.
+
+\subsection{Performance and Reliability}
+Lineage and labels add negligible runtime cost; their cost is discipline. Erasure coordination with \texttt{VACUUM} schedules must respect Chapter~4's retention rules---shorter retention eases erasure and complicates recovery; the balance is a documented decision.
+
+\subsection{Security and Governance Checklist}
+\begin{itemize}
+    \item Label coverage monitored in the hub; inheritance audited, not assumed.
+    \item Legal holds recorded in the register and checked before any erasure.
+    \item Lineage reviewed before any schema-breaking change.
+    \item Certification reserved for products passing the published criteria.
+    \item Erasure drill executed annually with per-domain evidence.
+    \item Key-vault lifecycle (approvals, soft-delete, rotation) documented and tested.
+\end{itemize}
+
+\section{Interview Q\&A}
+\begin{enumerate}
+    \item \textbf{Q: What does a sensitivity label pass on to downstream items?}\\
+    A: The classification itself---labels inherit downstream through lineage, so a \emph{Highly Confidential} lakehouse's models and reports carry the label; inheritance is audited, not assumed.
+    \item \textbf{Q: What is the difference between Promoted and Certified endorsement?}\\
+    A: Promoted is the owner's vouch; Certified is the organization's official approval against published criteria---the signal that tells consumers which table is the real one.
+    \item \textbf{Q: How does lineage help with impact analysis before a change?}\\
+    A: It enumerates every downstream consumer of an item, so a schema change or retirement is reviewed against the actual dependency list rather than discovered by broken reports.
+    \item \textbf{Q: Why is row-level DELETE insufficient for GDPR erasure in Fabric?}\\
+    A: Delta history keeps rows readable until \texttt{VACUUM}, KQL retains per policy, caches hold copies, and backups restore them; DELETE addresses only the current table state of one layer.
+    \item \textbf{Q: How does crypto-shredding sidestep all of those?}\\
+    A: PII is encrypted per subject with keys in Key Vault; deleting the key renders every copy---current, history, cache, backup---unreadable in one auditable act, with no dependence on per-layer cleanup timing.
+    \item \textbf{Q: What is a legal hold's interaction with erasure?}\\
+    A: A hold overrides the erasure obligation until release; it is recorded as a documented exception in the audit register, and erasure executes on release---procedural resolution, not technical.
+\end{enumerate}
+
+\section{Further Reading}
+Review Microsoft Purview and Fabric governance \cite{microsoftPurviewFabric}, lineage \cite{microsoftFabricLineage}, sensitivity labels \cite{microsoftFabricLabels}, and domains \cite{microsoftDomains}. The Delta retention interactions come from Chapter~4 \cite{microsoftFabricVacuum,deltaLakeDocs}; access layers from Chapter~21 \cite{microsoftFabricSecurity}.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item The Purview hub turns governance into observable queues: label coverage, endorsement, ownership.
+    \item Labels classify and inherit; enforcement is a separate, verified chain.
+    \item Lineage is the impact-analysis tool: read it before breaking anything.
+    \item Erasure is propagation across raw zones, Delta history, KQL retention, caches, and backups---DELETE alone never suffices.
+    \item Crypto-shredding makes erasure one auditable key-deletion, at the price of designed-in encryption and key-vault criticality.
+    \item Legal holds override erasure and live in the audit register as documented exceptions.
+    \item Data mesh centralizes policy and visibility through Purview while domains execute---including their own erasure runbooks.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Explain why a label without enforcement is worse than no label for audit confidence.
+    \item \textbf{(Conceptual)} Argue both sides: when is row-level DELETE an acceptable erasure strategy?
+    \item \textbf{(Hands-on)} Extend the lab: execute \texttt{VACUUM} after the DELETE and show time-travel readability ends.
+    \item \textbf{(Hands-on)} Write the per-domain erasure checklist for one domain, timed step by step.
+    \item \textbf{(Design)} Design the central erasure register: schema, evidence fields, and the query proving a request is fully satisfied.
+    \item \textbf{(Design)} Draft the key-deletion approval workflow that makes crypto-shredding safe against accidents.
+    \item \textbf{(Interview)} In five sentences, walk a DPO through what happens the day an erasure request arrives.
+    \item \textbf{(Operational)} Write the annual erasure fire-drill procedure with pass/fail criteria.
+\end{enumerate}
+
+\section{Capstone Project: Auditable Erasure Pipeline}\label{sec:ch22-capstone}
+\index{capstone project}\index{GDPR!capstone}\index{crypto-shredding!capstone}
+
+\begin{capstonebox}
+\textbf{Mission.} Build the complete erasure capability: labeled and lineage-traced PII estate, per-subject encryption, both erasure strategies demonstrated with their asymmetry proven, a legal-hold check, and a central audit register producing completion evidence for a sample request across two ``domains.''
+
+\textbf{Estimated time.} 6--8 hours.
+
+\textbf{What you'll practice.}
+\begin{itemize}
+    \item Label application, inheritance verification, and lineage capture.
+    \item Per-subject encryption with vault-only key resolution.
+    \item Executing and evidencing both erasure strategies.
+    \item The register schema and completion query that satisfy an auditor.
+\end{itemize}
+\end{capstonebox}
+
+\subsection*{Scenario}
+Contoso Group's Data Protection Officer requires a working demonstration---not a policy deck---that a subject erasure request propagates correctly through the Fabric estate, honors legal holds, and produces auditable evidence.
+
+\subsection*{Requirements}
+\begin{itemize}
+    \item Two workspace ``domains,'' each with a PII lakehouse, labels applied and inheritance verified.
+    \item Per-subject encryption with keys in Key Vault; no key material in code or logs.
+    \item The propagation checklist executed per domain: raw, tables, history, derived, caches.
+    \item The DELETE-versus-shredding asymmetry demonstrated with time-travel evidence.
+    \item The legal-hold check integrated into the workflow.
+    \item The audit register with a completion query across both domains.
+\end{itemize}
+
+\subsection*{Implementation Steps}
+\begin{enumerate}
+    \item Stand up both domains' estates with labels and lineage captured.
+    \item Implement per-subject encryption.
+    \item Execute the DELETE path with time-travel and \texttt{VACUUM} evidence.
+    \item Execute the shredding path with history-included unreadability evidence.
+    \item Run one full request through the register, including the hold check.
+\end{enumerate}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item Label and lineage evidence per domain.
+    \item The encryption notebook and vault configuration (references only).
+    \item Both strategies' evidence captures.
+    \item The register schema, rows, and completion query output.
+    \item The per-domain runbook documents.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item[\(\square\)] Labels inherit downstream in both domains, verified in the hub.
+    \item[\(\square\)] DELETE leaves history readable until \texttt{VACUUM}, demonstrated.
+    \item[\(\square\)] Key deletion renders the subject unreadable everywhere including history, demonstrated.
+    \item[\(\square\)] A held subject is skipped and the exception recorded.
+    \item[\(\square\)] The register's completion query returns full satisfaction for the executed request.
+    \item[\(\square\)] No keys, secrets, or real personal data appear in any artifact.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Add the third domain as a KQL/telemetry estate and extend the checklist to retention windows.
+    \item Automate register fan-out: request in, per-domain tasks created, evidence collected.
+    \item Add the key-deletion approval workflow with dual sign-off.
+    \item Produce the annual fire-drill report template from the register.
+\end{itemize}

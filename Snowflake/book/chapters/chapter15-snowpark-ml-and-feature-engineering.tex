@@ -1,0 +1,239 @@
+\chapter{Stored Procedures in Python, Anaconda Packages, and In-Database ML}
+\index{stored procedures}\index{Anaconda}\index{scikit-learn}\index{feature engineering}\index{Week 15}%
+\begin{objectives}
+\begin{itemize}
+    \item Distinguish stored procedures from UDFs: orchestration and data transformation versus per-row computation.
+    \item Write Python stored procedures using the Snowpark API inside the handler.
+    \item Use third-party Anaconda packages (scikit-learn, NumPy, pandas) with pinned, reproducible environments.
+    \item Choose between owner's-rights and caller's-rights execution deliberately.
+    \item Build a parameterized stored procedure that trains a linear regression with scikit-learn and writes predictions.
+    \item Design an ML feature-engineering pipeline running entirely inside Snowflake, with no data export.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+Stored procedure languages are the oldest form of in-database programmability; the modern variant swaps proprietary PL for Python plus a package ecosystem.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{2.8cm}p{3.0cm}p{3.0cm}p{3.0cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{AWS (Redshift)} & \textbf{Azure (Synapse/Fabric)} & \textbf{GCP (BigQuery)} \\
+\midrule
+Procedure language & PL/pgSQL & T-SQL procedures & BigQuery scripting (SQL) \\
+Python in-database & Redshift ML + Lambda UDFs & Spark jobs in Fabric & BigQuery ML + remote functions \\
+ML training in-engine & Redshift ML (SageMaker) & Fabric notebooks (Spark) & BigQuery ML \\
+Package ecosystem & Limited library imports & Full PyPI in Spark pools & Containers via remote functions \\
+\addlinespace
+Snowflake equivalent & \multicolumn{3}{l}{Python/SQL procedures, Anaconda channel packages, Snowpark ML in-warehouse} \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+\textbf{MongoDB} runs server-side logic via Atlas triggers and functions. Snowflake's proposition for ML teams: scikit-learn trains where the features already are, governed by the same RBAC as the tables, with zero export pipeline to secure.
+\end{crosscloud}
+
+\section{Week 15 Roadmap}
+Chapter 14 gave Python the power of per-row and per-batch computation. This chapter gives it \emph{control flow}: loops, conditionals, transactions, and multi-step orchestration---plus the package ecosystem (scikit-learn, pandas, NumPy) that turns Snowflake into a serious ML feature-engineering platform \cite{snowflakeStoredProceduresDocs}.
+
+Monday draws the UDF/procedure line. Tuesday writes Python procedures with Snowpark. Wednesday manages Anaconda packages. Thursday trains a model in-database. Friday designs the full in-platform feature pipeline.
+
+\begin{keyterms}
+\textbf{Stored procedure}: a callable, multi-statement unit with control flow, transactions, and optional result sets.\quad
+\textbf{Owner's rights}: the procedure executes with the privileges of its owner.\quad
+\textbf{Caller's rights}: the procedure executes with the privileges of whoever called it.\quad
+\textbf{PACKAGES clause}: the declaration pulling Anaconda-channel libraries into the Python runtime.\quad
+\textbf{Feature engineering}: deriving model-ready signals from raw data---here, without leaving the warehouse.
+\end{keyterms}
+
+\section{Monday: Procedures Versus UDFs}
+\index{stored procedure!vs. UDF}
+The distinction is architectural, not syntactic. A \textbf{UDF} computes a value \emph{within} a query: it appears in SELECT lists and WHERE clauses, runs per row or per batch, and must stay side-effect-free. A \textbf{stored procedure} \emph{runs} things: it is invoked with \texttt{CALL}, executes a sequence of statements, manages transactions, performs administrative work, and returns at most a single value or result set.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{4.4cm}p{4.6cm}p{4.6cm}@{}}
+\toprule
+ & \textbf{UDF / UDTF} & \textbf{Stored procedure} \\
+\midrule
+Invocation & Inside SQL (\texttt{SELECT f(x)}) & \texttt{CALL p(...)} \\
+Purpose & Row/batch computation & Orchestration, admin, multi-step transformation \\
+Control flow & None (expression-like) & Full (loops, branches, transactions) \\
+Side effects & None & Expected (DML, DDL, logging) \\
+Typical home & Silver/gold column derivations & Task DAG bodies, admin tooling, ML pipelines \\
+\bottomrule
+\end{tabular}
+\caption{The UDF/procedure boundary.}
+\label{tab:chapter15-udf-vs-proc}
+\end{table}
+
+The week-8 connection is direct: task bodies should be procedure calls, so the graph orchestrates and the procedures encapsulate. That separation is what made Chapter 8's task trees testable and idempotent.
+
+\section{Tuesday: Python Stored Procedures with Snowpark}
+\index{stored procedure!Python}
+A Python procedure's handler receives a live Snowpark \texttt{Session}---the same API as Chapter 13, now running \emph{inside} the warehouse. The handler reads tables as DataFrames, runs SQL, controls transactions, and returns results.
+
+\begin{lstlisting}[language=SQL, caption={A Python stored procedure orchestrating an incremental load}]
+CREATE OR REPLACE PROCEDURE elt.sp_rebuild_mart(run_date DATE)
+RETURNS STRING
+LANGUAGE PYTHON
+RUNTIME_VERSION = '3.10'
+PACKAGES = ('snowflake-snowpark-python')
+HANDLER = 'run'
+AS
+$$
+from snowflake.snowpark import Session
+
+def run(session: Session, run_date: str) -> str:
+    session.sql("BEGIN").collect()
+    try:
+        n = session.sql(f"""
+            INSERT OVERWRITE INTO gold.daily_mart
+            SELECT * FROM silver.build_daily('{run_date}')""").collect()
+        session.sql("COMMIT").collect()
+        return f"mart rebuilt for {run_date}"
+    except Exception as e:
+        session.sql("ROLLBACK").collect()
+        raise
+$$;
+\end{lstlisting}
+
+Procedures earn their complexity when they encapsulate \emph{decisions}: which partitions to rebuild, whether a gate passed, how to recover. Parameterizing on table names or run dates turns one procedure into a fleet---with the caveat that dynamic SQL built from parameters must be constructed carefully (identifier whitelists, never raw string interpolation of values).
+
+\begin{pitfall}
+\textbf{Dynamic SQL from procedure parameters is an injection surface.} Whitelist table and schema identifiers against an allowed set or \texttt{IDENTIFIER()} lookups; never concatenate user-supplied strings into statements.
+\end{pitfall}
+
+\section{Wednesday: Anaconda Packages and Reproducible Runtimes}
+\index{Anaconda}\index{PACKAGES clause}
+Snowflake's Python runtime ships with a curated \textbf{Anaconda channel}: declare \texttt{PACKAGES = ('scikit-learn', 'pandas', 'numpy')} and the sandbox resolves them---no containers, no dependency hell, no outbound network. Curation is the trade: only channel-listed packages and versions are available, so check availability before designing around a library.
+
+Production discipline mirrors Chapter 13: pin versions in the \texttt{PACKAGES} clause (or via the environment specification), record them in git, and upgrade deliberately through CI. An unpinned \texttt{scikit-learn} that silently upgrades can change model behavior without a single line of your code changing.
+
+\begin{tipbox}
+Keep heavy model artifacts off the per-row path: train once in a procedure, serialize the model to a stage, and load it per-partition (UDTF \texttt{end\_partition} pattern) or per-batch in vectorized UDFs. Training inside a scoring UDF is the classic ML-in-warehouse performance bug.
+\end{tipbox}
+
+\section{Thursday Hands-On Project: Train and Score with scikit-learn}
+\index{hands-on project!stored procedure}
+This lab builds the parameterized procedure from the week's core scenario: accept a table name, train a linear regression in-database, write predictions back.
+
+\subsection*{Scenario}
+The finance team wants a baseline revenue-forecast model retrained nightly on the latest mart---no notebooks, no exports, no external compute.
+
+\subsection*{Procedure}
+\begin{enumerate}
+    \item Create \texttt{gold.training\_features} with a target and three numeric features; load 200{,}000 rows.
+    \item Write \texttt{ml.sp\_train\_predict(source\_table STRING, target\_table STRING)}: read the source via Snowpark, convert to pandas, train \texttt{sklearn.linear\_model.LinearRegression}, write predictions plus run metadata to the target.
+    \item Whitelist \texttt{source\_table} against an approved-tables mapping before building any identifier.
+    \item Wrap training and the prediction write in one transaction; log row counts and $R^2$ to an \texttt{ml.run\_log} table.
+    \item Schedule the procedure as a nightly serverless task (Chapter 8 pattern).
+    \item Test owner's-rights versus caller's-rights variants with a low-privilege caller and record the behavioral difference.
+\end{enumerate}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item \textbf{Procedure DDL} with pinned packages and identifier whitelisting.
+    \item \textbf{Run-log evidence:} nightly rows with metrics, row counts, and duration.
+    \item \textbf{Rights experiment:} the owner/caller comparison and which model this pipeline needs.
+    \item \textbf{Task wiring:} the scheduled task DDL and one \texttt{TASK\_HISTORY} success record.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item Training reads Snowflake data; no data leaves the account at any point.
+    \item Predictions and run metadata land atomically---a failed train never leaves partial predictions.
+    \item Package versions are pinned and recorded.
+    \item The rights model is chosen, implemented, and justified in writing.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Serialize the trained model to a stage and serve it from a vectorized scoring UDF.
+    \item Add a champion/challenger comparison: only promote the new model when $R^2$ beats the incumbent.
+    \item Track feature drift: alert when input-column distributions shift beyond a threshold week over week.
+\end{itemize}
+
+\section{Friday Real-World Architecture: The In-Database Feature Pipeline}
+\index{Real-World Architecture!feature engineering}\index{ML pipeline}
+A subscription business currently exports 300 GB nightly to an external Spark cluster for feature engineering, trains there, and ships scores back. The export pipeline is the highest-risk, highest-latency component they own. The mandate: eliminate the export.
+
+\subsection{Target Design}
+Raw events (Chapters 6--7) feed silver dynamic tables (Chapter 11) that compute rolling behavioral features---the window-function patterns of Chapter 12---directly where events live. A nightly owner's-rights procedure trains scikit-learn models on the feature mart; a vectorized scoring UDF (Chapter 14) applies the staged model inside the gold layer. Tasks orchestrate; resource monitors cap; the entire lineage is queryable in \texttt{ACCESS\_HISTORY} because every step is in-platform.
+
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[
+        tbl/.style={rectangle, rounded corners, draw=codegreen!60!black, thick, fill=green!8, align=center, minimum width=2.7cm, minimum height=1.0cm, font=\small\bfseries},
+        sf/.style={rectangle, rounded corners, draw=primary, thick, fill=primary!6, align=center, minimum width=2.7cm, minimum height=1.0cm, font=\small\bfseries},
+        ml/.style={rectangle, rounded corners, draw=magenta, thick, fill=magenta!10, align=center, minimum width=2.7cm, minimum height=1.0cm, font=\small\bfseries},
+        arrow/.style={-{Stealth[length=2.5mm]}, draw=primary, thick},
+        lbl/.style={font=\scriptsize\itshape, text=codegray}
+    ]
+        \node[tbl] (raw) at (0, 0) {raw events\\(streaming)};
+        \node[sf] (feat) at (3.8, 0) {silver features\\(dynamic tables)};
+        \node[ml] (train) at (7.6, 1.3) {train procedure\\scikit-learn};
+        \node[ml] (model) at (11.4, 1.3) {model\\on stage};
+        \node[ml] (score) at (11.4, -1.3) {scoring UDF\\(vectorized)};
+        \node[tbl] (gold) at (14.2, 0) {gold scores\\serving};
+        \draw[arrow] (raw) -- (feat);
+        \draw[arrow] (feat) -- node[lbl, above]{nightly} (train);
+        \draw[arrow] (train) -- (model);
+        \draw[arrow] (model) -- (score);
+        \draw[arrow] (feat) -- node[lbl, above, sloped]{features} (score);
+        \draw[arrow] (score) -- (gold);
+    \end{tikzpicture}%
+    }
+    \caption{In-database ML: features, training, and scoring never leave Snowflake; the model artifact lives on a stage.}
+    \label{fig:chapter15-ml-pipeline}
+\end{figure}
+
+\subsection{Honest Limits}
+In-database ML wins for tabular models on warehouse-scale data---regressions, gradient boosting, feature transforms. It does not replace GPU training for deep learning; the honest architecture keeps Snowflake as the feature and serving layer and calls specialized training infrastructure for the models that need it (Chapter 22's Cortex discussion shows where Snowflake's own LLM functions fit). The engineering victory is that 90\% of the pipeline---the features, the orchestration, the governance, the serving---no longer moves data at all.
+
+\begin{pitfall}
+\textbf{Eliminating the export but keeping the ad hoc notebook culture recreates the risk inside the perimeter.} Version procedures in git, review them like code, and grant \texttt{USAGE} on procedures rather than broad table rights to data scientists.
+\end{pitfall}
+
+\section{Interview Q\&A}
+\begin{enumerate}
+    \item \textbf{Q: How does a stored procedure differ from a UDF?}\\
+    A: A UDF computes values inside queries without side effects; a procedure is \texttt{CALL}ed, runs multi-statement control flow, manages transactions, and performs transformations or administration.
+    \item \textbf{Q: Why parameterize a procedure with a table name?}\\
+    A: One tested procedure serves many datasets---but identifiers must be whitelisted to avoid injection.
+    \item \textbf{Q: How do you make scikit-learn available to a Python procedure?}\\
+    A: Declare it in the \texttt{PACKAGES} clause, which resolves it from Snowflake's curated Anaconda channel.
+    \item \textbf{Q: Owner's-rights versus caller's-rights---when each?}\\
+    A: Owner's rights let a controlled procedure act on privileged data on behalf of low-privilege callers (the common pipeline case); caller's rights make the procedure act only with the caller's own privileges (safer for shared utilities).
+    \item \textbf{Q: How do procedures fit into a task DAG?}\\
+    A: Task bodies should be procedure calls: the graph schedules, the procedure encapsulates testable, transactional logic.
+\end{enumerate}
+
+\section{Further Reading}
+Snowflake's Python stored-procedure guide covers sessions, transactions, and rights models \cite{snowflakeStoredProceduresDocs}; the Anaconda integration documentation covers packages and environment pinning \cite{snowflakeAnacondaDocs}. Chapter 14's UDF patterns \cite{snowflakeUdfPythonDocs} are the scoring half of this chapter's ML architecture.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item UDFs compute; procedures orchestrate. Task bodies should be procedure calls.
+    \item Python procedure handlers receive a live Snowpark session---the full Chapter 13 API, server-side.
+    \item The Anaconda channel provides curated packages; pin versions and upgrade through CI.
+    \item Dynamic SQL from parameters demands identifier whitelists.
+    \item Train once, store the model on a stage, score with vectorized UDFs---never train per row.
+    \item In-database feature engineering eliminates the export pipeline, the highest-risk ML component most teams own.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Classify six example routines as UDF or procedure and justify each.
+    \item \textbf{(Conceptual)} Explain the privilege escalation risk owner's-rights procedures create and how to contain it.
+    \item \textbf{(Hands-on)} Refactor a three-statement worksheet script into a transactional procedure with rollback.
+    \item \textbf{(Hands-on)} Build the approved-tables whitelist and demonstrate rejection of a non-whitelisted identifier.
+    \item \textbf{(Hands-on)} Persist a trained model to a stage and score with it from a vectorized UDF.
+    \item \textbf{(Design)} Design champion/challenger promotion with metric gates and rollback.
+    \item \textbf{(Design)} Specify feature-drift monitoring: metrics, thresholds, and alert routing.
+    \item \textbf{(Operations)} Write the run-log schema and the dashboard queries over it.
+    \item \textbf{(Cost)} Compare nightly in-database training credits versus the exported-Spark architecture's total cost.
+    \item \textbf{(Interview)} Argue which ML workloads should leave Snowflake for GPU infrastructure and which should not.
+\end{enumerate}

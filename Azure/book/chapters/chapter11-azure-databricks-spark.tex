@@ -1,0 +1,302 @@
+\chapter{Change Data Capture, Migration, and Data Contracts}
+\index{change data capture}\index{Azure DMS}\index{data contract}\index{Event Grid}\index{replication lag}%
+\begin{objectives}
+\begin{itemize}
+    \item Explain Azure Database Migration Service architecture---offline versus online migration---and reach private sources through the integration runtimes from Chapter 10.
+    \item Run a DMS migration task with ongoing replication (CDC) enabled and reconcile before cutover.
+    \item Compare CDC mechanisms---Azure SQL CDC, Cosmos DB change feed, and DMS replication---and monitor replication lag as an SLO.
+    \item Design event-driven ingestion with Azure Event Grid as the notification fabric.
+    \item Enforce versioned JSON data contracts at the lake boundary, routing violations to quarantine.
+    \item Architect near-real-time synchronization from an on-premises Oracle database to Synapse for live BI.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+Hybrid connectivity and change-data-capture are universal integration problems. Every cloud offers an agent/relay that reaches private networks and a replication service that streams database changes.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{3.0cm}p{2.9cm}p{3.1cm}p{3.2cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{AWS} & \textbf{Azure} & \textbf{GCP} \\
+\midrule
+Private data movement agent & Glue connectors / DataSync agent & Self-Hosted Integration Runtime & Cloud VPN/Interconnect + Data Fusion remote agent \\
+Database migration & AWS DMS (+SCT) & Azure DMS (+DMA) & Database Migration Service \\
+CDC stream & DMS ongoing replication & Azure SQL CDC / DMS CDC & Datastream \\
+Event fabric & EventBridge & Event Grid & Eventarc \\
+Schema enforcement & Glue Schema Registry & Contract checks in ADF/Databricks & Dataflow / Dataplex validation \\
+\addlinespace
+\multicolumn{4}{@{}l@{}}{\textbf{Fabric}: on-premises data gateway; \textbf{Snowflake}: Snowpipe + connectors; \textbf{MongoDB}: change streams (CDC-native).} \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+Data contracts---schema, versioning, quarantine---are platform-neutral governance. The implementation differs; the obligation to reject malformed producer output at the boundary does not.
+\end{crosscloud}
+
+\begin{keyterms}
+\textbf{CDC}: change data capture---streaming inserts, updates, and deletes from a source database instead of re-extracting full tables.\quad
+\textbf{Replication lag}: the delay between a source commit and its appearance downstream; a first-class SLO.\quad
+\textbf{Data contract}: a versioned schema plus semantics agreed between a data producer and its consumers.\quad
+\textbf{Quarantine}: a holding zone for records that fail contract validation, isolating poison data from curated zones.
+\end{keyterms}
+
+\section{Week 11 Overview: Reaching Data and Trusting It}
+Chapter 10's pipelines moved data on schedules between systems the integration runtimes could reach. Real estates violate two deeper assumptions: that data is \emph{fresh enough} when extracted nightly, and that it is \emph{well-formed} when it arrives. The source may be an Oracle server behind a corporate firewall whose dashboards must reflect orders within minutes, and the files it emits drift schema whenever the vendor patches. Week 11 addresses both: \textbf{change data capture} solves freshness without full re-extracts, and \textbf{data contracts} solve trust at the boundary.
+
+\begin{definitionbox}
+\textbf{Change data capture (CDC)} publishes a database's insert/update/delete stream so downstream systems can apply deltas continuously. Compared with nightly full extracts, CDC cuts source load, shrinks latency from hours to minutes, and makes deletes representable.
+\end{definitionbox}
+
+\section{Monday: Azure Database Migration Service}
+\index{Azure DMS}\index{migration!online}
+
+\subsection{DMS Architecture}
+Azure Database Migration Service orchestrates schema and data movement between database engines \cite{microsoft2025dms}. An \textbf{offline} migration copies once and cuts over; an \textbf{online} migration performs the initial bulk copy, then keeps the target synchronized by streaming the source's transaction log until cutover. Online migrations require the premium tier and a source configuration that exposes change records (for Azure SQL targets, SQL Server CDC or replication; for Oracle sources, supplemental logging).
+
+\subsection{Reaching the Source}
+DMS and ADF reach private networks through Chapter 10's integration runtimes: a Self-Hosted IR pair installed inside the source network dials \emph{outbound} to Azure, so no inbound firewall exposure is required. Size the SHIR nodes for the initial bulk copy's parallelism, and remember that the same pair will carry the steady-state CDC stream afterward---plan CPU and concurrency headroom for both phases.
+\section{Tuesday: Change Data Capture Mechanisms}
+\index{change data capture!mechanisms}
+
+\subsection{Platform CDC Mechanisms}
+\begin{itemize}
+    \item \textbf{Azure SQL CDC:} per-table change tables populated from the transaction log; consumers poll with \texttt{cdc.fn\_cdc\_get\_all\_changes\_*}. Durable, exact, and pull-based.
+    \item \textbf{Cosmos DB change feed:} an ordered log of inserts/updates per logical partition, consumed by push (Functions trigger) or pull; deletes require soft-delete flags or the all-versions mode (Chapter 3).
+    \item \textbf{DMS replication:} managed streaming from heterogeneous sources (Oracle, SQL Server, MySQL) to Azure targets, hiding the per-engine log plumbing.
+\end{itemize}
+
+\subsection{Replication Lag as an SLO}
+CDC pipelines fail quietly: replication stalls, dashboards go stale, and nobody is paged because nothing errored. Treat \textbf{lag}---the delay between a source commit and its lake/warehouse appearance---as a first-class SLO. Azure Monitor metrics on the DMS task expose latency; alert when it exceeds the SLA (for example, five minutes), and give the alert a runbook: check source log pressure, SHIR health, and target write throughput, in that order.
+
+\begin{pitfall}
+\textbf{CDC without a delete story.} Inserts and updates are easy; deletes are where synchronization designs diverge. Decide explicitly whether deletes propagate as hard deletes, soft-delete flags, or tombstones---and test it before go-live, not during the first data-privacy erasure request.
+\end{pitfall}
+
+\section{Wednesday: Event-Driven Ingestion and Data Contracts}
+\index{Event Grid}\index{data contract}\index{quarantine}
+
+\subsection{Event Grid as the Notification Fabric}
+Azure Event Grid is a serverless publish/subscribe broker for resource and application events \cite{microsoft2025eventGrid}. The canonical data-engineering pattern: a system topic on the storage account emits \texttt{BlobCreated}; subscriptions fan that event out to an ADF event trigger, a Function, or a Logic App. Polling disappears; latency drops from ``next schedule'' to seconds; and cost follows events, not empty checks. Chapter 12 composes these events into full orchestration.
+
+\subsection{Data Contracts at the Boundary}
+A \textbf{data contract} is a versioned, machine-checkable agreement: the JSON schema of the payload, the semantics of each field, the SLA, and the ownership. The producer owns the contract; consumers build against versions of it. Adding an optional field is \textbf{non-breaking}; renaming a field or changing its type is \textbf{breaking} and requires a major version with a migration window.
+
+Enforcement happens at the lake boundary, before landing: validate each payload against its versioned schema---in a Databricks notebook with \texttt{spark.read.schema(...)} or an ADF data flow with derived-column/assert patterns---and route violations to a \textbf{quarantine} container with the failure reason attached. Quarantined data is a producer bug made visible; silently coerced data is a producer bug made permanent.
+
+\begin{lstlisting}[language=json,caption={A versioned contract (excerpt) with a breaking-change policy.},label={lst:ch11-contract}]
+{
+  "contract": "orders",
+  "version": "2.1.0",
+  "owner": "checkout-team@example.com",
+  "schema": {
+    "type": "object",
+    "required": ["order_id", "customer_id", "order_ts", "amount"],
+    "properties": {
+      "order_id":    { "type": "string", "pattern": "^ORD-[0-9]+$" },
+      "customer_id": { "type": "string" },
+      "order_ts":    { "type": "string", "format": "date-time" },
+      "amount":      { "type": "number", "minimum": 0 },
+      "coupon_code": { "type": ["string", "null"] }
+    }
+  },
+  "compatibility": "backward",
+  "sla": { "freshnessMinutes": 15 }
+}
+\end{lstlisting}
+
+\begin{tipbox}
+Put the contract version \emph{in the payload or its metadata}, not in tribal knowledge. A quarantine record that cannot say which schema version it violated cannot be reprocessed after the producer fixes the bug.
+\end{tipbox}
+
+\section{Thursday Hands-on Project: DMS CDC with a Contract Gate}
+\index{hands-on lab}\index{Azure DMS}\index{quarantine}
+Configure an Azure DMS task with CDC to stream changes from an Azure SQL Database to ADLS Gen2, then gate the landing zone with schema validation that quarantines contract-violating records.
+
+\subsection{Stand Up Source and Migration Service}
+\begin{lstlisting}[language=bash,caption={Registering the DMS resource provider and creating the service.},label={lst:ch11-dms}]
+az provider register --namespace Microsoft.DataMigration
+$rg = "rg-de-azure-book-week10"
+az group create --name $rg --location eastus
+
+az network vnet create --name vnet-dms --resource-group $rg `
+  --subnet-name snet-dms --address-prefix 10.10.0.0/16 --subnet-prefix 10.10.1.0/24
+
+az dms create --name dms-week10 --resource-group $rg `
+  --location eastus --subnet "/subscriptions/<sub>/resourceGroups/$rg/providers/Microsoft.Network/virtualNetworks/vnet-dms/subnets/snet-dms" `
+  --sku-name Premium_4vCores
+\end{lstlisting}
+
+In the portal or via task JSON: define the source (Azure SQL Database with CDC-enabled tables), the target (ADLS Gen2 container \texttt{cdc/orders/}), and enable ongoing replication. Seed the source with the \texttt{orders} table from the Chapter 10 lab.
+
+\subsection{Add the Contract Gate}
+A Databricks notebook (or ADF data flow) reads each landed CDC batch, applies the contract from Listing~\ref{lst:ch11-contract}, splits into \texttt{silver/orders/} (valid) and \texttt{quarantine/orders/} (invalid with \texttt{\_error} reason column), and writes both with the batch's event time. Then induce three violations---missing \texttt{order\_id}, negative \texttt{amount}, malformed \texttt{order\_ts}---and prove each lands in quarantine with a readable reason while valid rows flow through.
+
+\subsection{Wire the Lag Alert}
+Create a Log Analytics workspace, enable diagnostic settings on the DMS task, and add an alert: \emph{replication latency $>$ 5 minutes for 3 consecutive evaluations}. Test it by pausing the consumer, not by hoping.
+
+\section{Friday Use Case: Oracle to Synapse in Near Real Time}
+\index{use case}\index{Oracle!migration}
+A manufacturer runs order management on on-premises Oracle. Executives want BI dashboards reflecting orders within minutes, not the current 24-hour batch.
+
+\subsection{Target Architecture}
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[node distance=1.2cm]
+        \node[store] (oracle) {On-prem\\Oracle};
+        \node[stage, right=1.3cm of oracle] (shir) {SHIR pair\\(outbound only)};
+        \node[stage, right=1.3cm of shir] (dms) {Azure DMS\\online migration};
+        \node[store, right=1.3cm of dms] (lake) {ADLS Gen2\\CDC landing};
+        \node[stage, above=1.0cm of lake] (gate) {Contract gate\\(quarantine)};
+        \node[store, right=1.3cm of lake] (syn) {Synapse\\dedicated pool};
+        \node[stage, right=1.3cm of syn] (pbi) {Power BI\\DirectQuery};
+        \draw[arrow] (oracle) -- (shir);
+        \draw[arrow] (shir) -- (dms);
+        \draw[arrow] (dms) -- (lake);
+        \draw[arrow] (lake) -- (gate);
+        \draw[arrow] (gate) -- (syn);
+        \draw[arrow] (syn) -- (pbi);
+    \end{tikzpicture}%
+    }
+    \caption{Near-real-time Oracle synchronization: SHIR for reachability, DMS for continuous replication, contract gate before Synapse.}
+    \label{fig:ch11-oracle-sync}
+\end{figure}
+
+The design combines this chapter's pieces: a two-node SHIR reaches Oracle through outbound-only connections; DMS online migration performs the initial load and streams redo-log changes; a contract gate validates and quarantines; a merge job applies deltas (including the tested delete semantics) into the hash-distributed Synapse tables from Chapter 5; Power BI DirectQuery (Chapter 16) serves the live dashboards. The lag SLO---five minutes, alerted---is the operational contract that makes ``near real time'' a commitment instead of a hope.
+
+\begin{pitfall}
+\textbf{Big-bang cutover.} Run the CDC stream in parallel with the legacy batch for at least two reconciliation cycles. Cut over only when row counts and control totals match for consecutive windows; keep the batch path disabled-but-runnable for one month as the rollback.
+\end{pitfall}
+
+\section{Architectural Decision Record Template}
+\index{architectural decision record}
+Per integration record: IR type and node count with the network evidence; CDC mechanism and its delete semantics; lag SLO with the alert threshold; contract owner, version, and compatibility mode; quarantine location and reprocessing runbook; and the reconciliation plan used at cutover.
+
+\section{Operational Deep Dive: SHIR Fleet Hygiene}
+\index{Self-Hosted Integration Runtime!operations}
+SHIR nodes are servers you own: patch them, monitor their CPU and queue depth, and rotate their certificates. Log Analytics can ingest the agent's diagnostic logs; alert on node heartbeat loss, because a dead node in a two-node pair halves capacity silently. Keep the SHIR's concurrent-jobs limit aligned with the source's tolerance---the IR will happily open enough parallel connections to flatten an old Oracle instance.
+
+\section{Troubleshooting Patterns}
+\index{troubleshooting!integration}
+Copy fails with \emph{server not found} through SHIR $\rightarrow$ DNS resolution on the agent node, not in Azure. DMS task stuck at 99\% $\rightarrow$ long-running open transactions pinning the source log. Sudden lag growth $\rightarrow$ a bulk operation on the source generating change volume the sink cannot absorb. Quarantine spike after a vendor release $\rightarrow$ contract drift; diff the payloads against the previous version and page the producer, not the pipeline.
+
+\section{Week 11 Lab Rubric}
+\index{rubric}
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.2cm}p{5.0cm}p{5.0cm}@{}}
+\toprule
+\textbf{Criterion} & \textbf{Meets expectation} & \textbf{Needs improvement} \\
+\midrule
+Connectivity & IR choice justified; SHIR HA with two nodes & Single node, no justification \\
+CDC & Online migration with deletes handled explicitly & Deletes ignored or untested \\
+Contracts & Versioned schema enforced; violations quarantined with reasons & Validation absent or silently coercive \\
+Observability & Lag SLO defined and alert tested & No lag metric; staleness discovered by users \\
+\bottomrule
+\end{tabular}
+\caption{Week 11 rubric for the integration deliverables.}
+\label{tab:ch11-rubric}
+\end{table}
+
+\section{Interview Q\&A}
+\subsection{Concepts and Trade-offs}
+\begin{enumerate}
+    \item \textbf{Q: Why would you need a Self-Hosted Integration Runtime?}\\
+    A: When sources sit in private networks; the SHIR dials outbound to ADF so no inbound firewall exposure is needed.
+    \item \textbf{Q: How does CDC differ from a nightly full extract?}\\
+    A: CDC streams deltas from the transaction log---minutes of latency, low source load, deletes representable---versus hours of latency and full table scans.
+    \item \textbf{Q: Is adding an optional field a breaking contract change?}\\
+    A: No---backward-compatible. Renaming a field or changing its type breaks existing consumers and requires a major version.
+    \item \textbf{Q: Who owns a data contract?}\\
+    A: The producer owns and versions it; consumers pin to versions, and breaking changes ship with a migration window.
+\end{enumerate}
+
+\section{Further Reading}
+The integration runtime concepts \cite{microsoft2025adfIR}, Azure DMS overview \cite{microsoft2025dms}, and Event Grid documentation \cite{microsoft2025eventGrid} are the primary references. The Cosmos DB change feed \cite{microsoft2025cosmosChangeFeed} completes the CDC survey, and Chapter 12's orchestration patterns compose these events into self-healing pipelines.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item Choose the IR by network reach: Azure IR for cloud endpoints, SHIR (two nodes, per environment) for private networks, Azure-SSIS for package lift-and-shift.
+    \item DMS online migration is bulk copy plus log streaming; cutover is a reconciliation decision, not a date.
+    \item Replication lag is an SLO---metric, alert, runbook---because stalled CDC fails silently.
+    \item Event Grid replaces polling with push; storage events are the canonical ingestion trigger.
+    \item Data contracts make producer drift visible at the boundary; quarantine with reasons, never coerce silently.
+    \item Deletes are the hardest part of synchronization; decide their semantics before go-live.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Why does the SHIR need no inbound firewall rules, and what does that cost you operationally?
+    \item \textbf{(Conceptual)} Compare polling-based and change-feed-based consumption of Cosmos DB changes.
+    \item \textbf{(Conceptual)} Why must a quarantine record carry the contract version it violated?
+    \item \textbf{(Hands-on)} Complete the Thursday lab: DMS CDC stream plus contract gate, with three induced violations quarantined.
+    \item \textbf{(Hands-on)} Configure the lag alert and capture it firing during a consumer pause.
+    \item \textbf{(Hands-on)} Write the reprocessing script that replays a quarantined batch after a producer fix.
+    \item \textbf{(Design)} Design delete propagation (hard, soft, tombstone) for the Oracle-to-Synapse pipeline and justify the choice.
+    \item \textbf{(Design)} Write the ADR for DMS versus a nightly ADF full-extract for the Oracle estate.
+    \item \textbf{(Design)} Specify the reconciliation report that gates cutover: counts, totals, and sampling strategy.
+    \item \textbf{(Interview)} Prepare a two-minute answer to ``the dashboards are stale but nothing failed---walk me through your morning.''
+\end{enumerate}
+
+\section{Capstone Project: Hybrid CDC Pipeline with Contract Enforcement}\label{sec:ch11-capstone}
+\index{capstone project}\index{change data capture!capstone}
+
+\begin{capstonebox}
+\textbf{Mission:} Build the Friday use case end-to-end at lab scale: an online DMS migration streaming changes through a contract gate into a queryable warehouse, with a tested lag alert and a quarantine reprocessing runbook.
+
+\textbf{Estimated time:} 5--7 hours.
+
+\textbf{What you will practice:}
+\begin{itemize}
+    \item DMS online migration with CDC and explicit delete semantics.
+    \item Contract validation with quarantine and replay.
+    \item Lag as a measured, alerted SLO.
+    \item Cutover reconciliation and rollback planning.
+\end{itemize}
+\end{capstonebox}
+
+\subsection*{Scenario}
+The manufacturer tolerates a five-minute staleness SLO on order dashboards. The current nightly batch violates it structurally. You are replacing it with continuous replication, and compliance requires that malformed vendor data never reaches the warehouse unmarked.
+
+\subsection*{Requirements}
+\begin{itemize}
+    \item \textbf{Replication:} DMS online migration from the source with inserts, updates, and deletes all demonstrated.
+    \item \textbf{Contract:} versioned schema enforced before the silver zone; violations quarantined with machine-readable reasons.
+    \item \textbf{Observability:} lag metric, five-minute alert, and a captured firing.
+    \item \textbf{Cutover:} reconciliation report comparing batch and CDC outputs over a full window; documented rollback.
+\end{itemize}
+
+\subsection*{Reference Architecture}
+Figure~\ref{fig:ch11-oracle-sync} is the reference; at lab scale, Azure SQL Database stands in for Oracle and the Azure IR stands in for the SHIR pair.
+
+\subsection*{Implementation Steps}
+\begin{enumerate}
+    \item Create DMS and the online task (Listing~\ref{lst:ch11-dms}); verify initial load and streaming.
+    \item Implement the contract gate and quarantine; induce and fix a violation end-to-end.
+    \item Apply deltas to the warehouse with merge semantics including deletes.
+    \item Wire the lag alert; trigger it deliberately.
+    \item Produce the reconciliation report and the rollback note.
+\end{enumerate}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item Task definitions, contract files, gate code, and the merge procedure in the repo.
+    \item Evidence pack: quarantined violations, lag alert firing, reconciliation output.
+    \item Runbook: reprocess-from-quarantine and rollback-to-batch procedures.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item A source insert, update, and delete each appear correctly in the warehouse within the SLO.
+    \item No malformed record reaches the warehouse without a quarantine record.
+    \item The reconciliation report shows zero unexplained differences for a full window.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Replay a 24-hour quarantine backlog through a corrected contract version.
+    \item Replace the polling merge with an Event Grid-triggered apply.
+    \item Add a chaos drill: kill the consumer for 30 minutes, then measure catch-up time against the SLO.
+\end{itemize}

@@ -1,0 +1,267 @@
+\chapter{Atlas Stream Processing and Event-Driven Pipelines}
+\index{Atlas Stream Processing}\index{stream processing}\index{tumbling window}\index{hopping window}\index{session window}\index{checkpointing}\index{dead-letter queue}\index{exactly-once}\index{stream join}%
+
+\begin{objectives}
+\begin{itemize}
+    \item Explain Atlas Stream Processing (ASP) concepts: stream processors, workspaces, connections, and pipelines.
+    \item Consume from Kafka, Kinesis, and MongoDB change streams inside ASP pipelines.
+    \item Implement stream-collection joins with \texttt{\$lookup} and reason about time-windowed stream-stream joins and late arrivals.
+    \item Choose tumbling, hopping, and session windows and manage window/checkpoint state growth.
+    \item Build end-to-end exactly-once-effect sinks with checkpointing plus idempotent \texttt{\$merge} upserts on a dedup key, with a dead-letter queue for poison events.
+    \item Architect a real-time fraud-detection pipeline in the Friday engagement.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+Managed streaming with SQL-like or pipeline semantics over a broker backbone is a commodity layer now; the differentiators are state management, exactly-once composition, and how tightly the sink integrates with the operational store.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{2.9cm}p{3.0cm}p{3.0cm}p{3.0cm}@{}} 
+\toprule
+\textbf{Capability} & \textbf{AWS} & \textbf{Azure} & \textbf{GCP} \\
+\midrule
+Broker backbone & MSK / Kinesis & Event Hubs (Kafka API) & Pub/Sub / Managed Kafka \\
+Stream processor & Kinesis Data Analytics (Flink) & Stream Analytics / Fabric RTI & Dataflow (Beam) \\
+Windowing & Tumbling/hopping/session & Tumbling/hopping/session & Full Beam window model \\
+State/checkpointing & Flink state backends & Managed & Managed (streaming engine) \\
+Exactly-once sink & Idempotent/transactional sinks & Idempotent upserts & Idempotent writes \\
+DB-native option & DMS streams & Cosmos change feed + Functions & Firestore triggers + Dataflow \\
+\addlinespace
+Snowflake / Fabric & \multicolumn{3}{l}{Streams + Tasks for incremental CDC pipelines; Snowpipe Streaming; Fabric eventstreams with KQL windows} \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+ASP's distinction is the same as Chapter 13's: the streaming tier speaks the aggregation pipeline and sinks directly into Atlas collections, so enrichment joins and materialized outputs stay on one platform \cite{mongodbStreamProcessingDocs,apacheKafkaRepo}.
+\end{crosscloud}
+
+\section{Week 15 Roadmap: Continuous Computation Over the Firehose}
+Chapter 16 will consume change streams imperatively; this week computes over streams declaratively. Atlas Stream Processing runs continuous aggregation pipelines over event sources---Kafka topics, Kinesis streams, or MongoDB change streams---with windows, joins, state, and checkpointing managed for you. The week's spine is the syllabus's hardest requirement: making the sink end-to-end exactly-once in effect, because at-least-once delivery is the honest model of every broker \cite{mongodbStreamProcessingDocs,kleppmann2017ddia}.
+
+\begin{definitionbox}
+A \textbf{stream processor} in ASP is a continuously running aggregation pipeline with a \texttt{\$source} (a connection to a broker or change stream), optional windowing and enrichment stages, and a sink (\texttt{\$merge} or \texttt{\$emit}), checkpointed by the platform for fault tolerance.
+\end{definitionbox}
+
+\begin{keyterms}
+\textbf{Connection}: a named, reusable source/sink binding (Kafka cluster, Atlas database). \textbf{Window}: tumbling (fixed, non-overlapping), hopping (fixed, overlapping), or session (gap-closed) event-time grouping. \textbf{Checkpoint}: persisted processor state enabling resume-after-failure. \textbf{State store}: the per-key window state whose growth must be bounded. \textbf{DLQ}: dead-letter queue for poison events. \textbf{Exactly-once effect}: observable state equivalent to single application, achieved by idempotent sinks.
+\end{keyterms}
+
+\section{Monday: ASP Concepts}
+\subsection{Workspaces, Connections, and Processors}
+An ASP workspace hosts connections (Kafka clusters, Atlas databases, HTTPS endpoints) and stream processors. A processor's pipeline is the aggregation language you already know---\texttt{\$match}, \texttt{\$set}, \texttt{\$lookup}, \texttt{\$group} inside windows---extended with streaming primitives: \texttt{\$source} reads a connection, \texttt{\$tumblingWindow}/\texttt{\$hoppingWindow} group by event time, \texttt{\$merge} upserts into an Atlas collection, and \texttt{\$emit} writes to a topic. Validation is a first-class operation: \texttt{sp.process()} starts the processor, and a ``sample'' mode runs the pipeline against live source data without committing a sink---always sample before starting.
+
+\subsection{The Operational Contract}
+ASP manages checkpoints automatically: processor state (window contents, source offsets) is persisted at intervals, and a restarted processor resumes from its last checkpoint. The interval is a latency/recovery trade-off: frequent checkpoints bound duplicate re-emission after a crash but cost throughput; infrequent checkpoints do the opposite. What ASP does \emph{not} do is make your sink idempotent---that remains your schema design (Wednesday).
+
+\begin{notebox}
+A change-stream source gives ASP the database's own event feed (Chapter 16 mechanics: resume tokens, oplog window). The same sizing rule applies: if the processor pauses longer than the oplog window, the stream cannot resume and must re-bootstrap from a snapshot---size the oplog for your worst-case processor downtime.
+\end{notebox}
+
+\section{Tuesday: Streaming Ingestion and Stream Joins}
+\subsection{Sources: Kafka, Kinesis, Change Streams}
+Connection registry entries carry bootstrap servers, topics, authentication (SASL, IAM, x.509), and schema/serialization settings. The three source families cover the platform patterns: Kafka topics for application event buses, Kinesis for AWS-native pipelines, and change streams for database-as-event-source designs. Source configuration includes the starting position (earliest vs.\ latest)---a deliberate choice: reprocessing history is sometimes the feature (backfill) and sometimes the bug (double-sending notifications).
+
+\subsection{Stream-Collection Enrichment}
+\texttt{\$lookup} inside an ASP pipeline joins each event against an Atlas collection---the fraud-pipeline pattern: enrich a card event with cardholder data before scoring. The join is a point lookup per event against the current collection state; it is not a temporal join (the event sees the cardholder as of now, not as of event time). For correctness under updates, either accept current-state semantics (usually right for enrichment) or model the dimension as an event stream and do a windowed stream-stream join.
+
+\begin{lstlisting}[language=JavaScript, caption={ASP pipeline skeleton: source, enrich, dedup-key, idempotent sink.}]
+pipeline = [
+  { $source: { connectionName: "kafka_orders" } },
+  { $lookup: {                          // stream-collection enrichment
+      from: { connectionName: "atlas_db", db: "shop", coll: "customers" },
+      localField: "customer_id", foreignField: "_id", as: "customer" } },
+  { $set: { dedup_key: { $concat: ["$customer_id", ":", "$event_id"] } } },
+  { $merge: {                           // exactly-once-effect sink
+      into: { connectionName: "atlas_db", db: "shop", coll: "enriched_orders" },
+      on: "dedup_key",
+      whenMatched: "replace", whenNotMatched: "insert" } }
+];
+\end{lstlisting}
+
+\subsection{Stream-Stream Joins and Late Arrivals}
+Joining two event streams requires a time window: an event waits for its counterpart within the window or matches nothing. Late arrivals---events whose event time precedes the window's watermark---are the defining complication: within the allowed lateness they join and correct the output; beyond it they are dropped or routed to a side output. The design questions are the watermark (how late is ``late''), the join window (how long events wait), and the correction policy (update the emitted result, or emit a compensating event).
+
+\section{Wednesday: Windowing and State Management}
+\subsection{Tumbling, Hopping, and Session Windows}
+\textbf{Tumbling} windows partition time into fixed non-overlapping buckets (five-minute sales totals). \textbf{Hopping} windows overlap (a five-minute window every minute) for smoother moving metrics. \textbf{Session} windows close after an inactivity gap, grouping a user's burst of activity. Event-time processing (timestamps from the events, not arrival time) is what makes results correct under out-of-order delivery; every window definition names its time field and its allowed lateness.
+
+\subsection{State Growth Is the Killer}
+Every open window holds state per group key. High-cardinality keys---one window per user per five minutes across ten million users---grow the state store unboundedly, and the syllabus's warning is literal: unbounded state kills streaming jobs through memory pressure, slow checkpoints, and restart storms (each restart reloads and rebuilds state). The defenses: bound cardinality by design (windowed aggregates with watermark expiry, not per-key-forever state), monitor state size and checkpoint duration as first-class metrics, and treat a growing-state trend as a capacity incident.
+
+\begin{pitfall}
+\textbf{Windowed \texttt{\$merge} without a deterministic key.} At-least-once delivery means window emissions can repeat after a checkpoint restore. A sink keyed on \texttt{user\_id + window\_start} upserts idempotently; a sink without it duplicates rows on every replay. The deterministic \texttt{\_id} (window start + group key) is the entire exactly-once story.
+\end{pitfall}
+
+\subsection{Composing Exactly-Once Effect}
+End-to-end exactly-once is a composition, not a feature flag: checkpointing gives the processor a consistent resume point; the source replays from it (at-least-once); the sink's idempotent upsert makes replay harmless; and the DLQ isolates poison events so one malformed message cannot stall the stream forever. Alert on consumer lag---not on errors---as the paging signal; a processor silently falling behind is the failure mode that page-worthy systems catch late.
+
+\section{Thursday Hands-On Project: Exactly-Once Kafka Windowed Pipeline}
+Build the syllabus lab: Kafka source, five-minute tumbling windows, idempotent \texttt{\$merge} into Atlas, DLQ for poison events.
+
+\subsection{Lab Protocol}
+\begin{enumerate}
+    \item Stand up a local Kafka (or Redpanda) container and an Atlas/Enterprise connection registry in ASP.
+    \item Produce a scripted order-event stream with two deliberate poison messages (malformed JSON, missing key field).
+    \item Define the processor: source $\to$ parse/validate (route failures to a dead-letter topic) $\to$ five-minute tumbling window summing revenue per SKU $\to$ \texttt{\$merge} with \texttt{on: ["sku", "window\_start"]}.
+    \item Prove exactly-once effect: kill the processor mid-window, restart it, and verify the output collection matches a single-run reference exactly (no duplicates, no gaps).
+    \item Prove the DLQ: both poison events land in the dead-letter topic and the stream continues.
+\end{enumerate}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item The connection and processor definitions as code, plus the producer script.
+    \item The kill-and-restart evidence: output diff against the reference run.
+    \item The DLQ contents and the lag/checkpoint metrics captured during the drill.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item Post-restart output is byte-identical to the uninterrupted reference run.
+    \item Both poison events reach the DLQ with the stream uninterrupted.
+    \item Checkpoint interval, state size, and lag are captured as metrics, not impressions.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Switch the window to hopping (5-minute size, 1-minute hop) and quantify the state-size increase.
+    \item Let the processor pause past a shrunken oplog window on a change-stream source and execute the re-bootstrap procedure (snapshot + fresh stream).
+\end{itemize}
+
+\section{Friday Use Case and Architecture: Real-Time Fraud Detection}
+\subsection{Scenario and Requirements}
+A card network must score authorization events in under 300 ms end-to-end: enrich each event with cardholder data, compute velocity features (authorizations per card per five minutes), and persist materialized alerts---with malformed events isolated and no duplicate alerts after infrastructure failures.
+
+\subsection{Architecture}
+The ASP pipeline: Kafka authorization events $\to$ validation with DLQ routing $\to$ \texttt{\$lookup} enrichment against the cardholders collection $\to$ a tumbling velocity window per card $\to$ a scoring stage that joins the velocity stream against per-card risk profiles (windowed stream-stream join with a two-minute lateness allowance) $\to$ \texttt{\$merge} alerts keyed on \texttt{card\_id + window\_start}. Exactly-once effect comes from checkpointing plus the deterministic merge key; cardholder freshness is a change-stream-fed cache inside Atlas so the enrichment lookup never leaves the platform. SLOs are wired per Chapter 23: end-to-end latency histogram, consumer lag, state size, checkpoint duration, and DLQ depth, each with a runbook entry.
+
+\begin{figure}[H]
+    \centering
+    \resizebox{0.98\textwidth}{!}{%
+    \begin{tikzpicture}[
+        st/.style={stage, minimum width=2.15cm, font=\scriptsize\bfseries},
+        bad/.style={rectangle, rounded corners, draw=red!60!black, fill=red!6, minimum width=2.0cm, minimum height=0.9cm, align=center, font=\scriptsize\bfseries},
+        store/.style={cylinder, shape aspect=0.25, draw=primary, thick, fill=primary!8, shape border rotate=90, align=center, minimum width=1.5cm, minimum height=1.1cm, font=\scriptsize\bfseries},
+        arrow/.style={-{Stealth[length=2.2mm]}, draw=primary, thick}
+    ]
+        \node[st] (src) at (0,0) {\$source\\Kafka};
+        \node[st] (val) at (2.7,0) {validate\\+ route};
+        \node[st] (enr) at (5.4,0) {\$lookup\\cardholder};
+        \node[st] (win) at (8.1,0) {tumbling\\velocity 5m};
+        \node[st] (score) at (10.8,0) {score +\\risk join};
+        \node[store] (sink) at (13.6,0) {alerts\\(\$merge)};
+        \node[bad] (dlq) at (2.7,-1.9) {DLQ topic};
+        \draw[arrow] (src) -- (val);
+        \draw[arrow] (val) -- (enr);
+        \draw[arrow] (enr) -- (win);
+        \draw[arrow] (win) -- (score);
+        \draw[arrow] (score) -- (sink);
+        \draw[arrow, dashed] (val) -- (dlq);
+    \end{tikzpicture}%
+    }
+    \caption{Fraud pipeline: validate, enrich, window, score, and idempotently merge---with poison events routed to the DLQ.}
+    \label{fig:ch15-fraud}
+\end{figure}
+
+\subsection{Guardrails}
+Four standing controls: state-size and checkpoint-duration alerts (state growth is the slow killer), a lag-based page (not error-based), a monthly kill-and-restart drill re-proving the exactly-once effect, and a documented re-bootstrap procedure for oplog-window expiry on any change-stream source.
+
+\section{Interview Q\&A}
+\subsection{Streaming}
+\begin{enumerate}
+    \item \textbf{Q: Why does unbounded state from high-cardinality keys kill a streaming job?}\\
+    A: Every open key holds memory and must be checkpointed; growth without bounds means memory pressure, slow checkpoints, and restarts that reload ever-larger state---a storm that never converges.
+
+    \item \textbf{Q: What does \texttt{\$lookup} enable inside an ASP pipeline?}\\
+    A: Stream-collection enrichment: each event joins current Atlas collection state (cardholders, product catalogs) without leaving the platform. It is current-state, not temporal---event-time-correct dimensions need stream-stream joins.
+
+    \item \textbf{Q: What do late-arriving events imply for windowed joins?}\\
+    A: Within allowed lateness they correct the window's output; beyond it they are dropped or side-output. Watermarks and join windows are business decisions about how late data may be.
+
+    \item \textbf{Q: How do checkpointing + idempotent \texttt{\$merge} deliver exactly-once effect?}\\
+    A: Checkpoints resume the processor consistently; replay re-emits windows (at-least-once); the sink upsert on a deterministic key (window start + group key) makes re-emission harmless.
+
+    \item \textbf{Q: What happens when a resume token outlives the oplog window?}\\
+    A: The stream cannot resume---the entries it needs have rolled off. Re-bootstrap: snapshot the source, open a fresh stream from the post-snapshot point, and resume checkpointing. Size the oplog beyond worst-case processor downtime.
+\end{enumerate}
+
+\section{Further Reading}
+The Atlas Stream Processing documentation covers connections, processors, windows, and checkpointing \cite{mongodbStreamProcessingDocs}; Kafka's semantics underpin the source model \cite{apacheKafkaRepo}. Kleppmann's stream-processing chapters are the theory base \cite{kleppmann2017ddia}, and Chapter 16's change-stream consumer mechanics complete the picture (resume tokens, pre-images, imperative consumers) \cite{mongodbChangeStreamsDocs}.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item ASP runs continuous aggregation pipelines over Kafka, Kinesis, or change streams, with managed checkpoints.
+    \item Sample before you start; validate before you merge; route poison events to a DLQ.
+    \item Windows group by event time; watermarks and allowed lateness are business decisions.
+    \item State growth is the slow killer: bound cardinality, monitor state and checkpoint duration.
+    \item Exactly-once is a composition: checkpoint + at-least-once replay + deterministic-key upsert.
+    \item Lag is the paging metric; a silently behind processor is worse than a crashing one.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Choose tumbling, hopping, or session windows for: hourly revenue, a live dashboard's moving five-minute error rate, and per-user activity bursts.
+    \item \textbf{(Conceptual)} Explain why \texttt{\$lookup} enrichment is not event-time-correct, and when that matters.
+    \item \textbf{(Conceptual)} Design the dedup key for a sensor-rollup pipeline; show why each component is necessary.
+    \item \textbf{(Hands-on)} Run the Thursday lab and capture the kill-and-restart parity evidence.
+    \item \textbf{(Hands-on)} Measure state size and checkpoint duration as you raise group-key cardinality 10$\times$; plot the trend.
+    \item \textbf{(Design)} Design the watermark and lateness policy for the fraud pipeline, with the business justification.
+    \item \textbf{(Design)} Write the re-bootstrap runbook for a change-stream-sourced processor after oplog expiry.
+    \item \textbf{(Interview)} ``Alerts doubled after every deploy until we fixed the sink.'' Explain the mechanism.
+\end{enumerate}
+
+\section{Capstone Project: Provably Idempotent Streaming Platform}\label{sec:ch15-capstone}
+
+\begin{capstonebox}
+\textbf{Mission:} deliver the fraud-pipeline pattern as a reusable platform: ASP processor with enrichment, windowing, exactly-once-effect sink, DLQ, and full SLO wiring---proven by a kill-and-restart drill and a poison-flood drill, with state-growth monitoring as a first-class alert.
+
+\textbf{Estimated time:} 6--8 hours.
+
+\textbf{What you will practice:}
+\begin{itemize}
+    \item Streaming pipeline design with enrichment and windowed joins.
+    \item Exactly-once effect via checkpointing and deterministic merge keys.
+    \item Operationalizing a stream processor: lag, state, checkpoints, DLQ.
+\end{itemize}
+\end{capstonebox}
+
+\subsection*{Scenario}
+The fraud platform's reviewers require evidence that alerts are never duplicated and never lost, including across processor failures and a flood of malformed events. This capstone is that evidence.
+
+\subsection*{Requirements}
+\begin{itemize}
+    \item The full pipeline (source, validation+DLQ, enrichment, velocity window, risk join, \texttt{\$merge} sink) defined as code.
+    \item A kill-and-restart drill proving output parity with an uninterrupted reference run.
+    \item A poison-flood drill (100 malformed events) proving DLQ isolation and stream continuity.
+    \item Metrics and alerts: consumer lag, state size, checkpoint duration, DLQ depth, end-to-end latency.
+    \item A state-growth capacity note: measured state per key, projected growth, and the watermark-expiry bound.
+\end{itemize}
+
+\subsection*{Implementation Steps}
+\begin{enumerate}
+    \item \textbf{Build.} Define connections and processor; sample against live data before starting.
+    \item \textbf{Prove idempotency.} Run the kill-and-restart drill; diff outputs.
+    \item \textbf{Prove isolation.} Run the poison flood; verify DLQ contents and continuity.
+    \item \textbf{Instrument.} Wire the five metrics with alerts and runbook links.
+    \item \textbf{Project.} Write the state-growth capacity note with the cardinality sweep.
+\end{enumerate}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item Processor and connection definitions, producer/drill scripts, and the metrics evidence.
+    \item The two drill reports and the state-growth capacity note.
+    \item The runbook entries for lag, state, and DLQ alerts.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item Output parity after restart is byte-exact against the reference run.
+    \item The poison flood leaves zero processing gaps and full DLQ accounting.
+    \item All five metrics alert correctly under injected conditions.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Add a second consumer of the same topic (analytics sink) and prove consumer independence under one side's failure.
+    \item Re-implement the velocity window with a hopping window and quantify the state and cost delta.
+\end{itemize}

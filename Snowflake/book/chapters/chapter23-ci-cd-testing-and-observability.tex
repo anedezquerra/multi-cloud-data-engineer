@@ -1,0 +1,291 @@
+\chapter{Production DataOps and Observability: Terraform, dbt, Schemachange, and Alerts}
+\index{DataOps}\index{Terraform}\index{dbt}\index{schemachange}\index{Snowflake Alerts}\index{Week 23}%
+\begin{objectives}
+\begin{itemize}
+    \item Provision Snowflake infrastructure as code with Terraform and manage credit spend with resource monitors.
+    \item Enforce data quality with dbt generic and singular tests plus Snowflake Data Metric Functions (DMFs).
+    \item Run versioned, backward-compatible migrations with schemachange and the expand--migrate--contract pattern.
+    \item Build Snowflake Alerts for cost anomalies over \texttt{ACCOUNT\_USAGE} and wire them to notification integrations.
+    \item Assemble a hands-on GitHub Actions CI/CD pipeline deploying changes and testing models on pull requests.
+    \item Architect a multi-environment (Dev/QA/Prod) deployment framework with zero-downtime schema evolution.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+DataOps is the most cloud-portable chapter in this book: Terraform, dbt, and GitHub Actions are the same tools on every platform; only the provider plugin and the warehouse-specific monitors differ.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{2.8cm}p{3.0cm}p{3.0cm}p{3.0cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{AWS} & \textbf{Azure} & \textbf{GCP} \\
+\midrule
+Infrastructure as code & Terraform AWS provider / CloudFormation & Terraform azurerm / Bicep & Terraform google provider \\
+Warehouse IaC objects & Redshift clusters, S3, IAM & Synapse/Fabric workspaces & BigQuery datasets, slots \\
+Transformation + tests & dbt-redshift & dbt-fabric / dbt-synapse & dbt-bigquery \\
+Migration runner & Flyway / Liquibase / schemachange-style & Flyway / DbUp & Flyway / Liquibase \\
+Spend monitoring & Cost Explorer + budgets & Cost Management + alerts & Budgets + billing export \\
+\addlinespace
+Snowflake equivalent & \multicolumn{3}{l}{terraform-provider-snowflake, dbt-snowflake, schemachange, resource monitors, alerts, DMFs} \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+\textbf{MongoDB} uses the same Terraform/dbt-adjacent discipline with Atlas providers; \textbf{Fabric} adds workspace deployment pipelines. The Snowflake-specific craft is in the platform-native observability: resource monitors, alerts, DMFs, and the \texttt{ACCOUNT\_USAGE} schema as the telemetry source of truth.
+\end{crosscloud}
+
+\section{Week 23 Roadmap}
+Twenty-two chapters built capability; this one builds the \emph{operating system} around it. DataOps applies software engineering discipline---version control, code review, automated testing, CI/CD, observability---to data platform change, so that a Tuesday afternoon deploy is boring \cite{terraformDocs,dbtCoreDocs}.
+
+Monday covers Terraform-managed infrastructure and resource monitors. Tuesday is dbt testing and DMFs. Wednesday handles migrations, alerts, and cost-anomaly detection. Thursday assembles the CI/CD pipeline. Friday designs the multi-environment framework.
+
+\begin{keyterms}
+\textbf{DataOps}: applying DevOps discipline---versioning, testing, CI/CD, observability---to data platform change.\quad
+\textbf{Resource monitor}: a Snowflake object capping warehouse credit consumption with notify/suspend triggers.\quad
+\textbf{DMF}: a Data Metric Function---a scheduled, table-attached data-quality metric (freshness, nulls, volume).\quad
+\textbf{schemachange}: a versioned migration runner applying SQL change scripts in order, exactly once.\quad
+\textbf{Expand--contract}: zero-downtime schema evolution: add new shape, migrate consumers, remove old shape---in separate releases.
+\end{keyterms}
+
+\section{Monday: Terraform-Managed Infrastructure and Resource Monitors}
+\index{Terraform}\index{resource monitor}
+Click-ops does not scale and cannot be reviewed. Terraform's Snowflake provider makes roles, warehouses, databases, monitors, and grants declarative: the desired state lives in git, \texttt{terraform plan} is the code review, and \texttt{apply} is the audited change \cite{terraformSnowflakeProvider}.
+
+\begin{lstlisting}[caption={Terraform: warehouse plus a resource monitor with two triggers}]
+resource "snowflake_warehouse" "etl_wh" {
+  name           = "ETL_WH"
+  warehouse_size = "XSMALL"
+  auto_suspend   = 120
+  auto_resume    = true
+}
+
+resource "snowflake_resource_monitor" "etl_budget" {
+  name         = "ETL_MONTHLY_BUDGET"
+  credit_quota = 200
+  frequency    = "MONTHLY"
+  triggers {
+    on_percent = 75
+    do_action  = "NOTIFY"
+  }
+  triggers {
+    on_percent = 100
+    do_action  = "SUSPEND_IMMEDIATE"
+  }
+  warehouses = [snowflake_warehouse.etl_wh.name]
+}
+\end{lstlisting}
+
+The \textbf{resource monitor} is the platform-native cost circuit breaker: a credit quota with trigger percentages mapped to actions---notify, suspend (after running queries finish), or suspend immediately \cite{snowflakeResourceMonitorsDocs}. Every warehouse in a governed account has one; the 75\%-notify / 100\%-suspend-immediately pair is the standard posture for non-production, with production monitors tuned to page rather than halt.
+
+\begin{pitfall}
+\textbf{A suspended production warehouse is a self-inflicted outage.} Production monitors notify early and suspend late (or never, paging instead); development monitors suspend aggressively. Encode the difference in Terraform variables per environment so it cannot drift.
+\end{pitfall}
+
+\section{Tuesday: dbt Testing and Data Metric Functions}
+\index{dbt}\index{DMF}\index{data quality}
+dbt brings software engineering to SQL: models are versioned SELECTs with a dependency graph, and \emph{tests} make data quality executable. The four generic tests every model should carry---\texttt{unique}, \texttt{not\_null}, \texttt{accepted\_values}, \texttt{relationships}---plus singular tests for business invariants:
+
+\begin{lstlisting}[language=SQL, caption={dbt incremental model plus schema.yml tests}]
+-- models/marts/fct_orders.sql
+{{ config(materialized='incremental', unique_key='order_id') }}
+SELECT order_id, customer_id, order_ts, order_total, status
+FROM {{ ref('stg_orders') }}
+{% if is_incremental() %}
+WHERE order_ts > (SELECT MAX(order_ts) FROM {{ this }})
+{% endif %}
+
+-- models/marts/schema.yml
+-- version: 2
+-- models:
+--   - name: fct_orders
+--     tests:
+--       - dbt_utils.unique_combination_of_columns:
+--           combination_of_columns: [order_id]
+--     columns:
+--       - name: order_id
+--         tests: [unique, not_null]
+--       - name: status
+--         tests:
+--           - accepted_values:
+--               values: ['NEW', 'COMPLETE', 'CANCELLED']
+--       - name: customer_id
+--         tests:
+--           - relationships:
+--               to: ref('dim_customers')
+--               field: customer_id
+\end{lstlisting}
+
+\textbf{Data Metric Functions} complement dbt's build-time tests with platform-native, always-on monitoring: attach DMFs (freshness, row count, null count, uniqueness) to tables and schedule evaluation---\texttt{ALTER TABLE ... SET DATA\_METRIC\_SCHEDULE = '60 MINUTE'}---with results queryable in \texttt{SNOWFLAKE.LOCAL.DATA\_METRIC\_FUNCTION\_RESULTS} \cite{snowflakeDmfDocs}. dbt tests gate \emph{deploys}; DMFs watch \emph{reality} between deploys.
+
+\begin{tipbox}
+dbt incremental models without \texttt{unique\_key} silently duplicate rows on re-runs. Declare the key, and add the \texttt{unique} test so CI catches what the config missed.
+\end{tipbox}
+
+\section{Wednesday: Migrations, Alerts, and Cost-Anomaly Detection}
+\index{schemachange}\index{expand-contract}\index{cost anomaly}
+\subsection{Versioned Migrations with schemachange}
+Snowflake DDL has no built-in migration ledger. \textbf{schemachange} provides it: versioned scripts (\texttt{V1.3.2\_\_add\_order\_channel.sql}) applied in order, exactly once, tracked in a change-history table; repeatables (\texttt{R\_\_...}) reapply on content change for views and procedures \cite{schemachangeDocs}. CI runs schemachange per environment; the ledger is the audit trail of what changed where and when.
+
+\subsection{Expand--Migrate--Contract for Zero Downtime}
+Renaming a column the naive way---drop, add---breaks every consumer between the two statements. The professional sequence spans releases:
+\begin{enumerate}
+    \item \textbf{Expand:} add the new nullable column (\texttt{order\_total\_v2}) in one release.
+    \item \textbf{Migrate:} dual-write and backfill; repoint dbt models and dashboards; keep a compatibility view (\texttt{CREATE OR REPLACE VIEW ... AS SELECT ..., order\_total\_v2 AS order\_total}) aliasing old names.
+    \item \textbf{Contract:} in a later release, after a CI gate proves no dbt model or BI extract references the old column, drop it.
+\end{enumerate}
+In dbt, \texttt{on\_schema\_change} on incremental models participates: \texttt{append\_new\_columns} for the expand phase, \texttt{sync\_all\_columns} only after consumers migrate.
+
+\begin{pitfall}
+\textbf{Failure story:} a schemachange script dropped \texttt{order\_total} in the same release dbt introduced \texttt{order\_total\_v2}; the contract step ran before dbt rebuilt the shim view, and the executive revenue dashboard errored for 40 minutes. Rule: expand and contract in separate releases, keep the compatibility view until every consumer migrates, and gate the contract migration in CI.
+\end{pitfall}
+
+\subsection{Snowflake Alerts and Cost-Anomaly Detection}
+\index{Snowflake Alerts}
+An \textbf{alert} is a scheduled condition: every interval, evaluate a query; if it returns rows, execute an action---typically a notification-integration call to email or SNS-to-Slack \cite{snowflakeAlertsDocs}. The canonical first alert detects credit anomalies against \texttt{WAREHOUSE\_METERING\_HISTORY}:
+
+\begin{lstlisting}[language=SQL, caption={Cost-anomaly alert: 2x deviation from trailing 7-day average}]
+CREATE OR REPLACE ALERT gov.credit_anomaly_alert
+  WAREHOUSE = gov_wh
+  SCHEDULE = '60 MINUTE'
+  IF (EXISTS (
+    WITH daily AS (
+      SELECT warehouse_name, DATE(start_time) AS d,
+             SUM(credits_used) AS credits
+      FROM SNOWFLAKE.ACCOUNT_USAGE.WAREHOUSE_METERING_HISTORY
+      WHERE start_time >= DATEADD(day, -8, CURRENT_TIMESTAMP())
+      GROUP BY 1, 2)
+    SELECT d.warehouse_name, d.credits,
+           AVG(p.credits) AS trailing_avg
+    FROM daily d
+    JOIN daily p
+      ON p.warehouse_name = d.warehouse_name
+     AND p.d BETWEEN DATEADD(day, -7, d.d) AND DATEADD(day, -1, d.d)
+    WHERE d.d = CURRENT_DATE()
+    GROUP BY 1, 2
+    HAVING d.credits > 2 * AVG(p.credits)))
+  THEN CALL SYSTEM$SEND_EMAIL(...);
+\end{lstlisting}
+
+\section{Thursday Hands-On Project: The CI/CD Pipeline with Observability}
+\index{hands-on project!CI/CD}
+This lab assembles the week: a GitHub repository where pull requests deploy migrations and test models, with cost observability wired end to end.
+
+\subsection*{Scenario}
+The platform team requires every Snowflake change reviewed, tested, and traceable: no manual DDL in production, failing data tests block deploys, and cost anomalies page within an hour.
+
+\subsection*{Procedure}
+\begin{enumerate}
+    \item Create the repository: \texttt{migrations/} (schemachange), \texttt{models/} (dbt), Terraform for warehouses and monitors.
+    \item Configure key-pair secrets in GitHub Actions (never passwords in CI variables).
+    \item Build the workflow: on PR, run schemachange against QA, then \texttt{dbt build} (models + tests).
+    \item Create the resource monitor with 75\%-notify / 100\%-suspend triggers in Terraform.
+    \item Deploy the cost-anomaly alert from Wednesday wired to an email notification integration.
+    \item Attach two DMFs (freshness, null count) to \texttt{fct\_orders} with a 60-minute schedule.
+    \item Demonstrate failure: open a PR whose model breaks \texttt{not\_null}; show CI red and the deploy blocked.
+    \item Walk an expand--contract column rename through two separate PRs with the shim view.
+\end{enumerate}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item \textbf{Repository:} migrations, models with tests, Terraform, and the Actions workflow.
+    \item \textbf{Evidence pack:} a green deploy run, the blocked bad-PR run, monitor configuration, and a fired test alert.
+    \item \textbf{Migration ledger:} schemachange history table output for both environments.
+    \item \textbf{Expand--contract record:} both PRs, the shim view, and the contract gate's consumer-reference check.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item Production DDL changes only through merged PRs; the ledger proves it.
+    \item A failing dbt test blocks deploy; a failing migration never half-applies.
+    \item The monitor and the anomaly alert are demonstrated live.
+    \item The column rename completes across two releases with zero consumer-visible downtime.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Add the contract-gate script failing CI while any model or extract references the old column.
+    \item Extend the alert suite: DMF breach alerts and warehouse-queue-depth anomalies.
+    \item Add a terraform plan comment bot to PRs for reviewer visibility.
+\end{itemize}
+
+\section{Friday Real-World Architecture: The Multi-Environment DataOps Framework}
+\index{Real-World Architecture!DataOps}
+A regulated enterprise runs Dev, QA, and Prod Snowflake accounts with change-freeze windows, audited promotion, and developer self-service. The framework's shape:
+
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[
+        repo/.style={rectangle, rounded corners, draw=codegray, thick, fill=white, align=center, minimum width=2.5cm, minimum height=1.0cm, font=\small\bfseries},
+        ci/.style={rectangle, rounded corners, draw=primary, thick, fill=primary!6, align=center, minimum width=2.5cm, minimum height=1.0cm, font=\small\bfseries},
+        env/.style={rectangle, rounded corners, draw=codegreen!60!black, thick, fill=green!8, align=center, minimum width=2.2cm, minimum height=1.0cm, font=\small\bfseries},
+        obs/.style={rectangle, rounded corners, draw=red!60!black, thick, fill=red!8, align=center, minimum width=2.5cm, minimum height=1.0cm, font=\small\bfseries},
+        arrow/.style={-{Stealth[length=2.5mm]}, draw=primary, thick},
+        lbl/.style={font=\scriptsize\itshape, text=codegray}
+    ]
+        \node[repo] (git) at (0, 0) {Git\\dbt + Terraform\\+ migrations};
+        \node[ci] (pr) at (3.6, 1.2) {PR pipeline\\schemachange$\rightarrow$QA\\dbt build + tests};
+        \node[ci] (rel) at (3.6, -1.2) {Release pipeline\\promote on tag\\contract gate};
+        \node[env] (qa) at (7.4, 1.2) {QA};
+        \node[env] (prod) at (7.4, -1.2) {Prod\\(freeze-aware)};
+        \node[obs] (obs) at (11.2, 0) {Monitors + Alerts\\+ DMFs $\rightarrow$ Slack};
+        \draw[arrow] (git) -- (pr);
+        \draw[arrow] (git) -- (rel);
+        \draw[arrow] (pr) -- (qa);
+        \draw[arrow] (rel) -- (prod);
+        \draw[arrow, dashed] (qa) |- (obs);
+        \draw[arrow, dashed] (prod) |- (obs);
+    \end{tikzpicture}%
+    }
+    \caption{Multi-environment DataOps: PRs prove changes in QA; tagged releases promote to Prod through a contract gate; observability wraps everything.}
+    \label{fig:chapter23-dataops}
+\end{figure}
+
+\subsection{Operating Principles}
+\begin{enumerate}
+    \item \textbf{Everything is code.} Objects in Terraform, schema evolution in schemachange, transformations and tests in dbt; Snowsight edits in Prod are policy violations detected by drift reports.
+    \item \textbf{Environments differ by data and blast radius, not shape.} Same Terraform modules, different variables: QA monitors suspend, Prod monitors page.
+    \item \textbf{Zero-downtime is a process property.} Expand--contract with shim views and CI contract gates, rehearsed on every rename---not a hero move during incidents.
+    \item \textbf{Observability closes the loop.} Resource monitors bound spend, DMFs watch data reality, alerts route anomalies to humans, and \texttt{ACCOUNT\_USAGE} retains the evidence.
+\end{enumerate}
+
+\section{Interview Q\&A}
+\begin{enumerate}
+    \item \textbf{Q: Why manage Snowflake objects with Terraform instead of UI clicks?}\\
+    A: Declarative state in git gives review (plan), audit (apply logs), repeatability across environments, and drift detection; click-ops has none of these.
+    \item \textbf{Q: Which four dbt generic tests should every model carry?}\\
+    A: \texttt{unique}, \texttt{not\_null}, \texttt{accepted\_values}, and \texttt{relationships}.
+    \item \textbf{Q: What does a Data Metric Function monitor?}\\
+    A: Table-attached quality metrics---freshness, volume, null counts, uniqueness---evaluated on a schedule with results in \texttt{DATA\_METRIC\_FUNCTION\_RESULTS}.
+    \item \textbf{Q: How does schemachange apply migrations safely?}\\
+    A: Versioned scripts apply in order exactly once per environment, tracked in a change-history table; repeatables reapply only on content change.
+    \item \textbf{Q: Walk through the expand-contract sequence for renaming a column.}\\
+    A: Add the new column in release one; dual-write, backfill, and migrate consumers behind a compatibility view; drop the old column in a later release after CI proves no consumer references it.
+\end{enumerate}
+
+\section{Further Reading}
+Terraform's Snowflake provider, dbt Core, and schemachange are the toolchain references \cite{terraformDocs,terraformSnowflakeProvider,dbtCoreDocs,schemachangeDocs}. Snowflake's resource-monitor, alert, and DMF documentation covers the platform-native observability \cite{snowflakeResourceMonitorsDocs,snowflakeAlertsDocs,snowflakeDmfDocs}. Chapter 10's audit patterns supply the queries these alerts automate.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item Everything is code: Terraform for objects, schemachange for evolution, dbt for transformation and tests.
+    \item Resource monitors are cost circuit breakers; their posture differs per environment by design.
+    \item dbt tests gate deploys; DMFs watch reality between deploys.
+    \item Expand--contract with shim views makes schema change boring; one-release renames are outages.
+    \item Alerts over \texttt{ACCOUNT\_USAGE} turn cost and quality anomalies into pages within an hour.
+    \item CI secrets use key-pair auth; no passwords in CI variables, ever.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Explain the difference between build-time tests (dbt) and runtime monitors (DMFs).
+    \item \textbf{(Conceptual)} Why must expand and contract be separate releases even when both scripts are ready?
+    \item \textbf{(Hands-on)} Add a singular dbt test enforcing a business invariant (e.g., refunds never exceed order totals) and break it deliberately.
+    \item \textbf{(Hands-on)} Write the drift report comparing Terraform state against \texttt{SHOW} output for warehouses.
+    \item \textbf{(Hands-on)} Build the freeze-window gate: releases blocked outside approved windows except hotfix labels.
+    \item \textbf{(Design)} Design the environment-promotion model for a team with feature branches and a shared QA.
+    \item \textbf{(Design)} Specify the notification taxonomy: which alerts page, which post to Slack, which email a digest.
+    \item \textbf{(Operations)} Write the monthly DataOps health report: deploy frequency, failure rate, mean recovery, alert precision.
+    \item \textbf{(Cost)} Model credit savings from aggressive dev-environment auto-suspend and monitor suspension.
+    \item \textbf{(Interview)} Argue to a skeptical manager why ``slow'' expand--contract deploys are cheaper than fast breaking ones.
+\end{enumerate}

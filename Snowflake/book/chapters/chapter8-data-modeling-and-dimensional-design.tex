@@ -1,0 +1,296 @@
+\chapter{Orchestration with Snowflake Tasks and Task Graphs}
+\index{tasks}\index{task graph}\index{orchestration}\index{serverless tasks}\index{Week 8}%
+\begin{objectives}
+\begin{itemize}
+    \item Schedule tasks with CRON expressions or interval schedules and configure execution parameters.
+    \item Compose multi-step task trees (DAGs) with root tasks and \texttt{AFTER} dependencies.
+    \item Choose between warehouse-backed and serverless tasks and explain the billing difference.
+    \item Wire error notifications and failure suspension so task graphs fail loudly and stop cascading.
+    \item Write idempotent task steps so retries never double-apply work.
+    \item Architect a serverless, self-healing ELT orchestration engine for 50 dependent business transformations.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+Every cloud grew a scheduler, a DAG engine, and a serverless variant; Snowflake tasks are simply the in-database member of that family.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{2.8cm}p{3.0cm}p{3.0cm}p{3.0cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{AWS} & \textbf{Azure} & \textbf{GCP} \\
+\midrule
+Cron scheduler & EventBridge Scheduler & Azure Functions timer / Logic Apps & Cloud Scheduler \\
+DAG orchestrator & Step Functions / MWAA (Airflow) & Data Factory pipelines & Cloud Composer (Airflow) \\
+In-warehouse scheduling & Redshift scheduled queries & Synapse/ADF triggers & BigQuery scheduled queries \\
+Serverless per-run billing & Lambda-style per invocation & Consumption plans & Per-request / slot-time \\
+Failure notification & SNS & Azure Monitor / Logic Apps & Cloud Monitoring + Pub/Sub \\
+\addlinespace
+Snowflake equivalent & \multicolumn{3}{l}{Tasks (CRON or interval), task graphs via \texttt{AFTER}, serverless compute, \texttt{ERROR\_INTEGRATION}} \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+\textbf{Microsoft Fabric} orchestrates with Data Factory pipelines and notebook scheduling; \textbf{MongoDB} relies on Atlas triggers and external schedulers. Snowflake's edge is proximity: when the entire transformation lives in SQL, orchestrating inside the database removes a whole external system---and its credentials, networking, and failure modes.
+\end{crosscloud}
+
+\section{Week 8 Roadmap}
+Chapters 6 and 7 produced continuous inputs and change deltas. Something must still \emph{decide when work runs}, \emph{in what order}, and \emph{what happens when it fails}. Snowflake tasks answer inside the platform, replacing a surprising share of external orchestrators for ELT workloads \cite{snowflakeTasksDocs}.
+
+Monday covers scheduling and execution parameters. Tuesday builds task trees with \texttt{AFTER}. Wednesday addresses serverless tasks, error notifications, and failure containment. Thursday constructs a gated three-task CDC graph. Friday scales to a 50-transformation self-healing orchestration engine.
+
+\begin{keyterms}
+\textbf{Task}: a scheduled Snowflake object executing SQL or a stored procedure call.\quad
+\textbf{Root task}: the scheduled head of a task graph; child tasks hang below it.\quad
+\textbf{Task tree / DAG}: a dependency graph of tasks linked by \texttt{AFTER} clauses.\quad
+\textbf{Serverless task}: a task run on Snowflake-managed compute, billed per second of usage.\quad
+\textbf{ERROR\_INTEGRATION}: a notification integration that emits task failure events to SNS, queues, or email.
+\end{keyterms}
+
+\section{Monday: Scheduling and Execution Parameters}
+\index{task!scheduling}\index{CRON}
+A task binds four things: a schedule, a compute choice, optional preconditions, and a body (a single SQL statement, a multi-statement script, or a stored procedure call). Schedules come in two forms: \texttt{SCHEDULE = 'n MINUTE'} intervals, and full \texttt{USING CRON} expressions with an explicit time zone for calendar-shaped timing such as ``06:00 Europe/Berlin on weekdays.''
+
+\begin{lstlisting}[language=SQL, caption={Two scheduling styles and execution parameters}]
+CREATE OR REPLACE TASK t_daily_billing
+  WAREHOUSE = etl_wh
+  SCHEDULE = 'USING CRON 0 6 * * MON-FRI Europe/Berlin'
+  AS CALL billing.sp_build_daily_charges();
+
+CREATE OR REPLACE TASK t_incremental
+  WAREHOUSE = etl_wh
+  SCHEDULE = '15 MINUTE'
+  USER_TASK_TIMEOUT_MS = 600000          -- fail fast, not silently hung
+  SUSPEND_TASK_AFTER_NUM_FAILURES = 3     -- stop cascading failure
+  AS CALL elt.sp_merge_orders();
+
+-- New tasks are created suspended
+ALTER TASK t_daily_billing RESUME;
+\end{lstlisting}
+
+Two governance facts deserve emphasis. First, tasks are created \emph{suspended}; forgetting \texttt{RESUME} is the most common first-day bug. Second, \texttt{USER\_TASK\_TIMEOUT\_MS} and \texttt{SUSPEND\_TASK\_AFTER\_NUM\_FAILURES} are not optional hardening---they are the difference between a stuck task burning credits for a weekend and a contained incident.
+
+\begin{pitfall}
+\textbf{Resuming a child task before its root} silently leaves the tree inert: child tasks resume into a waiting state and run only when the root fires and the dependency chain above them has succeeded. Operational runbooks should resume trees leaf-last, root-first---or script the resume order.
+\end{pitfall}
+
+\section{Tuesday: Task Trees and DAGs}
+\index{task tree}\index{AFTER clause}\index{DAG}
+A task graph forms when child tasks declare \texttt{AFTER <parent>}. Exactly one root carries the schedule; children inherit the graph's rhythm and run only after every declared parent succeeds in a given run. Dependencies can fan out (one parent, many children) and fan in (a child with multiple \texttt{AFTER} parents), producing arbitrary DAGs.
+
+\begin{lstlisting}[language=SQL, caption={A gated CDC task tree}]
+CREATE OR REPLACE TASK t_gate
+  WAREHOUSE = etl_wh
+  SCHEDULE = '5 MINUTE'
+  AS CALL elt.sp_noop();   -- anchor; children carry the guard
+
+CREATE OR REPLACE TASK t_merge_customers
+  AFTER t_gate
+  WHEN SYSTEM$STREAM_HAS_DATA('raw.customer_stream')
+  AS CALL elt.sp_merge_customers();
+
+CREATE OR REPLACE TASK t_merge_orders
+  AFTER t_gate
+  WHEN SYSTEM$STREAM_HAS_DATA('raw.order_stream')
+  AS CALL elt.sp_merge_orders();
+
+CREATE OR REPLACE TASK t_cleanup
+  AFTER t_merge_customers, t_merge_orders
+  AS CALL elt.sp_truncate_staging();
+\end{lstlisting}
+
+The \texttt{WHEN} clause deserves careful reading: it is a per-run precondition evaluated when the task's parents complete. If the predicate is false, the task \emph{skips}---and, critically, its children skip too. That makes a gated parent the standard ``don't run the graph when there's no data'' pattern, saving credits across an entire subtree.
+
+\begin{tipbox}
+Keep the root task a trivial anchor and push all gating logic into \texttt{WHEN} clauses on first-level children. Graphs whose root does heavy work are hard to re-point at new schedules without disturbing the tree.
+\end{tipbox}
+
+\subsection{Execution Semantics and Overlap}
+\index{task!overlap}
+A graph run that exceeds its schedule interval does not overlap itself: the next run starts only after the current one completes. Latency-sensitive graphs must therefore be designed so worst-case runtime fits inside the interval, or split so slow branches live on their own roots. \texttt{ALTER TASK ... SET TARGET\_COMPLETION\_INTERVAL} and query history make this measurable rather than assumed.
+
+\section{Wednesday: Serverless Tasks and Error Handling}
+\index{serverless task}\index{error notification}\index{ERROR\_INTEGRATION}
+Omitting \texttt{WAREHOUSE} makes a task \textbf{serverless}: Snowflake manages and autosizes the compute, billing per second of task compute. Serverless is the right default for short, frequent, spiky steps---a five-minute MERGE every five minutes leaves a warehouse-backed design paying for idle time between runs---while long, steady, or resource-hungry steps still justify a dedicated warehouse whose size you control.
+
+\subsection{Failure Containment}
+\index{SUSPEND\_TASK\_AFTER\_NUM\_FAILURES}
+Three mechanisms convert task failures from silent data rot into actionable incidents:
+\begin{enumerate}
+    \item \textbf{\texttt{ERROR\_INTEGRATION}} wires task failures to a notification integration (SNS to Slack or PagerDuty, or email), so the on-call engineer learns about the failure in minutes.
+    \item \textbf{\texttt{SUSPEND\_TASK\_AFTER\_NUM\_FAILURES}} halts a repeatedly failing task before it cascades: a root suspended after three failures stops the whole subtree rather than corrupting downstream layers.
+    \item \textbf{Idempotent steps} make retry safe. Every task body should be re-runnable: \texttt{MERGE} with keys, \texttt{INSERT OVERWRITE}, or swap-based rebuilds. A task whose retry double-applies work converts a transient failure into a data-quality incident.
+\end{enumerate}
+
+\begin{notebox}
+Task observability lives in \texttt{INFORMATION\_SCHEMA.TASK\_HISTORY} and \texttt{SNOWFLAKE.ACCOUNT\_USAGE.TASK\_HISTORY}: run states, error messages, durations, and skip reasons. Build the operations dashboard on day one, not after the first missed SLA.
+\end{notebox}
+
+\section{Thursday Hands-On Project: A Gated Three-Task CDC Graph}
+\index{hands-on project!tasks}
+This project assembles Chapters 6--7 machinery into a self-managing graph: gate on stream data, merge deltas, clean staging.
+
+\subsection*{Scenario}
+The retailer from Chapter 7 wants its MySQL-derived streams consumed every five minutes, but only when data exists, with staging truncated after successful application and on-call paged on failure.
+
+\subsection*{Procedure}
+\begin{enumerate}
+    \item Reuse \texttt{raw.customer\_stream} and the \texttt{MERGE} logic from Chapter 7, wrapping the merge in \texttt{elt.sp\_merge\_customers()}.
+    \item Create the anchor root \texttt{t\_gate} on a 5-minute schedule.
+    \item Create \texttt{t\_merge\_customers} with \texttt{AFTER t\_gate} and the \texttt{WHEN SYSTEM\$STREAM\_HAS\_DATA} guard.
+    \item Create \texttt{t\_cleanup} after the merge, truncating staging.
+    \item Attach an \texttt{ERROR\_INTEGRATION} notification integration and set \texttt{SUSPEND\_TASK\_AFTER\_NUM\_FAILURES = 3} on each task.
+    \item Resume in order (children, then root); insert test rows and watch one full run in \texttt{TASK\_HISTORY}.
+    \item Force a failure (bad privilege on the procedure); confirm the error notification fires and the task auto-suspends after three failures.
+    \item Fix the fault, resume, and prove the retry applied deltas exactly once.
+\end{enumerate}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item \textbf{DDL script:} procedures, three tasks, notification integration, resume sequence.
+    \item \textbf{Run evidence:} \texttt{TASK\_HISTORY} excerpts showing a skip (no data), a success, and a contained failure.
+    \item \textbf{Idempotency proof:} row counts unchanged across the recovery retry.
+    \item \textbf{Graph diagram:} dependencies, schedules, and gating predicates.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item No graph run occurs when the stream is empty; \texttt{TASK\_HISTORY} shows the skip reason.
+    \item Failures notify through the integration and the faulting task suspends after the configured threshold.
+    \item Cleanup runs only after the merge succeeds, demonstrated by an induced merge failure.
+    \item Post-fix retry neither loses nor duplicates deltas.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Convert the merge tasks to serverless and compare weekly credits against the warehouse-backed version.
+    \item Add a second stream-gated branch (orders) and show fan-out/fan-in at cleanup.
+    \item Build a \texttt{TASK\_HISTORY} health view: per-task success rate, mean duration, and skip ratio over 7 days.
+\end{itemize}
+
+\section{Friday Real-World Architecture: A 50-Transformation Orchestration Engine}
+\index{Real-World Architecture!ELT orchestration}
+An insurer runs roughly 50 dependent business transformations nightly: reference data, policy facts, claims marts, regulatory extracts. The mandate is serverless, self-healing, and free of external orchestrators.
+
+\subsection{Layered Graph Design}
+Fifty tasks in one tree is unmaintainable. The design layers graphs by medallion stage---a bronze root with its children, a silver root gated on bronze completion via a handoff check, and gold marts beneath---with each layer's root scheduled and cross-layer coupling expressed through a small \texttt{layer\_status} control table rather than deep cross-tree \texttt{AFTER} edges. Within a layer, independent marts fan out to maximize parallelism on serverless compute.
+
+\begin{figure}[H]
+    \centering
+    \resizebox{0.95\textwidth}{!}{%
+    \begin{tikzpicture}[
+        root/.style={rectangle, rounded corners, draw=primary, thick, fill=primary!8, align=center, minimum width=2.5cm, minimum height=0.9cm, font=\small\bfseries},
+        leaf/.style={rectangle, rounded corners, draw=codegreen!60!black, thick, fill=green!8, align=center, minimum width=2.2cm, minimum height=0.8cm, font=\scriptsize},
+        ctrl/.style={rectangle, rounded corners, draw=red!60!black, thick, fill=red!6, align=center, minimum width=3.2cm, minimum height=0.9cm, font=\scriptsize\bfseries},
+        arrow/.style={-{Stealth[length=2.2mm]}, draw=primary, thick},
+        lbl/.style={font=\scriptsize\itshape, text=codegray}
+    ]
+        \node[root] (broot) at (0, 0) {bronze root\\(CRON 01:00)};
+        \node[leaf] (b1) at (-2.6, -1.5) {policies};
+        \node[leaf] (b2) at (0, -1.5) {claims};
+        \node[leaf] (b3) at (2.6, -1.5) {reference};
+        \node[ctrl] (status) at (6.4, -1.5) {layer\_status\\control table};
+        \node[root] (sroot) at (6.4, -3.2) {silver root\\(gated on bronze OK)};
+        \node[leaf] (s1) at (3.8, -4.7) {policy mart};
+        \node[leaf] (s2) at (6.4, -4.7) {claims mart};
+        \node[leaf] (s3) at (9.0, -4.7) {reg extracts};
+        \draw[arrow] (broot) -- (b1);
+        \draw[arrow] (broot) -- (b2);
+        \draw[arrow] (broot) -- (b3);
+        \draw[arrow] (b1) |- (status);
+        \draw[arrow] (b2) -- (status);
+        \draw[arrow] (b3) |- (status);
+        \draw[arrow] (status) -- node[lbl, right]{all-green gate} (sroot);
+        \draw[arrow] (sroot) -- (s1);
+        \draw[arrow] (sroot) -- (s2);
+        \draw[arrow] (sroot) -- (s3);
+    \end{tikzpicture}%
+    }
+    \caption{Layered orchestration: intra-layer \texttt{AFTER} trees, inter-layer handoff through a control table.}
+    \label{fig:chapter8-orchestration}
+\end{figure}
+
+\subsection{Self-Healing Properties}
+\begin{itemize}
+    \item \textbf{Idempotent everything:} each transformation is a keyed \texttt{MERGE} or \texttt{INSERT OVERWRITE}, so any failed branch can simply resume and retry.
+    \item \textbf{Bounded blast radius:} \texttt{SUSPEND\_TASK\_AFTER\_NUM\_FAILURES = 3} per task; one poisoned feed stalls its branch, not the night.
+    \item \textbf{One notification surface:} a single error integration fans failures into the on-call channel with task name and error text from \texttt{TASK\_HISTORY}.
+    \item \textbf{Data-quality gates as tasks:} row-count reconciliation and freshness checks are themselves tasks whose failure suspends publication tasks downstream.
+\end{itemize}
+
+\begin{pitfall}
+\textbf{An orchestrator without backfill semantics rots.} When a night fails, operators need a sanctioned ``replay layer L for date D'' path---parameterized procedures reading a run-date control table---not fifty manual reruns in Snowsight.
+\end{pitfall}
+
+For context on when to outgrow in-platform orchestration, compare Airflow's model---external, Python-defined DAGs with rich cross-system operators---which Chapter 11's dynamic-table discussion revisits from the declarative side \cite{airflowDocs}.
+
+\section{Interview Q\&A}
+\begin{enumerate}
+    \item \textbf{Q: Which two schedule types can a task use?}\\
+    A: A fixed interval (\texttt{'n MINUTE'}) or a \texttt{USING CRON} expression with an explicit time zone.
+    \item \textbf{Q: How do child tasks declare dependencies?}\\
+    A: With \texttt{AFTER <parent>} clauses; a child runs only when all declared parents succeed in that graph run.
+    \item \textbf{Q: What is a serverless task and how is it billed?}\\
+    A: A task without a named warehouse, run on Snowflake-managed autosized compute and billed per second of task compute.
+    \item \textbf{Q: Why must every task step be idempotent?}\\
+    A: Because retries after failure must not double-apply work; keyed MERGEs and INSERT OVERWRITE make re-runs no-ops.
+    \item \textbf{Q: How do you alert on a task-graph failure?}\\
+    A: Attach \texttt{ERROR\_INTEGRATION} to push failures to SNS/email, and set \texttt{SUSPEND\_TASK\_AFTER\_NUM\_FAILURES} to contain cascades.
+\end{enumerate}
+
+\section{Further Reading}
+Snowflake's task documentation covers scheduling, graphs, serverless compute, and monitoring views \cite{snowflakeTasksDocs,snowflakeAlertsDocs}. Airflow's documentation is the benchmark for external orchestration and a useful contrast when deciding what belongs in-platform \cite{airflowDocs}.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item Tasks combine schedule, compute, precondition, and body; they are created suspended and need explicit \texttt{RESUME}.
+    \item Task graphs fan out and fan in through \texttt{AFTER}; \texttt{WHEN} predicates skip work---and its subtree---when no data exists.
+    \item Serverless tasks fit short, frequent, spiky steps; steady heavy steps belong on controlled warehouses.
+    \item Error integrations, failure suspension, and idempotent bodies turn failures into contained, pageable incidents.
+    \item At 50+ transformations, layer graphs with control-table handoffs rather than one monolithic tree.
+    \item \texttt{TASK\_HISTORY} is the operational source of truth; build its dashboard on day one.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Explain the resume-order rule for task trees and what breaks when it is violated.
+    \item \textbf{(Conceptual)} A 5-minute task regularly runs 7 minutes. What happens to the schedule, and what are two remedies?
+    \item \textbf{(Conceptual)} Contrast \texttt{WHEN} gating on a parent versus on each child.
+    \item \textbf{(Hands-on)} Build a fan-in graph where a report task waits on three independent merge tasks.
+    \item \textbf{(Hands-on)} Convert a warehouse task to serverless and compare credits over 24 hours of 5-minute runs.
+    \item \textbf{(Design)} Design the control-table schema for cross-layer handoffs, including stale-layer detection.
+    \item \textbf{(Design)} Specify the backfill interface (parameters, procedures, and operator steps) for replaying a failed night.
+    \item \textbf{(Operations)} Write a \texttt{TASK\_HISTORY} query listing yesterday's failures with root-cause error text and affected subtrees.
+    \item \textbf{(Cost)} Estimate monthly serverless task credits for the insurer's 50-task graph given per-task durations.
+    \item \textbf{(Interview)} Argue when an organization should keep Airflow instead of moving orchestration into Snowflake tasks.
+\end{enumerate}
+
+\section{Capstone Project: Real-Time CDC and Automated ELT Pipeline}\label{sec:ch8-capstone}
+\index{capstone project!Milestone 2}
+\begin{capstonebox}
+\textbf{Mission.} Integrate Weeks 5--8 into one continuous ingestion engine: an external S3 stage with storage integration feeding auto-ingest Snowpipe into a raw VARIANT landing table; a standard stream tracking changes; and a serverless task DAG that parses JSON, executes incremental \texttt{MERGE} statements into a Gold schema, and sends error alerts on failure.
+
+\textbf{Estimated time.} 6--9 hours across the four weeks' labs.
+
+\textbf{Deliverable checklist.}
+\begin{itemize}
+    \item End-to-end ingestion runs from a clean environment following a committed README.
+    \item Architecture diagram: stage $\rightarrow$ pipe $\rightarrow$ stream $\rightarrow$ task DAG $\rightarrow$ Gold, with SNS error notifications.
+    \item At least three automated data-quality checks (row-count reconciliation, duplicate-key detection, JSON parse-failure quarantine) with a failing-case demonstration.
+    \item Monitoring evidence: exported pipe error-integration and task error-notification configuration.
+    \item Monthly cost estimate (Snowpipe credits plus serverless tasks) with two documented optimization decisions.
+    \item Security review: scoped storage-integration IAM, no hardcoded secrets, least-privilege roles on stream and task objects.
+\end{itemize}
+\end{capstonebox}
+
+The gating task---the capstone's hardest element---follows the pattern from Wednesday:
+
+\begin{lstlisting}[language=SQL, caption={Serverless task gated on the stream offset}]
+CREATE OR REPLACE TASK t_merge_customers  -- no WAREHOUSE = serverless
+  AFTER t_gate
+WHEN SYSTEM$STREAM_HAS_DATA('raw.customer_stream')
+AS
+  CALL sp_merge_customers();  -- idempotent MERGE procedure
+\end{lstlisting}
+
+Watch three pitfalls from the field: an unconsumed stream goes stale after 14 days (monitor \texttt{STALE} and re-snapshot); SQS events redeliver, so a non-idempotent MERGE double-applies changes; and an S3 event rule on the wrong prefix silently starves the pipe.

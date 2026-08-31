@@ -1,0 +1,320 @@
+\chapter{Advanced Streaming with Spark Structured Streaming on Databricks}
+\index{Structured Streaming}\index{watermark!Spark}\index{state store}\index{checkpointing}\index{exactly-once}\index{stream-stream join}%
+\begin{objectives}
+\begin{itemize}
+    \item Consume Event Hubs from Spark Structured Streaming through the Kafka-compatible endpoint with secrets from Key Vault.
+    \item Explain micro-batch versus continuous processing and their latency/throughput trade-offs.
+    \item Manage streaming state: watermarks, the RocksDB state-store provider, and why unbounded state kills jobs.
+    \item Deliver end-to-end exactly-once semantics via checkpointing plus an idempotent Delta merge sink.
+    \item Write stream-stream joins with watermark constraints that bound state retention on both sides.
+    \item Apply checkpoint-location discipline across deployments so changed queries never replay or corrupt state.
+    \item Design a real-time HL7 anonymization pipeline from Event Hubs through Databricks into Synapse.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+Structured Streaming's model---a stream as an unbounded table, micro-batches, watermarks, checkpoints---maps directly onto the streaming engines of the other platforms.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{3.0cm}p{2.9cm}p{3.1cm}p{3.2cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{AWS} & \textbf{Azure} & \textbf{GCP} \\
+\midrule
+Spark streaming host & EMR / Glue streaming & Azure Databricks & Dataproc / Serverless Spark \\
+Stream source & Kinesis / MSK connector & Event Hubs (Kafka endpoint) & Pub/Sub / Kafka connector \\
+State store & RocksDB on EMR & Default or RocksDB provider & RocksDB on Dataproc \\
+Exactly-once sink & Delta/Iceberg merge & Delta Lake merge & BigQuery Storage Write API \\
+Checkpoint storage & S3 & ADLS Gen2 & GCS \\
+\addlinespace
+\multicolumn{4}{@{}l@{}}{\textbf{Fabric}: Spark structured streaming on OneLake; \textbf{Snowflake}: Snowpipe Streaming + tasks; \textbf{MongoDB}: Atlas Stream Processing.} \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+The Structured Streaming programming guide \cite{apache2025structuredStreaming} is platform-neutral reading; everything in this chapter about watermarks and state applies identically on EMR and Dataproc.
+\end{crosscloud}
+
+\begin{keyterms}
+\textbf{Micro-batch}: the default execution mode---the stream processed as a sequence of small batch jobs.\quad
+\textbf{Watermark}: a threshold on event time beyond which state for old windows/keys is evicted.\quad
+\textbf{State store}: the per-partition store holding aggregation and join state between micro-batches.\quad
+\textbf{Checkpoint}: the durable directory binding offsets, state, and query plan for exactly-once recovery.\quad
+\textbf{Stream-stream join}: a join of two unbounded streams, kept finite by watermark and time-range constraints.
+\end{keyterms}
+
+\section{Week 15 Overview: When SQL-Over-Streams Is Not Enough}
+Chapter 14's Stream Analytics covers rules expressible in SQL over bounded windows. This chapter covers everything else: sessionization with custom logic, ML model scoring in the stream, joins between two live streams, and stateful computations ASA cannot express. Spark Structured Streaming treats a stream as an unbounded table and the query as an incremental computation over it \cite{apache2025structuredStreaming}---the same DataFrame API as Chapter 9, extended with triggers, watermarks, and checkpoints.
+
+The price of this power is \emph{state ownership}. ASA managed state invisibly; Structured Streaming makes you declare how long state lives (watermarks), where it lives (state-store provider), and how it survives restarts (checkpoints). This chapter is about that ownership.
+
+\section{Monday: State Management---Watermarks, Stores, and Checkpoints}
+\index{state store}\index{RocksDB}\index{checkpointing}
+
+\subsection{Why Unbounded State Kills Jobs}
+A stateful query---a \texttt{groupBy} aggregation, a deduplication, a join---keeps state per key. Without eviction, state for every key ever seen accumulates until executors exhaust memory and the job dies, usually weeks after deployment when the keyspace has grown. The \textbf{watermark} is the eviction rule: \texttt{withWatermark("event\_time", "10 minutes")} tells the engine it may discard state for windows whose event time is more than ten minutes behind the current maximum. Watermarks are the boundary between a streaming job and a memory leak.
+
+\subsection{State-Store Providers}
+The default in-memory state store keeps state in executor JVM memory with a write-ahead log in the checkpoint; it suits moderate state. The \textbf{RocksDB provider} spills state to an embedded key-value store on local disk, scaling to hundreds of millions of keys per executor at the cost of serialization overhead. Choose RocksDB when state size is the scaling constraint; measure the per-batch commit latency either way.
+
+\subsection{Checkpoints Bind Everything}
+The checkpoint directory holds source offsets, state-store snapshots, and the query plan. This is what makes recovery exact---and what makes the directory sacred. A changed query started from an old checkpoint can replay data, corrupt state, or refuse to start. The discipline: \textbf{version checkpoint paths per deployment} (\texttt{.../ad-join/v3}), start materially changed queries from fresh locations, and backfill from the source when history matters.
+
+\begin{pitfall}
+\textbf{Reusing a checkpoint directory after changing the query.} Offsets, state schema, and plan are bound together in the checkpoint. New logic plus old state is undefined behavior; version the path and reprocess deliberately.
+\end{pitfall}
+
+\section{Tuesday: Micro-Batch, Continuous, and Exactly-Once}
+\index{micro-batch}\index{continuous processing}\index{exactly-once}
+
+\subsection{Execution Modes}
+\textbf{Micro-batch} (the default) processes the stream in sub-second-to-minutes batches: high throughput, hundred-millisecond-to-second latencies, and the mature path for stateful operations. \textbf{Continuous processing} runs long-lived operators for single-digit-millisecond latency, but with a restricted operator set and at-least-once semantics---appropriate for stateless, ultra-low-latency forwarding, rare in practice. The realistic choice for nearly all production streaming is micro-batch with a tuned trigger interval.
+
+\subsection{End-to-End Exactly-Once}
+Exactly-once is a property of the \emph{pipeline}, not the engine. The recipe: (1) replayable source (Event Hubs offsets survive), (2) checkpointed query (offsets and state recover together), (3) \textbf{idempotent sink}---a Delta merge keyed on the event's unique id, or a sink that tracks which batch wrote which rows. The weaker alternative---at-least-once delivery plus downstream deduplication---moves the dedup cost to every consumer forever; prefer paying it once, in the sink.
+
+\begin{definitionbox}
+\textbf{End-to-end exactly-once} means each input record affects the final output exactly once, across failures. It requires replayable sources, deterministic processing with checkpointed state, and sinks that are idempotent or transactional with the checkpoint.
+\end{definitionbox}
+
+\section{Wednesday: Event Hubs via Kafka and Stream-Stream Joins}
+\index{Kafka!Structured Streaming}\index{stream-stream join}
+
+\subsection{Consuming the Hub}
+Event Hubs' Kafka endpoint plugs straight into Spark's Kafka source; the connection string comes from Key Vault via Databricks secrets:
+
+\begin{lstlisting}[language=Python,caption={Structured Streaming from the Event Hubs Kafka endpoint.},label={lst:ch15-kafka}]
+from pyspark.sql import functions as F
+
+EH_CONN = dbutils.secrets.get("kv-scope", "eventhubs-conn-str")
+kafka_options = {
+    "kafka.bootstrap.servers": "<ns>.servicebus.windows.net:9093",
+    "subscribe": "iot-telemetry",
+    "kafka.security.protocol": "SASL_SSL",
+    "kafka.sasl.mechanism": "PLAIN",
+    "kafka.sasl.jaas.config": (
+        "kafkashaded.org.apache.kafka.common.security.plain."
+        'PlainLoginModule required username="$ConnectionString" '
+        f'password="{EH_CONN}";'
+    ),
+}
+
+raw = (spark.readStream.format("kafka").options(**kafka_options).load()
+       .select(F.from_json(F.col("value").cast("string"),
+               "deviceId STRING, tempC DOUBLE, ts DOUBLE").alias("e"))
+       .select("e.*")
+       .withColumn("event_time", F.from_unixtime("ts").cast("timestamp")))
+
+agg = (raw.withWatermark("event_time", "10 minutes")
+       .groupBy(F.window("event_time", "5 minutes"), "deviceId")
+       .agg(F.avg("tempC").alias("avg_temp")))
+
+(agg.writeStream.format("delta")
+    .outputMode("append")
+    .option("checkpointLocation",
+            "abfss://checkpoints@<adls>.dfs.core.windows.net/iot/v1")
+    .toTable("iot_agg"))
+\end{lstlisting}
+
+\subsection{Stream-Stream Joins with Bounded State}
+Joining two live streams---ad impressions to ad clicks---requires both sides to declare watermarks \emph{and} a time-range join condition, so the engine knows when join state for a key can be evicted:
+
+\begin{lstlisting}[language=Python,caption={Watermarks on both sides bound how long join state is retained.},label={lst:ch15-streamjoin}]
+impressions = impressions.withWatermark("impression_ts", "10 minutes")
+clicks = clicks.withWatermark("click_ts", "20 minutes")
+
+joined = impressions.join(
+    clicks,
+    F.expr("""click_ad_id = impression_ad_id
+              AND click_ts BETWEEN impression_ts
+              AND impression_ts + INTERVAL 30 MINUTES"""),
+    "leftOuter",
+)
+
+(joined.writeStream.format("delta")
+    .outputMode("append")
+    .option("checkpointLocation",
+            "abfss://checkpoints@<adls>.dfs.core.windows.net/ad-join/v1")
+    .toTable("ad_attribution"))
+\end{lstlisting}
+
+Without the watermark-plus-interval pair, the join retains state forever---the unbounded-state failure wearing a join's clothes.
+
+\begin{tipbox}
+Set the two watermarks asymmetrically on purpose: the side expected to arrive later (here, clicks after impressions) gets the longer watermark. The interval condition then expresses the business window---``a click counts if within 30 minutes of the impression.''
+\end{tipbox}
+
+\section{Thursday Hands-on Project: Event Hubs to Delta with Windowed Aggregation}
+\index{hands-on lab}\index{Structured Streaming!project}
+Implement Listing~\ref{lst:ch15-kafka} end-to-end against the Chapter 13 hub: consume telemetry through the Kafka endpoint, aggregate into five-minute windows with a ten-minute watermark, and append results into a Delta table.
+
+\subsection{Setup}
+Create the Databricks secret scope backed by Key Vault; store the Event Hubs connection string; create the checkpoints container in the lake. Run the Chapter 13 producer so the stream has live data.
+
+\subsection{Run and Observe}
+Start the stream; in the Spark UI watch \texttt{inputRate} versus \texttt{processingRate}---when processing lags input, micro-batches grow. Stop the query, restart it, and confirm it resumes from the checkpoint with no reprocessing beyond the watermark. Query \texttt{iot\_agg} from the Chapter 7 serverless pool to close the lakehouse loop.
+
+\subsection{Break It Deliberately}
+(1) Send events with \texttt{ts} twenty minutes old: watch them evicted by the watermark and count them in the stream metrics. (2) Change the aggregation and restart from the same checkpoint: observe the failure or corruption risk, then restart from a versioned path (\texttt{/iot/v2}) and document the difference.
+
+\section{Friday Use Case: Real-Time HL7 Anonymization}
+\index{use case}\index{HL7}\index{anonymization}
+A hospital network must stream HL7 admission/discharge/transfer messages into analytics, but PHI may never persist unmasked. Design: producers publish to Event Hubs partitioned by facility; a Structured Streaming job parses HL7 segments, tokenizes patient identifiers via a lookup against a Key Vault-backed token service (batch the lookups per micro-batch to bound latency), writes the anonymized stream to the curated Delta zone, and lets Synapse serverless views serve analysts---the Chapter 23 compliance chapter owns the full erasure story this design must support.
+
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[node distance=1.3cm]
+        \node[stage] (hl7) {HL7 feeds\\(facilities)};
+        \node[stage, right=1.4cm of hl7] (eh) {Event Hubs\\partition by facility};
+        \node[stage, right=1.4cm of eh] (dbx) {Structured Streaming\\parse + tokenize};
+        \node[store, right=1.4cm of dbx] (delta) {Curated Delta\\(de-identified)};
+        \node[stage, right=1.4cm of delta] (syn) {Synapse\\serverless views};
+        \node[doc, above=0.9cm of dbx] (kv) {Key Vault\\token service};
+        \node[doc, below=0.9cm of dbx] (chk) {Checkpoints\\(versioned)};
+        \draw[arrow] (hl7) -- (eh);
+        \draw[arrow] (eh) -- (dbx);
+        \draw[arrow] (dbx) -- (delta);
+        \draw[arrow] (delta) -- (syn);
+        \draw[arrow, dashed] (kv) -- (dbx);
+        \draw[arrow, dashed] (dbx) -- (chk);
+    \end{tikzpicture}%
+    }
+    \caption{Real-time HL7 anonymization: tokenize in motion, persist only de-identified data, serve through governed views.}
+    \label{fig:ch15-hl7}
+\end{figure}
+
+\begin{pitfall}
+\textbf{PHI in checkpoints and logs.} The state store and the driver's logs are persistence too. If PHI enters the stream, it enters checkpoints; design the tokenization to happen before any stateful operator, and scope checkpoint containers with the same ACL rigor as curated data.
+\end{pitfall}
+
+\section{Architectural Decision Record Template}
+\index{architectural decision record}
+Per streaming job record: trigger interval with the latency SLO, watermark with the late-data contract, state-store provider with state-size evidence, checkpoint path versioning policy, sink idempotency mechanism, and the backfill procedure for changed logic.
+
+\section{Operational Deep Dive: Lag, Restarts, and Backfills}
+\index{streaming!operations}
+Operate a stream on three signals: \textbf{input vs.\ processing rate} (growing gap $\rightarrow$ scale or optimize), \textbf{batch duration} (approaching the trigger interval $\rightarrow$ you are at capacity), and \textbf{state size} (growing without bound $\rightarrow$ watermark too generous or keys unbounded). For deploys, the runbook is: stop, bump the checkpoint path version, deploy, start, and---if the change altered semantics---backfill the affected window from the lake's captured bronze data.
+
+\section{Troubleshooting Patterns}
+\index{troubleshooting!Structured Streaming}
+Job OOMs after weeks of health $\rightarrow$ state growth; audit watermarks and key cardinality. Restart reprocesses hours of data $\rightarrow$ checkpoint lost or path reused after a query change. Kafka auth failures $\rightarrow$ the \texttt{\$ConnectionString} JAAS literal misquoted or the secret rotated without a job restart. Delta sink duplicates $\rightarrow$ sink is append-only without idempotency keys; exactly-once requires the merge.
+
+\section{Week 15 Lab Rubric}
+\index{rubric}
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.2cm}p{5.0cm}p{5.0cm}@{}}
+\toprule
+\textbf{Criterion} & \textbf{Meets expectation} & \textbf{Needs improvement} \\
+\midrule
+State discipline & Watermarks on every stateful op; state size monitored & Unbounded state discovered post-mortem \\
+Checkpointing & Versioned paths; restart resumes exactly; changed query starts fresh & Checkpoint reused across logic changes \\
+Delivery & Idempotent Delta sink demonstrated under forced retry & Append-only sink with visible duplicates \\
+Security & Secrets via Key Vault scope; checkpoint ACLs considered & Connection strings in notebooks \\
+\bottomrule
+\end{tabular}
+\caption{Week 15 rubric for the streaming deliverables.}
+\label{tab:ch15-rubric}
+\end{table}
+
+\section{Interview Q\&A}
+\subsection{Concepts and Trade-offs}
+\begin{enumerate}
+    \item \textbf{Q: Micro-batch vs.\ continuous processing---what is the trade-off?}\\
+    A: Micro-batch offers full operators and exactly-once at sub-second latency; continuous offers millisecond latency with a restricted operator set and at-least-once semantics.
+    \item \textbf{Q: Why does unbounded state kill a streaming job, and how do watermarks evict it?}\\
+    A: State per key accumulates until memory is exhausted; the watermark tells the engine it may evict state older than the tolerance behind the event-time frontier.
+    \item \textbf{Q: What must both sides of a stream-stream join declare?}\\
+    A: A watermark each, plus a time-range join condition, so join state retention is bounded on both sides.
+    \item \textbf{Q: Contrast checkpointing plus an idempotent Delta sink with at-least-once plus downstream dedup.}\\
+    A: The former pays dedup cost once in the sink and gives consumers clean data; the latter pushes dedup to every consumer forever.
+\end{enumerate}
+
+\section{Further Reading}
+The Structured Streaming programming guide \cite{apache2025structuredStreaming} is the canonical reference. The Spark project \cite{apache2025spark} and Delta Lake paper \cite{armbrust2020delta} cover the engine and the sink; the Event Hubs documentation \cite{microsoft2025eventhubs} covers the Kafka endpoint configuration used here.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item Structured Streaming treats streams as unbounded tables; state, not syntax, is the new responsibility.
+    \item Every stateful operator needs a watermark; unbounded state is a memory leak with a time delay.
+    \item RocksDB scales the state store; measure commit latency when you switch.
+    \item Exactly-once is replayable source + checkpointed state + idempotent sink; anything less is at-least-once with marketing.
+    \item Stream-stream joins need watermarks on both sides and an interval condition.
+    \item Checkpoint paths are versioned deployment artifacts; changed logic starts fresh and backfills deliberately.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Explain what the checkpoint directory contains and why each part matters at recovery.
+    \item \textbf{(Conceptual)} Why does a deduplication query need a watermark just as much as a windowed aggregation?
+    \item \textbf{(Conceptual)} What changes when you switch the state store to RocksDB, and what would you measure before and after?
+    \item \textbf{(Hands-on)} Complete the Thursday project including both deliberate-breaking experiments; record the outcomes.
+    \item \textbf{(Hands-on)} Add a deduplication on \texttt{eventId} with \texttt{dropDuplicates} and a watermark; show the state-size difference versus no watermark.
+    \item \textbf{(Hands-on)} Implement the ad-attribution join from Listing~\ref{lst:ch15-streamjoin} with simulated late clicks and verify the 30-minute attribution window.
+    \item \textbf{(Design)} Write the ADR for the HL7 pipeline: tokenization placement, checkpoint ACLs, and the erase-support story.
+    \item \textbf{(Design)} Design the backfill procedure for a changed aggregation: which window, from which bronze data, into which table version.
+    \item \textbf{(Design)} Specify SLOs (lag, batch duration, state size) with alert thresholds for the \texttt{iot\_agg} job.
+    \item \textbf{(Interview)} Prepare a two-minute answer to ``the stream was fine for a month and then OOMed overnight---why?''
+\end{enumerate}
+
+\section{Capstone Project: Exactly-Once Windowed Aggregation from Event Hubs}\label{sec:ch15-capstone}
+\index{capstone project}\index{Structured Streaming!capstone}
+
+\begin{capstonebox}
+\textbf{Mission:} Deliver an exactly-once streaming aggregation: Kafka-endpoint consumption, watermark-bounded state, versioned checkpoints, an idempotent Delta sink, and operational evidence---rates, state size, and a clean restart.
+
+\textbf{Estimated time:} 4--5 hours.
+
+\textbf{What you will practice:}
+\begin{itemize}
+    \item Key Vault-scoped Kafka configuration against Event Hubs.
+    \item Watermark and state-store selection with measurements.
+    \item Checkpoint versioning and restart behavior.
+    \item Idempotent sinks proven under forced failure.
+\end{itemize}
+\end{capstonebox}
+
+\subsection*{Scenario}
+The games publisher from Chapter 13 wants five-minute engagement aggregates in a Delta table for live dashboards, with a guarantee that a consumer crash or deploy never double-counts a session.
+
+\subsection*{Requirements}
+\begin{itemize}
+    \item \textbf{Source:} Kafka endpoint with Key Vault-scoped credentials; partition-aligned consumption.
+    \item \textbf{State:} watermark matching the documented late-data contract; state size graphed over a run.
+    \item \textbf{Delivery:} Delta sink with merge-based idempotency; forced-crash test with zero duplicates.
+    \item \textbf{Deployment:} versioned checkpoint paths; a documented query-change procedure.
+\end{itemize}
+
+\subsection*{Reference Architecture}
+Figure~\ref{fig:ch15-hl7}'s backbone applies with the games schema: hub $\rightarrow$ Structured Streaming (windowed aggregation) $\rightarrow$ curated Delta $\rightarrow$ serverless views, checkpoints versioned per deployment.
+
+\subsection*{Implementation Steps}
+\begin{enumerate}
+    \item Configure the secret scope and Kafka options (Listing~\ref{lst:ch15-kafka}).
+    \item Run the windowed aggregation; record rate and state-size metrics.
+    \item Crash the consumer mid-batch; restart; prove no duplicates via the sink's merge key.
+    \item Change the aggregation; deploy to a new checkpoint version; backfill the affected window.
+\end{enumerate}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item Notebook, job definition, and checkpoint-versioning runbook.
+    \item Metrics evidence: input/processing rates, batch durations, state size.
+    \item The duplicate-proof test write-up.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item Forced mid-batch failure followed by restart produces exactly-once output.
+    \item Late events beyond the watermark are evicted and counted, not silently absorbed.
+    \item A changed query never starts from a stale checkpoint.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Switch to the RocksDB provider and benchmark commit latency at 10$\times$ key cardinality.
+    \item Add a stream-stream join to the pipeline with asymmetric watermarks.
+    \item Implement Trigger.AvailableNow for a cost-optimized hourly micro-batch variant and compare lag.
+\end{itemize}

@@ -1,0 +1,324 @@
+% NOTE: Filename is fixed by the book outline; content teaches Week 19
+% (MLOps & SageMaker Pipelines) of the syllabus.
+\chapter{MLOps: Feature Stores, Pipelines, and Model Monitoring}
+\index{MLOps}\index{Feature Store}\index{SageMaker Pipelines}\index{Model Registry}\index{Model Monitor}\index{data drift}\index{concept drift}\index{lineage}%
+\begin{objectives}
+\begin{itemize}
+    \item Operate SageMaker Feature Store with online and offline stores and reason about training/serving skew.
+    \item Build SageMaker Pipelines: Preprocess $\rightarrow$ Train $\rightarrow$ Evaluate $\rightarrow$ Register, with quality gates.
+    \item Gate deployments through the Model Registry with approval states.
+    \item Configure Model Monitor baselines and schedules to detect data drift and quality violations.
+    \item Architect a drift-triggered retraining loop with human approval before redeployment.
+    \item Trace lineage across features, training jobs, model versions, and endpoints.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+MLOps primitives---feature stores, pipeline orchestration, registries, drift monitoring---are platform-standard; the AWS names map one-for-one.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{2.8cm}p{3.0cm}p{3.0cm}p{3.0cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{AWS} & \textbf{Azure} & \textbf{GCP} \\
+\midrule
+Feature store & SageMaker Feature Store & Fabric feature store / Feathr & Vertex AI Feature Store \\
+ML pipelines & SageMaker Pipelines & Azure ML pipelines & Vertex AI Pipelines (KFP) \\
+Model registry & SageMaker Model Registry & Azure ML registry & Vertex AI Model Registry \\
+Drift monitoring & SageMaker Model Monitor & Azure ML monitoring & Vertex AI Model Monitoring \\
+Retrain trigger & EventBridge + pipeline & Logic Apps/Functions + pipeline & Eventarc + pipeline \\
+\addlinespace
+Online store backing & DynamoDB-backed records & Cosmos-backed & Bigtable-backed \\
+Lineage & SageMaker Lineage + OpenLineage & MLflow tracking & Vertex ML Metadata \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+\textbf{Snowflake}'s Feature Store and Model Registry bring the same lifecycle inside the warehouse. \textbf{Databricks} MLflow is the open-source reference many of these services interoperate with. \textbf{MongoDB} typically appears as the online-serving store behind low-latency feature lookups in self-managed stacks.
+\end{crosscloud}
+
+\section{Week 19 Roadmap and Mental Model}
+Week~18 trained and deployed a model. Week~19 makes that a \emph{lifecycle}: models are retrained on fresh features, gated by quality thresholds, registered as immutable versions, monitored in production, and rolled back when reality disagrees with them. The discipline is called MLOps, and its artifacts will feel familiar: pipelines, registries, gates, monitors, runbooks---the data-engineering practices of Part~3 applied to models \cite{awsSageMakerPipelinesDocs}.
+
+Three systems carry the week. \textbf{Feature Store} makes features shared, versioned, and consistent between training and serving. \textbf{SageMaker Pipelines} makes the path from data to registered model a code artifact. \textbf{Model Monitor} watches production traffic against a baseline and turns drift into events---which EventBridge routes back into the pipeline, closing the loop.
+
+\begin{definitionbox}
+\textbf{MLOps} is the application of CI/CD and observability discipline to machine learning: versioned features, reproducible training pipelines, gated model registration, monitored production behavior, and controlled retraining and rollback.
+\end{definitionbox}
+
+\begin{keyterms}
+\textbf{Feature group}: a Feature Store table of related features keyed by record ID and event time. \textbf{Online store}: low-latency lookup for inference. \textbf{Offline store}: S3-backed history for training. \textbf{Pipeline}: a DAG of steps (processing, training, evaluation, registration) defined in Python. \textbf{Model Registry}: versioned model packages with approval states. \textbf{Baseline}: the training-data statistics and constraints Model Monitor compares production traffic against. \textbf{Data drift}: input distribution change; \textbf{concept drift}: the input-to-outcome relationship changing.
+\end{keyterms}
+
+\section{Monday: SageMaker Feature Store---Online and Offline}
+\subsection{One Definition, Two Stores}
+A feature group declares feature names, types, a record identifier, and an event-time column. Writes flow to two stores \cite{awsFeatureStoreDocs}: the \emph{online store} (millisecond \texttt{GetRecord} lookups for inference) and the \emph{offline store} (an S3-backed, catalog-registered table for training-set construction and point-in-time-correct joins). The same definition serves both, which is the entire point: \textbf{the feature a model trained on is the feature the endpoint receives}---same computation, same values, no hand-ported transformation.
+\index{feature group}\index{online store}\index{offline store}
+
+\subsection{Training/Serving Skew and Point-in-Time Correctness}
+The classic ML production bug is skew: features computed one way in a training notebook and another way in the serving path. Feature Store's answer is structural---one ingestion path feeding both stores. Its second answer is \emph{point-in-time correctness}: offline queries can reconstruct \emph{as of} timestamps, so training examples join features as they were when the label was known, preventing the future from leaking into training.
+\index{training-serving skew}\index{point-in-time join}
+
+\begin{pitfall}
+\textbf{Computing features twice.} When transforms are coded once for training and again for serving, they will drift---different null handling, different rounding, different time zones. If you cannot use Feature Store, put the transformation in one shared library both paths call. The mechanism is negotiable; the single definition is not.
+\end{pitfall}
+
+\section{Tuesday: SageMaker Pipelines}
+\subsection{The Pipeline as the Product}
+A SageMaker Pipeline defines ML workflow steps in Python---\texttt{ProcessingStep} (feature prep), \texttt{TrainingStep}, evaluation, \texttt{ConditionStep} gates, and \texttt{RegisterModel}---executed on managed infrastructure with per-step caching and full lineage \cite{awsSageMakerPipelinesDocs}. Parameters (input S3 URI, instance types, thresholds) make one definition serve experimentation and production. Caching means rerunning with unchanged inputs reuses prior outputs---iteration is cheap; correctness is enforced.
+
+\begin{lstlisting}[language=Python,caption={The quality gate: register only when F1 clears the bar.},label={lst:ch19-pipeline-gate}]
+cond = ConditionStep(
+    name="QualityGate",
+    conditions=[ConditionGreaterThanOrEqualTo(
+        left=JsonGet(step=eval_step, property_file=metrics,
+                     json_path="classification.f1"),
+        right=0.80)],
+    if_steps=[register_step],
+    else_steps=[FailStep(name="RejectModel",
+                         error_message="F1 below 0.80")],
+)
+\end{lstlisting}
+
+The \texttt{ConditionStep} is where engineering judgment becomes policy: no metric, no registration. Note what this implies---every pipeline needs an evaluation step that produces a machine-readable metrics file, which forces the team to state its acceptance criteria in code.
+
+\subsection{Model Registry: Versions and Approvals}
+Registered models are immutable versioned packages: artifact location, metrics, approval status (\texttt{PendingManualApproval} $\rightarrow$ \texttt{Approved}), and lineage back to the training job and dataset. Deployment automation keys on approval: the CD system (Chapter~24) deploys only \texttt{Approved} versions, so ``who approved this model in production?'' always has an auditable answer.
+\index{Model Registry}
+
+\section{Wednesday: Model Monitor---Drift as an Event}
+\subsection{Baselines and Schedules}
+Model Monitor learns a baseline from the training data---per-feature distributions and constraints---then runs scheduled jobs comparing captured production traffic against it \cite{awsModelMonitorDocs}. Violations (a feature's distribution shifted, nulls appeared, types changed) emit events. Two monitoring modes matter: \emph{data quality} (inputs versus baseline) and \emph{model quality} (predictions versus ground truth, when labels arrive later).
+\index{Model Monitor}\index{baseline}
+
+\textbf{Data drift versus concept drift.} Data drift: the inputs changed (a new traffic source, a broken upstream feed emitting nulls). Concept drift: the relationship between inputs and outcomes changed (customer behavior shifted after a pricing change). Data drift is detectable immediately from features alone; concept drift requires delayed ground truth. Both are events to respond to, not curiosities to report.
+
+\begin{pitfall}
+\textbf{A baseline computed from stale training data.} If the baseline is six months old, Monitor reports drift against a world that no longer exists, and the team learns to ignore alerts---the worst possible outcome. Refresh baselines on a cadence tied to retraining, and treat alert fatigue as a monitoring bug.
+\end{pitfall}
+
+\begin{tipbox}
+Treat drift alerts as incidents, not curiosities: violations publish to SNS with a runbook that defines who acknowledges, what the rollback path is (previous Model Registry version), and when retraining auto-triggers. Gate automatic retraining behind a human approval step---drift can also mean broken upstream ingestion, and retraining on corrupt data makes things worse.
+\end{tipbox}
+
+\section{Thursday Hands-on Project: A SageMaker Pipeline, End to End}
+\index{hands-on project!SageMaker Pipeline}
+Build and execute a SageMaker Pipeline---Preprocess $\rightarrow$ Train $\rightarrow$ Evaluate $\rightarrow$ Register---from a notebook, with a quality gate.
+
+\subsection*{Lab Objectives}
+\begin{itemize}
+    \item Define the four-step pipeline with parameters for input data and thresholds.
+    \item Execute from a notebook and inspect per-step outputs and lineage.
+    \item Demonstrate the gate: one run passes, one fails on an injected quality drop.
+    \item Approve the registered version in the Registry.
+\end{itemize}
+
+\subsection*{Procedure}
+The pipeline definition (abridged to its skeleton; the full script lives in the lab repository):
+
+\begin{lstlisting}[language=Python,caption={Pipeline skeleton: four steps and a gate.},label={lst:ch19-pipeline}]
+from sagemaker.workflow.pipeline import Pipeline
+from sagemaker.workflow.parameters import ParameterString, ParameterFloat
+from sagemaker.workflow.steps import ProcessingStep, TrainingStep
+from sagemaker.workflow.conditions import ConditionGreaterThanOrEqualTo
+from sagemaker.workflow.condition_step import ConditionStep
+from sagemaker.workflow.fail_step import FailStep
+from sagemaker.workflow.properties import PropertyFile
+
+input_data = ParameterString(name="InputData")
+f1_threshold = ParameterFloat(name="F1Threshold", default_value=0.80)
+
+# preprocess_step: ProcessingStep running the exported Wrangler/job script
+# train_step:      TrainingStep (XGBoost) consuming preprocess output
+# eval_step:       ProcessingStep producing evaluation.json
+
+metrics = PropertyFile(name="Metrics", step_name="Evaluate",
+                       path="evaluation.json")
+
+register_step = ...  # RegisterModel with metrics + approval "PendingManualApproval"
+
+gate = ConditionStep(
+    name="QualityGate",
+    conditions=[ConditionGreaterThanOrEqualTo(
+        left=PropertyFile(...),  # JsonGet on classification.f1
+        right=f1_threshold)],
+    if_steps=[register_step],
+    else_steps=[FailStep(name="RejectModel", error_message="F1 below gate")],
+)
+
+pipeline = Pipeline(
+    name="churn-pipeline",
+    parameters=[input_data, f1_threshold],
+    steps=[preprocess_step, train_step, eval_step, gate],
+)
+pipeline.upsert(role_arn="arn:aws:iam::123456789012:role/SageMakerExecRole")
+execution = pipeline.start(parameters={"InputData": "s3://.../curated/churn/"})
+\end{lstlisting}
+
+\subsection*{Verification}
+\begin{itemize}
+    \item A run on good data registers a model version in \texttt{PendingManualApproval} with metrics attached.
+    \item A run on the corrupted dataset fails at \texttt{QualityGate} with the reject reason visible.
+    \item Rerunning with unchanged inputs reuses cached step outputs---visible in execution time and step status.
+    \item Approving the version is a recorded, attributable action; the lineage graph links endpoint $\rightarrow$ version $\rightarrow$ training job $\rightarrow$ dataset.
+\end{itemize}
+
+\section{Friday Use Case: Drift-Triggered Retraining for a Recommendation Engine}
+\index{use case!drift-triggered retraining}
+A recommendation engine serves from a real-time endpoint. Traffic patterns shift seasonally and after marketing campaigns. The team wants drift in production to trigger retraining automatically---but never to deploy automatically without a human decision. Architect the loop.
+
+\subsection{Architecture}
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[
+        node distance=0.55cm and 0.9cm,
+        box/.style={rectangle, rounded corners, draw=blue!70!black, thick, fill=blue!10, align=center, font=\small, minimum height=0.9cm, inner sep=4pt},
+        side/.style={rectangle, rounded corners, draw=brown!70!black, thick, fill=brown!10, align=center, font=\footnotesize, inner sep=3pt},
+        arr/.style={-{Stealth}, thick}
+    ]
+    \node[box] (s3) {S3 training\\data};
+    \node[box, right=of s3] (fs) {Feature Store\\(offline/online)};
+    \node[box, right=of fs] (pipe) {SageMaker\\Pipeline};
+    \node[box, right=of pipe] (reg) {Model\\Registry};
+    \node[box, right=of reg] (ep) {SageMaker\\Endpoint};
+    \node[side, below=0.7cm of pipe] (mm) {Model Monitor (drift)};
+    \node[side, above=0.5cm of fs] (mwaa) {MWAA orchestration};
+    \draw[arr] (s3) -- (fs);
+    \draw[arr] (fs) -- (pipe);
+    \draw[arr] (pipe) -- (reg);
+    \draw[arr] (reg) -- (ep);
+    \draw[arr] (ep.south) |- (mm.east);
+    \draw[arr, dashed] (mm.west) -| (pipe.south);
+    \draw[arr, dashed] (mwaa) -- (fs);
+    \draw[arr, dashed] (mwaa.east) -| (pipe.north);
+    \end{tikzpicture}%
+    }
+    \caption{The MLOps loop: monitored endpoint traffic feeds drift detection; violations route through EventBridge to a retraining pipeline with a human approval gate before redeploy.}
+    \label{fig:ch19-mlops-loop}
+\end{figure}
+
+\subsection{Design Decisions}
+\textbf{The loop.} Endpoint traffic is captured (data capture config) $\rightarrow$ Model Monitor's scheduled comparison against the baseline $\rightarrow$ violations publish to EventBridge $\rightarrow$ a rule starts the retraining pipeline with fresh Feature Store data $\rightarrow$ the quality gate and a \emph{human approval} step stand between a candidate and the registry $\rightarrow$ the CD system deploys approved versions (blue/green, with rollback to the previous approved version).
+
+\textbf{Why the human stays in.} Drift has two causes: the world changed (retrain is right) or the pipeline broke (retraining on broken data is doubly wrong). The monitor cannot tell these apart; the runbook can. The approval step's job is the triage: check the ingestion alarms from Chapters 11--14 before approving anything.
+
+\textbf{Skew control.} All training features come from the offline store; all serving lookups from the online store; one ingestion path defines both. The pipeline's preprocess step reads the offline store by point-in-time join, so retraining on ``last 90 days'' is one parameter change.
+
+\textbf{Rollback as a first-class path.} Every endpoint change is a registry-versioned deployment; the previous approved version stays warm enough to restore within minutes. ``Rollback'' is a deployment of an older artifact, not an emergency procedure.
+
+\begin{pitfall}
+\textbf{Online/offline feature skew.} If a campaign-feature transform is coded in the training job and again in the serving Lambda, the two will diverge---silently. Ingest through one path into Feature Store, or share one transformation library between paths, and test equivalence in CI.
+\end{pitfall}
+
+\section{Interview Q\&A}
+\subsection{Concepts and Trade-offs}
+\begin{enumerate}
+    \item \textbf{Q: Online versus offline Feature Store: which serves training, which inference?}\\
+    A: Offline (S3-backed, point-in-time joins) builds training sets; online (millisecond \texttt{GetRecord}) serves inference. One feature-group definition feeds both to prevent skew.
+    \item \textbf{Q: What does the Model Registry gate before deployment?}\\
+    A: Approval. Deployment automation keys on the \texttt{Approved} state of a versioned, metrics-carrying package---so production changes are deliberate and attributable.
+    \item \textbf{Q: Data drift versus concept drift: what is the difference?}\\
+    A: Data drift is a change in input distributions, detectable from features alone. Concept drift is a change in the input-to-outcome relationship, detectable only when delayed ground truth arrives.
+    \item \textbf{Q: Why gate automatic retraining behind human approval?}\\
+    A: Drift can mean the world changed \emph{or} upstream ingestion broke. Automatic retraining on corrupt data automates the production of worse models; the human triages the cause.
+    \item \textbf{Q: What baseline does Model Monitor need to detect violations?}\\
+    A: Per-feature statistics and constraints learned from the training data, refreshed on a cadence tied to retraining so ``normal'' stays current.
+    \item \textbf{Q: What does pipeline step caching buy you?}\\
+    A: Reruns with unchanged inputs reuse prior outputs: cheaper, faster iteration with correctness enforced by input fingerprinting.
+\end{enumerate}
+
+\section{Further Reading}
+The SageMaker documentation covers Feature Store \cite{awsFeatureStoreDocs}, Pipelines \cite{awsSageMakerPipelinesDocs}, and Model Monitor \cite{awsModelMonitorDocs} in depth. OpenLineage provides the open lineage standard for cross-platform tracing \cite{openLineage}. The Airflow documentation covers the MWAA side of the loop \cite{apacheAirflow}.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item Feature Store is the skew-control mechanism: one definition, two stores, point-in-time correctness.
+    \item Pipelines make the path from data to registry a code artifact; the ConditionStep is policy in code.
+    \item The Registry's approval state is the deployment boundary; lineage makes every production model answerable.
+    \item Model Monitor turns drift into events; baselines must stay fresh or alerts become noise.
+    \item The retraining loop is EventBridge-routed and human-gated; rollback is a deployment, not a panic.
+    \item MLOps is data-engineering discipline---versioning, gates, monitors, runbooks---applied to models.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Explain why point-in-time joins prevent label leakage even when feature data arrives late.
+    \item \textbf{(Conceptual)} Why is an ignored drift alert worse than no monitoring at all?
+    \item \textbf{(Hands-on)} Run the Thursday pipeline; then lower the gate threshold, rerun, and observe the registry outcome change.
+    \item \textbf{(Hands-on)} Create a feature group, ingest a week of synthetic features, and build a training set via point-in-time query.
+    \item \textbf{(Hands-on)} Configure Model Monitor on a deployed endpoint; inject a shifted feature and capture the violation event.
+    \item \textbf{(Design)} Write the drift runbook: alert payload, triage steps, approval criteria, rollback steps, and retraining triggers.
+    \item \textbf{(Design)} Design the label-arrival path for model-quality monitoring when outcomes are known 30 days late.
+    \item \textbf{(Architecture)} Extend the loop for two models sharing one feature group; where does shared infrastructure help and where does it couple failure?
+\end{enumerate}
+
+\section{Capstone Project: A Drift-Guarded Recommendation Lifecycle}\label{sec:ch19-capstone}
+\index{capstone project}\index{MLOps!capstone}
+
+\begin{capstonebox}
+\textbf{Mission.} Operate the Friday loop for real: a Feature-Store-backed pipeline, a monitored endpoint, drift events routed to retraining with human approval, and rollback demonstrated---the complete MLOps lifecycle with evidence at every stage.
+
+\textbf{Estimated time.} 8--10 hours in a sandbox AWS account.
+
+\textbf{What you\textquotesingle{}ll practice.}
+\begin{itemize}
+    \item Feature Store ingestion with online and offline stores.
+    \item Pipeline construction with evaluation gates and registry integration.
+    \item Monitor baselines, schedules, and violation-to-EventBridge routing.
+    \item Approval-gated deployment and versioned rollback.
+\end{itemize}
+\end{capstonebox}
+
+\subsection*{Scenario}
+The recommendation engine's owner wants one monthly touch: review the drift report, approve or reject the candidate model. Everything else---features, training, evaluation, registration, monitoring---runs itself and produces the evidence for that decision.
+
+\subsection*{Requirements}
+\textbf{Functional requirements.}
+\begin{itemize}
+    \item A feature group with daily ingestion; training sets built by point-in-time offline queries.
+    \item The four-step pipeline with an F1 gate and registry integration.
+    \item A monitored endpoint (data capture on, baseline, daily schedule) with violations to SNS via EventBridge.
+    \item A retraining trigger from violations to the pipeline, ending at human approval.
+\end{itemize}
+
+\textbf{Non-functional requirements.}
+\begin{itemize}
+    \item A rollback drill: deploy candidate, detect regression, restore previous approved version in minutes.
+    \item Skew evidence: the same feature values served online as used in training, tested.
+    \item Every monthly decision is reconstructable: drift report, candidate metrics, approver, deployment record.
+\end{itemize}
+
+\subsection*{Implementation Steps}
+\begin{enumerate}
+    \item Create the feature group and the ingestion job; verify online/offline parity.
+    \item Build and gate the pipeline; register the baseline model.
+    \item Deploy the monitored endpoint; establish the baseline and schedule.
+    \item Wire violations through EventBridge to the retraining pipeline with the approval step.
+    \item Run the drift drill (shifted feature) and the rollback drill; record both.
+    \item Produce the first monthly decision packet end to end.
+\end{enumerate}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item All code: ingestion, pipeline, monitor configuration, EventBridge rules.
+    \item Drill evidence: drift detection to approval, and rollback timing.
+    \item The skew test and the lineage graph for the production model.
+    \item The monthly decision packet template, completed once.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item A drift violation demonstrably reaches a human decision with full context attached.
+    \item No candidate deploys without approval; the gate is tested with a rejected candidate.
+    \item Rollback restores the prior version within the stated time, with evidence.
+    \item Training and serving features are provably identical for a sample of records.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Add model-quality monitoring with a simulated 30-day label delay.
+    \item Emit OpenLineage events and trace one production prediction to its training data.
+    \item Blue/green deploy with automatic rollback on endpoint metric regression.
+    \item Add a challenger model in shadow mode and compare live predictions before promotion.
+\end{itemize}

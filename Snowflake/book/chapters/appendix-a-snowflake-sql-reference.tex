@@ -1,0 +1,229 @@
+\chapter{Snowflake SQL Reference for Data Engineers}
+\index{SQL reference}\index{cheat sheet}%
+This appendix condenses the DDL, DML, system functions, and monitoring views used throughout the book into quick-reference tables. It is organized by task, alphabetically within each group, and cross-referenced to the chapter that teaches the concept. Syntax is simplified for scanning; consult the linked documentation for full grammar \cite{snowflakeDataLoadDocs,snowflakeTasksDocs,snowflakeStreamsDocs}.
+
+\section{Stages, File Formats, and Loading (Chapter 5)}
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{5.6cm}p{8.6cm}@{}}
+\toprule
+\textbf{Command} & \textbf{Purpose / notes} \\
+\midrule
+\texttt{CREATE STAGE ... URL=... STORAGE\_INTEGRATION=...} & External stage over S3/GCS/Azure with governed credentials \\
+\texttt{CREATE STAGE ... DIRECTORY=(ENABLE=TRUE)} & Stage with queryable file-metadata directory table \\
+\texttt{LIST @stage PATTERN='.*csv'} & Enumerate staged files matching a regex \\
+\texttt{CREATE FILE FORMAT ... TYPE=CSV SKIP\_HEADER=1} & Reusable parse rules; inline with \texttt{FILE\_FORMAT=(...)} \\
+\texttt{COPY INTO t FROM @s PATTERN=... ON\_ERROR=...} & Bulk load; idempotent per file for 64 days \\
+\texttt{COPY INTO t FROM (SELECT \$1, \$2 ...)} & Projection/transformation on load; \texttt{METADATA\$FILENAME} lineage \\
+\texttt{VALIDATION\_MODE=RETURN\_ERRORS} & Dry-run validation without writing \\
+\texttt{FORCE=TRUE} & Reload files already in load history (duplicates!) \\
+\texttt{CREATE STORAGE INTEGRATION ... TYPE=EXTERNAL\_STAGE} & Cloud identity for stages; \texttt{DESC} yields ARN + external ID \\
+\texttt{REMOVE @stage / PUT file://... @stage} & Manage internal-stage files \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{Snowpipe and Streaming (Chapter 6)}
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{5.6cm}p{8.6cm}@{}}
+\toprule
+\textbf{Command / function} & \textbf{Purpose / notes} \\
+\midrule
+\texttt{CREATE PIPE p AUTO\_INGEST=TRUE AS COPY INTO ...} & Event-driven serverless loading \\
+\texttt{SHOW PIPES} & Includes \texttt{notification\_channel} ARN for the S3 rule \\
+\texttt{SYSTEM\$PIPE\_STATUS('p')} & Execution state, \texttt{pendingFileCount} backlog \\
+\texttt{ALTER PIPE p REFRESH} & Manually trigger a scan of staged files \\
+\texttt{REST insertFiles} & Client-driven submission for non-event sources \\
+\texttt{SYSTEM\$PIPE\_FORCE\_PAUSE / ALTER PIPE SET PIPE\_EXECUTION\_PAUSED} & Stop/start ingestion \\
+Streaming channels + offset tokens & Row-set ingestion, exactly-once per channel (client API) \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{Streams and CDC (Chapter 7)}
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{5.6cm}p{8.6cm}@{}}
+\toprule
+\textbf{Command / column} & \textbf{Purpose / notes} \\
+\midrule
+\texttt{CREATE STREAM s ON TABLE t} & Standard CDC journal with transactional offset \\
+\texttt{CREATE STREAM ... APPEND\_ONLY=TRUE} & Inserts only; cheaper on append-mostly sources \\
+\texttt{SYSTEM\$STREAM\_HAS\_DATA('s')} & Gate predicate for consumers and tasks \\
+\texttt{SHOW STREAMS} & \texttt{STALE} column flags expired change data \\
+\texttt{METADATA\$ACTION} & \texttt{INSERT} / \texttt{DELETE}; updates appear as pairs \\
+\texttt{METADATA\$ISUPDATE} & \texttt{TRUE} marks the two halves of an update \\
+\texttt{METADATA\$ROW\_ID} & Physical row identifier for tracing \\
+\texttt{MERGE INTO t USING stream ...} & Idempotent delta application; offset advances on commit \\
+\texttt{CREATE/ALTER TABLE ... CHANGE\_TRACKING=TRUE} & Enables change tracking for streams/shares \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{Tasks and Orchestration (Chapter 8)}
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{5.6cm}p{8.6cm}@{}}
+\toprule
+\textbf{Command / parameter} & \textbf{Purpose / notes} \\
+\midrule
+\texttt{CREATE TASK ... SCHEDULE='USING CRON ...' / 'n MINUTE'} & The two schedule forms; CRON needs a time zone \\
+\texttt{CREATE TASK c AFTER p WHEN ... AS ...} & Child task with dependency and gate predicate \\
+\texttt{WAREHOUSE=wh} vs.\ omitted & Warehouse-backed vs.\ serverless (per-second) compute \\
+\texttt{USER\_TASK\_TIMEOUT\_MS} & Kill hung runs \\
+\texttt{SUSPEND\_TASK\_AFTER\_NUM\_FAILURES=3} & Contain cascading failure \\
+\texttt{ERROR\_INTEGRATION=...} & Failure notifications to SNS/email \\
+\texttt{ALTER TASK ... RESUME / SUSPEND} & Tasks are created suspended; resume children first \\
+\texttt{TASK\_HISTORY()} & Run states, durations, errors, skip reasons \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{Semi-Structured Data (Chapter 9)}
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{5.6cm}p{8.6cm}@{}}
+\toprule
+\textbf{Construct} & \textbf{Purpose / notes} \\
+\midrule
+\texttt{VARIANT / OBJECT / ARRAY} & Semi-structured column types \\
+\texttt{v:path.to:key}, \texttt{v['key']} & Dot and bracket path navigation \\
+\texttt{v:x::NUMBER}, \texttt{TRY\_CAST} & Hard cast (loud) vs.\ soft cast (NULL on error) \\
+\texttt{TRY\_PARSE\_JSON(text)} & Safe text-to-VARIANT for quarantine patterns \\
+\texttt{LATERAL FLATTEN(INPUT=>v:arr)} & Explode arrays/objects; exposes \texttt{VALUE, KEY, INDEX, PATH} \\
+\texttt{IS\_NULL\_VALUE(v:k)} & Distinguish JSON null from a missing key \\
+\texttt{OBJECT\_CONSTRUCT / ARRAY\_AGG} & Reassemble JSON documents from relational rows \\
+\texttt{CHECK (...)} constraints & Contract enforcement on extracted columns \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{Performance and Warehouses (Chapters 2, 10)}
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{5.6cm}p{8.6cm}@{}}
+\toprule
+\textbf{Command / view} & \textbf{Purpose / notes} \\
+\midrule
+\texttt{ALTER WAREHOUSE ... SET WAREHOUSE\_SIZE=...} & Vertical scaling; T-shirt sizes double per step \\
+\texttt{MAX\_CLUSTER\_COUNT / SCALING\_POLICY} & Multi-cluster; Standard vs.\ Economy \\
+\texttt{AUTO\_SUSPEND / AUTO\_RESUME} & Idle-stop seconds; 60--300 s typical \\
+\texttt{ALTER SESSION SET USE\_CACHED\_RESULTS=FALSE} & Honest benchmarking \\
+\texttt{SYSTEM\$CLUSTERING\_INFORMATION('t','(cols)')} & Depth/overlap before and after clustering \\
+\texttt{ALTER TABLE t CLUSTER BY (c1, c2)} & Custom clustering key; background reclustering costs credits \\
+\texttt{ALTER TABLE t ADD SEARCH OPTIMIZATION} & Point-lookup acceleration on large tables \\
+Query Profile (Snowsight) & Dominant operator, partitions scanned/total, spill bytes \\
+\texttt{QUERY\_HISTORY}, \texttt{WAREHOUSE\_METERING\_HISTORY} & Cost attribution and audit queries \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{Dynamic Tables and Analytics SQL (Chapters 11, 12)}
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{5.6cm}p{8.6cm}@{}}
+\toprule
+\textbf{Construct} & \textbf{Purpose / notes} \\
+\midrule
+\texttt{CREATE DYNAMIC TABLE ... TARGET\_LAG='5 minutes' WAREHOUSE=... AS SELECT ...} & Declarative pipeline node; DAG auto-derived \\
+\texttt{ALTER DYNAMIC TABLE ... REFRESH / SUSPEND} & Manual control when needed \\
+\texttt{DYNAMIC\_TABLE\_REFRESH\_HISTORY()} & Incremental vs.\ full refresh, credits, failures \\
+\texttt{f(x) OVER (PARTITION BY ... ORDER BY ... ROWS BETWEEN ...)} & Window functions; mind WHERE-before-window \\
+\texttt{QUALIFY} & Filter window results without a subquery \\
+\texttt{GROUP BY ROLLUP / CUBE / GROUPING SETS} & Multi-grain aggregation in one scan; \texttt{GROUPING()} decodes \\
+\texttt{PIVOT / UNPIVOT} & Rotate row values to columns and back \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{Programmability (Chapters 13--16)}
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{5.6cm}p{8.6cm}@{}}
+\toprule
+\textbf{Construct} & \textbf{Purpose / notes} \\
+\midrule
+\texttt{CREATE FUNCTION ... LANGUAGE PYTHON RUNTIME\_VERSION='3.10' HANDLER=...} & Scalar Python UDF \\
+\texttt{@pandas\_udf(...)} & Vectorized UDF; batches via Arrow as pandas DataFrames \\
+\texttt{RETURNS TABLE (...) ... class with process()} & UDTF; consume via \texttt{TABLE(f(...))} in FROM \\
+\texttt{PACKAGES=('scikit-learn', ...)} & Anaconda-channel dependencies; pin versions \\
+\texttt{CREATE PROCEDURE ... EXECUTE AS OWNER/CALLER} & Owner's vs.\ caller's rights \\
+\texttt{CREATE API INTEGRATION ... API\_ALLOWED\_PREFIXES} & Trust boundary for external functions \\
+\texttt{CREATE EXTERNAL FUNCTION ... API\_INTEGRATION=... AS 'https://...'} & Synchronous per-call-billed API access \\
+\texttt{Session.builder.configs(...).create()} & Snowpark session; key-pair auth, never embedded secrets \\
+\texttt{df.explain()} / \texttt{df.write.save\_as\_table(...)} & Pushdown audit / safe persistence \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{Governance, Sharing, and Recovery (Chapters 4, 17--20)}
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{5.6cm}p{8.6cm}@{}}
+\toprule
+\textbf{Construct} & \textbf{Purpose / notes} \\
+\midrule
+\texttt{GRANT SELECT ON FUTURE TABLES IN SCHEMA s TO ROLE r} & Least-privilege without per-table toil \\
+\texttt{USE SECONDARY ROLES ALL} & Session exercises multiple roles; primary owns new objects \\
+\texttt{CREATE NETWORK POLICY ... ALLOWED\_IP\_LIST} & Origin perimeter for users/services \\
+\texttt{CREATE TAG ... ALLOWED\_VALUES} & Classification taxonomy \\
+\texttt{CREATE MASKING POLICY ... ; ALTER TAG t SET MASKING POLICY} & Tag-based dynamic masking \\
+\texttt{CREATE ROW ACCESS POLICY ... ; ALTER TABLE ... ADD ROW ACCESS POLICY} & Entitlement-driven row filtering \\
+\texttt{CREATE SHARE ... ; GRANT SELECT ON VIEW v TO SHARE s} & Zero-copy sharing of secure views \\
+\texttt{CREATE DATABASE ... FROM SHARE provider.share} & Consumer mount (imported database) \\
+\texttt{SELECT ... AT/BEFORE(TIMESTAMP|STATEMENT|OFFSET=>...)} & Time Travel queries \\
+\texttt{UNDROP TABLE/SCHEMA/DATABASE} & Restore within retention \\
+\texttt{CREATE TABLE c CLONE src} & Zero-copy clone; copy-on-write storage \\
+\texttt{DATA\_RETENTION\_TIME\_IN\_DAYS} & Per-object Time Travel window (edition-limited) \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{Platform Breadth: Hybrid Tables, Cortex, DataOps (Chapters 21--23)}
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{5.6cm}p{8.6cm}@{}}
+\toprule
+\textbf{Construct} & \textbf{Purpose / notes} \\
+\midrule
+\texttt{CREATE HYBRID TABLE (id NUMBER PRIMARY KEY, ...)} & Enforced PK/FK/unique; indexes; ms point ops \\
+\texttt{INDEX idx (col)} on hybrid tables & Secondary index for selective non-key access \\
+\texttt{SNOWFLAKE.CORTEX.COMPLETE(model, prompt)} & Serverless LLM call as a SQL function \\
+\texttt{SNOWFLAKE.CORTEX.EMBED\_TEXT\_768(model, text)} & 768-dim embedding for \texttt{VECTOR(FLOAT,768)} \\
+\texttt{VECTOR\_COSINE\_SIMILARITY(a, b)} & Similarity search ranking \\
+\texttt{PARSE\_DOCUMENT(@stage, 'file.pdf')} & PDF text extraction \\
+\texttt{CORTEX\_FUNCTIONS\_USAGE\_HISTORY} & Token-spend monitoring \\
+\texttt{CREATE RESOURCE MONITOR ... CREDIT\_QUOTA TRIGGERS} & Cost circuit breakers (notify/suspend) \\
+\texttt{CREATE ALERT ... SCHEDULE IF(...) THEN ...} & Scheduled condition $\rightarrow$ notification \\
+\texttt{ALTER TABLE t SET DATA\_METRIC\_SCHEDULE='60 MINUTE'} & DMF evaluation cadence \\
+\texttt{DATA\_METRIC\_FUNCTION\_RESULTS} & DMF outcomes for alerting \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{Essential Information Schema and Account Usage Views}
+\index{ACCOUNT\_USAGE}\index{INFORMATION\_SCHEMA}
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{5.2cm}p{9.0cm}@{}}
+\toprule
+\textbf{View} & \textbf{Answers} \\
+\midrule
+\texttt{INFORMATION\_SCHEMA.COPY\_HISTORY} & Which files loaded, failed, or were skipped \\
+\texttt{INFORMATION\_SCHEMA.TASK\_HISTORY} & Task runs, states, errors, skips \\
+\texttt{INFORMATION\_SCHEMA.DYNAMIC\_TABLE\_REFRESH\_HISTORY} & Refresh type, credits, failures \\
+\texttt{ACCOUNT\_USAGE.QUERY\_HISTORY} & Per-query cost signals (bytes, duration, warehouse) \\
+\texttt{ACCOUNT\_USAGE.WAREHOUSE\_METERING\_HISTORY} & Credits by warehouse by hour \\
+\texttt{ACCOUNT\_USAGE.GRANTS\_TO\_ROLES / GRANTS\_TO\_USERS} & The RBAC graph for audits \\
+\texttt{ACCOUNT\_USAGE.ACCESS\_HISTORY} & Who touched what data, and lineage \\
+\texttt{ACCOUNT\_USAGE.LOGIN\_HISTORY} & Authentication audit (MFA, key-pair, anomalies) \\
+\texttt{ACCOUNT\_USAGE.TAG\_REFERENCES} & Classification coverage report \\
+\texttt{ACCOUNT\_USAGE.STORAGE\_USAGE} & Table and stage storage over time \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{tipbox}
+Latency caveat: \texttt{ACCOUNT\_USAGE} views lag up to a few hours; the \texttt{INFORMATION\_SCHEMA} table functions are near-real-time but windowed. Monitoring that must react in minutes uses information-schema functions; monthly reporting uses account usage.
+\end{tipbox}

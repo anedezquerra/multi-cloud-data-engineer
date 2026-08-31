@@ -1,0 +1,204 @@
+\chapter{Lab Solutions and Acceptance Guidance}
+\index{lab solutions}\index{acceptance criteria}\index{capstone!solutions}%
+This appendix provides reference solutions for the weekly Thursday labs and the six milestone
+capstones. Each entry gives the approach, the critical steps, and the evidence that satisfies the
+chapter's acceptance criteria. Use it to unblock yourself after a genuine attempt---not instead
+of one: the labs are the curriculum, and the DP-600 measures exactly the judgment they build
+\cite{microsoftDp600}.
+
+\begin{notebox}
+A solution counts only when the chapter's acceptance criteria are met with evidence: row counts,
+screenshots, ledger rows, drill outputs. ``It ran once on my machine'' is the starting point of
+each lab, never the end.
+\end{notebox}
+
+\section{Part I: Core Infrastructure (Weeks 1--4)}
+\subsection{Week 1: Workspace, Lakehouse, and Shortcut}
+\textbf{Approach.} Create the workspace on trial capacity, provision the lakehouse, and shortcut
+to a public Blob container. \textbf{Critical evidence.} The shortcut path read from PySpark with
+zero bytes uploaded; the screenshot shows the shortcut icon, not a copied folder.
+\textbf{Common failure.} Confusing \texttt{Files/} uploads with shortcuts---if the data is
+physically in OneLake, the lab's point was missed.
+
+\subsection{Week 2: Medallion Transformations}
+\textbf{Approach.} Bronze landing as-is, Silver typed and deduplicated, Gold conformed.
+\textbf{Critical evidence.} Row-count reconciliation Bronze $\rightarrow$ Silver (accepted +
+rejected = input), and Gold aggregates matching a direct source computation.
+\textbf{Common failure.} Silent row drops between layers with no quarantine accounting.
+
+\subsection{Week 3: Spark Notebook Transformations}
+\textbf{Approach.} Parameterized notebook (\texttt{processing\_date}, \texttt{source\_system}),
+explicit schemas, Delta writes. \textbf{Critical evidence.} The notebook reruns with a different
+date parameter and no code edits. \textbf{Common failure.} Hardcoded personal workspace paths.
+
+\subsection{Week 4: OPTIMIZE, V-Order, and Time Travel}
+\textbf{Approach.} Baseline query timed, \texttt{OPTIMIZE ... VORDER}, accidental delete in a
+training copy, \texttt{VERSION AS OF} recovery. \textbf{Critical evidence.} \texttt{DESCRIBE
+HISTORY} showing optimize and delete; the recovered row count matching the pre-delete baseline.
+\textbf{Common failure.} Running \texttt{VACUUM} before the recovery validation, destroying the
+versions the lab exists to demonstrate.
+
+\subsection{Milestone 1 Capstone}
+The reference flow: Bronze shortcuts $\rightarrow$ parameterized Silver notebooks $\rightarrow$
+Gold star schema $\rightarrow$ \texttt{OPTIMIZE VORDER}, with the operations note (retry unit,
+retention, cadence) as the differentiating artifact. The acceptance criteria' decisive items are
+the row-count reconciliation and the parameterization; reviewers check those first.
+
+\section{Part II: Warehousing and BI (Weeks 5--8)}
+\subsection{Week 5: COPY INTO Five Million Rows}
+\textbf{Approach.} Staged Parquet under date-partitioned paths, \texttt{COPY INTO} per month,
+manifest insert after each batch. \textbf{Critical evidence.} Five million rows, aggregates
+matching the source profile, one manifest row per batch. \textbf{Common failure.} A malformed
+OneLake DFS path---copy it from the lakehouse explorer (Appendix~B).
+
+\subsection{Week 6: SSMS and the Silver-to-Gold View}
+\textbf{Approach.} Entra-authenticated SSMS connection to the endpoint, the join view, the TVF,
+the RLS objects, the deliberate (failing) write attempt. \textbf{Critical evidence.} Two-persona
+row counts under \texttt{EXECUTE AS USER}. \textbf{Common failure.} Testing RLS as the
+owner---where every policy passes trivially.
+
+\subsection{Week 7: Relationship, Measure, and SCD2 Merge}
+\textbf{Approach.} Surrogate-key one-to-many relationships, four DAX measures, the two-step
+MERGE. \textbf{Critical evidence.} The changed customer shows exactly two rows, one current,
+with contiguous validity dates; a second merge run changes nothing. \textbf{Common failure.}
+Running the insert step before the expire step---order is correctness.
+
+\subsection{Week 8: Direct Lake versus DirectQuery Benchmark}
+\textbf{Approach.} Two identical models, identical visuals, measured timings, one deliberate
+fallback. \textbf{Critical evidence.} The completed benchmark table and a captured fallback event
+in the Capacity Metrics app. \textbf{Common failure.} Benchmarking before V-Order, then
+concluding the wrong thing.
+
+\subsection{Milestone 2 Capstone}
+The reference flow: manifest-gated \texttt{COPY INTO} $\rightarrow$ stored-procedure star schema
+(SCD2 customer) $\rightarrow$ custom semantic model with RLS $\rightarrow$ benchmarked Direct Lake
+report. Reviewers check idempotence (re-run changes nothing), the failing DQ test, and RLS proven
+\emph{as every role}, in that order.
+
+\section{Part III: ETL Orchestration (Weeks 9--12)}
+\subsection{Week 9: Metadata-Driven Pipeline}
+\textbf{Approach.} Config table $\rightarrow$ Lookup $\rightarrow$ ForEach $\rightarrow$ contract
+gate $\rightarrow$ Copy. \textbf{Critical evidence.} A renamed column rejected, an additive column
+flowing, and a fourth table onboarded by \texttt{INSERT} alone. \textbf{Common failure.} ForEach
+unbounded parallelism flattening the source.
+
+\subsection{Week 10: Dataflow Gen2 with Quality Gate}
+\textbf{Approach.} Named Power Query steps $\rightarrow$ staging destination $\rightarrow$
+notebook assertions $\rightarrow$ quarantine $\rightarrow$ Gold. \textbf{Critical evidence.} The
+deliberately broken payload quarantined with reasons; Gold untouched. \textbf{Common failure.}
+The gate existing but not being wired into the pipeline---aspirational quality control.
+
+\subsection{Week 11: Gateway Extraction}
+\textbf{Approach.} Clustered gateway, least-privilege identity, watermark-incremental pipeline,
+gateway-down drill. \textbf{Critical evidence.} The duplicate-free rerun after the drill.
+\textbf{Common failure.} The gateway on a laptop that sleeps---the lab's own anti-pattern.
+
+\subsection{Week 12: Master Orchestration Pipeline}
+\textbf{Approach.} Dataflow $\rightarrow$ gate notebook $\rightarrow$ ledger, On Failure $\rightarrow$
+alert with runbook link. \textbf{Critical evidence.} The deliberate-gate-failure alert firing with
+the link, and one ledger row per outcome. \textbf{Common failure.} Wiring On Completion where On
+Success was meant---partial failures publishing to Gold.
+
+\subsection{Milestone 3 Capstone}
+The reference flow: config-driven ingestion $\rightarrow$ dataflow cleansing $\rightarrow$ notebook
+features $\rightarrow$ gated Gold, under one master pipeline with alerting. The decisive artifacts
+are the deliberate-failure drill evidence and the watermark discipline (advance on success only).
+
+\section{Part IV: Real-Time Intelligence (Weeks 13--16)}
+\subsection{Week 13: Eventstream and Producer}
+\textbf{Approach.} Custom app source, Python producer with unique \texttt{event\_id}s, KQL
+destination. \textbf{Critical evidence.} The dedup query disagreeing with the raw count after the
+replay test---proving duplicates existed and were handled. \textbf{Common failure.} The
+connection string committed to source.
+
+\subsection{Week 14: Rolling Average and Anomalies}
+\textbf{Approach.} \texttt{make-series} $\rightarrow$ \texttt{series\_fir} $\rightarrow$
+\texttt{series\_decompose\_anomalies}, plus the materialized view. \textbf{Critical evidence.} The
+injected hot streak flagged, normal noise quiet, every query time-bounded. \textbf{Common
+failure.} \texttt{default=0} silently inventing readings for offline devices.
+
+\subsection{Week 15: Sustained-Threshold Alert}
+\textbf{Approach.} Per-device rule, three-consecutive-minutes condition, cooldown, resolved
+notification. \textbf{Critical evidence.} Two-minute breach fires nothing; sustained breach fires
+exactly once. \textbf{Common failure.} The rule reading the raw stream, double-firing on replay.
+
+\subsection{Week 16: Dashboard and Reverse ETL}
+\textbf{Approach.} Bounded parameterized tiles at decision cadence; Dataverse upsert on the
+alternate key. \textbf{Critical evidence.} The second reverse-ETL run changing zero record
+counts. \textbf{Common failure.} Refresh cadence set to platform maximum rather than decision
+cadence.
+
+\subsection{Milestone 4 Capstone}
+The reference flow: faker producer $\rightarrow$ Eventstream $\rightarrow$ deduped KQL $\rightarrow$
+impossible-travel query $\rightarrow$ Reflex $\rightarrow$ Teams, with the replay drill producing
+zero duplicate alerts. Reviewers check the dedup-before-rule ordering and the freshness indicator
+on the dashboard.
+
+\section{Part V: Data Science and ML (Weeks 17--20)}
+\subsection{Week 17: Data Wrangler Export}
+\textbf{Approach.} Visual cleaning $\rightarrow$ exported code $\rightarrow$ parameterized cell
+$\rightarrow$ as-of-dated feature table. \textbf{Critical evidence.} Rebuilds for three historical
+dates, identical on rerun. \textbf{Common failure.} The windowed feature computed past its as-of
+date---leakage by construction.
+
+\subsection{Week 18: Autologged Random Forest}
+\textbf{Approach.} Six tracked runs, fixed snapshot, registry round-trip by alias.
+\textbf{Critical evidence.} Every run tagged with dataset and commit; the model loading from
+\texttt{models:/.../Staging} in a fresh notebook. \textbf{Common failure.} Comparing runs across
+different data snapshots and calling the difference model quality.
+
+\subsection{Week 19: SynapseML Sentiment}
+\textbf{Approach.} Key-Vault-resolved credentials, batched calls, raw responses persisted, Gold
+with \texttt{model\_version}. \textbf{Critical evidence.} The 50-row sample inspected before
+scale-up; the measured cost per thousand rows. \textbf{Common failure.} A key literal in the
+notebook---an incident once Week~23 syncs it.
+
+\subsection{Week 20: Batch Scoring at 100k}
+\textbf{Approach.} Alias-loaded UDF, partition-idempotent write, distribution gate.
+\textbf{Critical evidence.} The injected skew caught by the gate; the rerun replacing rather than
+duplicating. \textbf{Common failure.} Scoring against ad hoc features instead of the governed
+feature table---training-serving skew by design.
+
+\subsection{Milestone 5 Capstone}
+The reference flow: leakage-safe features $\rightarrow$ autologged training $\rightarrow$ registry
+$\rightarrow$ gated daily scoring $\rightarrow$ Direct Lake report, with drift triggering retraining
+but never promotion. The decisive artifacts are the three failing-case tests and the
+human-gated promotion evidence.
+
+\section{Part VI: Governance and Exam Prep (Weeks 21--24)}
+\subsection{Week 21: Roles and RLS}
+\textbf{Approach.} Contributor for the builder, item-level for the analyst, RLS tested per
+persona per engine path. \textbf{Critical evidence.} The access matrix with the Spark path's
+result documented, not assumed. \textbf{Common failure.} SQL-layer security declared complete
+while the Spark path reads everything.
+
+\subsection{Week 22: Labels, Lineage, and Crypto-Shredding}
+\textbf{Approach.} Label inheritance verified, lineage captured, both erasure strategies
+demonstrated. \textbf{Critical evidence.} \texttt{DELETE} rows readable via time travel; shredded
+subject unreadable everywhere including history. \textbf{Common failure.} Keys resolved from
+anywhere but the vault.
+
+\subsection{Week 23: Git and Deployment Pipeline}
+\textbf{Approach.} Dev bound to Git, three-stage pipeline with rules, promotion through stages
+only. \textbf{Critical evidence.} The rehydration path documented or executed; the secret scan
+clean. \textbf{Common failure.} Deployment rules left unreviewed while silently rewiring
+production references.
+
+\subsection{Week 24: Mock Exams and Remediation}
+\textbf{Approach.} Two timed, closed-book mocks scored by domain; misses classified; weak domains
+remediated by rebuilding labs. \textbf{Critical evidence.} Two consecutive 80\%+ mocks with no
+domain below 70\%. \textbf{Common failure.} Reviewing answer keys instead of rebuilding labs.
+
+\subsection{Milestone 6 Capstone}
+The reference flow: three workspaces, Git-bound Dev, staged pipeline with rules, PII masked before
+Gold, labels inheriting, RLS tested, DR plan naming its three mechanisms. The decisive artifacts
+are the clean-environment redeploy and the DR plan---the two things that cannot be faked in a
+screenshot.
+
+\begin{tipbox}
+For portfolio use, each capstone README should lead with the problem statement and architecture
+diagram, include clean-environment setup, screenshots of the pipeline run, dashboard, and alert,
+the capacity cost estimate, and a lessons-learned section naming what broke. Interviewers probe
+trade-offs: be ready to defend Lakehouse versus Warehouse, Import versus Direct Lake, and batch
+versus streaming at ten times the scale.
+\end{tipbox}

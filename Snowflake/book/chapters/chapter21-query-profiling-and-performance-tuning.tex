@@ -1,0 +1,217 @@
+\chapter{Unistore and Hybrid Tables: OLTP Meets OLAP}
+\index{Unistore}\index{hybrid tables}\index{OLTP}\index{Week 21}%
+\begin{objectives}
+\begin{itemize}
+    \item Explain Unistore's architecture: one platform serving transactional and analytical workloads.
+    \item Create hybrid tables with enforced primary keys, foreign keys, unique constraints, and indexes.
+    \item Reason about row-level locking and single-digit-millisecond point reads and writes.
+    \item Join hybrid (OLTP) and columnar (OLAP) tables without a CDC bridge.
+    \item Build a hands-on hybrid table with high-frequency single-row writes joined live to an analytical table.
+    \item Architect an e-commerce order system where transactional writes are immediately analytics-ready.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+The HTAP (hybrid transactional/analytical processing) question---can one store serve both workload shapes?---has an answer on every cloud, with different seams.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{2.8cm}p{3.0cm}p{3.0cm}p{3.0cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{AWS} & \textbf{Azure} & \textbf{GCP} \\
+\midrule
+HTAP offering & Aurora $\rightarrow$ Redshift zero-ETL & Cosmos DB + Synapse Link; SQL Hyperscale replicas & AlloyDB (columnar engine); Spanner + BigQuery federation \\
+Row store + analytics & RDS/Aurora + zero-ETL replica & Synapse Link analytical store & AlloyDB columnar engine \\
+Constraint enforcement & Full relational DDL & Full relational DDL & Spanner full DDL \\
+Point-read latency & Millisecond (OLTP engine) & Millisecond & Millisecond (Spanner/AlloyDB) \\
+\addlinespace
+Snowflake equivalent & \multicolumn{3}{l}{Hybrid tables (Unistore): enforced constraints, indexes, row-store speed beside columnar analytics} \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+\textbf{MongoDB} is the original operational/analytics hybrid discussion (replica-set analytics nodes); \textbf{Fabric} separates KQL/warehouse from operational stores. Snowflake's Unistore move: the transactional table lives \emph{inside} the analytical database, so joining orders to the warehouse mart is a same-platform query, not a replication pipeline.
+\end{crosscloud}
+
+\section{Week 21 Roadmap}
+Everything since Chapter 5 assumed the analytical shape: bulk loads, columnar scans, eventual consistency through pipelines. Real businesses also need the other shape: a shopping-cart write that commits in milliseconds, a point lookup by primary key, an enforced foreign key. Unistore brings that shape into Snowflake via hybrid tables \cite{snowflakeHybridTablesDocs}.
+
+Monday explains the Unistore architecture. Tuesday covers hybrid-table DDL: constraints and indexes. Wednesday digs into locking and point-query performance. Thursday builds and stress-tests a hybrid table. Friday designs the order-management system without a CDC bridge.
+
+\begin{keyterms}
+\textbf{Unistore}: Snowflake's workload unifying transactional and analytical processing in one platform.\quad
+\textbf{Hybrid table}: a Snowflake table type with a row-store layer optimized for point operations plus analytical accessibility.\quad
+\textbf{Enforced constraint}: primary key, foreign key, or unique constraint the engine actually rejects violations of.\quad
+\textbf{Row-level locking}: fine-grained concurrency control enabling concurrent single-row transactions.\quad
+\textbf{Point lookup}: a single-row read by key, the latency signature of OLTP.
+\end{keyterms}
+
+\section{Monday: The Unistore Architecture}
+\index{Unistore}
+Analytical Snowflake (Chapters 1--12) stores immutable columnar micro-partitions---magnificent for scans, wrong for single-row writes, because a one-row \texttt{UPDATE} rewrites a whole partition. Unistore adds a row-store layer beneath hybrid tables: small, row-oriented storage with indexes and locking for transactional access, integrated with the same metadata, governance, and query layers.
+
+\begin{definitionbox}
+\textbf{Unistore} is the architectural claim that one governed platform can hold both workload shapes: hybrid tables serve high-frequency point operations while remaining fully queryable---and joinable---by the analytical engine, with one security model and no replication.
+\end{definitionbox}
+
+The strategic consequence: the CDC bridge between the operational database and the warehouse (Chapter 7's entire DMS pipeline) becomes optional for workloads that can live in hybrid tables directly. Not all can---throughput ceilings and workload isolation still argue for dedicated OLTP systems at extreme scale---but the broad middle of operational applications can collapse two systems into one.
+
+\begin{notebox}
+Hybrid tables and standard tables coexist in the same schema and the same query. The optimizer knows each table's storage type; a join between a hybrid orders table and a columnar events fact is just a join.
+\end{notebox}
+
+\section{Tuesday: Constraints, Indexes, and DDL}
+\index{primary key}\index{foreign key}\index{index}
+Standard Snowflake tables accept constraint syntax but do not \emph{enforce} it (except \texttt{NOT NULL})---constraints are documentation and optimizer hints. Hybrid tables enforce: duplicate primary keys are rejected, orphan foreign keys fail, unique violations error. That enforcement is what makes application-grade writes trustworthy.
+
+\begin{lstlisting}[language=SQL, caption={Hybrid tables with enforced constraints and an index}]
+CREATE OR REPLACE HYBRID TABLE oms.customers (
+  customer_id   NUMBER PRIMARY KEY,
+  email         STRING UNIQUE NOT NULL,
+  region        STRING NOT NULL
+);
+
+CREATE OR REPLACE HYBRID TABLE oms.orders (
+  order_id      NUMBER PRIMARY KEY,
+  customer_id   NUMBER NOT NULL
+                REFERENCES oms.customers(customer_id),
+  status        STRING NOT NULL,
+  total         NUMBER(12,2),
+  order_ts      TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
+  INDEX idx_orders_status (status)   -- secondary index for point-ish access
+);
+\end{lstlisting}
+
+Secondary indexes accelerate selective non-key lookups (status queues: ``next 50 \texttt{PENDING} orders''). As with all indexes, they cost write throughput---index the access paths you actually have, not the ones you can imagine.
+
+\begin{pitfall}
+\textbf{Hybrid tables are not the default.} Standard columnar tables remain the right home for append-mostly analytical data; hybrid tables trade scan economics for point-operation speed. Choosing hybrid for a 10 TB fact table inverts the trade-off.
+\end{pitfall}
+
+\section{Wednesday: Locking and Point-Operation Performance}
+\index{row-level locking}\index{point lookup}
+Row-level locking means two transactions updating different rows of the same hybrid table do not serialize behind each other; high-frequency single-row \texttt{INSERT}/\texttt{UPDATE}/\texttt{DELETE} operations commit with single-digit-millisecond latency targets. This is the behavior class micro-partition storage cannot offer and the reason Unistore exists as a separate storage path.
+
+Engineering guidance for workload placement:
+\begin{itemize}
+    \item \textbf{Hybrid tables:} order state, carts, inventory counters, user sessions---small rows, high write rates, key-addressed reads, constraint-checked integrity.
+    \item \textbf{Standard tables:} events, telemetry, facts, history---append-heavy, scan-heavy, latency-tolerant at the row level.
+    \item \textbf{The seam:} aggregate hybrid-table state into columnar marts on a schedule (tasks or dynamic tables) when analytical scan volume justifies it; join live when freshness beats scan cost.
+\end{itemize}
+
+\section{Thursday Hands-On Project: Hybrid Orders Under Concurrent Writes}
+\index{hands-on project!hybrid tables}
+This lab proves the OLTP claims: enforced constraints, fast point writes, and a live join to analytical data.
+
+\subsection*{Scenario}
+The e-commerce team wants order writes committed in milliseconds with referential integrity, and dashboards reading order state the instant it changes---no pipeline in between.
+
+\subsection*{Procedure}
+\begin{enumerate}
+    \item Create the \texttt{oms} schema and the two hybrid tables from Tuesday, plus a standard columnar \texttt{analytics.daily\_metrics} table.
+    \item Seed 100{,}000 customers; then run a Python driver executing thousands of single-row order inserts and status updates from parallel threads.
+    \item Attempt violations: duplicate \texttt{order\_id}, order against a missing customer, duplicate email. Record each rejection.
+    \item Benchmark point lookups (\texttt{WHERE order\_id = ?}) and the status-index query; record latency distributions.
+    \item Join hybrid \texttt{oms.orders} live against \texttt{analytics.daily\_metrics} and a columnar events table; confirm correctness and note scan behavior.
+    \item Compare a bulk aggregation over the hybrid table against the same over a columnar copy; quantify the scan trade-off.
+\end{enumerate}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item \textbf{DDL pack:} hybrid tables, constraints, indexes.
+    \item \textbf{Load-generator script:} the parallel single-row writer with throughput report.
+    \item \textbf{Integrity evidence:} the three rejected violations with error text.
+    \item \textbf{Latency table:} point read/write medians and p95s, plus the live-join query profile summary.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item All three constraint classes are provably enforced under concurrent load.
+    \item Point operations land in the single-digit-millisecond class at the tested concurrency.
+    \item The hybrid-to-columnar join returns correct results with no replication step.
+    \item The scan trade-off (hybrid vs.\ columnar for aggregation) is quantified, not asserted.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Add a dynamic table aggregating hybrid orders into a columnar mart at 1-minute lag; compare dashboard latency against live joins.
+    \item Introduce a hot-key update stream (one famous product's inventory counter) and measure contention behavior.
+    \item Fail the writer mid-transaction and verify atomicity from the reader's side.
+\end{itemize}
+
+\section{Friday Real-World Architecture: Order Management Without CDC}
+\index{Real-World Architecture!order management}
+An e-commerce platform runs order management on PostgreSQL and analytics on Snowflake, bridged by a CDC pipeline that is the team's least-loved component: lag alerts at peak, schema-drift breakage, reconciliation jobs. The mandate: evaluate collapsing OMS into Snowflake hybrid tables.
+
+\begin{figure}[H]
+    \centering
+    \resizebox{0.95\textwidth}{!}{%
+    \begin{tikzpicture}[
+        app/.style={rectangle, rounded corners, draw=orange!70!black, thick, fill=orange!10, align=center, minimum width=2.8cm, minimum height=1.0cm, font=\small\bfseries},
+        hyb/.style={rectangle, rounded corners, draw=primary, thick, fill=primary!6, align=center, minimum width=2.8cm, minimum height=1.0cm, font=\small\bfseries},
+        ana/.style={rectangle, rounded corners, draw=codegreen!60!black, thick, fill=green!8, align=center, minimum width=2.8cm, minimum height=1.0cm, font=\small\bfseries},
+        arrow/.style={-{Stealth[length=2.5mm]}, draw=primary, thick},
+        lbl/.style={font=\scriptsize\itshape, text=codegray}
+    ]
+        \node[app] (shop) at (0, 0) {Storefront\\checkout API};
+        \node[hyb] (oms) at (4.4, 0) {oms.orders\\(hybrid, enforced PK/FK)};
+        \node[ana] (mart) at (9.4, 1.3) {gold.order\_mart\\(columnar, dynamic table)};
+        \node[ana] (dash) at (9.4, -1.3) {Live ops dashboard\\(direct join)};
+        \draw[arrow] (shop) -- node[lbl, above]{ms-scale writes} (oms);
+        \draw[arrow] (oms) -- node[lbl, right]{1-min lag aggregate} (mart);
+        \draw[arrow] (oms) -- node[lbl, right]{zero-lag join} (dash);
+    \end{tikzpicture}%
+    }
+    \caption{Unistore order management: hybrid tables serve checkout writes; analytics choose live joins (zero lag) or a columnar mart (scan economics).}
+    \label{fig:chapter21-oms}
+\end{figure}
+
+\subsection{The Decision Analysis}
+\textbf{For collapse:} constraint enforcement matches the application's integrity needs; dashboards join live with zero pipeline; one governance plane covers PII in orders and marts alike; the CDC pipeline, its lag, and its reconciliation jobs are deleted. \textbf{Against:} checkout is the most availability-critical workload the company runs, and coupling it to the analytical platform concentrates risk; extreme write peaks (flash sales) must be load-tested against hybrid-table throughput; some team still owns database operations, now inside Snowflake.
+
+The disciplined rollout: shadow-write both systems for a quarter, reconcile continuously, fail over reads first, then writes---the same dual-run discipline Chapter 11 applied to Airflow migration. Unistore changes what is \emph{possible}; migration discipline decides whether it is \emph{safe}.
+
+\begin{pitfall}
+\textbf{Do not collapse workloads that need independent scaling or isolation.} A fraud-scoring burst and checkout writes sharing one failure domain is a business decision, not a default. Unistore removes the \emph{need} for CDC; it does not remove the reasons workloads are isolated.
+\end{pitfall}
+
+\section{Interview Q\&A}
+\begin{enumerate}
+    \item \textbf{Q: What workload are hybrid tables designed for?}\\
+    A: High-frequency, key-addressed point operations---single-row reads and writes with transactional integrity---alongside analytical access to the same data.
+    \item \textbf{Q: Which constraints do hybrid tables enforce that standard tables do not?}\\
+    A: Primary keys, foreign keys, and unique constraints are enforced at write time; standard tables accept the syntax as documentation/optimizer hints only.
+    \item \textbf{Q: Why are point lookups fast on hybrid tables?}\\
+    A: A row-oriented storage layer with indexes serves key-addressed reads without scanning columnar micro-partitions.
+    \item \textbf{Q: What is Unistore's core idea?}\\
+    A: One governed platform holding both transactional (row-store) and analytical (columnar) data, queryable together, with no replication between them.
+    \item \textbf{Q: When should you still choose a standard columnar table?}\\
+    A: For append-mostly, scan-heavy analytical data---events, facts, history---where scan economics and pruning dominate.
+\end{enumerate}
+
+\section{Further Reading}
+Snowflake's hybrid-tables documentation covers DDL, constraints, indexes, and workload guidance \cite{snowflakeHybridTablesDocs}. Chapter 7's CDC architecture is the pipeline this chapter optionally replaces \cite{snowflakeStreamsDocs}; Chapter 11's dynamic tables provide the aggregation seam \cite{snowflakeDynamicTablesDocs}.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item Unistore unifies OLTP and OLAP in one governed platform; hybrid tables are its row-store surface.
+    \item Hybrid tables enforce PK/FK/unique constraints---application-grade integrity inside Snowflake.
+    \item Row-level locking and indexes deliver millisecond point operations that columnar storage cannot.
+    \item Hybrid and columnar tables join freely; freshness versus scan economics chooses the seam.
+    \item Collapsing an OMS into Snowflake deletes the CDC pipeline but concentrates availability risk---dual-run before cutover.
+    \item Standard tables remain the default for analytical data; hybrid is a deliberate choice.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Explain why a one-row update is expensive on micro-partitions and cheap on a row store.
+    \item \textbf{(Conceptual)} Argue both sides of collapsing checkout into the analytical platform.
+    \item \textbf{(Hands-on)} Reproduce the three constraint violations and capture exact error behavior under concurrency.
+    \item \textbf{(Hands-on)} Benchmark the status index: build the queue query with and without the index and compare.
+    \item \textbf{(Hands-on)} Implement the 1-minute dynamic-table mart over hybrid orders and compare with live joins.
+    \item \textbf{(Design)} Classify ten application tables (sessions, carts, events, inventory, audit log, \ldots) as hybrid or columnar.
+    \item \textbf{(Design)} Write the dual-run migration plan from PostgreSQL OMS to hybrid tables, with reconciliation queries.
+    \item \textbf{(Operations)} Define SLOs for checkout writes and the monitors proving them inside Snowflake.
+    \item \textbf{(Cost)} Model the credit delta: CDC pipeline deleted, hybrid compute added, warehouse mix unchanged.
+    \item \textbf{(Interview)} Explain Unistore to a DBA who believes warehouses cannot do transactions.
+\end{enumerate}

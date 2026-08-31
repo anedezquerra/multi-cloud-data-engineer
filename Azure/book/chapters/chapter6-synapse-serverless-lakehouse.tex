@@ -1,0 +1,302 @@
+\chapter{Query Optimization and Cost Control in Synapse}
+\index{query optimization}\index{clustered columnstore}\index{partitioning}\index{workload management}\index{materialized view}\index{result-set caching}%
+\begin{objectives}
+\begin{itemize}
+    \item Select the right index structure---clustered columnstore, heap, or clustered index with nonclustered indexes---for each Synapse table role.
+    \item Apply table partitioning in dedicated pools without falling into the too-many-partitions trap.
+    \item Configure workload groups, workload classifiers, and resource isolation so critical dashboards survive ad-hoc load.
+    \item Decide when a materialized view or result-set cache pays off and when it just moves cost around.
+    \item Benchmark distribution types on JOIN-heavy queries and interpret the execution plan's data-movement steps.
+    \item Diagnose and re-architect a multi-petabyte table that causes CPU bottlenecks during daily dashboard aggregations.
+    \item Execute a benchmark-driven re-architecture of a slow warehouse workload, from diagnosis to a measured, cheaper steady state.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+Columnar storage, partition pruning, and workload isolation are universal warehouse concerns; only the knobs differ. Synapse exposes physical design explicitly (you choose distribution and indexes), while BigQuery and Snowflake automate more of it---the trade-off is control versus toil.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{3.0cm}p{2.9cm}p{3.1cm}p{3.2cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{AWS (Redshift)} & \textbf{Azure (Synapse)} & \textbf{GCP (BigQuery)} \\
+\midrule
+Columnar storage & Columnar by default & Clustered columnstore index & Columnar by default \\
+Physical layout & Sort keys + dist keys & Distribution + partitioning & Clustering + partitioning \\
+Workload isolation & WLM queues & Workload groups + classifiers & Slot reservations \\
+Precomputed results & Materialized views & Materialized views + result-set cache & Materialized views + BI Engine \\
+Query cache & Result cache & Result-set cache & Cached query results \\
+\addlinespace
+\multicolumn{4}{@{}l@{}}{\textbf{Fabric}: warehouse with automatic tuning; \textbf{Snowflake}: micro-partition pruning + resource monitors; \textbf{MongoDB}: indexes + covered queries.} \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+The benchmark habit this chapter teaches---three physical designs, one query workload, measured timings---is the antidote to cargo-cult optimization on every platform.
+\end{crosscloud}
+
+\begin{keyterms}
+\textbf{Clustered columnstore index (CCI)}: the default analytical storage format; column-wise compressed segments of up to ~1M rows.\quad
+\textbf{Partitioning}: dividing a table's data by a boundary column within each distribution for pruning and fast switching.\quad
+\textbf{Workload group}: a resource container that reserves or caps CPU, memory, and concurrency for a class of queries.\quad
+\textbf{Classifier}: a rule mapping incoming requests to a workload group by user, role, label, or time.\quad
+\textbf{Materialized view}: a precomputed, automatically maintained query result stored like a table.
+\end{keyterms}
+
+\section{Week 6 Overview: Making the Warehouse Fast and the Bill Predictable}
+Chapter 5 built the provisioned warehouse. This chapter makes it perform and proves it with measurement---before Chapter 7 asks how much of that warehouse you even need. Optimization in Synapse has a strict order of operations, and most failed tuning efforts violate it: first fix \emph{data layout} (distribution, indexing, partitioning), then \emph{resource governance} (workload management), and only then \emph{precomputation} (materialized views, caching). Teams that jump to materialized views while their fact table round-robins are paying to precompute a shuffle \cite{microsoft2025synapseDedicatedBest}.
+
+Cost control is the same discipline viewed from the invoice side: the expensive query is usually the badly laid-out one, and the expensive month is usually the ungoverned one.
+
+\section{Monday: Indexing---Columnstore, Heap, and Clustered}
+\index{clustered columnstore}\index{heap}\index{rowgroup}
+
+\subsection{Clustered Columnstore: The Default}
+A clustered columnstore index stores data in compressed column segments (rowgroups of up to 1{,}048{,}576 rows). Analytics queries read only the referenced columns, and compression shrinks IO by 10$\times$ or more versus row storage. CCI is the right default for every fact table and large dimension. Its enemies are \textbf{small rowgroups}: singleton inserts or trickle loads create thousands of open delta rowgroups that must be read as row storage. Bulk loads (COPY, CTAS) build compressed rowgroups directly; row-by-row writes destroy them.
+
+\subsection{Heap and Clustered Rowstore}
+A \textbf{heap} is an unindexed table---fastest to load because nothing is maintained, slowest to query selectively. Heaps are the right structure for transient staging tables whose entire contents are consumed once. A \textbf{clustered (rowstore) index with nonclustered indexes} fits small lookup dimensions and tables with frequent singleton updates, where columnstore's batch-oriented write path works against you. The decision rule: large and scanned $\rightarrow$ CCI; transient staging $\rightarrow$ heap; small and point-looked-up $\rightarrow$ clustered rowstore.
+
+\begin{tipbox}
+After any load, check rowgroup health with \texttt{sys.pdw\_nodes\_column\_store\_row\_groups}. A table whose average rowgroup is under 100k rows is a candidate for \texttt{ALTER INDEX ... REORGANIZE} (merge delta rowgroups) or a CTAS rebuild (full recompression).
+\end{tipbox}
+
+\begin{pitfall}
+\textbf{Adding nonclustered indexes to a fact table.} In an MPP warehouse, indexes are maintained per distribution; a handful of nonclustered indexes can slow loads measurably while almost never being chosen by the optimizer for scan-heavy analytics. Fix the layout, not the index list.
+\end{pitfall}
+
+\section{Tuesday: Partitioning Strategies}
+\index{partitioning!Synapse}
+
+\subsection{Partitioning Is Pruning and Switching, Not Performance Magic}
+Dedicated-pool partitioning divides each of the 60 distributions by a boundary column---typically date. Its two real wins are \textbf{partition elimination} (queries filtered on the boundary skip whole partitions) and \textbf{partition switching} (instant, metadata-only load or purge of a day/month slice). What partitioning does \emph{not} do is parallelize scans---that is what distribution already does.
+
+\subsection{The Too-Many-Partitions Trap}
+The partition count multiplies by 60 distributions and, for CCI, each partition builds its own rowgroups. A daily-partitioned 10-year table holds $3{,}650 \times 60 = 219{,}000$ partitions; if each holds only a few thousand rows, every columnstore rowgroup is a fragment and every query pays metadata overhead. Size partitions so each holds at least a few million rows: monthly or quarterly partitioning is right for most warehouses; daily partitioning requires billions of rows per year to justify.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.4cm}p{4.6cm}p{5.6cm}@{}}
+\toprule
+\textbf{Design choice} & \textbf{Right use} & \textbf{Failure mode} \\
+\midrule
+Daily partitions & Multi-billion-row tables; daily purge by switching & Fragmented rowgroups; slow everything \\
+Monthly/quarterly & Most fact tables & Fewer, larger switching units \\
+No partitioning & Small dims; evenly scanned tables & Losing the switch-based load/purge pattern \\
+Hash on join key & Large facts and joined dims & Skew concentrates load on one distribution \\
+\bottomrule
+\end{tabular}
+\caption{Partitioning complements distribution; it does not replace it.}
+\label{tab:ch6-partitioning}
+\end{table}
+
+\section{Wednesday: Workload Management and Materialized Views}
+\index{workload management}\index{workload classifier}\index{materialized view}
+
+\subsection{Workload Groups and Classifiers}
+Without governance, one runaway ad-hoc query can starve the executive dashboard. Workload management assigns incoming requests to \textbf{workload groups} via \textbf{classifiers}---rules on login, role, query label, or time window \cite{microsoft2025synapseWorkloadMgmt}. Each group gets importance, memory percentages, and concurrency caps. The canonical split: a \texttt{dashboards} group with high importance and guaranteed resources, an \texttt{etl} group capped to leave headroom, and an \texttt{adhoc} group with low importance and tight caps.
+
+\begin{lstlisting}[language=SQL,caption={Workload group and classifier: pin finance dashboards above ad-hoc queries.},label={lst:ch6-workload}]
+CREATE WORKLOAD GROUP wg_dashboards
+WITH ( MIN_PERCENTAGE_RESOURCE = 30,
+       CAP_PERCENTAGE_RESOURCE = 60,
+       IMPORTANCE = HIGH,
+       QUERY_EXECUTION_TIMEOUT_SEC = 600 );
+
+CREATE WORKLOAD CLASSIFIER wc_finance
+WITH ( WORKLOAD_GROUP = 'wg_dashboards',
+       MEMBERNAME = 'finreporting_role',
+       IMPORTANCE = HIGH );
+\end{lstlisting}
+
+\subsection{Materialized Views and Result-Set Caching}
+A \textbf{materialized view} stores a precomputed aggregation (for example, daily revenue by region) and is maintained automatically as the base table changes; the optimizer can rewrite queries to use it transparently. It pays off when many queries share the same expensive aggregation and the base table is append-mostly. \textbf{Result-set caching} is cheaper still: repeated identical queries return the cached result instantly. Both are the \emph{last} optimization step---they multiply the value of good layout and cannot rescue bad layout.
+
+\section{Thursday Hands-on Project: Benchmarking Distribution Types}
+\index{hands-on lab}\index{distribution!benchmark}
+This project proves, with numbers, what Chapter 5 asserted: distribution choice decides join performance. You will create three copies of a 50-million-row orders table---hash on the join key, hash on the wrong key, and round-robin---and benchmark a JOIN-heavy query against each.
+
+\subsection{Build the Three Tables}
+\begin{lstlisting}[language=SQL,caption={Three physical designs, identical data.},label={lst:ch6-bench-setup}]
+CREATE TABLE fact_orders_hash
+WITH ( DISTRIBUTION = HASH(customer_id), CLUSTERED COLUMNSTORE INDEX )
+AS SELECT * FROM stg_orders;
+
+CREATE TABLE fact_orders_wrongkey
+WITH ( DISTRIBUTION = HASH(order_id), CLUSTERED COLUMNSTORE INDEX )
+AS SELECT * FROM stg_orders;
+
+CREATE TABLE fact_orders_rr
+WITH ( DISTRIBUTION = ROUND_ROBIN, CLUSTERED COLUMNSTORE INDEX )
+AS SELECT * FROM stg_orders;
+\end{lstlisting}
+
+\subsection{Benchmark Query}
+\begin{lstlisting}[language=SQL,caption={The benchmark: a star join with aggregation.},label={lst:ch6-bench-query}]
+DBCC FREEPROCCACHE;  -- clear result-set cache between runs
+SELECT c.city, d.year, SUM(f.net_amount) AS revenue
+FROM fact_orders_hash f          -- swap per run
+JOIN dim_customer c ON f.customer_id = c.customer_id
+JOIN dim_date d     ON f.date_key    = d.date_key
+GROUP BY c.city, d.year
+ORDER BY revenue DESC
+OPTION (LABEL = 'bench-hash');   -- label enables DMV lookup
+\end{lstlisting}
+
+Run the query against all three tables, then pull timings from \texttt{sys.dm\_pdw\_exec\_requests} filtered by label. Inspect the plans: \texttt{ShuffleMoveOperation} steps in the wrong-key and round-robin runs are the Data Movement Service doing the work the hash table avoided. Record timings and row-movement counts in a table---that table \emph{is} the deliverable.
+
+\subsection{Extend: Rowgroup and Partition Effects}
+Repeat the benchmark after trickle-loading 1\% new rows one-by-one into each table (rowgroup fragmentation) and again after \texttt{REORGANIZE}. The degradation curve teaches more about CCI than any diagram.
+
+\section{Friday Use Case: The Multi-Petabyte Table That Melts the Pool}
+\index{use case}\index{query optimization!case study}
+A retailer's 3 PB clickstream fact table causes 100\% CPU every morning at 08:00 when 200 dashboards refresh their daily aggregations. Queries queue for forty minutes. The current design: round-robin distribution, CCI with fragmented rowgroups, daily partitions, no workload management, every dashboard computing \texttt{COUNT(DISTINCT session\_id)} from raw rows.
+
+\subsection{Diagnosis}
+Layout first: round-robin forces a full shuffle per query; fragmented rowgroups inflate IO; \texttt{COUNT(DISTINCT)} per dashboard per morning recomputes the same aggregates 200 times; and with no workload groups, a single accidental cross-join from an analyst notebook can starve everything.
+
+\subsection{Re-Architecture}
+\begin{enumerate}
+    \item \textbf{Layout:} CTAS the fact to hash on \texttt{session\_id}; rebuild rowgroups; collapse daily partitions to monthly (row counts per partition were far below the millions threshold).
+    \item \textbf{Precompute:} a materialized view of daily session counts per dashboard grain; dashboards retarget to the view.
+    \item \textbf{Governance:} \texttt{wg\_dashboards} with guaranteed resources and high importance; \texttt{wg\_adhoc} capped at 10\%; analysts routed by classifier on role.
+    \item \textbf{Cost:} with the layout fixed and aggregations precomputed, the pool drops from DW3000c to DW1500c for the same SLA---the optimization pays for itself.
+\end{enumerate}
+
+\begin{pitfall}
+\textbf{Scaling up to hide bad design.} Doubling cDWUs halves the queue time and doubles the bill; three months later the data doubles and the incident repeats. Measure layout, governance, and precomputation before touching the size slider.
+\end{pitfall}
+
+\section{Architectural Decision Record Template}
+\index{architectural decision record}
+Record per major table: distribution key with skew measurement, index type with rowgroup-health baseline, partition scheme with rows-per-partition arithmetic, and the review date. Record platform-wide: workload groups and classifier rules, materialized views with the queries they absorb, and the cDWU size with the utilization evidence that justifies it.
+
+\section{Operational Deep Dive: The Monthly Optimization Review}
+\index{statistics}\index{health check}
+Three habits keep a Synapse pool fast. \textbf{Statistics:} the optimizer needs current statistics on join and filter columns---enable auto-create and auto-update, and manually refresh stats on distribution keys after large loads. \textbf{Top-N query review:} monthly, pull the ten most expensive queries by elapsed time and CPU from the DMVs; they are almost always a new report missing a filter or a join fan-out. \textbf{Utilization review:} if the pool sits under 20\% utilization outside the morning peak, the Friday use case's hybrid dedicated/serverless split deserves another look.
+
+\section{Troubleshooting Patterns}
+\index{troubleshooting!Synapse performance}
+Slow query after a big load $\rightarrow$ stale statistics. Slow query that was fast last month $\rightarrow$ rowgroup fragmentation or data growth crossing a partition threshold. All queries slow at the same hour $\rightarrow$ concurrency slot exhaustion; check queue depth before blaming any query. One user's queries slow $\rightarrow$ they are classified into the wrong workload group. Sudden wrong results after adding a materialized view $\rightarrow$ you did not add one; the optimizer did---verify the rewrite is semantically what you intended.
+
+\section{Week 6 Lab Rubric}
+\index{rubric}
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.2cm}p{5.0cm}p{5.0cm}@{}}
+\toprule
+\textbf{Criterion} & \textbf{Meets expectation} & \textbf{Needs improvement} \\
+\midrule
+Benchmark rigor & Three distributions timed with cache cleared, labels, DMV evidence & Anecdotal timings, single runs, warm cache \\
+Diagnosis & Shuffle steps identified in plans; root cause named & ``It was slow, now it is fast'' with no mechanism \\
+Governance & Workload groups and classifiers configured and tested & All users share the default group \\
+Cost & cDWU change justified with utilization evidence & Scale changed without measurement \\
+\bottomrule
+\end{tabular}
+\caption{Week 6 rubric for the optimization deliverables.}
+\label{tab:ch6-rubric}
+\end{table}
+
+\section{Interview Q\&A}
+\subsection{Concepts and Trade-offs}
+\begin{enumerate}
+    \item \textbf{Q: Why is clustered columnstore the default for large fact tables?}\\
+    A: Columnar compression cuts IO roughly 10$\times$ and analytics queries touch few columns; CCI reads only what is referenced.
+    \item \textbf{Q: What problem does hash distribution solve for large JOINs?}\\
+    A: It co-locates rows with equal keys on the same distribution, so joins execute locally without Data Movement Service shuffles.
+    \item \textbf{Q: What do workload classifiers map incoming queries to?}\\
+    A: Workload groups---based on login, role, label, or time---so each class of work gets reserved resources, caps, and importance.
+    \item \textbf{Q: When does a materialized view beat adding an index?}\\
+    A: When many queries repeat the same aggregation; a materialized view precomputes it, while an index only speeds row lookup and barely helps scans.
+\end{enumerate}
+
+\section{Further Reading}
+The workload-management documentation \cite{microsoft2025synapseWorkloadMgmt} and the dedicated-pool best practices \cite{microsoft2025synapseDedicatedBest} are the primary references. The Data Engineer Handbook collects community tuning playbooks \cite{dataexpert2025handbook}. For the physical-design theory behind distribution and columnar storage, revisit the Delta Lake and lakehouse papers \cite{armbrust2020delta,armbrust2021lakehouse}.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item Optimize in order: layout (distribution, CCI, partitioning), then governance (workload groups), then precomputation (materialized views, caching).
+    \item CCI rowgroups near one million rows are the health metric; trickle loads fragment them and REORGANIZE or CTAS rebuilds repair them.
+    \item Partitions exist for elimination and switching; multiply by 60 distributions and keep each partition in the millions of rows.
+    \item Workload classifiers route users to groups with reserved resources and importance---the mechanism that protects dashboards from ad-hoc queries.
+    \item Benchmark distribution choices with cache cleared and labels set; the ShuffleMoveOperation is the cost you are measuring.
+    \item Scaling up hides bad design at 2$\times$ the price; measure first.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Why does partitioning interact with columnstore rowgroups in a 60-distribution pool?
+    \item \textbf{(Conceptual)} Explain the difference between importance and resource caps in workload groups.
+    \item \textbf{(Conceptual)} When is a heap the correct index choice in a warehouse?
+    \item \textbf{(Hands-on)} Run the distribution benchmark and produce the timings table with plan screenshots.
+    \item \textbf{(Hands-on)} Fragment a CCI with singleton inserts, measure the regression, and repair it with REORGANIZE.
+    \item \textbf{(Hands-on)} Create the \texttt{wg\_dashboards}/\texttt{wc\_finance} objects from Listing~\ref{lst:ch6-workload} and verify routing with a test query label.
+    \item \textbf{(Design)} Given a 500 GB fact table growing 2 GB/day, choose partition granularity and justify with rows-per-partition math.
+    \item \textbf{(Design)} Write the ADR for the Friday use case re-architecture, including the rejected ``just scale up'' alternative.
+    \item \textbf{(Design)} Define a materialized view for daily revenue by region and list which of your dashboard queries it can absorb.
+    \item \textbf{(Interview)} Prepare a two-minute answer to ``the pool is at 100\% CPU every morning---what do you check first?''
+\end{enumerate}
+
+\section{Capstone Project: Warehouse Performance Rescue}\label{sec:ch6-capstone}
+\index{capstone project}\index{query optimization!capstone}
+
+\begin{capstonebox}
+\textbf{Mission:} Take a deliberately degraded Synapse workload---round-robin fact table, fragmented columnstore, no workload governance, dashboards recomputing aggregates---and rescue it with measured, in-order optimization: layout, governance, precomputation, then a justified resize.
+
+\textbf{Estimated time:} 4--6 hours.
+
+\textbf{What you will practice:}
+\begin{itemize}
+    \item Diagnosing with DMVs and execution plans before changing anything.
+    \item The distribution benchmark from Listing~\ref{lst:ch6-bench-setup} as decision evidence.
+    \item Workload groups and classifiers protecting critical dashboards.
+    \item Materialized views absorbing repeated aggregations.
+\end{itemize}
+\end{capstonebox}
+
+\subsection*{Scenario}
+You inherit the Friday use case: a 3 PB clickstream fact table, 200 morning dashboards, forty-minute queues, and a pool at 100\% CPU. Leadership's only constraint: fix the SLA before buying more capacity.
+
+\subsection*{Requirements}
+\begin{itemize}
+    \item \textbf{Diagnosis:} DMV and plan evidence naming the top three cost drivers (data movement, rowgroup fragmentation, repeated aggregation).
+    \item \textbf{Layout:} CTAS rebuild to hash distribution on the dominant key; rowgroup repair; partition scheme validated by rows-per-partition math.
+    \item \textbf{Governance:} dashboard and ad-hoc workload groups with classifiers; demonstrated protection during a load test.
+    \item \textbf{Precomputation:} one materialized view absorbing the top repeated aggregation, with the query rewrite verified.
+    \item \textbf{Cost:} before/after timings, and a resize \emph{down} or a justified decision to hold, with utilization evidence.
+\end{itemize}
+
+\subsection*{Reference Architecture}
+The Chapter 5 star schema re-architected: hash-distributed CCI facts, monthly partitions, a materialized-aggregate layer, and workload groups separating dashboards, ETL, and ad-hoc analysts.
+
+\subsection*{Implementation Steps}
+\begin{enumerate}
+    \item Baseline: run the dashboard workload; capture timings, queue depth, and shuffle steps.
+    \item Rebuild the fact table with correct distribution and healthy rowgroups; re-measure.
+    \item Create the workload groups and classifiers (Listing~\ref{lst:ch6-workload}); load-test with an ad-hoc bully query.
+    \item Add the materialized view; retarget dashboards; re-measure.
+    \item Produce the before/after table and the resize decision with evidence.
+\end{enumerate}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item All SQL scripts (diagnosis queries, rebuilds, workload objects, view).
+    \item The before/after measurements table and plan screenshots.
+    \item An ADR including the rejected ``just scale up'' alternative.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item Dashboard p95 latency meets the stated SLA under the ad-hoc load test.
+    \item Every optimization is backed by a measurement, before and after.
+    \item Final cDWU is justified by utilization evidence, not by guesswork.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Quantify result-set caching's contribution by re-running the benchmark with it disabled.
+    \item Add statistics maintenance to the runbook and measure a stale-stats regression.
+    \item Repeat the rescue on a serverless-pool equivalent and compare cost per dashboard run.
+\end{itemize}

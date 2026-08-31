@@ -1,0 +1,299 @@
+\chapter{Replica Set Internals and Consensus Protocol}
+\index{replica set}\index{election}\index{Raft}\index{oplog}\index{write concern}\index{read concern}\index{arbiter}\index{failover}\index{rollback}%
+
+\begin{objectives}
+\begin{itemize}
+    \item Explain MongoDB's Raft-like election protocol: terms, votes, heartbeats, priorities, and why arbiters are risky.
+    \item Size the oplog, explain idempotent replication, and debug replication lag from first principles.
+    \item Select write concerns (\texttt{w:1}, \texttt{w:majority}, \texttt{j:true}) and read concerns (\texttt{local}, \texttt{majority}, \texttt{linearizable}) for stated durability targets.
+    \item Deploy a three-node replica set, force elections with \texttt{rs.stepDown()}, and simulate node loss under \texttt{w:majority}.
+    \item Architect a multi-datacenter banking replica set with zero data loss and sub-minute recovery.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+Every managed database hides consensus behind a product name, but the trade-offs---quorum size, failover time, rollback risk---are identical. Knowing MongoDB's protocol lets you reason about the managed services you cannot inspect.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{2.9cm}p{3.0cm}p{3.0cm}p{3.0cm}@{}} 
+\toprule
+\textbf{Capability} & \textbf{AWS} & \textbf{Azure} & \textbf{GCP} \\
+\midrule
+Managed replication & RDS Multi-AZ & Azure SQL auto-failover groups & Cloud SQL HA \\
+Quorum/consensus & Aurora 6-copy quorum & Cosmos DB quorum & Spanner Paxos \\
+Multi-region reads & Aurora Global / ElastiCache & Cosmos DB multi-region & Spanner multi-region \\
+Failover control & Manual or auto promote & Priority-based failover & Automatic regional \\
+Durable-write analog & \texttt{synchronous} commit & Strong consistency bound & Commit quorum \\
+\addlinespace
+Snowflake / Fabric & \multicolumn{3}{l}{Consensus invisible; durability delegated to cloud object storage (S3/ADLS/GCS) with cross-region replication as a DR feature} \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+MongoDB exposes what the warehouses hide: you choose the quorum that acknowledges a write and the consistency that a read observes. That explicitness is why replica-set internals are examinable engineering rather than vendor plumbing \cite{mongodbReplicationDocs,ongaro2014raft}.
+\end{crosscloud}
+
+\section{Week 5 Roadmap: Durability as a Protocol Decision}
+Part I treated one \texttt{mongod}; Part II treats the cluster. A replica set is a group of \texttt{mongod} processes holding the same data, electing one primary that accepts writes, and replicating its oplog to secondaries. The week's core insight is that durability and availability are protocol parameters: who must acknowledge a write, who may serve a read, and what happens when the primary vanishes mid-flight \cite{mongodbReplicationDocs}.
+
+\begin{definitionbox}
+A \textbf{replica set} is a MongoDB deployment of one primary and multiple secondary members (plus optional arbiters) that maintain identical data through asynchronous oplog replication and survive primary failure through automatic elections.
+\end{definitionbox}
+
+\begin{keyterms}
+\textbf{Term}: a monotonically increasing election epoch. \textbf{Heartbeat}: the periodic liveness signal between members. \textbf{Oplog}: the capped collection of idempotent operations secondaries apply. \textbf{Majority}: more than half the voting members. \textbf{Rollback}: reverting writes that never reached a majority when a primary fails. \textbf{Arbiter}: a vote-only member holding no data.
+\end{keyterms}
+
+\section{Monday: Elections and Consensus}
+\subsection{The Protocol in One Paragraph}
+MongoDB elections follow the Raft family design \cite{ongaro2014raft}: members exchange heartbeats; if a member stops hearing from the primary past an election timeout, it seeks votes for a new term; a candidate needs a strict majority of voting members; the candidate with the most up-to-date oplog wins. Terms prevent split-brain: a member in an old term steps down when it sees a newer term. Priority weights let you prefer well-provisioned members, and \texttt{priority: 0} members can never become primary---the standard pattern for analytics or DR nodes.
+
+\subsection{Why Majority, and Why Arbiters Are Risky}
+Majority is the magic number because two majorities always intersect: any new primary elected by a majority is guaranteed to have at least one voter holding every majority-acknowledged write. An arbiter adds a vote without data. The classic risk: in a primary + secondary + arbiter (PSA) set, if the secondary fails, the primary still has a majority (P+A) and acknowledges \texttt{w:majority} writes---but a subsequent primary failure elects nobody with the data, and majority writes acknowledged to P+A alone may be lost. PSA is a cost-saving topology with a real durability hole.
+
+\begin{pitfall}
+\textbf{Two data-bearing members plus an arbiter, split by a network partition.} With \texttt{w:majority} in a PSA set, the partition containing P+A keeps acknowledging writes with zero data redundancy. Prefer three data-bearing members (PSS) whenever the budget allows; the arbiter saves little and risks much.
+\end{pitfall}
+
+\subsection{Failure Timelines}
+Elections are fast but not instant: heartbeat intervals, election timeout, and catch-up together define the write unavailability window---typically a few seconds, tuned by \texttt{settings.electionTimeoutMillis} and heartbeat configuration. Applications must survive this window with retryable writes (the driver default) rather than erroring out to users.
+
+\section{Tuesday: The Oplog}
+\subsection{Idempotent Operations, Not SQL Statements}
+The oplog (\texttt{local.oplog.rs}) is a capped collection recording every write as an \emph{idempotent} transformation: not ``increment counter by 1'' but ``set counter to 42.'' Secondaries apply oplog entries, possibly in parallel and out of order, and must reach the same state regardless---idempotency is what makes re-application after a crash safe. This is why some update patterns (e.g. certain multi-document increments) are rewritten by the server into idempotent form before entering the oplog.
+
+\subsection{Sizing the Oplog Window}
+The oplog is capped: old entries roll off. The \textbf{oplog window}---the time span between its newest and oldest entries---is the maximum duration a secondary can be down and still catch up by replication. Beyond it, the member requires a full initial sync. Size the oplog for the worst case: peak write throughput multiplied by your longest tolerable maintenance or outage window, plus margin. Change streams (Chapter 16) consume the same oplog, so CDC consumers with long pauses have the same dependency \cite{mongodbReplicationDocs,mongodbOplogDocs}.
+
+\begin{tipbox}
+Monitor the oplog window as an alertable metric (\texttt{rs.printReplicationInfo()}). A shrinking window at rising write volume is an early warning that your maintenance SLA and your oplog size are diverging.
+\end{tipbox}
+
+\subsection{Debugging Replication Lag}
+Replication lag is the distance between a secondary's applied optime and the primary's. Causes decompose into four buckets: network (throughput, latency), secondary capacity (CPU, disk slower than the primary), write bursts exceeding apply parallelism, and deliberate delayed secondaries. \texttt{rs.status()} exposes per-member optimes; sustained lag growth on adequately sized hardware usually means the primary's write rate exceeds single-threaded apply for a hot document pattern---check for the same document being hammered, since parallel apply cannot parallelize one document's oplog entries.
+
+\section{Wednesday: Write Concern and Read Concern}
+\subsection{The Durability Ladder}
+Write concern is a per-operation durability contract. \texttt{w:1} acknowledges after the primary applies the write: fast, and silently rollable-back if the primary fails before replication. \texttt{w:majority} waits until a majority of voting members have applied it: the write survives any single election. \texttt{j:true} adds a journal flush requirement, ensuring the acknowledged writes are on disk, not just in memory. The banking standard is \texttt{\{w: "majority", j: true\}}; analytics ingestion might accept \texttt{w:1} with idempotent retry \cite{mongodbWriteConcernDocs}.
+
+\subsection{Read Concern and Rollback}
+Rollback is the mirror image of write concern: when a primary fails with un-replicated \texttt{w:1} writes, the new primary's history diverges, and the old primary's uncommitted writes are moved aside as rollback files. Read concern controls whether you can \emph{see} such doomed data. \texttt{local} reads whatever the node has (possibly doomed); \texttt{majority} reads only majority-committed data (never rolled back); \texttt{linearizable} adds a majority confirmation that the reading node is still primary, giving the strongest single-document guarantee at the highest latency cost.
+
+\begin{definitionbox}
+\textbf{Read-your-writes safety} across failover requires both halves of the contract: writes at \texttt{w:majority} (so they survive elections) and reads at \texttt{readConcern: "majority"} (so you never observe data an election would erase).
+\end{definitionbox}
+
+\begin{table}[H]
+\centering\footnotesize
+\begin{tabular}{@{}llll@{}}
+\toprule
+\textbf{Goal} & \textbf{Write concern} & \textbf{Read concern} & \textbf{Cost} \\
+\midrule
+Maximum throughput & \texttt{w:1} & \texttt{local} & Rollback risk on failover \\
+Balanced default & \texttt{w:majority} & \texttt{local} & Election-safe writes \\
+Never read doomed data & \texttt{w:majority} & \texttt{majority} & Stale-visibility nuance \\
+Strongest single-doc read & \texttt{w:majority, j:true} & \texttt{linearizable} & Highest latency \\
+\bottomrule
+\end{tabular}
+\caption{Durability/consistency ladder: match the pair to the business guarantee.}
+\label{tab:ch9-ladder}
+\end{table}
+
+\section{Thursday Hands-On Project: Break a Replica Set on Purpose}
+Deploy a three-node local replica set, then attack it: step down the primary, kill a secondary, and partition the network with the Windows firewall, observing write availability under \texttt{w:majority} throughout.
+
+\subsection{Deployment}
+\begin{lstlisting}[language=bash, caption={Three local mongod instances forming one replica set.}]
+$root = "C:\MongoData\rs-lab"
+0..2 | ForEach-Object {
+  New-Item -ItemType Directory -Force "$root\n$_.\db", "$root\n$_.\log"
+}
+# Start each in its own terminal (ports 28017, 28018, 28019):
+mongod --replSet labrs --port 28017 --dbpath "$root\n0\db" --bind_ip 127.0.0.1 --oplogSize 1024
+mongod --replSet labrs --port 28018 --dbpath "$root\n1\db" --bind_ip 127.0.0.1 --oplogSize 1024
+mongod --replSet labrs --port 28019 --dbpath "$root\n2\db" --bind_ip 127.0.0.1 --oplogSize 1024
+
+mongosh --port 28017 --eval 'rs.initiate({_id:"labrs", members:[
+  {_id:0, host:"127.0.0.1:28017"},
+  {_id:1, host:"127.0.0.1:28018"},
+  {_id:2, host:"127.0.0.1:28019"}]})'
+\end{lstlisting}
+
+\subsection{The Failure Experiments}
+\begin{lstlisting}[language=JavaScript, caption={Controlled failover and node-loss experiments.}]
+// Experiment 1: graceful stepdown; measure the write gap.
+db.adminCommand({ replSetStepDown: 60, force: true });
+// Re-run an insert loop with w:majority; record the unavailable seconds.
+
+// Experiment 2: ungraceful loss of a SECONDARY.
+db.getSiblingDB("admin").shutdownServer();   // run on the secondary
+// w:majority writes must continue (P + remaining S = 2 of 3).
+
+// Experiment 3: firewall partition of the primary.
+//   netsh advfirewall firewall add rule name="mongo-partition" ^
+//     dir=in action=block protocol=TCP localport=28017
+// Observe: the partitioned side cannot reach a majority;
+// w:majority writes block there while the other side elects.
+\end{lstlisting}
+
+\begin{pitfall}
+\textbf{Judging failover by error messages alone.} The correct observation is a latency histogram of \texttt{w:majority} inserts across the event: how long is the gap, and do retryable writes mask it from the application? Drivers retry; log lines panic.
+\end{pitfall}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item The replica-set deployment scripts and the three experiment logs.
+    \item A latency timeline of \texttt{w:majority} inserts across the stepdown event.
+    \item A written explanation of why Experiment 3 blocks writes on the partitioned side.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item \texttt{rs.status()} correctly interpreted after each event (primary, secondaries, optimes).
+    \item Write unavailability measured in seconds, not asserted in adjectives.
+    \item The firewall rule removed and the cluster verified healthy at the end.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Repeat with a PSA topology and demonstrate the durability hole with a scripted write-acknowledgement audit.
+    \item Add a delayed secondary and use it to recover a dropped collection.
+    \item Measure the oplog window shrinking under a write burst and compute the size needed for a 24-hour maintenance SLA.
+\end{itemize}
+
+\section{Friday Use Case and Architecture: Banking Replica Set Across Datacenters}
+\subsection{Scenario and Requirements}
+A bank requires account writes with zero data loss (RPO = 0) and recovery from a full datacenter loss in under one minute. The compliance team additionally requires that no read ever observes a balance that a failover could erase.
+
+\subsection{Topology}
+The reference topology is five voting members across three fault domains: two in DC-A, two in DC-B, one tiebreaker in DC-C (or a cloud region). Five members let the cluster lose an entire datacenter and still form a majority (3 of 5). All financial writes use \texttt{\{w: "majority", j: true, wtimeout: 5000\}}; balance reads that feed decisions use \texttt{readConcern: "majority"}; customer-facing cached views may use \texttt{local}. A \texttt{priority: 0} delayed secondary in DC-B provides a human-error recovery point; arbiters are rejected outright.
+
+\begin{figure}[H]
+    \centering
+    \resizebox{0.95\textwidth}{!}{%
+    \begin{tikzpicture}[
+        dc/.style={rectangle, rounded corners, draw=codegray, thick, fill=backcolour, minimum width=4.4cm, minimum height=2.5cm, align=center},
+        member/.style={rectangle, rounded corners, draw=primary, fill=primary!8, minimum width=1.7cm, minimum height=0.8cm, align=center, font=\scriptsize\bfseries},
+        hb/.style={{Stealth[length=2mm]}-{Stealth[length=2mm]}, draw=codegray, thick, dashed}
+    ]
+        \node[dc, label={[font=\small\bfseries]above:DC-A}] (a) at (0,0) {};
+        \node[member] (a1) at (-1.0,0.4) {P};
+        \node[member] (a2) at (1.0,-0.4) {S};
+        \node[dc, label={[font=\small\bfseries]above:DC-B}] (b) at (6.4,0) {};
+        \node[member] (b1) at (5.4,0.4) {S};
+        \node[member] (b2) at (7.4,-0.4) {S (delayed, p0)};
+        \node[dc, label={[font=\small\bfseries]above:DC-C}] (c) at (12.8,0) {};
+        \node[member] (c1) at (12.8,0) {S (tiebreak)};
+        \draw[hb] (a) -- (b);
+        \draw[hb] (b) -- (c);
+        \draw[hb] (a) to[bend left=25] (c);
+    \end{tikzpicture}%
+    }
+    \caption{Five voting members across three fault domains: any single DC loss preserves a majority and zero-loss durability.}
+    \label{fig:ch9-banking}
+\end{figure}
+
+\subsection{Failure Math and Operations}
+The design review walks three failures. DC-A loss: three members remain, election completes in seconds, \texttt{w:majority} continues, no acknowledged write is lost. DC-A + DC-B loss: two members cannot form a majority; writes halt (correctly---availability sacrificed for zero loss) and DR procedures promote a rebuilt set from the delayed member. Split brain is impossible because neither side of any partition holds three of five votes. Operational guardrails: oplog sized to 72 hours, lag alerts at 10 seconds, quarterly game-day failovers measured against the one-minute objective.
+
+\section{Interview Q\&A}
+\subsection{Replication and Durability}
+\begin{enumerate}
+    \item \textbf{Q: Why can \texttt{w:1} writes be rolled back?}\\
+    A: They are acknowledged before replication. If the primary dies before any secondary applies them, the elected primary's history lacks them, and the old primary's copy becomes rollback files.
+
+    \item \textbf{Q: Why must oplog entries be idempotent?}\\
+    A: Secondaries apply entries in parallel and may re-apply after crashes; only idempotent operations converge to the same state under re-application.
+
+    \item \textbf{Q: Why is an arbiter dangerous in a PSA set?}\\
+    A: It lets \texttt{w:majority} be satisfied by one data-bearing member plus the arbiter, so acknowledged writes can exist on a single copy that a subsequent failure loses.
+
+    \item \textbf{Q: What does \texttt{j:true} add?}\\
+    A: A journal-flush requirement: the acknowledged write is durable on disk, protecting against process or host crash, not just replication lag.
+
+    \item \textbf{Q: Which read concern avoids reading rolled-back data?}\\
+    A: \texttt{majority}---it returns only data known to be committed on a majority, which elections cannot erase.
+\end{enumerate}
+
+\section{Further Reading}
+MongoDB's replication manual is the primary source \cite{mongodbReplicationDocs}, with write concern \cite{mongodbWriteConcernDocs}, read concern \cite{mongodbReadConcernDocs}, and oplog \cite{mongodbOplogDocs} references covering this chapter's semantics. Raft's design rationale is best read in the original paper \cite{ongaro2014raft}, and the broader consistency taxonomy is in Kleppmann \cite{kleppmann2017ddia} and the CAP literature \cite{brewer2012cap}.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item Elections are Raft-like: terms, heartbeats, majority votes; majorities intersect, which is what makes failover safe.
+    \item PSA topologies have a real durability hole; prefer three data-bearing members.
+    \item The oplog is an idempotent, capped replication journal; its window bounds secondary downtime and change-stream pauses.
+    \item Durability is a per-operation contract: \texttt{w:majority} + \texttt{j:true} for anything that may not be lost.
+    \item Reads have a matching contract: \texttt{readConcern: "majority"} to never observe rollback-doomed data.
+    \item Failover behavior must be measured in drills, not assumed from documentation.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Prove that any two majorities of a five-member set intersect, and state the consequence for elections.
+    \item \textbf{(Conceptual)} Explain why a delayed secondary must have \texttt{priority: 0}.
+    \item \textbf{(Conceptual)} Why does \texttt{linearizable} read concern cost more than \texttt{majority}?
+    \item \textbf{(Hands-on)} Script the full Thursday lab end-to-end so one command builds and one command destroys the replica set.
+    \item \textbf{(Hands-on)} Fill 80\% of the lab oplog with a write burst, measure the window, and compute the size for a 24-hour SLA.
+    \item \textbf{(Design)} Design the replica-set topology for a Latin-American fintech with users in Mexico City and S\~ao Paulo and a DR requirement in a third region.
+    \item \textbf{(Design)} Write the durability policy document for a payments company: which operations get which concern pair, and why.
+    \item \textbf{(Interview)} ``Failover took 90 seconds and the dashboard showed errors.'' List your investigation order.
+\end{enumerate}
+
+\section{Capstone Project: Zero-Loss Failover Certification Lab}\label{sec:ch5-capstone}
+
+\begin{capstonebox}
+\textbf{Mission:} build a five-member, three-fault-domain replica set on your lab machine (namespaces per ``datacenter''), script a write-availability monitor, and produce measured evidence that \texttt{w:majority} + \texttt{j:true} writes are never lost and never falsely acknowledged across three scripted failure scenarios.
+
+\textbf{Estimated time:} 4--6 hours.
+
+\textbf{What you will practice:}
+\begin{itemize}
+    \item Multi-member replica-set topology design and election control.
+    \item Write-availability and durability measurement under failure.
+    \item Reading \texttt{rs.status()} and oplog evidence to prove durability claims.
+\end{itemize}
+\end{capstonebox}
+
+\subsection*{Scenario}
+Your bank's auditor requires evidence, not architecture diagrams: demonstrate that during a simulated datacenter loss, every write acknowledged to the application was present in the post-failover cluster, and no write was acknowledged while the cluster lacked a majority. The lab substitutes firewall rules and process kills for real datacenter failures.
+
+\subsection*{Requirements}
+\begin{itemize}
+    \item Five members across three simulated fault domains, initiated from scripts; no arbiters.
+    \item A Python writer that inserts monotonically numbered documents with \texttt{\{w: "majority", j: true\}}, logging every acknowledgement with a timestamp.
+    \item Three scripted scenarios: graceful stepdown, abrupt primary kill, and firewall partition isolating one domain.
+    \item A post-scenario audit script that reads back the collection and asserts every acknowledged sequence number is present, with zero gaps.
+    \item A written report: write-gap duration per scenario, audit results, and the configuration that produced them.
+\end{itemize}
+
+\subsection*{Implementation Steps}
+\begin{enumerate}
+    \item \textbf{Build.} Script the five-member cluster with per-domain directories and ports; verify steady-state replication and oplog window.
+    \item \textbf{Monitor.} Implement the Python writer with acknowledgement logging and gap detection in its own sequence log.
+    \item \textbf{Break.} Automate the three scenarios with PowerShell (process stop, \texttt{netsh} rules, \texttt{replSetStepDown}).
+    \item \textbf{Audit.} After each scenario, verify zero acknowledged writes are missing and report the unavailability window.
+    \item \textbf{Report.} Tabulate the evidence and state the RPO/RTO the lab demonstrated.
+\end{enumerate}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item Cluster build/teardown scripts, the writer, the scenario scripts, and the audit script.
+    \item The evidence report with per-scenario write-gap measurements and zero-loss audit output.
+    \item A one-page durability policy derived from the measurements.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item All three scenarios complete with zero acknowledged writes missing in the audit.
+    \item Write-gap durations are measured and reported per scenario.
+    \item The cluster self-heals after each scenario without manual reconfiguration.
+    \item All firewall rules and processes are cleaned up by the teardown script.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Repeat the audit with \texttt{w:1} writes and quantify exactly how many acknowledged writes a primary kill loses.
+    \item Add a PSA topology variant and demonstrate the durability hole with the same audit harness.
+\end{itemize}

@@ -1,0 +1,173 @@
+\chapter{Azure CLI Reference for Data Engineers}
+\index{Azure CLI}\index{command reference}%
+This appendix is a working reference for the Azure CLI commands used throughout the
+book, organized by service. All examples assume Windows PowerShell with backtick
+line continuation, a signed-in session (\texttt{az login}), and a subscription
+selected with \texttt{az account set}. Replace placeholder names before running.
+
+\begin{notebox}
+Commands are shown in their simplest useful form. Production deployments belong in
+Terraform or Bicep (Chapter 24); the CLI is for learning, inspection, and one-off
+operations. Every command shown mutating a resource should be run first in a
+sandbox subscription.
+\end{notebox}
+
+\section{Account, Identity, and Access}
+\index{Azure CLI!identity and access}
+
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{6.6cm}p{6.8cm}@{}}
+\toprule
+\textbf{Command} & \textbf{Purpose} \\
+\midrule
+\texttt{az login} & Interactive sign-in \\
+\texttt{az account set --subscription <id>} & Select the working subscription \\
+\texttt{az group create -n <rg> -l eastus} & Create a resource group \\
+\texttt{az ad signed-in-user show} & Show the current identity \\
+\texttt{az role assignment create --assignee <id> \textbackslash} & Grant an RBAC role at a scope \\
+\quad \texttt{--role "Storage Blob Data Reader" --scope <resource-id>} & \\
+\texttt{az role assignment list --scope <resource-id>} & Audit role assignments \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Prefer object IDs with \texttt{--assignee-object-id} and
+\texttt{--assignee-principal-type ServicePrincipal} for managed identities; it
+avoids Graph lookup ambiguity.
+
+\section{Storage and ADLS Gen2}
+\index{Azure CLI!storage}
+
+\begin{lstlisting}[language=bash,caption={Core ADLS Gen2 lifecycle commands.},label={lst:app-cli-storage}]
+az storage account create --name <adls> --resource-group $rg `
+  --location eastus --sku Standard_GZRS --kind StorageV2 --hns true `
+  --min-tls-version TLS1_2 --allow-blob-public-access false
+
+az storage fs create --name raw --account-name <adls> --auth-mode login
+az storage fs directory create --name bronze -f raw `
+  --account-name <adls> --auth-mode login
+az storage fs file upload -s ./orders.csv `
+  -p bronze/year=2026/month=08/orders.csv -f raw `
+  --account-name <adls> --auth-mode login
+az storage fs file list -f raw --path bronze `
+  --account-name <adls> --auth-mode login --recursive
+
+az storage account management-policy create `
+  --account-name <adls> --resource-group $rg --policy @lifecycle.json
+
+az storage blob service-properties update --account-name <adls> `
+  --enable-delete-retention true --delete-retention-days 14 `
+  --enable-versioning true
+
+az storage account update --name <adls> --resource-group $rg `
+  --public-network-access Disabled --default-action Deny
+\end{lstlisting}
+
+\begin{tipbox}
+Use \texttt{--auth-mode login} so data-plane operations execute as your Entra
+identity under RBAC instead of the account key. Scripts that pass account keys
+are credential-handling liabilities.
+\end{tipbox}
+
+\section{Synapse Analytics}
+\index{Azure CLI!Synapse}
+
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{7.2cm}p{6.2cm}@{}}
+\toprule
+\textbf{Command} & \textbf{Purpose} \\
+\midrule
+\texttt{az synapse workspace create ...} & Workspace with storage and SQL admin \\
+\texttt{az synapse sql pool create --performance-level DW100c} & Provision a dedicated pool \\
+\texttt{az synapse sql pool pause / resume} & Stop/start compute billing \\
+\texttt{az synapse sql pool list --workspace-name <ws>} & Inventory pools \\
+\texttt{az synapse workspace firewall-rule create} & Allow a client IP range \\
+\texttt{az synapse spark pool create} & Provision a Spark pool \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The pause/resume pair is the cost-control command set from Chapter 5; automate it
+rather than relying on memory.
+
+\section{Data Factory, Databricks, and Event Hubs}
+\index{Azure CLI!ADF}\index{Azure CLI!Databricks}\index{Azure CLI!Event Hubs}
+
+\begin{lstlisting}[language=bash,caption={Orchestration and streaming estate commands.},label={lst:app-cli-data}]
+az datafactory create --name <adf> --resource-group $rg --location eastus
+az datafactory show --name <adf> --resource-group $rg `
+  --query identity.principalId
+
+az databricks workspace create --name <dbx> --resource-group $rg `
+  --location eastus --sku premium
+
+az eventhubs namespace create --name <ns> --resource-group $rg `
+  --sku Standard --capacity 2 --enable-auto-inflate `
+  --maximum-throughput-units 10
+az eventhubs eventhub create --name <hub> --namespace-name <ns> `
+  --resource-group $rg --partition-count 8 --message-retention-in-days 3
+
+az stream-analytics job create --name <job> --resource-group $rg `
+  --location eastus --streaming-units 3
+\end{lstlisting}
+
+\section{Networking, Key Vault, and Security}
+\index{Azure CLI!networking}\index{Azure CLI!Key Vault}
+
+\begin{lstlisting}[language=bash,caption={Private networking and secrets.},label={lst:app-cli-net}]
+az network vnet create --name vnet-data --resource-group $rg `
+  --address-prefix 10.20.0.0/16 --subnet-name snet-data `
+  --subnet-prefix 10.20.1.0/24
+
+az network private-endpoint create --name pep-adls-dfs `
+  --resource-group $rg --vnet-name vnet-data --subnet snet-data `
+  --private-connection-resource-id <adls-id> `
+  --group-id dfs --connection-name adls-dfs-conn
+
+az network private-dns zone create --resource-group $rg `
+  --name "privatelink.dfs.core.windows.net"
+
+az keyvault create --name <kv> --resource-group $rg --location eastus `
+  --enable-rbac-authorization true --enable-purge-protection true
+az keyvault secret set --vault-name <kv> --name my-secret --value <value>
+az keyvault secret show --vault-name <kv> --name my-secret --query value -o tsv
+\end{lstlisting}
+
+\section{Monitoring and Cost}
+\index{Azure CLI!monitoring}
+
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{7.4cm}p{6.0cm}@{}}
+\toprule
+\textbf{Command} & \textbf{Purpose} \\
+\midrule
+\texttt{az monitor diagnostic-settings create} & Route resource logs to Log Analytics \\
+\texttt{az monitor metrics alert create} & Threshold alert on a metric \\
+\texttt{az monitor log-analytics query} & Run a KQL query from the shell \\
+\texttt{az consumption budget create} & Budget with alert thresholds \\
+\texttt{az resource list --tag product=orders} & Inventory by cost-allocation tag \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{Universal Flags and Query Patterns}
+\begin{itemize}
+    \item \texttt{--query "<jmespath>" -o tsv} extracts fields for scripting;
+          \texttt{-o table} for humans; \texttt{-o json} for full fidelity.
+    \item \texttt{--what-if} is available on deployments (not direct resource
+          commands); use Bicep/ARM deployment what-if for previewing changes.
+    \item \texttt{az find "<fuzzy description>"} searches the command surface
+          when you remember the intent but not the verb.
+    \item \texttt{az <command> --help} is consistently excellent; consult it
+          before searching the web.
+\end{itemize}
+
+\section{Cross-References}
+The chapters that use each command family: storage (Chapters 1, 5), Synapse
+(Chapters 5--8), ADF and Databricks (Chapters 9--12), Event Hubs and ASA
+(Chapters 13--16), ML workspaces (Chapters 18--19), and networking and Key Vault
+(Chapters 21--23). For infrastructure as code, see Chapter 24 and
+\cite{hashicorp2025azurerm,microsoft2025bicep}.

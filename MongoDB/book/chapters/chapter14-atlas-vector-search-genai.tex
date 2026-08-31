@@ -1,0 +1,279 @@
+\chapter{Atlas Vector Search and GenAI Architectures}
+\index{Atlas Search}\index{vector search}\index{embeddings}\index{HNSW}\index{\$vectorSearch}\index{hybrid search}\index{RAG}\index{BM25}\index{reciprocal rank fusion}%
+
+\begin{objectives}
+\begin{itemize}
+    \item Explain embeddings, distance metrics (cosine, dot product, Euclidean), and why high-dimensional nearest neighbors need approximate indexes.
+    \item Create Atlas Vector Search (HNSW) indexes and run \texttt{\$vectorSearch} queries with pre-filters.
+    \item Build Atlas Search (Lucene) indexes with custom analyzers, autocomplete, and faceting.
+    \item Combine BM25 and vector results into hybrid retrieval with reciprocal-rank fusion for RAG pipelines.
+    \item Build the RAG backend lab: embed documents, index them, and serve grounded retrieval.
+    \item Architect an enterprise semantic search platform over unstructured documents plus structured metadata.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+Vector search moved from specialty to commodity in two years; every platform now ships it, and the differentiators are index algorithm, pre-filtering, and operational integration with the primary store.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{2.9cm}p{3.0cm}p{3.0cm}p{3.0cm}@{}} 
+\toprule
+\textbf{Capability} & \textbf{AWS} & \textbf{Azure} & \textbf{GCP} \\
+\midrule
+Vector store & OpenSearch k-NN / pgvector on Aurora & Cosmos DB vector search / AI Search & Vertex AI Vector Search / AlloyDB \\
+Embedding service & Bedrock Titan & Azure OpenAI & Vertex AI embeddings \\
+Hybrid search & OpenSearch BM25 + k-NN & AI Search hybrid & Vertex hybrid ranking \\
+RAG framework & Bedrock Knowledge Bases & Azure OpenAI + AI Search & Vertex AI RAG Engine \\
+Co-located OLTP & Aurora pgvector & Cosmos DB (same doc) & AlloyDB (same row) \\
+\addlinespace
+Snowflake / Fabric & \multicolumn{3}{l}{Snowflake Cortex (embed + vector similarity in SQL); Fabric integrates with AI Search via OneLake} \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+Atlas Vector Search's distinctive property is co-location: vectors, BM25 text indexes, and the operational documents live in one system, so hybrid retrieval and its filters execute in one aggregation pipeline without a second store to sync \cite{mongodbAtlasVectorSearch,mongodbAtlasSearchDocs}.
+\end{crosscloud}
+
+\section{Week 14 Roadmap: From Keywords to Meaning}
+Chapter 9's text index answers ``contains these words.'' This week answers ``means the same thing'': embeddings map text to points in a high-dimensional space where semantic similarity is geometric proximity, and vector indexes make nearest-neighbor search over millions of points fast enough for interactive products. The destination is hybrid retrieval---keyword precision plus semantic recall---as the retrieval layer of retrieval-augmented generation \cite{mongodbAtlasVectorSearch}.
+
+\begin{definitionbox}
+An \textbf{embedding} is a learned mapping from content (text, image) to a dense vector such that semantically similar items land near each other under a distance metric. \textbf{Vector search} finds the $k$ nearest stored vectors to a query vector, approximately, at interactive latency.
+\end{definitionbox}
+
+\begin{keyterms}
+\textbf{HNSW}: hierarchical navigable small world, the graph-based approximate nearest-neighbor index Atlas uses. \textbf{Cosine similarity}: angle-based distance, standard for text embeddings. \textbf{Pre-filter}: a metadata predicate narrowing candidates before/during vector search. \textbf{BM25}: Lucene's keyword relevance scoring. \textbf{RRF}: reciprocal-rank fusion, merging ranked lists by rank position. \textbf{RAG}: retrieval-augmented generation---grounding an LLM's answer in retrieved documents.
+\end{keyterms}
+
+\section{Monday: Embeddings and Distance}
+\subsection{What the Model Gives You}
+An embedding model (HuggingFace sentence transformers, an OpenAI/Bedrock/Vertex endpoint) maps a chunk of text to a fixed-dimension float vector---768 and 1024 are common. Two properties drive all downstream design: dimensions are fixed per model version (a 768-d index cannot search 1024-d vectors, and mixed dimensions silently zero recall---the syllabus's drift pitfall), and the distance metric is part of the model's contract (most text models are trained for cosine). Store \texttt{model\_version} on every embedding document from day one; re-embedding rollouts depend on it.
+
+\subsection{Choosing the Metric}
+Cosine distance measures angle---robust to vector magnitude, the default for text. Dot product rewards magnitude as well as direction---appropriate when magnitude is meaningful (learned scoring models). Euclidean measures absolute distance---common for image and audio embeddings. The metric is set at index creation and cannot change without a rebuild; read the embedding model's card before creating the index, not after the relevance complaints arrive.
+
+\begin{pitfall}
+\textbf{Chunking as an afterthought.} Retrieval quality is dominated by how documents are chunked (size, overlap, semantic boundaries) before embedding. A 10{,}000-word PDF embedded as one vector retrieves mush; 300--500 token chunks with 10--15\% overlap are the usual starting point---then evaluate with real queries.
+\end{pitfall}
+
+\section{Tuesday: HNSW and the Vector Index}
+\subsection{Approximate Nearest Neighbors}
+Exact $k$-NN over millions of 768-d vectors is a scan; HNSW builds a layered proximity graph where greedy walks from coarse to fine layers find near-exact neighbors in logarithmic-ish time \cite{malkov2020hnsw}. ``Approximate'' has a measurable meaning: \textbf{recall}---the fraction of true nearest neighbors the index returns---trades against latency via \texttt{numCandidates} at query time. Production tuning is a recall measurement exercise: sample queries, brute-force their true neighbors on a subset, and set \texttt{numCandidates} where recall plateaus.
+
+\subsection{Index Definition and Pre-Filters}
+\begin{lstlisting}[language=JavaScript, caption={Vector index definition and a filtered \texttt{\$vectorSearch} query.}]
+// Atlas Search index (JSON, via UI, API, or Terraform):
+{
+  "fields": [
+    { "type": "vector", "path": "embedding", "numDimensions": 768,
+      "similarity": "cosine" },
+    { "type": "filter", "path": "tenant_id" },
+    { "type": "filter", "path": "doc_type" }
+  ]
+}
+
+// Query: semantic search scoped to one tenant's policies.
+db.docs.aggregate([
+  { $vectorSearch: {
+      index: "docs_vector",
+      path: "embedding",
+      queryVector: queryEmbedding,           // 768-d from the same model
+      numCandidates: 200,
+      limit: 10,
+      filter: { tenant_id: "acme", doc_type: "policy" }
+  } },
+  { $project: { _id: 1, title: 1, score: { $meta: "vectorSearchScore" } } }
+]);
+\end{lstlisting}
+
+Filters declared in the index are applied during the graph walk, which is what makes multi-tenant vector search viable: without pre-filtering, a tenant-scoped query would over-fetch globally and discard---latency and a potential cross-tenant leakage surface in one mistake. Declare every field you will filter on; the index rebuilds when the filter set changes.
+
+\section{Wednesday: Atlas Search and Hybrid Retrieval}
+\subsection{The Lucene Side}
+Atlas Search embeds Apache Lucene: analyzers tokenize and normalize (standard, keyword, ngram---the ngram analyzer powering autocomplete), operators span \texttt{text}, \texttt{phrase}, \texttt{wildcard}, \texttt{autocomplete}, and \texttt{compound} boolean compositions, and \texttt{facet} collectors produce filter-count UIs in one pass. Index definitions are code: mappings, analyzers, and synonyms version-controlled and applied via API.
+
+\subsection{Hybrid Search and RRF}
+Keyword and vector retrieval fail differently: BM25 misses paraphrase, vectors miss exact tokens (SKUs, part numbers, error codes). Hybrid search runs both and fuses. Reciprocal-rank fusion is the robust default merger: score $= \sum_i 1/(k + \text{rank}_i)$ per list with $k \approx 60$, requiring no score normalization between incompatible scales.
+
+\begin{lstlisting}[language=Python, caption={Reciprocal-rank fusion of BM25 and vector hits.}]
+def hybrid(bm25, vec, k=60, top=20):
+    score = {}
+    for rank, doc in enumerate(bm25):
+        score[doc["_id"]] = score.get(doc["_id"], 0) + 1 / (k + rank + 1)
+    for rank, doc in enumerate(vec):
+        score[doc["_id"]] = score.get(doc["_id"], 0) + 1 / (k + rank + 1)
+    return sorted(score, key=score.get, reverse=True)[:top]
+\end{lstlisting}
+
+\begin{notebox}
+Evaluate hybrid retrieval with a labeled query set: twenty to fifty real queries with known relevant documents, tracking recall@10 for BM25-only, vector-only, and fused. The fusion win is usually largest on the exact-token and paraphrase extremes---which is the argument for keeping both paths.
+\end{notebox}
+
+\section{Thursday Hands-On Project: The RAG Backend}
+Build the retrieval layer: embed a document corpus, index it in Atlas, and serve a retrieval API that a generation step can ground on.
+
+\subsection{Pipeline}
+\begin{enumerate}
+    \item \textbf{Chunk and embed.} Load a corpus (product manuals or policy PDFs), chunk to ${\sim}$400 tokens with overlap, embed each chunk with a sentence-transformers model, and store \texttt{\{text, embedding, doc\_id, tenant\_id, model\_version\}}.
+    \item \textbf{Index.} Create the vector index (768-d, cosine, filters on \texttt{tenant\_id}, \texttt{doc\_type}) and a BM25 index (custom analyzer on \texttt{text}).
+    \item \textbf{Retrieve.} Implement the hybrid function: embed the query, run \texttt{\$vectorSearch} and \texttt{\$search}, fuse with RRF, return the top chunks with scores and citations.
+    \item \textbf{Evaluate.} Run the labeled query set; record recall@10 per path.
+\end{enumerate}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item The ingestion pipeline (chunk, embed, store) and both index definitions as code.
+    \item The hybrid retrieval function with RRF and the evaluation results table.
+    \item A failure-mode note: what breaks on dimension mismatch, filter omission, or model upgrade.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item Hybrid recall@10 beats both single-path results on the labeled set.
+    \item Tenant pre-filters are provably applied (no cross-tenant result in any test).
+    \item Index definitions and model version are captured as deployable artifacts.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Add a reranking stage (cross-encoder or LLM) over the fused top-50 and measure the recall@5 change.
+    \item Drive index freshness from a change stream (Chapter 16) so document updates re-embed automatically.
+\end{itemize}
+
+\section{Friday Use Case and Architecture: Enterprise Semantic Search over PDFs}
+\subsection{Scenario and Requirements}
+An enterprise must search 2 million unstructured PDFs (contracts, policies, engineering reports) mixed with structured metadata (department, effective date, jurisdiction), with sub-second retrieval, tenant isolation, and an audit trail of what was retrieved for generated answers.
+
+\subsection{Architecture}
+Ingestion: a document pipeline extracts text, chunks, embeds (recording \texttt{model\_version}), and writes chunks with metadata into Atlas. Serving: a retrieval API runs hybrid search with mandatory tenant pre-filters and returns cited chunks to the generation layer; every retrieval logs query, filters, chunk IDs, and scores for audit. Operations: index definitions in Terraform (Chapter 21), embedding drift guarded by a CI dimension check, freshness driven by change streams, and relevance regression-tested in CI against the labeled query set. Cost: Atlas Search nodes are sized separately from the data nodes---search workload isolation is a tier decision, documented with the Chapter 12 method.
+
+\begin{figure}[H]
+    \centering
+    \resizebox{0.98\textwidth}{!}{%
+    \begin{tikzpicture}[
+        box/.style={rectangle, rounded corners, draw=primary, fill=primary!6, minimum width=2.5cm, minimum height=1.05cm, align=center, font=\small\bfseries},
+        llm/.style={llmstage, minimum width=2.5cm},
+        store/.style={cylinder, shape aspect=0.25, draw=primary, thick, fill=primary!8, shape border rotate=90, align=center, minimum width=1.8cm, minimum height=1.2cm, font=\small\bfseries},
+        arrow/.style={-{Stealth[length=2.5mm]}, draw=primary, thick}
+    ]
+        \node[box] (pdf) at (0,0) {PDF corpus\\+ metadata};
+        \node[box] (ing) at (3.6,0) {Chunk +\\embed pipeline};
+        \node[store] (atlas) at (7.2,0) {Atlas\\vectors + BM25\\+ filters};
+        \node[box] (ret) at (10.9,1.5) {Hybrid retrieval\\(RRF, tenant\\pre-filter)};
+        \node[llm] (gen) at (10.9,-1.5) {Generation\\(cited chunks)};
+        \node[box] (aud) at (7.2,-2.6) {Retrieval audit\\log};
+        \draw[arrow] (pdf) -- (ing);
+        \draw[arrow] (ing) -- (atlas);
+        \draw[arrow] (atlas) -- (ret);
+        \draw[arrow] (ret) -- (gen);
+        \draw[arrow, dashed] (ret) -- (aud);
+    \end{tikzpicture}%
+    }
+    \caption{Enterprise RAG platform: one Atlas store for vectors, keywords, and metadata; hybrid retrieval with tenant isolation; every retrieval audited.}
+    \label{fig:ch20-rag}
+\end{figure}
+
+\begin{pitfall}
+\textbf{Embedding dimension drift across model upgrades.} Re-embedding with a new model (768 $\to$ 1024 dimensions) against an old index silently zeroes recall. Guard with a CI dimension check on the index definition and a two-index blue/green re-embedding rollout keyed on \texttt{model\_version}.
+\end{pitfall}
+
+\section{Interview Q\&A}
+\subsection{Vector Search and RAG}
+\begin{enumerate}
+    \item \textbf{Q: What makes HNSW fast?}\\
+    A: A layered proximity graph: coarse layers route long hops, fine layers refine---greedy walks reach near-exact neighbors without scanning the corpus \cite{malkov2020hnsw}.
+
+    \item \textbf{Q: Cosine versus Euclidean for text embeddings?}\\
+    A: Cosine: text models are trained for angular similarity, and vector magnitude in text embeddings is usually noise rather than signal.
+
+    \item \textbf{Q: What does hybrid search buy that neither path has alone?}\\
+    A: BM25 nails exact tokens (SKUs, codes); vectors capture paraphrase. RRF fusion keeps both strengths without score-scale normalization.
+
+    \item \textbf{Q: What does \texttt{\$vectorSearch} do inside a RAG pipeline?}\\
+    A: It is the retrieval stage: query vector $\to$ nearest chunks with metadata filters, feeding the generation context---with the audit trail a regulated deployment requires.
+
+    \item \textbf{Q: Why declare filter fields in the vector index?}\\
+    A: Filters apply during the graph walk; undeclared fields force post-filtering that over-fetches, hurts latency, and (for tenant filters) risks cross-tenant exposure.
+\end{enumerate}
+
+\section{Further Reading}
+Atlas Vector Search and Atlas Search documentation cover index definitions, operators, and filters \cite{mongodbAtlasVectorSearch,mongodbAtlasSearchDocs}; the HNSW paper explains the index structure \cite{malkov2020hnsw}. The RAG system context---retrieval quality, grounding, and evaluation---builds on the data-engineering foundations in Kleppmann \cite{kleppmann2017ddia}. Chapter 16's change streams provide the freshness mechanism, and Chapter 23's SLO method applies to retrieval latency.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item Embeddings make semantics geometric; the model version and metric are schema contracts.
+    \item HNSW trades exactness for speed; tune \texttt{numCandidates} by measured recall, not vibes.
+    \item Pre-filter fields belong in the index definition---especially tenant boundaries.
+    \item Hybrid (BM25 + vector, RRF-fused) beats either path on real query sets; measure with labels.
+    \item Chunking strategy dominates retrieval quality more than index tuning.
+    \item RAG in production is a data platform: freshness via CDC, definitions as code, retrieval audited.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Why does a 1024-d query vector against a 768-d index fail silently rather than erroring, and what CI check prevents it?
+    \item \textbf{(Conceptual)} When would you choose dot product over cosine similarity?
+    \item \textbf{(Conceptual)} Explain why RRF needs no score normalization between BM25 and vector lists.
+    \item \textbf{(Hands-on)} Build the Thursday lab end-to-end and produce the recall@10 table.
+    \item \textbf{(Hands-on)} Sweep \texttt{numCandidates} $\in \{50, 100, 200, 500\}$ and plot recall versus latency.
+    \item \textbf{(Design)} Design the blue/green re-embedding rollout for a model upgrade on 2M chunks without retrieval downtime.
+    \item \textbf{(Design)} Specify the retrieval audit schema and the query that answers ``what context produced answer X?''
+    \item \textbf{(Interview)} ``Semantic search returns great results---for the wrong tenant.'' Diagnose and remediate.
+\end{enumerate}
+
+\section{Capstone Project: RAG Backend with Measured Hybrid Retrieval}\label{sec:ch14-capstone}
+
+\begin{capstonebox}
+\textbf{Mission:} deliver the retrieval layer of a RAG system with evidence: a chunked, embedded document corpus in Atlas, scripted BM25 and vector index definitions, hybrid retrieval with reciprocal-rank fusion and tenant pre-filters, and a labeled evaluation proving the hybrid path beats either path alone.
+
+\textbf{Estimated time:} 5--7 hours.
+
+\textbf{What you will practice:}
+\begin{itemize}
+    \item Chunking, embedding, and storing documents with model-version discipline.
+    \item Creating vector and search indexes as code with declared filter fields.
+    \item Measuring recall@10 per retrieval path and tuning \texttt{numCandidates} on evidence.
+\end{itemize}
+\end{capstonebox}
+
+\subsection*{Scenario}
+Your team is piloting grounded question-answering over the company''s policy and runbook corpus. Before any generation layer ships, the retrieval layer must prove tenant isolation, hybrid relevance, and resistance to embedding drift.
+
+\subsection*{Requirements}
+\begin{itemize}
+    \item Ingest a corpus of at least 500 documents: chunk (${\sim}$400 tokens, 10--15\% overlap), embed with a fixed-dimension model, store \texttt{model\_version} on every chunk.
+    \item Create the vector index (cosine, correct dimensions, filter fields for \texttt{tenant\_id} and \texttt{doc\_type}) and the BM25 index (custom analyzer) via API or Terraform---no UI clicks.
+    \item Implement hybrid retrieval: \texttt{\$vectorSearch} and \texttt{\$search} fused with RRF, mandatory tenant pre-filter, cited chunk output.
+    \item Evaluate recall@10 on a labeled query set of at least 25 queries for BM25-only, vector-only, and fused paths.
+    \item Demonstrate the guards: a CI dimension check that fails on a simulated model upgrade, and a cross-tenant leakage test that must return zero results.
+\end{itemize}
+
+\subsection*{Implementation Steps}
+\begin{enumerate}
+    \item \textbf{Ingest.} Script chunking and embedding; validate dimensions on every batch.
+    \item \textbf{Index.} Apply both index definitions as code; poll index status before serving.
+    \item \textbf{Retrieve.} Implement RRF fusion with tenant filters; log every retrieval for audit.
+    \item \textbf{Evaluate.} Run the labeled set; produce the recall table; sweep \texttt{numCandidates}.
+    \item \textbf{Guard.} Wire the dimension check and the leakage test; document the blue/green re-embedding plan.
+\end{enumerate}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item Ingestion pipeline, index definitions as code, and the hybrid retrieval service.
+    \item The evaluation report (recall@10 per path, numCandidates curve).
+    \item The guard demonstrations and the audit-log schema.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item Fused recall@10 exceeds both single-path results on the labeled set.
+    \item Zero cross-tenant results in the leakage test; filters declared in the index.
+    \item The dimension check fails loudly on simulated drift; the system rebuilds from the repo.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Add a cross-encoder reranker over the fused top-50 and measure recall@5 lift.
+    \item Drive re-embedding from a change stream (Chapter 16) so document edits refresh vectors automatically.
+\end{itemize}

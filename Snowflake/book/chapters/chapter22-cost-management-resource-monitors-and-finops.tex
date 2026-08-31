@@ -1,0 +1,251 @@
+\chapter{Cortex AI and Vector Search: RAG Inside the Warehouse}
+\index{Cortex AI}\index{vector search}\index{RAG}\index{embeddings}\index{Week 22}%
+\begin{objectives}
+\begin{itemize}
+    \item Call Cortex serverless LLM functions (\texttt{CORTEX.COMPLETE}, \texttt{CORTEX.EXTRACT\_ANSWER}) from SQL.
+    \item Generate vector embeddings natively with \texttt{CORTEX.EMBED\_TEXT\_768}.
+    \item Store embeddings in the \texttt{VECTOR} type and run similarity search with vector distance functions.
+    \item Build a retrieval-augmented generation (RAG) pipeline: parse PDFs, embed, index, retrieve, answer.
+    \item Monitor and cap Cortex token spend with resource monitors and usage history.
+    \item Design an enterprise document-intelligence pipeline parsing and indexing PDF invoices.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+Managed LLM functions inside the data platform are now table stakes; the differences are model catalogs, billing shape, and how natively vectors live in the engine.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{2.8cm}p{3.0cm}p{3.0cm}p{3.0cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{AWS} & \textbf{Azure / Fabric} & \textbf{GCP} \\
+\midrule
+Managed LLM service & Bedrock & Azure OpenAI / Fabric Copilot & Vertex AI \\
+In-database LLM call & Redshift ML $\rightarrow$ Bedrock & Synapse/Fabric notebooks + AOAI & BigQuery ML remote models (Gemini) \\
+Embeddings & Bedrock Titan embeddings & AOAI embeddings & Vertex text embeddings \\
+Vector type / search & OpenSearch / pgvector on Aurora & Cosmos/AI Search vector indexes & BigQuery VECTOR\_SEARCH \\
+Document parsing & Textract & Document Intelligence & Document AI \\
+\addlinespace
+Snowflake equivalent & \multicolumn{3}{l}{\texttt{CORTEX.*} functions, \texttt{VECTOR} type, \texttt{PARSE\_DOCUMENT}, usage metering} \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+\textbf{MongoDB} Atlas Vector Search pairs operational documents with embeddings; Fabric routes through Azure OpenAI. Snowflake's distinction is governance continuity: documents, embeddings, prompts, and answers all live under the same RBAC and masking as every other table---no extracts to a side vector database.
+\end{crosscloud}
+
+\section{Week 22 Roadmap}
+The newest workload class in this book: unstructured text at warehouse scale. Cortex AI makes LLM calls SQL functions; the \texttt{VECTOR} type makes embeddings first-class columns; together they let a data engineer build document intelligence and RAG without leaving the platform \cite{snowflakeCortexDocs}.
+
+Monday covers serverless LLM functions. Tuesday generates embeddings. Wednesday builds vector search and RAG. Thursday constructs the PDF-to-answer pipeline. Friday designs the invoice-intelligence system.
+
+\begin{keyterms}
+\textbf{Cortex AI}: Snowflake's serverless AI layer exposing LLM and ML functions as SQL.\quad
+\textbf{Embedding}: a fixed-length vector encoding text semantics so similarity becomes distance.\quad
+\textbf{VECTOR type}: a Snowflake column type storing embeddings with a declared dimension.\quad
+\textbf{RAG}: retrieval-augmented generation---retrieve relevant chunks by vector similarity, then answer with an LLM grounded in them.\quad
+\textbf{Token billing}: Cortex pricing per token/row processed, requiring deliberate cost gates.
+\end{keyterms}
+
+\section{Monday: Serverless LLM Functions}
+\index{CORTEX.COMPLETE}\index{CORTEX.EXTRACT\_ANSWER}
+Cortex functions run as ordinary SQL scalar functions over table data---no endpoints to deploy, no models to host:
+
+\begin{lstlisting}[language=SQL, caption={Cortex serverless functions in a pipeline query}]
+SELECT ticket_id,
+       SNOWFLAKE.CORTEX.COMPLETE(
+         'llama3.1-8b',
+         CONCAT('Classify this support ticket as BILLING, TECHNICAL, ',
+                'or ACCOUNT. Return one word. Ticket: ', body)
+       ) AS category,
+       SNOWFLAKE.CORTEX.EXTRACT_ANSWER(
+         body, 'What product is the customer asking about?'
+       ) AS product_mentioned
+FROM support.tickets
+WHERE created_ts >= DATEADD(day, -1, CURRENT_TIMESTAMP());
+\end{lstlisting}
+
+The function catalogue covers completion, summarization, sentiment, translation, and answer extraction, across a managed model catalog with per-model pricing. Being \emph{serverless SQL} is the engineering story: an LLM enrichment is a column in a query, which means it participates in tasks, dynamic tables, streams, masking, and RBAC like any other derivation.
+
+\begin{pitfall}
+\textbf{Cortex is billed per token/row processed.} \texttt{CORTEX.COMPLETE} in an unfiltered \texttt{SELECT} over a 50-million-row table is a five-figure query. Pre-filter rows ruthlessly, gate LLM workloads behind warehouse-level resource monitors, and log invocation volume via \texttt{SNOWFLAKE.ACCOUNT\_USAGE.CORTEX\_FUNCTIONS\_USAGE\_HISTORY}.
+\end{pitfall}
+
+\section{Tuesday: Embeddings with EMBED\_TEXT\_768}
+\index{embeddings}\index{CORTEX.EMBED\_TEXT\_768}
+An embedding maps text to a 768-dimensional vector such that semantically similar texts land near each other. Generating them is one function call; storing them is one column:
+
+\begin{lstlisting}[language=SQL, caption={Generating and storing embeddings}]
+CREATE OR REPLACE TABLE docs.chunks (
+  chunk_id   NUMBER PRIMARY KEY,
+  doc_id     NUMBER,
+  chunk_text STRING,
+  embedding  VECTOR(FLOAT, 768)
+);
+
+INSERT INTO docs.chunks
+SELECT seq4() AS chunk_id, doc_id, chunk_text,
+       SNOWFLAKE.CORTEX.EMBED_TEXT_768('e5-base-v2', chunk_text)
+FROM docs.raw_chunks;
+\end{lstlisting}
+
+The embedding model and the vector dimension are a married pair: a \texttt{VECTOR(FLOAT, 768)} column holds exactly what \texttt{EMBED\_TEXT\_768} produces. Changing embedding models later means re-embedding the corpus and migrating the column---version the model name in the schema (e.g., \texttt{embedding\_e5\_v2}) so mixed-model corpora are impossible by construction.
+
+\begin{tipbox}
+Chunk size is the RAG quality dial: 300--800 tokens with 10--15\% overlap is a sound default. Chunk by document structure (sections, paragraphs), not fixed character windows---a chunk that splits a sentence mid-thought retrieves and answers badly.
+\end{tipbox}
+
+\section{Wednesday: Vector Similarity Search and RAG}
+\index{vector search}\index{RAG}
+With embeddings stored, retrieval is a distance computation: \texttt{VECTOR\_COSINE\_SIMILARITY} (or L2/inner-product functions) ranks chunks against the embedded question, and \texttt{QUALIFY} or \texttt{LIMIT} keeps the top-$k$.
+
+\begin{lstlisting}[language=SQL, caption={Retrieval: top-k chunks for a question}]
+WITH q AS (
+  SELECT SNOWFLAKE.CORTEX.EMBED_TEXT_768(
+           'e5-base-v2', :user_question) AS qvec
+)
+SELECT c.chunk_id, c.chunk_text,
+       VECTOR_COSINE_SIMILARITY(c.embedding, q.qvec) AS score
+FROM docs.chunks c, q
+ORDER BY score DESC
+LIMIT 5;
+\end{lstlisting}
+
+RAG closes the loop: the top-$k$ chunks become the LLM's context, grounding the answer in your documents rather than the model's parametric memory \cite{lewis2020rag}.
+
+\begin{lstlisting}[language=SQL, caption={Generation: grounded answer from retrieved chunks}]
+SELECT SNOWFLAKE.CORTEX.COMPLETE(
+  'llama3.1-70b',
+  CONCAT(
+    'Answer using ONLY the context below. Cite chunk ids.\n\nContext:\n',
+    (SELECT LISTAGG(chunk_text, '\n---\n') WITHIN GROUP (ORDER BY score DESC)
+     FROM top_chunks),
+    '\n\nQuestion: ', :user_question)) AS grounded_answer;
+\end{lstlisting}
+
+\begin{definitionbox}
+\textbf{Retrieval-augmented generation} grounds LLM answers in retrieved evidence: embed the question, find the nearest document chunks by vector similarity, and prompt the model to answer from those chunks with citations. Hallucination drops because the model is reading, not remembering.
+\end{definitionbox}
+
+\section{Thursday Hands-On Project: PDF-to-Answer RAG Pipeline}
+\index{hands-on project!RAG}
+This lab builds the full native pipeline: parse PDFs, chunk, embed, store vectors, retrieve, and answer.
+
+\subsection*{Scenario}
+Legal operations receives hundreds of contract PDFs weekly. Analysts ask natural-language questions (``what is the termination notice period in the Acme agreement?'') and need cited answers.
+
+\subsection*{Procedure}
+\begin{enumerate}
+    \item Stage 20 sample PDFs; extract text with \texttt{PARSE\_DOCUMENT} into \texttt{docs.raw\_pages}.
+    \item Chunk extracted text by section with 10\% overlap into \texttt{docs.raw\_chunks}.
+    \item Embed chunks with \texttt{CORTEX.EMBED\_TEXT\_768} into the \texttt{VECTOR(768)} table.
+    \item Implement retrieval (top-5 cosine similarity) and the grounded \texttt{COMPLETE} call with citations.
+    \item Build a 10-question evaluation set with known answers; score pipeline accuracy and inspect failures (chunking? retrieval? prompting?).
+    \item Instrument cost: tokens per question, daily volume projection, and the resource-monitor gate.
+\end{enumerate}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item \textbf{Pipeline SQL:} parse, chunk, embed, retrieve, answer---each stage a tested step.
+    \item \textbf{Evaluation report:} 10-question accuracy with failure classification.
+    \item \textbf{Cost model:} per-question tokens, projected monthly spend, monitor configuration.
+    \item \textbf{Runbook:} how new documents flow from stage to searchable within the target lag.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item Answers cite chunk IDs traceable to source pages.
+    \item The evaluation set's accuracy is measured and failure modes are classified.
+    \item Token consumption is logged per run and the resource monitor is demonstrated firing.
+    \item No document text leaves the account at any stage.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Wrap retrieval plus generation in a stored procedure behind a Streamlit front end.
+    \item Compare two embedding models on the evaluation set and document the migration path.
+    \item Add a freshness loop: new PDFs become searchable via a stream-gated task within 15 minutes.
+\end{itemize}
+
+\section{Friday Real-World Architecture: Invoice Intelligence at Scale}
+\index{Real-World Architecture!document intelligence}
+An enterprise shared-services center processes 80{,}000 supplier PDF invoices monthly. Manual keying is slow and error-prone; the mandate is automated parsing, line-item extraction, and semantic search over the corpus.
+
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[
+        src/.style={rectangle, rounded corners, draw=orange!70!black, thick, fill=orange!10, align=center, minimum width=2.6cm, minimum height=1.0cm, font=\small\bfseries},
+        sf/.style={rectangle, rounded corners, draw=primary, thick, fill=primary!6, align=center, minimum width=2.6cm, minimum height=1.0cm, font=\small\bfseries},
+        ai/.style={rectangle, rounded corners, draw=magenta, thick, fill=magenta!10, align=center, minimum width=2.6cm, minimum height=1.0cm, font=\small\bfseries},
+        arrow/.style={-{Stealth[length=2.5mm]}, draw=primary, thick},
+        lbl/.style={font=\scriptsize\itshape, text=codegray}
+    ]
+        \node[src] (pdf) at (0, 0) {Invoice PDFs\\(email/S3 drop)};
+        \node[sf] (parse) at (3.7, 0) {PARSE\_DOCUMENT\\stage tables};
+        \node[ai] (extract) at (7.5, 1.3) {CORTEX line-item\\extraction};
+        \node[ai] (embed) at (7.5, -1.3) {EMBED\_TEXT\_768\\VECTOR columns};
+        \node[sf] (apps) at (11.6, 0) {AP posting +\\semantic search\\+ anomaly flags};
+        \draw[arrow] (pdf) -- (parse);
+        \draw[arrow] (parse) -- (extract);
+        \draw[arrow] (parse) -- (embed);
+        \draw[arrow] (extract) -- (apps);
+        \draw[arrow] (embed) -- (apps);
+    \end{tikzpicture}%
+    }
+    \caption{Invoice intelligence: parse, extract line items with Cortex, embed for search, serve AP workflows---all in-platform.}
+    \label{fig:chapter22-invoice-architecture}
+\end{figure}
+
+\subsection{Design Decisions}
+\begin{enumerate}
+    \item \textbf{Extraction is a typed contract.} \texttt{CORTEX.EXTRACT\_ANSWER} or completion-with-schema prompts fill a line-items table; a validation layer (CHECK constraints, totals reconciliation against the stated invoice total) quarantines extraction failures for human review---Chapter 9's contract discipline applied to LLM outputs.
+    \item \textbf{Search and workflow share one store.} The same parsed content feeds embeddings (semantic search: ``invoices mentioning auto-renewal'') and relational filters (vendor, amount, date)---hybrid queries beat either alone.
+    \item \textbf{Cost is engineered, not discovered.} Per-page token estimates set the monthly budget; the resource monitor caps the AI warehouse; \texttt{CORTEX\_FUNCTIONS\_USAGE\_HISTORY} reconciles forecast against actuals weekly.
+    \item \textbf{Humans review by exception.} Confidence routing---clean parses post straight through; low-confidence or total-mismatch invoices queue for review---keeps accuracy measurable and staffing proportional to true exceptions.
+\end{enumerate}
+
+\begin{pitfall}
+\textbf{LLM extraction without reconciliation is un-auditable automation.} The invoice total stated on the document must equal the sum of extracted line items within tolerance, every time, or the invoice routes to review. The check is cheap; unposted errors are not.
+\end{pitfall}
+
+\section{Interview Q\&A}
+\begin{enumerate}
+    \item \textbf{Q: Name two Cortex serverless LLM functions.}\\
+    A: \texttt{CORTEX.COMPLETE} (prompted generation/classification) and \texttt{CORTEX.EXTRACT\_ANSWER} (question answering over a given text); also summarization, sentiment, and \texttt{EMBED\_TEXT\_768}.
+    \item \textbf{Q: What does CORTEX.EMBED\_TEXT\_768 produce?}\\
+    A: A 768-dimensional float embedding of the input text, stored in a \texttt{VECTOR(FLOAT, 768)} column for similarity search.
+    \item \textbf{Q: How do you find similar documents using a Vector column?}\\
+    A: Embed the query, rank chunks by \texttt{VECTOR\_COSINE\_SIMILARITY} against stored embeddings, and take the top-$k$.
+    \item \textbf{Q: How is Cortex billed, and how do you cap spend?}\\
+    A: Per token/row processed; cap with warehouse-level resource monitors, aggressive pre-filtering, and monitoring of \texttt{CORTEX\_FUNCTIONS\_USAGE\_HISTORY}.
+    \item \textbf{Q: What does PARSE\_DOCUMENT extract from PDFs?}\\
+    A: Structured text content from staged documents, feeding the chunking and extraction stages of a document-intelligence pipeline.
+\end{enumerate}
+
+\section{Further Reading}
+Snowflake's Cortex documentation catalogs the LLM functions, models, and metering \cite{snowflakeCortexDocs}. The RAG concept originates with Lewis et al.\ \cite{lewis2020rag}. Chapter 14's vectorized-UDF patterns and Chapter 9's contract discipline are this chapter's engineering substrate.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item Cortex makes LLM calls SQL functions: enrichment becomes a governed column derivation.
+    \item Embeddings plus the \texttt{VECTOR} type make semantic similarity a warehouse query.
+    \item RAG grounds answers in retrieved, cited chunks---reading beats remembering.
+    \item Chunk by document structure with overlap; version the embedding model in the schema.
+    \item Token billing demands pre-filtering, monitors, and usage-history reconciliation.
+    \item LLM extraction is only production-grade behind deterministic reconciliation checks.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Explain why embeddings of similar texts are close, and what cosine similarity measures.
+    \item \textbf{(Conceptual)} Compare RAG against fine-tuning for the contract-Q\&A scenario.
+    \item \textbf{(Hands-on)} Rebuild retrieval with L2 distance and compare top-5 overlap against cosine on the eval set.
+    \item \textbf{(Hands-on)} Sweep chunk sizes (200/500/900 tokens) and report eval accuracy and token cost for each.
+    \item \textbf{(Hands-on)} Build the invoice reconciliation check and demonstrate it quarantining a doctored invoice.
+    \item \textbf{(Design)} Design the human-review queue: confidence signals, SLA, and feedback loop into prompts.
+    \item \textbf{(Design)} Write the model-migration plan when the embedding model is superseded.
+    \item \textbf{(Operations)} Build the weekly Cortex cost report: tokens by function, model, and calling user.
+    \item \textbf{(Cost)} Model monthly spend for 80{,}000 invoices at measured per-page token rates, with and without pre-filtering.
+    \item \textbf{(Interview)} Explain to a data-privacy officer why this architecture never sends documents to an external API.
+\end{enumerate}

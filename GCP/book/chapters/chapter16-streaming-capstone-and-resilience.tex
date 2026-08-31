@@ -1,0 +1,350 @@
+\chapter{Business Intelligence, Looker, and Real-Time Serving}
+\index{Looker}\index{LookML}\index{semantic layer}\index{reverse ETL}\index{Looker Studio}\index{explores}
+
+\begin{objectives}
+\begin{itemize}
+    \item Explain Looker's architecture and the role of the LookML semantic layer in governed BI.
+    \item Model dimensions, measures, views, and explores that encode metric definitions once.
+    \item Contrast Looker Studio with Looker (Core) for self-serve versus governed analytics.
+    \item Implement reverse ETL: push curated BigQuery segments to operational APIs with identity resolution.
+    \item Build a real-time streaming-sales dashboard with drill-down filters and a reverse-ETL sync.
+    \item Design a governed BI access layer for five hundred analysts with non-conflicting metrics.
+    \item Complete the Milestone~4 capstone: an end-to-end real-time fraud-detection pipeline.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+Every platform eventually confronts the same BI governance question: are metrics defined once in a semantic layer, or independently in every dashboard?
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{2.8cm}p{3.0cm}p{3.0cm}p{3.0cm}@{}} \\
+\toprule
+\textbf{Capability} & \textbf{GCP Looker} & \textbf{AWS} & \textbf{Azure / Fabric} \\
+\midrule
+Governed BI + semantic layer & Looker (LookML) & QuickSight (datasets) & Power BI (semantic models) \\
+Self-serve dashboards & Looker Studio & QuickSight & Power BI / Fabric \\
+Semantic model as code & LookML in Git & QuickSight APIs & TMDL / Fabric git integration \\
+In-memory acceleration & BI Engine (Ch. 6) & QuickSight SPICE & Import mode / DirectLake \\
+Reverse ETL & Scheduled queries + Functions (partner tools) & Partner tools (Census, Hightouch) & Partner tools \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+\textbf{Snowflake} users pair with the same BI tools over its warehouses; \textbf{MongoDB} charts serve operational analytics directly on Atlas. The portable insight: a semantic layer is a \emph{code artifact}---versioned, reviewed, tested---and the organizations that treat it as such are the ones where ``Gross Revenue'' means one thing.
+\end{crosscloud}
+
+\begin{keyterms}
+\textbf{LookML}: Looker's modeling language defining dimensions, measures, joins, and explores as versioned code.
+\textbf{View}: a LookML file mapping a table or derived table into dimensions and measures.
+\textbf{Explore}: a curated join of views exposed to analysts as a self-serve query surface.
+\textbf{Measure}: a LookML aggregate definition (count, sum, average) with declared type and filters.
+\textbf{Reverse ETL}: syncing curated warehouse data back into operational systems (CRM, marketing platforms).
+\textbf{Identity resolution}: reconciling entity keys across systems so a segment in BigQuery matches the same humans in the CRM.
+\end{keyterms}
+
+\section{Week 16 Roadmap}
+Week~16 closes Part~IV where streaming data meets human decision-making. Monday covers Looker's architecture and LookML. Tuesday models dimensions, measures, and explores. Wednesday contrasts self-serve and governed BI and introduces reverse ETL. Thursday builds the streaming-sales dashboard and a reverse-ETL sync to a marketing webhook. Friday designs the governed access layer for five hundred analysts. The week ends with the Milestone~4 real-time fraud capstone.
+
+\begin{definitionbox}
+\textbf{Looker} is Google Cloud's governed BI platform. Its defining feature is the \textbf{LookML semantic layer}: metric and join definitions live as versioned code between the database and every dashboard, so all consumers compute the same numbers \cite{googlecloudlookerdocs}.
+\end{definitionbox}
+
+\section{Monday: Looker Architecture and the Semantic Layer}
+\index{Looker!architecture}\index{LookML!semantic layer}
+
+\subsection{How Looker Differs}
+Most BI tools extract data into extracts or connect dashboards directly to tables; Looker connects to the database (BigQuery, via a service account) and generates SQL per user interaction. Nothing is extracted by default; freshness is the warehouse's freshness. The price of this elegance is that warehouse performance (Chapters 5--6) \emph{is} dashboard performance---partitioning, clustering, and BI Engine decisions surface directly in tile load times.
+
+\subsection{Why a Semantic Layer}
+Without a shared layer, every analyst re-implements ``Gross Revenue'' in a SQL snippet, a sheet formula, or a dashboard calculated field, and the definitions diverge silently. LookML defines it once---\texttt{measure: gross\_revenue \{ type: sum sql: \$\{order\_amount\} ;; filters: [is\_refunded: "no"] \}}---and every explore, dashboard, and API consumer inherits the same definition, reviewable in Git like any other code.
+
+\begin{notebox}
+The semantic layer is also a security layer: LookML access grants and user attributes restrict which explores, fields, and rows a user can see, composing with (not replacing) the warehouse's row access policies from Chapter~8.
+\end{notebox}
+
+\section{Tuesday: Dimensions, Measures, Explores, and Views}
+\index{dimensions}\index{measures}\index{explores!design}
+
+\subsection{Modeling Vocabulary}
+A \textbf{view} maps one table (or derived table) to LookML: \textbf{dimension}s for attributes and \textbf{measure}s for aggregates, each with types, SQL expressions, and formatting. An \textbf{explore} joins views with declared relationships and join keys, producing the analyst-facing query surface. Discipline points: always declare \texttt{relationship} (one\_to\_many, many\_to\_one) so Looker can apply symmetric aggregates and avoid fan-out inflation; expose only fields analysts should see; name measures as the business names them.
+
+\begin{lstlisting}[language=SQL,caption={A minimal LookML view and explore (LookML syntax in SQL listing).}]
+# file: views/order_items.view.lkml
+view: order_items {
+  sql_table_name: analytics.fact_order_items ;;
+  dimension: order_id    { type: string sql: ${TABLE}.order_id ;; }
+  dimension: order_date  { type: date   sql: ${TABLE}.order_date ;; }
+  dimension: is_refunded { type: yesno  sql: ${TABLE}.refund_flag = 'Y' ;; }
+  measure: gross_revenue {
+    type: sum
+    sql: ${TABLE}.order_amount ;;
+    filters: [is_refunded: "no"]
+    value_format_name: usd
+  }
+}
+
+# file: models/retail.model.lkml
+explore: orders {
+  join: customers {
+    sql_on: ${orders.customer_id} = ${customers.customer_id} ;;
+    relationship: many_to_one
+  }
+}
+\end{lstlisting}
+
+\begin{pitfall}
+Fan-out is the silent killer of joined explores: joining one-to-many without declared \texttt{relationship} inflates sums when Looker cannot apply symmetric aggregates. Declare every join's cardinality; spot-check a known total after every model change.
+\end{pitfall}
+
+\section{Wednesday: Looker Studio versus Looker, and Reverse ETL}
+\index{Looker Studio vs Looker}\index{reverse ETL!identity resolution}
+
+\subsection{Self-Serve versus Governed}
+\textbf{Looker Studio} is the free, self-serve dashboard tool: connect to BigQuery (or Sheets, or CSV), drag fields, publish. It is the right answer for departmental reporting and the Thursday lab's fast path. \textbf{Looker (Core)} is the governed platform: LookML, Git workflow, access grants, API, embeds. The enterprise pattern uses both---Studio for velocity at the edges, Looker for the certified metrics at the core---with BigQuery's governed tables as the common floor.
+
+\subsection{Reverse ETL}
+Dashboards inform; reverse ETL \emph{acts}: pushing the warehouse's computed segments (high-value customers, churn risks, fraud watchlists) back into the operational systems where work happens---CRM, marketing automation, ad platforms. The reference implementation is a scheduled BigQuery query materializing the segment, plus a Cloud Function (or Dataform operation) posting deltas to the operational API on a cadence. Two disciplines make it safe: \textbf{identity resolution}---the segment keys must map to the operational system's identifiers, or you sync a segment of strangers---and \textbf{sync-frequency trade-offs}: freshness versus API rate limits and cost, which usually lands on hourly deltas, not per-event pushes.
+
+\begin{tipbox}
+Sync deltas, not full snapshots: track a \texttt{last\_synced\_at} watermark per entity and push only changed segment membership. Full syncs multiply API calls by segment size daily; delta syncs keep both cost and rate-limit pressure flat.
+\end{tipbox}
+
+\section{Thursday Hands-On Project: Streaming Dashboard and Reverse-ETL Sync}
+\index{hands-on project}\index{Looker Studio dashboard}\index{Cloud Function!reverse ETL}
+This lab connects Looker Studio to a BigQuery streaming-sales dataset with drill-down filters, then reverse-ETLs a high-value customer segment to a mock marketing webhook via a scheduled query and Cloud Function.
+
+\subsection{The Live Dashboard}
+\begin{enumerate}
+    \item Create (or reuse) an \texttt{analytics.sales\_live} table receiving streaming inserts---the fraud capstone's alert table or a simple streaming sink works.
+    \item In Looker Studio, add a BigQuery data source with a custom query selecting the trailing hour: \texttt{WHERE sale\_ts >= TIMESTAMP\_SUB(CURRENT\_TIMESTAMP(), INTERVAL 1 HOUR)}.
+    \item Build tiles: revenue time series, sales-by-region map, top products table; add drill-down controls for region and product category; set data freshness to one minute.
+\end{enumerate}
+
+\subsection{The Reverse-ETL Sync}
+\begin{lstlisting}[language=SQL,caption={Scheduled query materializing the high-value segment with sync watermarks.}]
+CREATE OR REPLACE TABLE crm_sync.high_value_segment AS
+SELECT customer_id, email, lifetime_value,
+       CURRENT_TIMESTAMP() AS computed_at
+FROM analytics.dim_customer
+WHERE lifetime_value > 10000 AND is_current = TRUE;
+\end{lstlisting}
+
+\begin{lstlisting}[language=Python,caption={Cloud Function posting segment deltas to a mock marketing webhook.}]
+import os
+import requests
+from google.cloud import bigquery
+
+WEBHOOK = os.environ["MARKETING_WEBHOOK_URL"]
+
+
+def sync_segment(request):
+    bq = bigquery.Client()
+    rows = bq.query("""
+        SELECT customer_id, email FROM crm_sync.high_value_segment
+        WHERE computed_at > (
+          SELECT COALESCE(MAX(synced_at), '1970-01-01')
+          FROM crm_sync.sync_log)
+    """).result()
+    payload = {"members": [dict(r) for r in rows]}
+    resp = requests.post(WEBHOOK, json=payload, timeout=30)
+    resp.raise_for_status()
+    bq.query("INSERT INTO crm_sync.sync_log (synced_at, member_count) "
+             f"VALUES (CURRENT_TIMESTAMP(), {len(payload['members'])})").result()
+    return {"synced": len(payload["members"])}
+\end{lstlisting}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item The dashboard URL or screenshots showing live tiles and drill-down filters.
+    \item The scheduled query, Cloud Function, and sync-log table DDL.
+    \item Evidence of a sync run: webhook received payload and the sync-log row.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item The dashboard reflects new streaming rows within its freshness interval.
+    \item The reverse-ETL sync pushes deltas only and records each run in the sync log.
+    \item The segment definition lives in exactly one place (the scheduled query), not in the Function.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Rebuild one tile in Looker Core with a LookML measure and compare governance properties.
+    \item Add identity resolution: map \texttt{customer\_id} to the CRM's contact IDs through a mapping table.
+    \item Add alerting on sync failures and on segment-size anomalies (a segment that doubles overnight).
+\end{itemize}
+
+\section{Friday Use Case and Architecture: Governed BI for Five Hundred Analysts}
+\index{governed BI}\index{metric conflicts}\index{self-service analytics}
+
+\subsection{Scenario}
+An enterprise with five hundred analysts across finance, marketing, and operations suffers metric chaos: three departments report three different ``Gross Revenue'' numbers to the same executive meeting. The mandate: one governed access layer over the central warehouse, with self-service that cannot fork definitions.
+
+\subsection{Design}
+Certify a core LookML model owned by the analytics-engineering team: conformed explores for the shared fact tables, with measures defined once, access grants per department, and content validators in CI (LookML lint plus known-total tests). Analysts build dashboards freely \emph{on the explores} but cannot redefine measures---new metric requests enter as pull requests. Looker Studio remains available for departmental scratch work against curated datasets, clearly badged as uncertified. Adoption is enforced socially as much as technically: the data-literacy program teaches ``explores are the source of truth,'' and executive reviews cite only certified dashboards.
+
+\begin{figure}[H]
+    \centering
+    \resizebox{0.95\textwidth}{!}{%
+    \begin{tikzpicture}[
+        db/.style={cylinder, shape border rotate=90, aspect=0.25, draw=primary, thick, fill=primary!10, text width=2.9cm, minimum height=1.2cm, align=center, font=\small\bfseries},
+        svc/.style={rectangle, rounded corners, draw=primary, thick, fill=primary!6, text width=3.2cm, minimum height=1.1cm, align=center, font=\small\bfseries},
+        users/.style={rectangle, rounded corners, draw=codegreen!60!black, thick, fill=green!7, text width=3.0cm, minimum height=0.95cm, align=center, font=\small\bfseries},
+        arrow/.style={-{Stealth[length=2.5mm]}, draw=primary, thick}
+    ]
+        \node[db] (bq) at (0,0) {BigQuery\\governed tables\\row policies};
+        \node[svc] (lookml) at (5.0,0) {LookML model\\certified explores\\Git + CI};
+        \node[users] (analysts) at (10.4,1.4) {500 analysts\\certified dashboards};
+        \node[users] (studio) at (10.4,-1.4) {Looker Studio\\departmental scratch};
+
+        \draw[arrow] (bq) -- (lookml);
+        \draw[arrow] (lookml) -- (analysts);
+        \draw[arrow] (bq) -- (studio);
+    \end{tikzpicture}%
+    }
+    \caption{Governed BI: certified explores for shared truth, self-serve Studio at the edges.}
+    \label{fig:ch16-governed-bi}
+\end{figure}
+
+\begin{pitfall}
+A semantic layer nobody adopts is worse than none---it adds a third competing definition. Budget the socialization: training, office hours, and executive insistence on certified numbers are part of the deliverable, not an afterthought.
+\end{pitfall}
+
+\section{Interview Q\&A}
+\subsection{Concepts and Trade-offs}
+\begin{enumerate}
+    \item \textbf{Q: Why does a LookML semantic layer prevent conflicting metric definitions?}\\
+    A: Measures are defined once in versioned code and inherited by every explore, dashboard, and API call---analysts consume the definition instead of re-implementing it.
+
+    \item \textbf{Q: What problem does reverse ETL solve that dashboards cannot?}\\
+    A: Dashboards inform humans who must then act elsewhere; reverse ETL delivers the warehouse's computed decisions into the operational systems where action happens.
+
+    \item \textbf{Q: What breaks in a sync without identity resolution?}\\
+    A: Warehouse keys do not match CRM identifiers, so segments sync to wrong or nonexistent contacts---the pipeline runs green while marketing emails strangers.
+
+    \item \textbf{Q: What trade-off governs reverse-ETL sync frequency?}\\
+    A: Freshness versus API rate limits and cost; deltas on an hourly cadence are the usual optimum.
+
+    \item \textbf{Q: When is Looker Core justified over Looker Studio?}\\
+    A: When metrics must be governed---defined once, access-controlled, auditable---across many teams; Studio wins for velocity and departmental self-service.
+\end{enumerate}
+
+\section{Further Reading}
+Read the Looker documentation for LookML, explores, and content governance \cite{googlecloudlookerdocs}, and Looker Studio documentation for self-serve reporting \cite{googlecloudlookerstudio}. The BigQuery documentation covers scheduled queries and the Storage Write API behind live tiles \cite{googlecloudbigquerydocs}, and Chapter~6's BI Engine reference covers dashboard acceleration \cite{googlecloudbiengine}.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item A semantic layer is code: versioned, reviewed, CI-tested---and the only durable cure for metric chaos.
+    \item Declare join cardinality; fan-out inflation is silent and plausibly wrong.
+    \item Live dashboards inherit warehouse performance: partitioning and BI Engine are BI decisions.
+    \item Reverse ETL closes the loop from insight to action; identity resolution and delta syncs keep it safe.
+    \item Studio for velocity, Looker for governance, curated tables as the common floor.
+    \item Adoption is a deliverable: training and executive habits matter as much as the model.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Explain symmetric aggregates to an analyst whose revenue doubled after adding a join.
+    \item \textbf{(Conceptual)} Argue when \emph{not} to reverse-ETL: give two cases where a dashboard or a native integration is the better answer.
+    \item \textbf{(Hands-on)} Reproduce the Thursday lab, then add a second tile showing per-city sales with a cross-filter.
+    \item \textbf{(Hands-on)} Add a content-validation test to the LookML model that fails CI when \texttt{gross\_revenue} changes without a version bump in a comment convention you define.
+    \item \textbf{(Design)} Write the metric-governance policy for the 500-analyst enterprise: certification tiers, PR process, SLAs for new-metric requests.
+    \item \textbf{(Architecture)} Extend the reverse-ETL design with consent enforcement: only customers with marketing consent flags sync to the ad platform.
+\end{enumerate}
+
+\section{Milestone 4 Capstone: Real-Time Fraud Detection}\label{sec:ch16-capstone}
+\index{Milestone 4 capstone}\index{fraud detection}\index{sliding windows!fraud}
+
+\begin{capstonebox}
+\textbf{Mission:} Simulate credit-card swipes into Pub/Sub, detect with a sliding-window Dataflow rule any card used in two different cities within ten minutes, stream alerts to BigQuery, and visualize them live in Looker---serverless end to end, with DLQ, tests, and watermark-lag alerting.
+
+\textbf{Estimated time:} 8--10 hours.
+
+\textbf{What you'll practice:}
+\begin{itemize}
+    \item Publishing simulation traffic with retry/backoff and a dead-letter topic (Chapter~13).
+    \item Sliding-window stateful detection with allowed lateness (Chapter~15).
+    \item Exactly-once sinks and live BI on streaming results (Chapters 14, 16).
+    \item Unit-testing the fraud rule with PAssert including a late-data case.
+\end{itemize}
+\end{capstonebox}
+
+\subsection*{Scenario}
+Meridian Card Services wants a real-time fraud signal: a card physically presented in two distant cities within ten minutes is near-certainly compromised. Swipes stream from terminals; alerts must reach the fraud team's dashboard in under a minute; false negatives from late-arriving offline terminals are acceptable only within a documented tolerance.
+
+\subsection*{Requirements}
+\begin{itemize}
+    \item Python simulator publishing plausible swipes (with seeded cross-city anomalies) to a schema-validated topic with a DLQ.
+    \item Dataflow pipeline: key by card, 10-minute sliding windows with 1-minute period, two minutes allowed lateness, flag windows containing two or more distinct cities.
+    \item Alerts stream to BigQuery via exactly-once write; Looker (or Studio) dashboard shows live alerts with drill-down.
+    \item PAssert unit tests for the detection rule, including a late-data refinement case.
+    \item Alert policies on Dataflow watermark lag and Pub/Sub backlog; documented monthly cost estimate.
+\end{itemize}
+
+\subsection*{Reference Architecture and Core Rule}
+\begin{figure}[H]
+    \centering
+    \resizebox{0.95\textwidth}{!}{%
+    \begin{tikzpicture}[
+        svc/.style={rectangle, rounded corners, draw=primary, thick, fill=primary!6, text width=2.7cm, minimum height=1.0cm, align=center, font=\small\bfseries},
+        warn/.style={rectangle, rounded corners, draw=red!60!black, thick, fill=red!6, text width=2.6cm, minimum height=0.9cm, align=center, font=\footnotesize\bfseries},
+        arrow/.style={-{Stealth[length=2.5mm]}, draw=primary, thick},
+        dasharrow/.style={-{Stealth[length=2.5mm]}, draw=codegray, thick, dashed}
+    ]
+        \node[svc] (prod) at (0,0) {Producers\\(card swipes)};
+        \node[svc] (ps) at (3.4,0) {Pub/Sub\\(transactions)};
+        \node[svc] (df) at (6.8,0) {Dataflow\\(sliding window)};
+        \node[svc] (bq) at (10.2,0) {BigQuery\\(fraud alerts)};
+        \node[svc] (looker) at (13.6,0) {Looker\\(live dashboard)};
+        \node[warn] (dlq) at (3.4,-1.8) {Dead-Letter\\Topic};
+        \node[warn] (mon) at (6.8,-1.8) {Cloud Monitoring\\(watermark lag)};
+
+        \draw[arrow] (prod) -- (ps);
+        \draw[arrow] (ps) -- (df);
+        \draw[arrow] (df) -- (bq);
+        \draw[arrow] (bq) -- (looker);
+        \draw[dasharrow] (ps) -- (dlq);
+        \draw[dasharrow] (df) -- (mon);
+    \end{tikzpicture}%
+    }
+    \caption{Milestone 4 reference architecture: real-time fraud detection, serverless end to end.}
+    \label{fig:ch16-capstone-fraud}
+\end{figure}
+
+\begin{lstlisting}[language=Python,caption={The two-cities-in-ten-minutes detection rule.}]
+alerts = (
+    events
+    | "KeyByCard" >> beam.Map(lambda e: (e["card_id"], e))
+    | "Window" >> beam.WindowInto(SlidingWindows(600, 60),
+          allowed_lateness=120,
+          accumulation_mode=trigger.AccumulationMode.DISCARDING)
+    | "Group" >> beam.GroupByKey()
+    | "Flag" >> beam.FlatMap(lambda kv: [(kv[0], w)]
+        for w in [1] if len({e["city"] for e in kv[1]}) > 1))
+\end{lstlisting}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item A repository that runs end-to-end from a clean environment: simulator, pipeline, tests, dashboard link.
+    \item The architecture diagram including DLQ, windowing semantics, and serving layer.
+    \item At least three automated tests with a failing-case demonstration.
+    \item Monitoring evidence and the monthly cost estimate with two optimizations documented.
+    \item A security review: least-privilege runner service account, card data pseudonymized, no hardcoded secrets.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item A seeded cross-city anomaly surfaces as a BigQuery alert row within a minute of ingestion.
+    \item Late events (within tolerance) refine rather than duplicate alerts; out-of-tolerance events are measurably accounted.
+    \item The pipeline survives a worker kill test without losing or duplicating alerts.
+    \item The dashboard reflects the alert stream live with drill-down by city and card.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Key the rule on event time from the terminal (not arrival) and quantify the difference on replayed traffic.
+    \item Add a second rule---velocity (more than N swipes per minute per card)---using the State and Timers API.
+    \item Reverse-ETL confirmed-fraud card IDs back to a mock authorization API to auto-decline.
+    \item Load-test to ten thousand events per second and document the autoscaling curve and cost.
+\end{itemize}

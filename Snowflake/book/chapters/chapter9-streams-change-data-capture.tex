@@ -1,0 +1,270 @@
+\chapter{Semi-Structured Data Processing and Data Contracts}
+\index{semi-structured data}\index{VARIANT}\index{FLATTEN}\index{data contracts}\index{Week 9}%
+\begin{objectives}
+\begin{itemize}
+    \item Model JSON, Avro, and similar payloads with \texttt{VARIANT}, \texttt{OBJECT}, and \texttt{ARRAY} columns.
+    \item Extract nested fields with dot notation, bracket notation, and explicit casts that fail loudly by design.
+    \item Unpack nested arrays and objects into tabular rows with \texttt{LATERAL FLATTEN}.
+    \item Enforce data contracts at ingest with CHECK constraints on extracted fields and quarantine schema drift.
+    \item Build a hands-on pipeline that lands deeply nested clickstream JSON, flattens it, and proves contract enforcement by deliberately drifting the schema.
+    \item Architect a schema-on-read ingestion platform for a SaaS company whose mobile apps evolve payload schemas continuously.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+Every platform answers the same three semi-structured questions: what type holds the document, how do you project paths out of it, and where do you validate its shape.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{2.8cm}p{3.0cm}p{3.0cm}p{3.0cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{AWS} & \textbf{Azure} & \textbf{GCP} \\
+\midrule
+Document column type & Redshift SUPER & OPENJSON over NVARCHAR & BigQuery JSON \\
+Path extraction & PartiQL dot/bracket & JSON\_VALUE / JSON\_QUERY & JSON\_QUERY / JSON\_VALUE \\
+Array unnesting & UNNEST (PartiQL) & OPENJSON with schema & UNNEST \\
+Schema-on-read lake & Glue crawlers + Athena & Synapse serverless & BigQuery external tables \\
+Contract enforcement & Glue Schema Registry & Purview + ADF validation & Dataplex / Pub/Sub schemas \\
+\addlinespace
+Snowflake equivalent & \multicolumn{3}{l}{\texttt{VARIANT}/\texttt{OBJECT}/\texttt{ARRAY}, \texttt{LATERAL FLATTEN}, CHECK constraints on extracted columns} \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+\textbf{Microsoft Fabric} stores JSON in lakehouse files (Delta/Parquet) and explores it with Spark or KQL; \textbf{MongoDB} \emph{is} the document model---its \$jsonSchema validators are the closest analog to this chapter's contract checks. Snowflake's hybrid position is the lesson: one column type holds arbitrary JSON, yet extracted attributes can be cast, constrained, and governed like relational columns.
+\end{crosscloud}
+
+\section{Week 9 Roadmap}
+APIs, mobile apps, and IoT fleets emit JSON whose shape evolves faster than any DDL change process. This chapter builds the Snowflake discipline for that reality: land raw, extract deliberately, validate at the boundary, and make drift a visible event instead of a silent NULL \cite{snowflakeSemiStructuredDocs}.
+
+Monday covers the three semi-structured types and their storage behavior. Tuesday masters path navigation and casting. Wednesday unpacks nesting with \texttt{LATERAL FLATTEN} and formalizes data contracts. Thursday's lab flattens clickstream JSON and weaponizes a contract against deliberate drift. Friday designs the SaaS schema-on-read platform.
+
+\begin{keyterms}
+\textbf{VARIANT}: Snowflake's universal semi-structured column type for JSON, Avro, ORC, Parquet, and XML payloads.\quad
+\textbf{OBJECT} / \textbf{ARRAY}: typed semi-structured containers for key-value structures and ordered lists.\quad
+\textbf{LATERAL FLATTEN}: the table function that explodes nested arrays/objects into one row per element, correlated to the source row.\quad
+\textbf{Data contract}: an agreed, enforced schema between producer and consumers, with versioning and ownership.\quad
+\textbf{Schema drift}: producer-side shape changes that arrive unannounced in landed payloads.
+\end{keyterms}
+
+\section{Monday: VARIANT, OBJECT, and ARRAY}
+\index{VARIANT}\index{OBJECT}\index{ARRAY}
+\texttt{VARIANT} is the universal container: any JSON document up to the size limit lands intact, and Snowflake stores it internally in a compressed columnar form that preserves the metadata-pruning benefits of Chapter 1. \texttt{OBJECT} and \texttt{ARRAY} are typed specializations---an \texttt{OBJECT} must be a key-value structure, an \texttt{ARRAY} an ordered list---useful when the payload's top-level shape is known and you want the type system to reject the wrong kind of document.
+
+\begin{definitionbox}
+\textbf{Schema-on-read} in Snowflake means landing the payload whole in a \texttt{VARIANT} column and projecting typed attributes at extraction time, rather than forcing the payload into relational columns at the storage boundary.
+\end{definitionbox}
+
+The architectural habit that makes everything else in this chapter possible is the \emph{raw-first landing table}: one \texttt{VARIANT} column plus ingestion metadata (file name, load timestamp, source system). Nothing is rejected at landing; everything is auditable; replay is trivial. Validation belongs one layer downstream, where it can be versioned.
+
+\begin{notebox}
+Snowflake automatically extracts statistics about frequently occurring paths in \texttt{VARIANT} columns, so selective path filters can still prune micro-partitions. But high-cardinality, frequently filtered attributes deserve promotion to typed columns---governance, clustering, and developer clarity all improve.
+\end{notebox}
+
+\section{Tuesday: Path Navigation and Explicit Casting}
+\index{dot notation}\index{bracket notation}\index{casting}
+Snowflake navigates \texttt{VARIANT} with two notations. Dot notation (\texttt{payload:user.email}) reads naturally; bracket notation (\texttt{payload['user']['email']}) handles keys with spaces, special characters, or case sensitivity. Every path expression returns \texttt{VARIANT} until cast.
+
+Casting policy is where pipelines succeed or rot:
+\begin{itemize}
+    \item \texttt{payload:amount::NUMBER} \textbf{hard-casts}: a malformed value fails the statement. Correct for contract-enforced layers where loud failure is the goal.
+    \item \texttt{TRY\_CAST} / \texttt{TRY\_TO\_*} \textbf{soft-casts}: malformed values become NULL. Correct for exploratory layers---dangerous in production because drift decays into silent NULLs.
+    \item \texttt{TRY\_PARSE\_JSON} validates text before it becomes \texttt{VARIANT}, feeding the quarantine path for unparseable records.
+\end{itemize}
+
+\begin{pitfall}
+\textbf{A missing key and a NULL value are indistinguishable after extraction.} \texttt{payload:email} returns NULL both when the key is absent (drift!) and when it is explicitly JSON null. Pipelines that must tell them apart check \texttt{IS\_NULL\_VALUE(payload:email)} versus key existence---or enforce presence at the contract layer.
+\end{pitfall}
+
+\begin{lstlisting}[language=SQL, caption={Extraction with hard casts and drift detection}]
+SELECT payload:event_id::STRING                          AS event_id,
+       payload:user.id::INT                              AS user_id,
+       payload:device.os::STRING                         AS device_os,
+       TRY_TO_TIMESTAMP_NTZ(payload:ts::STRING)          AS event_ts,
+       IFF(payload:event_id IS NULL
+           AND NOT IS_NULL_VALUE(payload:event_id),
+           TRUE, FALSE)                                  AS key_missing
+FROM raw.clickstream_landing;
+\end{lstlisting}
+
+\section{Wednesday: LATERAL FLATTEN and Data Contracts}
+\index{LATERAL FLATTEN}\index{data contract}\index{schema drift}
+Nesting is where JSON stops being convenient. An event carrying an array of line items cannot model ``one row per item'' without exploding the array. \texttt{LATERAL FLATTEN} does exactly that: a table function correlated to each source row, emitting one row per array element or object field, with the element exposed as \texttt{VALUE} (plus \texttt{KEY}, \texttt{INDEX}, \texttt{PATH}).
+
+\begin{lstlisting}[language=SQL, caption={Flattening nested line items into tabular rows}]
+SELECT e.payload:event_id::STRING        AS event_id,
+       e.payload:user.id::INT            AS user_id,
+       item.value:sku::STRING            AS sku,
+       item.value:qty::INT               AS quantity,
+       item.value:price::NUMBER(10,2)    AS unit_price
+FROM raw.clickstream_landing e,
+     LATERAL FLATTEN(INPUT => e.payload:items) item
+WHERE e.payload:event_type::STRING = 'PURCHASE';
+\end{lstlisting}
+
+A plain join cannot do this: flattening changes the \emph{cardinality} of the result relative to the source row, which is precisely what a lateral table function is for. Multi-level nesting composes by chaining \texttt{LATERAL FLATTEN} calls.
+
+\subsection{Data Contracts on VARIANT Payloads}
+\index{data contract!enforcement}
+A data contract converts ``the producer usually sends these fields'' into an enforced agreement: required fields, types, allowed values, and an ownership rule---\emph{the producer defines the contract; consumers version and approve changes}, distinguishing breaking changes (renamed or removed keys, narrowed types) from non-breaking ones (new optional keys). In Snowflake the cheapest enforcement point is a CHECK constraint on the extracted columns of the typed table that ingests from the raw landing table:
+
+\begin{lstlisting}[language=SQL, caption={Contract enforcement on extracted VARIANT fields}]
+CREATE OR REPLACE TABLE silver.events (
+  event_id   STRING,
+  event_type STRING NOT NULL,
+  event_ts   TIMESTAMP_NTZ NOT NULL,
+  amount     NUMBER(12,2),
+  CONSTRAINT events_contract_chk
+    CHECK (event_type IN ('CLICK', 'VIEW', 'PURCHASE')
+           AND (amount IS NULL OR amount >= 0))
+);
+
+INSERT INTO silver.events
+SELECT payload:event_id::STRING,
+       payload:event_type::STRING,
+       payload:ts::TIMESTAMP_NTZ,
+       payload:amount::NUMBER(12,2)
+FROM raw.events_landing
+WHERE payload IS NOT NULL;
+-- Rows violating the CHECK are rejected at ingest.
+-- dbt alternative: contract: {enforced: true} with column
+-- data_types and constraints declared in the model YAML.
+\end{lstlisting}
+
+\subsection{Schema Drift Defense in Depth}
+\index{quarantine}\index{dead-letter}
+The layered defense: (1) land raw payloads in a single \texttt{VARIANT} column so nothing is ever rejected at the boundary; (2) quarantine unparseable records into a dead-letter table using \texttt{TRY\_PARSE\_JSON} plus \texttt{VALIDATION\_MODE} on file loads; (3) enforce contracts with CHECK constraints on extracted columns; (4) version downstream extractors with explicit casts so missing keys fail loudly in CI rather than silently returning NULL in production \cite{dbtContractsDocs}.
+
+\begin{tipbox}
+Alert on the \emph{quarantine rate}, not just quarantine contents. A producer drifting its schema shows up as a rising reject percentage days before a consumer complains.
+\end{tipbox}
+
+\section{Thursday Hands-On Project: Clickstream Flattening and Contract Enforcement}
+\index{hands-on project!semi-structured}
+This lab lands deeply nested clickstream JSON, flattens it into a dimensional shape, and proves that a contract rejects drifted payloads.
+
+\subsection*{Scenario}
+A media app's clickstream emits events like \texttt{\{"event\_id": ..., "user": \{...\}, "items": [...], "experiments": [...]\}} with nesting three levels deep. Analytics needs one row per item interaction; data governance wants the agreed schema enforced at ingest.
+
+\subsection*{Procedure}
+\begin{enumerate}
+    \item Generate 100{,}000 synthetic clickstream events (Python) with nested \texttt{user}, \texttt{items[]}, and \texttt{experiments[]} blocks; upload to the Chapter 5 stage.
+    \item Land them in \texttt{raw.clickstream\_landing(payload VARIANT, load\_file STRING, load\_ts TIMESTAMP)} via \texttt{COPY INTO}.
+    \item Write the extraction query with hard casts; count rows where key presence and NULL-ness diverge.
+    \item Build \texttt{silver.item\_interactions} with a chained \texttt{LATERAL FLATTEN} over \texttt{items}.
+    \item Add the CHECK contract on \texttt{event\_type} and non-negative amounts; load successfully.
+    \item Deliberately drift the producer: rename \texttt{event\_type} to \texttt{event\_kind} in a new batch. Observe rejection, route the batch to the dead-letter table, and write the alert query.
+\end{enumerate}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item \textbf{SQL scripts:} landing load, extraction, flatten, contract DDL, drift simulation, quarantine routing.
+    \item \textbf{Generator script:} the Python event generator with a \texttt{--drift} flag.
+    \item \textbf{Before/after evidence:} row counts in silver, dead-letter contents after drift, and the alert query output.
+    \item \textbf{Contract document:} one page listing required fields, types, allowed values, and the producer/consumer ownership rule.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item Nested arrays explode to correct per-item row counts reconciled against the raw payloads.
+    \item The contract rejects drifted rows at ingest and the rejects are quarantined with reasons, not lost.
+    \item Non-breaking additions (new optional key) pass the contract unchanged.
+    \item The pipeline distinguishes ``key missing'' from ``key NULL'' where the distinction matters.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Express the same contract as a dbt \texttt{contract: enforced} model and compare failure surfaces.
+    \item Add \texttt{OBJECT\_CONSTRUCT} re-assembly: emit a normalized outbound JSON document per event.
+    \item Measure pruning on a path filter before and after promoting \texttt{event\_type} to a typed, clustered column.
+\end{itemize}
+
+\section{Friday Real-World Architecture: SaaS Schema-on-Read Platform}
+\index{Real-World Architecture!SaaS schema-on-read}
+A SaaS vendor ships iOS, Android, and web clients on independent release trains; payload schemas change weekly without cross-team coordination. Downstream models must never break silently.
+
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[
+        src/.style={rectangle, rounded corners, draw=orange!70!black, thick, fill=orange!10, align=center, minimum width=2.3cm, minimum height=0.95cm, font=\small\bfseries},
+        sf/.style={rectangle, rounded corners, draw=primary, thick, fill=primary!6, align=center, minimum width=2.6cm, minimum height=0.95cm, font=\small\bfseries},
+        tbl/.style={rectangle, rounded corners, draw=codegreen!60!black, thick, fill=green!8, align=center, minimum width=2.6cm, minimum height=0.95cm, font=\small\bfseries},
+        bad/.style={rectangle, rounded corners, draw=red!60!black, thick, fill=red!8, align=center, minimum width=2.6cm, minimum height=0.95cm, font=\small\bfseries},
+        arrow/.style={-{Stealth[length=2.5mm]}, draw=primary, thick},
+        badarrow/.style={-{Stealth[length=2.5mm]}, draw=red!60!black, thick, dashed},
+        lbl/.style={font=\scriptsize\itshape, text=codegray}
+    ]
+        \node[src] (ios) at (0, 1.7) {iOS app};
+        \node[src] (and) at (0, 0) {Android app};
+        \node[src] (web) at (0, -1.7) {Web app};
+        \node[sf] (pipe) at (3.4, 0) {Snowpipe\\(VARIANT land)};
+        \node[tbl] (raw) at (6.8, 0) {raw.events\\payload + lineage};
+        \node[tbl] (silver) at (10.4, 0.9) {silver.events\\CHECK contract};
+        \node[bad] (dlq) at (10.4, -1.5) {dead\_letter\\quarantine + alert};
+        \node[tbl] (gold) at (13.8, 0.9) {gold marts\\versioned views};
+        \draw[arrow] (ios) -- (pipe);
+        \draw[arrow] (and) -- (pipe);
+        \draw[arrow] (web) -- (pipe);
+        \draw[arrow] (pipe) -- (raw);
+        \draw[arrow] (raw) -- node[lbl, above]{extract + cast} (silver);
+        \draw[badarrow] (raw) -- node[lbl, right]{contract rejects} (dlq);
+        \draw[arrow] (silver) -- (gold);
+    \end{tikzpicture}%
+    }
+    \caption{Schema-on-read platform: everything lands, contracts gate promotion, drift is quarantined and alerted.}
+    \label{fig:chapter9-saas-architecture}
+\end{figure}
+
+\subsection{Design Decisions}
+\begin{enumerate}
+    \item \textbf{Unconditional landing.} No validation at the raw boundary---a crashing app update can never lose data because the platform rejected it.
+    \item \textbf{Versioned extraction.} Extractors are code, reviewed and deployed; a consumer upgrading to payload schema v14 is a pull request, not a discovery.
+    \item \textbf{Contract at promotion.} CHECK constraints on the silver table enforce the agreed envelope; rejects route to a dead-letter table with the offending payload and reason.
+    \item \textbf{Drift observability.} A daily report profiles key presence per app version---the early-warning system that turns schema drift from an incident into a conversation with the producer team, who owns the contract.
+\end{enumerate}
+
+\begin{pitfall}
+\textbf{Hard casts without a quarantine path convert drift into downtime.} The pair---contract enforcement \emph{plus} dead-letter routing---is what makes enforcement safe. Enforcement alone just moves the failure from silent corruption to a broken pipeline.
+\end{pitfall}
+
+\section{Interview Q\&A}
+\begin{enumerate}
+    \item \textbf{Q: Which Snowflake type stores arbitrary JSON, and how does it remain efficient?}\\
+    A: \texttt{VARIANT}, stored internally in compressed columnar form with per-path statistics, so selective path filters can still prune micro-partitions.
+    \item \textbf{Q: Why cast VARIANT fields explicitly at extraction time?}\\
+    A: Path expressions return VARIANT; explicit casts make types a deliberate, versioned decision---and hard casts turn schema drift into loud failures instead of silent NULLs.
+    \item \textbf{Q: What does LATERAL FLATTEN do that a plain join cannot?}\\
+    A: It changes cardinality, exploding each source row into one row per nested array element or object field, correlated to that row.
+    \item \textbf{Q: How do CHECK constraints enforce a contract on extracted fields?}\\
+    A: The typed table's constraint validates every inserted row; violating rows are rejected at ingest and routed to quarantine.
+    \item \textbf{Q: Who owns a data contract, and who approves breaking changes?}\\
+    A: The producer defines the contract; consumers version and approve changes. Breaking changes (renames, removals, narrowed types) need coordinated rollout.
+\end{enumerate}
+
+\section{Further Reading}
+Snowflake's semi-structured data guide covers \texttt{VARIANT} internals, path syntax, and flattening \cite{snowflakeSemiStructuredDocs}. The dbt model-contracts documentation presents the declarative alternative to CHECK-constraint enforcement \cite{dbtContractsDocs}. For the lakehouse contrast, the lakehouse paper motivates schema enforcement at the storage layer \cite{armbrust2021lakehouse}.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item Land raw payloads whole in \texttt{VARIANT}; validation belongs one versioned layer downstream.
+    \item Dot and bracket notation navigate paths; explicit casts---hard or \texttt{TRY\_*} by design---define drift behavior.
+    \item \texttt{LATERAL FLATTEN} is the cardinality-changing tool for nested arrays and objects.
+    \item Data contracts are enforced agreements with ownership: CHECK constraints or dbt contracts at the promotion boundary.
+    \item Enforcement without quarantine converts drift into downtime; always pair them.
+    \item Missing keys and JSON nulls are different events---measure key presence, not just value NULLs.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Compare \texttt{VARIANT}, \texttt{OBJECT}, and \texttt{ARRAY} and choose the right one for three payloads of increasing knownness.
+    \item \textbf{(Conceptual)} Explain why \texttt{TRY\_CAST} in a production extractor is a governance risk.
+    \item \textbf{(Hands-on)} Flatten a two-level nested payload (order $\rightarrow$ items $\rightarrow$ options) with chained lateral flattens and reconcile row counts.
+    \item \textbf{(Hands-on)} Write the key-presence profiling query that reports, per app version, which contract keys are missing.
+    \item \textbf{(Hands-on)} Implement dead-letter routing for contract rejects including the rejection reason column.
+    \item \textbf{(Design)} Define the versioning policy for a contract: what is breaking, what requires a new silver table, and what rolls out silently.
+    \item \textbf{(Design)} A producer must remove a PII field from payloads. Walk through the contract change process and downstream impact analysis.
+    \item \textbf{(Operations)} Write the quarantine-rate alert: rejects divided by arrivals per hour, with a threshold and escalation path.
+    \item \textbf{(Performance)} Measure scan bytes for a path filter on \texttt{VARIANT} versus a promoted typed column on 10 million rows.
+    \item \textbf{(Interview)} Explain schema-on-read to a relational DBA, including where Snowflake's approach is stronger and weaker than a pure document store.
+\end{enumerate}

@@ -1,0 +1,154 @@
+\chapter{Spark SQL and Delta Lake Quick Reference}
+\index{Spark SQL}\index{Delta Lake!reference}\index{PySpark!reference}%
+This appendix consolidates the Spark, SQL, and Delta Lake syntax used across the
+book into one lookup. Examples run on Azure Databricks or Synapse Spark unless
+noted; T-SQL fragments are Synapse dedicated or serverless pool syntax.
+
+\section{Reading and Writing}
+\index{Spark SQL!read/write}
+
+\begin{lstlisting}[language=Python,caption={The lake read/write patterns used throughout Parts II--V.},label={lst:app-spark-io}]
+LAKE = "abfss://curated@<adls>.dfs.core.windows.net"
+
+df = spark.read.parquet(f"{LAKE}/orders/")
+df_json = (spark.read.schema("order_id STRING, amount DOUBLE")
+           .json(f"{LAKE}/raw/orders/"))
+df_csv = (spark.read.option("header", True)
+          .option("inferSchema", False)      # declare schemas; inference costs a pass
+          .csv(f"{LAKE}/raw/orders/"))
+
+(df.write.format("delta").mode("overwrite")
+   .option("overwriteSchema", "true")
+   .partitionBy("order_year", "order_month")
+   .save(f"{LAKE}/orders_v2/"))
+
+spark.sql(f"CREATE TABLE IF NOT EXISTS orders_v2 "
+          f"USING DELTA LOCATION '{LAKE}/orders_v2/'")
+\end{lstlisting}
+
+\section{DataFrame Operations and the Shuffle Boundary}
+\index{shuffle!reference}
+
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{5.6cm}p{3.2cm}p{4.4cm}@{}}
+\toprule
+\textbf{Operation} & \textbf{Type} & \textbf{Notes} \\
+\midrule
+\texttt{select}, \texttt{filter}, \texttt{withColumn} & Narrow & No shuffle; stays in partition \\
+\texttt{groupBy().agg()} & Wide & Shuffle by group key \\
+\texttt{join()} & Wide & Shuffle unless broadcast or co-located \\
+\texttt{broadcast(dim)} & Hint & Avoids the shuffle for small dims \\
+\texttt{distinct()}, \texttt{dropDuplicates()} & Wide & State/shuffle on the full key \\
+\texttt{repartition(n)} / \texttt{coalesce(n)} & Wide & Reshape partitions before writes \\
+\texttt{cache()} & Eager marker & Reuse across multiple actions only \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Key configuration: \texttt{spark.sql.shuffle.partitions} (default 200---tune to
+data volume), \texttt{spark.sql.adaptive.enabled} (skew and coalesce handling),
+and Photon on Databricks for vectorized scans (Chapter 11).
+
+\section{Delta Lake Operations}
+\index{Delta Lake!operations}
+
+\begin{lstlisting}[language=SQL,caption={Delta maintenance and time travel (Spark SQL).},label={lst:app-delta}]
+MERGE INTO silver.orders AS tgt
+USING staging.batch AS src ON tgt.order_id = src.order_id
+WHEN MATCHED AND src.updated_at > tgt.updated_at THEN UPDATE SET *
+WHEN NOT MATCHED THEN INSERT *;
+
+SELECT * FROM silver.orders VERSION AS OF 12;
+SELECT * FROM silver.orders TIMESTAMP AS OF '2026-08-01T00:00:00';
+
+DESCRIBE HISTORY silver.orders;
+DESCRIBE DETAIL  silver.orders;   -- file counts, sizes, partitioning
+
+OPTIMIZE silver.orders ZORDER BY (customer_id);
+VACUUM silver.orders RETAIN 168 HOURS;   -- 7 days; check time-travel consumers first
+\end{lstlisting}
+
+\begin{pitfall}
+\textbf{VACUUM under the retention horizon of a time-travel consumer.} Files
+removed by VACUUM break \texttt{VERSION AS OF} queries older than the retention.
+Coordinate the horizon with audit and reprocessing requirements (Chapters 6, 23).
+\end{pitfall}
+
+\section{Structured Streaming}
+\index{Structured Streaming!reference}
+
+\begin{lstlisting}[language=Python,caption={The Chapter 15 streaming skeleton, condensed.},label={lst:app-stream}]
+stream = (spark.readStream.format("kafka").options(**kafka_options).load()
+    .select(F.from_json(F.col("value").cast("string"), schema).alias("e"))
+    .select("e.*")
+    .withColumn("event_time", F.to_timestamp("ts")))
+
+agg = (stream.withWatermark("event_time", "10 minutes")
+       .groupBy(F.window("event_time", "5 minutes"), "deviceId")
+       .agg(F.avg("tempC").alias("avg_temp")))
+
+(agg.writeStream.format("delta").outputMode("append")
+    .option("checkpointLocation", "abfss://checkpoints@<adls>/iot/v1")
+    .trigger(processingTime="1 minute")     # or availableNow=True for batch-style
+    .toTable("iot_agg"))
+\end{lstlisting}
+
+Remember: version checkpoint paths per deployment; never restart changed logic
+from a stale checkpoint.
+
+\section{Synapse T-SQL Essentials}
+\index{Synapse!T-SQL reference}
+
+\begin{lstlisting}[language=SQL,caption={Dedicated and serverless pool statements used in Chapters 5--8.},label={lst:app-tsql}]
+-- bulk load (dedicated pool)
+COPY INTO stg_sales
+FROM 'https://<adls>.dfs.core.windows.net/raw/sales/*.parquet'
+WITH (FILE_TYPE='PARQUET', CREDENTIAL=(IDENTITY='Managed Identity'));
+
+-- distributed table creation
+CREATE TABLE fact_sales
+WITH (DISTRIBUTION = HASH(customer_id), CLUSTERED COLUMNSTORE INDEX)
+AS SELECT * FROM stg_sales;
+
+-- serverless: query the lake in place
+SELECT * FROM OPENROWSET(
+    BULK 'https://<adls>.dfs.core.windows.net/gold/fact_sales/',
+    FORMAT = 'DELTA') AS f
+WHERE f.filepath(1) = '2026';
+
+-- serverless: materialize back to the lake
+CREATE EXTERNAL TABLE curated.orders_clean
+WITH (LOCATION='orders_clean/', DATA_SOURCE=ds_curated,
+      FILE_FORMAT=parquet_ff)
+AS SELECT ... ;
+
+-- in-database scoring (dedicated pool)
+SELECT * FROM PREDICT(MODEL = @model, DATA = dbo.features AS d,
+                      RUNTIME = ONNX) WITH (score REAL);
+\end{lstlisting}
+
+\section{Useful DMVs}
+\index{DMV}
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{6.4cm}p{6.8cm}@{}}
+\toprule
+\textbf{DMV} & \textbf{Answers} \\
+\midrule
+\texttt{sys.dm\_pdw\_exec\_requests} & What ran, how long, which label \\
+\texttt{sys.dm\_pdw\_request\_steps} & Where data moved (shuffle steps) \\
+\texttt{sys.pdw\_nodes\_column\_store\_row\_groups} & Rowgroup health per table \\
+\texttt{sys.dm\_pdw\_wlm\_waiting\_requests} & Concurrency queue depth \\
+\texttt{sys.workload\_management\_workload\_classifiers} & Classifier routing rules \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{Cross-References}
+
+Chapters 5--7 (warehouse and lakehouse SQL), 9 and 12 (Spark and Delta), 15
+(streaming), and 17 (PREDICT). Primary documentation: Spark \cite{apache2025spark}, Structured
+Streaming \cite{apache2025structuredStreaming}, Delta Lake
+\cite{armbrust2020delta,deltaio2025delta}, and Synapse best practices
+\cite{microsoft2025synapseDedicatedBest,microsoft2025synapseServerless}.

@@ -1,0 +1,287 @@
+\chapter{Sharding Architecture and Chunk Allocations}
+\index{sharding}\index{mongos}\index{config server}\index{CSRS}\index{shard key}\index{chunk}\index{balancer}\index{hashed sharding}\index{hot shard}\index{scatter-gather}%
+
+\begin{objectives}
+\begin{itemize}
+    \item Identify the roles of \texttt{mongos} routers, the Config Server Replica Set (CSRS), and shard replica sets.
+    \item Compare range, hashed, and compound shard keys against read locality and write distribution goals.
+    \item Explain chunk splitting, migration, and balancer behavior, including their operational cost.
+    \item Score candidate shard keys on cardinality, frequency, and rate of change (monotonicity).
+    \item Diagnose a hot shard caused by a monotonic key and fix it with hashed keys or \texttt{refineCollectionShardKey}.
+    \item Deploy a two-shard local cluster and observe chunk distribution in the Thursday lab.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+Horizontal partitioning exists everywhere under different names; the shard-key decision is the same decision as a DynamoDB partition key, a Cosmos DB partition key, or a Bigtable row-key design.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{2.9cm}p{3.0cm}p{3.0cm}p{3.0cm}@{}} 
+\toprule
+\textbf{Concept} & \textbf{AWS} & \textbf{Azure} & \textbf{GCP} \\
+\midrule
+Partition unit & DynamoDB partition & Cosmos DB logical partition & Bigtable tablet \\
+Router & Client SDK (DynamoDB) & Gateway + partitions & Front end + tablet map \\
+Split metadata & Partition map & Partition map & Master tablet \\
+Hot-key risk & Hot partition throttling & 20 GB logical cap, hot RU & Hot tablet \\
+Even distribution tool & Hash of partition key & Hash of partition key & Salting / key design \\
+Rebalancing & Automatic split & Physical partition split & Tablet splits \\
+\addlinespace
+Snowflake / Fabric & \multicolumn{3}{l}{Micro-partitions replace user-visible sharding; clustering keys influence pruning, not routing} \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+MongoDB's difference is explicitness: you pick the shard key, you can refine it live, and you can mis-pick it badly enough to create a hot shard. The scoring discipline in this chapter transfers directly to DynamoDB and Cosmos DB key design \cite{mongodbShardingDocs,cosmosPartitionDocs,dynamodbSingleTableDocs}.
+\end{crosscloud}
+
+\section{Week 6 Roadmap: Distributing Data on Purpose}
+A single replica set scales reads (via secondaries) and availability, but every member holds every byte and the primary absorbs every write. Sharding scales storage and write throughput horizontally by partitioning one collection across many replica sets. The architecture adds two components---\texttt{mongos} routers and the CSRS---and one irreversible-feeling decision: the shard key. This week makes that decision systematic \cite{mongodbShardingDocs}.
+
+\begin{definitionbox}
+\textbf{Sharding} partitions a collection's documents across shards (replica sets) according to the shard-key value of each document; \texttt{mongos} routes operations to the right shards using chunk metadata stored in the CSRS.
+\end{definitionbox}
+
+\begin{keyterms}
+\textbf{Chunk}: a contiguous range of shard-key values owned by one shard. \textbf{Balancer}: the background process that migrates chunks to equalize load. \textbf{Jumbo chunk}: an indivisible oversized chunk. \textbf{Targeted query}: one routed to a single shard by its shard-key predicate. \textbf{Scatter-gather}: a query broadcast to all shards and merged by \texttt{mongos}. \textbf{Zone}: a shard subset pinned to a key range (Chapter 12).
+\end{keyterms}
+
+\section{Monday: The Sharding Components}
+\subsection{\texttt{mongos}: Stateless Routing}
+\texttt{mongos} holds no data. It caches the chunk map from the CSRS, parses each operation, routes targeted operations to the owning shard, and fans scatter-gather operations to all shards, merging results (including global sorts and aggregation merge stages). Because it is stateless, you run several behind a load balancer; the failure of one router loses no metadata and no data. Its cache can go stale after chunk migrations; the protocol version-checks and refreshes automatically, which surfaces to you as occasional retries, not errors.
+
+\subsection{CSRS: The Cluster's Brain}
+The Config Server Replica Set stores chunk ownership, shard membership, and zone mappings. It is itself a three-member replica set: its loss does not stop reads and writes on existing chunk placements, but it freezes all metadata operations---no splits, no migrations, no new sharded collections. Treat the CSRS with the same seriousness as a shard: dedicated, monitored, backed up.
+
+\subsection{Shards as Ordinary Replica Sets}
+Each shard is a full replica set with its own primary, elections, and oplog. This compositional design is the reason Chapter 5's durability machinery applies unchanged: a shard losing its primary fails over within the shard while the cluster keeps serving. Shard primaries also host the balancer (on the CSRS primary in modern versions) and coordinate chunk migrations as donors and recipients.
+
+\begin{figure}[H]
+    \centering
+    \resizebox{0.9\textwidth}{!}{%
+    \begin{tikzpicture}[
+        box/.style={rectangle, rounded corners, draw=primary, fill=primary!6, minimum width=2.6cm, minimum height=1cm, align=center, font=\small\bfseries},
+        meta/.style={rectangle, rounded corners, draw=orange!85!black, fill=orange!10, minimum width=2.6cm, minimum height=1cm, align=center, font=\small\bfseries},
+        shard/.style={cylinder, shape aspect=0.25, draw=primary, thick, fill=primary!8, shape border rotate=90, align=center, minimum width=2.0cm, minimum height=1.3cm, font=\small\bfseries},
+        arrow/.style={-{Stealth[length=2.5mm]}, draw=primary, thick},
+        metaarrow/.style={-{Stealth[length=2mm]}, draw=orange!85!black, thick, dashed}
+    ]
+        \node[box] (app) at (0,0) {Application};
+        \node[box] (mongos) at (3.4,0) {\texttt{mongos}\\routers};
+        \node[meta] (csrs) at (3.4,2.3) {CSRS\\chunk map};
+        \node[shard] (s1) at (7.2,1.6) {Shard 1\\RS};
+        \node[shard] (s2) at (7.2,0) {Shard 2\\RS};
+        \node[shard] (s3) at (7.2,-1.6) {Shard N\\RS};
+        \draw[arrow] (app) -- (mongos);
+        \draw[metaarrow] (mongos) -- (csrs);
+        \draw[arrow] (mongos) -- (s1);
+        \draw[arrow] (mongos) -- (s2);
+        \draw[arrow] (mongos) -- (s3);
+    \end{tikzpicture}%
+    }
+    \caption{Sharded cluster anatomy: stateless \texttt{mongos} routers, CSRS metadata, and shards that are ordinary replica sets.}
+    \label{fig:ch10-anatomy}
+\end{figure}
+
+\section{Tuesday: Shard Keys}
+\subsection{The Decision That Outlives You}
+The shard key assigns every document to exactly one shard for the collection's lifetime. Historically immutable, modern MongoDB allows a one-time refinement (adding suffix fields) but not replacement. The three scoring properties, in order of how badly their absence hurts:
+
+\begin{itemize}
+    \item \textbf{Cardinality}: few distinct values cap the number of chunks, so the balancer cannot spread load finely. A boolean shard key yields at most two chunks---two shards do all the work forever.
+    \item \textbf{Frequency}: a single value that dominates writes (``status: active'' on a hot queue) creates one hot chunk no balancing can split, because a chunk cannot split between identical keys.
+    \item \textbf{Rate of change (monotonicity)}: a monotonically increasing key (timestamps, ObjectIds) sends every new insert to the single highest chunk---one shard absorbs all writes while the others idle. This is Friday's production failure, and Chapter 7's redesign subject.
+\end{itemize}
+
+\subsection{Range, Hashed, Compound}
+\textbf{Range sharding} keeps key locality: range queries on the shard key are targeted and fast, and zones can pin ranges to shards (Chapter 8). Its risk is monotonic or skewed writes. \textbf{Hashed sharding} hashes the key, distributing writes evenly at the cost of destroying key locality---range queries scatter to every shard. \textbf{Compound shard keys} combine both: e.g. \texttt{\{tenantId: 1, bucket: 1, ts: 1\}} isolates tenants, bounds per-tenant churn with a bucket field, and preserves time order inside a bucket.
+
+\begin{definitionbox}
+A \textbf{hot shard} exists when one shard receives a disproportionate share of writes or reads because the shard key concentrates new or popular values into few chunks. The symptom pattern is one shard at high CPU/storage-I/O with the rest idle, visible in per-shard operation counters.
+\end{definitionbox}
+
+\begin{pitfall}
+\textbf{Sharding on \texttt{createdAt}.} The most common production sharding failure: time-ordered keys make the newest chunk the write target for 100\% of inserts. The balancer migrates older chunks continuously, adding movement load on top of the hotspot. Either hash the key, prefix it with a high-cardinality field, or bucket it.
+\end{pitfall}
+
+\section{Wednesday: Chunks, Splits, and the Balancer}
+\subsection{Chunk Mechanics}
+A chunk is a range of shard-key space. When a chunk grows past the configured size (default 128 MB), the shard primary splits it at a key midpoint. When shard chunk counts diverge beyond a threshold, the balancer migrates chunks from the fullest shard to the emptiest. A \textbf{jumbo chunk} arises when no split point exists---the hallmark of low shard-key cardinality---and the balancer simply cannot move it; it sits on its shard permanently, skewing storage and load.
+
+\subsection{The Real Cost of Migration}
+Migration copies chunk data from donor to recipient and transfers ownership via a metadata commit on the CSRS. During the move, the donor continues serving reads and writes, but the copy consumes disk I/O and WiredTiger cache on both sides, and range deletions (cleanup of orphaned documents) add deferred work. A cluster with a bad shard key enters a treadmill: hotspots cause splits, splits cause migrations, migrations add I/O, I/O worsens latency, latency looks like a capacity problem.
+
+\begin{tipbox}
+Restrict the balancer to a window during peak-sensitive periods, and alert on migration rate itself: a cluster migrating hundreds of chunks per hour is telling you the shard key is wrong, not that balancing is working.
+\end{tipbox}
+
+\subsection{Targeted vs. Scatter-Gather}
+With the shard key in the predicate, \texttt{mongos} routes to one shard. Without it, the query broadcasts: every shard scans, and \texttt{mongos} merges. Scatter-gather is not wrong---analytical queries are legitimately global---but an OLTP endpoint that scatters turns a cluster of $N$ shards into $N$ times the work for the same query, defeating the reason you sharded. \texttt{explain()} on a sharded cluster reports per-shard plans; count the shards hit, not just the latency \cite{mongodbExplainDocs}.
+
+\section{Thursday Hands-On Project: A Two-Shard Cluster on One Machine}
+Build the smallest real sharded cluster: a three-member CSRS, two single-node shards, one \texttt{mongos}, and a sharded collection whose chunk distribution you observe directly.
+
+\subsection{Cluster Build}
+\begin{lstlisting}[language=bash, caption={Minimal local sharded cluster (simplified single-node members).}]
+$root = "C:\MongoData\shard-lab"
+# Config servers (ports 29001-29003), shards (29101, 29201), mongos (29999)
+mongod --configsvr --replSet csrs --port 29001 --dbpath "$root\cfg1\db" --bind_ip 127.0.0.1
+mongod --configsvr --replSet csrs --port 29002 --dbpath "$root\cfg2\db" --bind_ip 127.0.0.1
+mongod --configsvr --replSet csrs --port 29003 --dbpath "$root\cfg3\db" --bind_ip 127.0.0.1
+mongosh --port 29001 --eval 'rs.initiate({_id:"csrs", configsvr:true, members:[
+  {_id:0,host:"127.0.0.1:29001"},{_id:1,host:"127.0.0.1:29002"},{_id:2,host:"127.0.0.1:29003"}]})'
+
+mongod --shardsvr --replSet shA --port 29101 --dbpath "$root\shA\db" --bind_ip 127.0.0.1
+mongod --shardsvr --replSet shB --port 29201 --dbpath "$root\shB\db" --bind_ip 127.0.0.1
+mongosh --port 29101 --eval 'rs.initiate({_id:"shA", members:[{_id:0,host:"127.0.0.1:29101"}]})'
+mongosh --port 29201 --eval 'rs.initiate({_id:"shB", members:[{_id:0,host:"127.0.0.1:29201"}]})'
+
+mongos --configdb csrs/127.0.0.1:29001,127.0.0.1:29002,127.0.0.1:29003 --port 29999 --bind_ip 127.0.0.1
+mongosh --port 29999 --eval 'sh.addShard("shA/127.0.0.1:29101"); sh.addShard("shB/127.0.0.1:29201")'
+\end{lstlisting}
+
+\subsection{Hashed Sharding and Observation}
+\begin{lstlisting}[language=JavaScript, caption={Enable hashed sharding and watch the chunk map form.}]
+sh.enableSharding("lab");
+sh.shardCollection("lab.events", { _id: "hashed" });
+
+for (let i = 0; i < 500000; i++) {
+  db.events.insertOne({ _id: i, ts: new Date(), v: i % 7 });
+}
+sh.status();   // chunk list per shard; verify near-even distribution
+db.events.explain("executionStats").find({ _id: 42 });     // targeted: 1 shard
+db.events.explain("executionStats").find({ v: 3 });        // scatter: all shards
+\end{lstlisting}
+
+Then re-shard a second collection by range on a monotonic key, insert the same volume, and use \texttt{sh.status()} plus per-shard \texttt{serverStatus} operation counters to watch the hot shard form.
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item The cluster build script and teardown script.
+    \item \texttt{sh.status()} output for the hashed collection showing balanced chunks.
+    \item The hot-shard evidence pack for the monotonic range-keyed collection.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item The hashed collection distributes documents within 15\% across the two shards.
+    \item \texttt{explain()} proves the shard-key query is targeted (one shard) and the non-key query scatters (two shards).
+    \item The monotonic-key experiment identifies the hot shard with per-shard metrics.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Add a third shard live and observe the balancer's migration timeline.
+    \item Create a jumbo chunk deliberately (single-key-value flood) and document the balancer's inability to move it.
+\end{itemize}
+
+\section{Friday Use Case and Architecture: The \texttt{createdAt} Hot Shard}
+\subsection{Incident Review}
+A telemetry platform sharded events on \texttt{\{ createdAt: 1 \}}. In production, shard 3 sits at 95\% CPU while shards 1 and 2 idle at 15\%; write latency p99 degrades hourly; the balancer migrates continuously. The root cause is the monotonic key: every insert lands on the newest (max) chunk, always on one shard. Range reads of recent data are fast---the one thing this key does well---but writes never parallelize.
+
+\subsection{The Redesign}
+The fix preserves read locality while spreading writes: a compound shard key \texttt{\{ deviceId: 1, createdAt: 1 \}} when device cardinality is high (each device's stream lands together, writes spread across devices), or \texttt{\{ bucket: 1, createdAt: 1 \}} with a computed bucket (\texttt{deviceId \% 64}) when device cardinality is low or skewed. For a write-once, read-rarely archive collection, a fully hashed key is the honest answer. Migration on a live 50 TB cluster uses a new collection with the new key, dual-writes plus backfill (Chapter 4's patterns), and cutover after parity---you do not ``fix'' a shard key in place at that scale; you migrate the collection \cite{mongodbShardingDocs}.
+
+\begin{notebox}
+\texttt{reshardCollection} (MongoDB 5.0+) can re-key a collection online, but it is a heavyweight operation requiring roughly 1.2$\times$ storage headroom and a low-write window. It belongs in a planned maintenance program, not in an incident response.
+\end{notebox}
+
+\section{Interview Q\&A}
+\subsection{Sharding Judgment}
+\begin{enumerate}
+    \item \textbf{Q: What do \texttt{mongos} and the CSRS each own?}\\
+    A: \texttt{mongos} owns routing (stateless, cache of the chunk map); the CSRS owns the authoritative chunk map and cluster metadata. Neither owns user data.
+
+    \item \textbf{Q: Hash vs.\ range shard key?}\\
+    A: Hash spreads writes evenly but destroys key locality, so range queries scatter. Range preserves locality and enables zones, but monotonic or skewed keys hotspot.
+
+    \item \textbf{Q: Why does a monotonic key create a hot shard?}\\
+    A: Every new insert has the highest key so far, which lives in the single top chunk, owned by one shard. Writes never parallelize regardless of cluster size.
+
+    \item \textbf{Q: What is a jumbo chunk?}\\
+    A: A chunk that cannot be split because no midpoint key exists---typically from a low-cardinality shard key---so the balancer cannot move it and skew is permanent.
+
+    \item \textbf{Q: What does the balancer cost?}\\
+    A: Each migration copies data and does deferred cleanup on the donor, consuming I/O and cache on both shards. Migrations during peak traffic are a latency tax; restrict them to a window.
+\end{enumerate}
+
+\section{Further Reading}
+MongoDB's sharding manual covers components, shard keys, chunks, and balancing \cite{mongodbShardingDocs}, with the shard-key selection guidance meriting a dedicated read \cite{mongodbShardKeyDocs}. The CAP and distributed-systems framing is in Kleppmann \cite{kleppmann2017ddia} and Brewer \cite{brewer2012cap}. Cross-platform partition-key design is documented for DynamoDB \cite{dynamodbSingleTableDocs} and Cosmos DB \cite{cosmosPartitionDocs}.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item Sharding scales storage and writes; it does not reduce per-query latency for queries that must scatter.
+    \item \texttt{mongos} is stateless; the CSRS is the metadata brain; shards are ordinary replica sets.
+    \item Score shard keys on cardinality, frequency, and monotonicity before you shard, not after.
+    \item Hashed keys trade locality for even distribution; compound keys can keep both when designed well.
+    \item The balancer is not free: splits and migrations consume I/O, and a high migration rate signals a bad key.
+    \item Fixing a wrong shard key at scale is a collection migration project, not a configuration change.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Score \texttt{\{userId: 1\}}, \texttt{\{country: 1\}}, and \texttt{\{createdAt: 1\}} as shard keys for a social app's posts collection.
+    \item \textbf{(Conceptual)} Why does CSRS unavailability freeze chunk splits but not reads?
+    \item \textbf{(Conceptual)} Explain why a low-cardinality prefix defeats balancing even when the suffix is monotonic.
+    \item \textbf{(Hands-on)} Extend the lab to three shards and document how long the balancer takes to reach balance.
+    \item \textbf{(Hands-on)} Use \texttt{explain("executionStats")} to count shards hit by five query shapes; classify each as targeted or scatter.
+    \item \textbf{(Design)} Design the shard key for a 50 TB IoT telemetry collection: 2 million devices, 1 KB readings every 10 seconds, 90\% of reads are per-device recent-history.
+    \item \textbf{(Design)} Write the decision tree your team uses to choose range, hashed, or compound shard keys.
+    \item \textbf{(Interview)} ``Adding shards made us slower.'' Give the three most likely structural explanations.
+\end{enumerate}
+
+\section{Capstone Project: Scripted Two-Shard Cluster with Balanced Hashed Distribution}\label{sec:ch6-capstone}
+
+\begin{capstonebox}
+\textbf{Mission:} deliver the smallest real sharded cluster as fully scripted infrastructure: CSRS, two shard replica sets, and \texttt{mongos} from one PowerShell command, with a hashed-sharded collection whose balanced chunk distribution and targeted-vs-scatter routing you prove with measured evidence.
+
+\textbf{Estimated time:} 3--4 hours.
+
+\textbf{What you will practice:}
+\begin{itemize}
+    \item Deploying every sharded-cluster component from scripts, not wizards.
+    \item Reading the chunk map and per-shard counters as distribution evidence.
+    \item Proving routing behavior with \texttt{explain()} shard counts.
+\end{itemize}
+\end{capstonebox}
+
+\subsection*{Scenario}
+Your platform team standardizes on scripted lab environments for every architecture review. This capstone is the reference implementation for ``sharded cluster on one machine''---the environment Chapter 7's shard-key forensics and Chapter 8's zone sharding will build on.
+
+\subsection*{Requirements}
+\begin{itemize}
+    \item One-command build and teardown of the full cluster: three-member CSRS, two single-node shard replica sets, one \texttt{mongos}.
+    \item A sharded collection using hashed sharding, loaded with at least 500{,}000 documents by a scripted generator.
+    \item Distribution evidence: \texttt{sh.status()} output plus per-shard document counts within 15\% of each other.
+    \item Routing evidence: \texttt{explain("executionStats")} showing the shard-key query hitting exactly one shard and a non-key query scattering to both.
+    \item A README that rebuilds the environment on a clean machine.
+\end{itemize}
+
+\subsection*{Implementation Steps}
+\begin{enumerate}
+    \item \textbf{Script the topology.} Parameterize ports and data paths; add health checks between stages.
+    \item \textbf{Shard and load.} Enable sharding, apply the hashed key, run the generator.
+    \item \textbf{Prove distribution.} Capture chunk maps and per-shard counts; let the balancer settle.
+    \item \textbf{Prove routing.} Run the targeted and scatter-gather \texttt{explain()} evidence.
+    \item \textbf{Package.} Teardown script, README, and evidence pack.
+\end{enumerate}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item Build/teardown scripts, the data generator, and the evidence captures.
+    \item A one-page note explaining the chunk map to a teammate.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item Clean-machine rebuild succeeds from the README alone.
+    \item Distribution is within 15\% across shards with the balancer settled.
+    \item Routing evidence shows one shard versus two shards for the two query shapes.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Add a third shard live and record the balancer's convergence timeline.
+    \item Deliberately create a jumbo chunk and document why the balancer cannot move it.
+\end{itemize}

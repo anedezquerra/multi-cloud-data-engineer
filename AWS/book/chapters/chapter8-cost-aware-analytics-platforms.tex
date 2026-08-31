@@ -1,0 +1,379 @@
+% NOTE: Filename is fixed by the book outline; content teaches Week 8
+% (Data Sharing & Lake Formation) of the syllabus, plus the Milestone 2 capstone.
+\chapter{Data Sharing and Governance with Lake Formation}
+\index{AWS Lake Formation}\index{LF-Tags}\index{row-level security}\index{column-level security}\index{Redshift data sharing}\index{data clean room}\index{AWS Clean Rooms}%
+\begin{objectives}
+\begin{itemize}
+    \item Explain how AWS Lake Formation centralizes data-lake governance on top of the Glue Data Catalog, S3, and IAM.
+    \item Configure row-level and column-level security, including column filters that hide PII from specific principals.
+    \item Apply LF-Tag-based access control and contrast it with named-resource grants.
+    \item Share live data across AWS accounts with Redshift data sharing without copying.
+    \item Design a data clean room that merges CRM and third-party advertiser data without exposing raw PII to either party.
+    \item Assemble the Milestone~2 enterprise lakehouse: Parquet zones, Glue catalog, Lake Formation security, and Spectrum-served dashboards.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+Governance travels with the data, and every platform has converged on the same primitives: a catalog, tag- or attribute-based policies, fine-grained (row/column) controls, and clean-room collaboration.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{2.8cm}p{3.0cm}p{3.0cm}p{3.0cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{AWS} & \textbf{Azure} & \textbf{GCP} \\
+\midrule
+Lake governance layer & Lake Formation & Microsoft Purview & Dataplex \\
+Tag-based access & LF-Tags & Purview classifications & Dataplex aspects/policy tags \\
+Row/column security & LF data filters + cell filters & Purview + SQL RLS/masking & BigQuery RLS + column ACLs \\
+Live cross-account share & Redshift data sharing & Fabric OneLake sharing & Analytics Hub \\
+Managed clean room & AWS Clean Rooms & Azure confidential clean rooms & BigQuery data clean rooms \\
+\addlinespace
+Enforcement point & Catalog (engine-agnostic) & Per engine + Purview policies & BigQuery policy tags \\
+Default stance & IAMAllowedPrincipals (revoke!) & Deny until granted & Deny until granted \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+\textbf{Snowflake} implements the same primitives natively---row access policies, masking policies, tags, and zero-copy shares/listings---and its clean-room offering parallels AWS Clean Rooms. \textbf{MongoDB} enforces field-level security at the document layer (client-side field-level encryption), a different but comparable fine-grained posture.
+\end{crosscloud}
+
+\section{Week 8 Roadmap and Mental Model}
+Week~7 built the lakehouse's query surface; Week~8 governs it. The problem Lake Formation solves is that IAM and S3 bucket policies operate on \emph{objects}, while analysts think in \emph{tables, columns, and rows}. Lake Formation sits between: it registers S3 locations, extends the Glue Data Catalog with table-, column-, row-, and cell-level grants, and vends temporary, scoped credentials to query engines so that the same permissions apply whether the query comes from Athena, Spectrum, or Glue ETL \cite{awsLakeFormationDocs}.
+
+The week's second theme is sharing \emph{without copying}. Redshift data sharing publishes live data from a producer cluster to consumer clusters---across accounts---with the producer owning storage and freshness. A data clean room pushes the idea to its privacy limit: two parties query combined data under cryptographic and policy constraints such that neither sees the other's raw PII \cite{awsCleanRoomsDocs}.
+
+\begin{definitionbox}
+\textbf{AWS Lake Formation} is a governance layer over the data lake. It registers S3 data locations, manages permissions on catalog databases, tables, columns, and rows, and brokers scoped credentials to integrated engines so access policy is enforced uniformly at the catalog level.
+\end{definitionbox}
+
+\begin{keyterms}
+\textbf{Data lake administrator}: principal allowed to manage Lake Formation settings and grants. \textbf{IAMAllowedPrincipals}: the default super-group that makes new catalog objects IAM-governed; revoked to enforce Lake Formation governance. \textbf{Named-resource grant}: permission on a specific database/table/column. \textbf{LF-Tag}: key--value attribute attached to catalog resources; grants reference tag expressions instead of resource names. \textbf{Data filter}: row-level and/or column-level restriction applied to a grant. \textbf{Datashare}: Redshift object publishing live tables to consumer clusters.
+\end{keyterms}
+
+\section{Monday: Lake Formation Centralized Governance}
+\subsection{The Permission Stack}
+Lake Formation permissions sit \emph{on top of} IAM, not instead of it. A query succeeds only when both layers allow it: IAM must permit the engine's role to call Lake Formation and S3, and Lake Formation must grant the caller table access. When a table is governed, engines never use the caller's S3 credentials directly; they request temporary, column-scoped credentials from Lake Formation, which is what makes column-level security enforceable at the storage layer.
+
+\subsection{Registering Locations and Revoking the Default}
+Governance begins with two administrative acts. First, \emph{register} each S3 location with Lake Formation under a service role, so the service controls credential vending for that path. Second, \emph{revoke the default}: new catalog databases and tables are created with a grant to \texttt{IAMAllowedPrincipals}, which makes them effectively IAM-governed and bypasses Lake Formation controls. Leaving that grant in place is the most common reason a ``secured'' lake leaks.
+
+\begin{pitfall}
+\textbf{Forgetting \texttt{IAMAllowedPrincipals}.} Every new database and table starts with this super-group grant. Until you revoke it---on the database and on each table---column filters and LF-Tag policies are decorative. Automate the revocation in the same deployment that creates the catalog.
+\end{pitfall}
+
+\begin{notebox}
+Apply least privilege in Lake Formation from day one: grant on named columns instead of \texttt{*}, and audit grants with CloudTrail Lake Formation data-plane events. A single overly broad \texttt{GRANT} silently defeats every column mask downstream.
+\end{notebox}
+
+\section{Tuesday: Row-Level and Column-Level Security}
+\subsection{Column-Level Grants}
+Column-level security restricts \emph{which columns} a principal can select. The mechanism is the grant itself: instead of granting \texttt{SELECT} on a table, you grant \texttt{SELECT} on an explicit column list (or use a data filter that excludes columns). A marketing analyst can hold \texttt{SELECT(customer\_id, segment, city)} on \texttt{customers} while \texttt{pii\_email} and \texttt{phone} are absent from the grant; Athena then returns an authorization error if the analyst's query references the excluded columns.
+\index{column-level security}
+
+\subsection{Row-Level Data Filters}
+A \emph{data filter} restricts \emph{which rows} a principal sees via a filter expression---for example, \texttt{region = 'EU'} for the European analyst role. Filters can also combine row and column restrictions, yielding cell-level control. The power and the danger are the same: the restriction is enforced by the engine at query time, so two analysts querying the same table can legitimately receive different result sets.
+\index{row-level security}\index{data filter}
+
+\begin{lstlisting}[language=bash,caption={Creating a row/column data filter and granting it to a role.},label={lst:ch8-data-filter}]
+aws lakeformation create-data-cells-filter `
+  --table-data "{`
+    `"DatabaseName`":`"week7_lake`",`
+    `"TableName`":`"customers`",`
+    `"Name`":`"eu_marketing_view`",`
+    `"ColumnNames`":[`"customer_id`",`"segment`",`"city`",`"region`"],`
+    `"RowFilter`":{`"FilterExpression`":`"region = 'EU'`"}`
+  }"
+
+aws lakeformation grant-permissions `
+  --principal DataLakePrincipalIdentifier=arn:aws:iam::123456789012:role/MarketingRole `
+  --resource "{`"DataCellsFilter`":{`
+    `"DatabaseName`":`"week7_lake`",`"TableName`":`"customers`",`
+    `"Name`":`"eu_marketing_view`"}}" `
+  --permissions SELECT
+\end{lstlisting}
+
+\subsection{LF-Tags: Policy by Attribute}
+Named-resource grants scale linearly with tables; LF-Tags scale with \emph{classes} of data. Assign tags like \texttt{domain=sales}, \texttt{sensitivity=pii} to databases, tables, or columns once, then grant \texttt{SELECT} to the marketing role \emph{on the expression} \texttt{domain=sales AND sensitivity<>pii}. Every table tagged correctly thereafter inherits the policy with no new grant \cite{awsLakeFormationDocs}. Tag-based control is what makes a multi-hundred-table lake governable---and what makes tag taxonomy a design artifact worth reviewing like schema.
+\index{LF-Tags}\index{attribute-based access control}
+
+\section{Wednesday: Redshift Data Sharing Across Accounts}
+\subsection{Live Shares, No Copies}
+A Redshift datashare publishes selected objects from a producer cluster; consumer clusters---in the same or a different account---create a read-only database from the share and query live producer data through the producer's managed storage \cite{awsRedshiftDataSharing}. There is no ETL copy to drift, no second storage bill, and no stale extract. The producer controls inclusion; consumers need only compute.
+
+\begin{lstlisting}[language=SQL,caption={Producer and consumer steps for a cross-account datashare.},label={lst:ch8-datashare}]
+-- On the producer:
+CREATE DATASHARE sales_share;
+ALTER DATASHARE sales_share ADD SCHEMA analytics;
+ALTER DATASHARE sales_share ADD ALL TABLES IN SCHEMA analytics;
+GRANT USAGE ON DATASHARE sales_share TO ACCOUNT '210987654321';
+
+-- On the consumer (account 210987654321):
+CREATE DATABASE sales_shared
+FROM DATASHARE sales_share OF ACCOUNT '123456789012';
+
+SELECT region, SUM(amount) FROM sales_shared.analytics.fact_sales
+GROUP BY 1;
+\end{lstlisting}
+
+\begin{tipbox}
+Data sharing pairs naturally with Lake Formation for the lake side of the estate: warehouse tables flow through datashares, lake tables through catalog grants, and the consumer experience---one SQL surface---stays consistent. Decide deliberately which sharing mechanism owns which dataset, and document it in the data catalog of record.
+\end{tipbox}
+
+\section{Thursday Hands-on Project: Hiding the PII Column from Marketing}
+\index{hands-on project!Lake Formation column security}
+This project operationalizes Tuesday's theory: register an S3 location with Lake Formation, revoke the default grant, and prove that a marketing role cannot see \texttt{pii\_email} in Athena while an analytics role can.
+
+\subsection*{Lab Objectives}
+\begin{itemize}
+    \item Register the lake location and designate a data lake administrator.
+    \item Revoke \texttt{IAMAllowedPrincipals} on the database and table.
+    \item Grant the marketing role \texttt{SELECT} on a named column list that excludes \texttt{pii\_email}.
+    \item Verify from both roles in Athena: marketing queries succeed on allowed columns and fail on the PII column.
+\end{itemize}
+
+\subsection*{Procedure}
+Build on the Chapter~7 \texttt{week7\_lake} catalog; add a \texttt{customers} table including a \texttt{pii\_email} column. Then configure governance:
+
+\begin{lstlisting}[language=bash,caption={Registering the location, revoking defaults, and granting column-scoped access.},label={lst:ch8-lf-setup}]
+$AccountId = "123456789012"
+$Bucket    = "acme-analytics-raw-123456789012"
+$AdminRole = "arn:aws:iam::${AccountId}:role/LakeFormationAdmin"
+
+# 1. You (or the admin role) become a data lake administrator.
+aws lakeformation put-data-lake-settings --data-lake-settings "{`
+  `"DataLakeAdmins`":[{`"DataLakePrincipalIdentifier`":`"$AdminRole`"}]}"
+
+# 2. Register the S3 location under a service role.
+aws lakeformation register-resource `
+  --resource-arn "arn:aws:s3:::$Bucket/curated/" `
+  --role-arn "arn:aws:iam::${AccountId}:role/LFServiceRole" `
+  --use-service-linked-role false
+
+# 3. Revoke the default super-group on database and table.
+aws lakeformation revoke-permissions `
+  --principal DataLakePrincipalIdentifier=IAM_ALLOWED_PRINCIPALS `
+  --resource "{`"Database`":{`"Name`":`"week7_lake`"}}" `
+  --permissions ALL
+
+aws lakeformation revoke-permissions `
+  --principal DataLakePrincipalIdentifier=IAM_ALLOWED_PRINCIPALS `
+  --resource "{`"Table`":{`"DatabaseName`":`"week7_lake`",`"Name`":`"customers`"}}" `
+  --permissions ALL
+
+# 4. Column-scoped grant to marketing: no pii_email.
+aws lakeformation grant-permissions `
+  --principal DataLakePrincipalIdentifier=arn:aws:iam::${AccountId}:role/MarketingRole `
+  --resource "{`"TableWithColumns`":{`
+    `"DatabaseName`":`"week7_lake`",`"Name`":`"customers`",`
+    `"ColumnNames`":[`"customer_id`",`"segment`",`"city`",`"region`"]}}" `
+  --permissions SELECT
+
+# 5. Full-table grant to the analytics role for contrast.
+aws lakeformation grant-permissions `
+  --principal DataLakePrincipalIdentifier=arn:aws:iam::${AccountId}:role/AnalyticsRole `
+  --resource "{`"Table`":{`"DatabaseName`":`"week7_lake`",`"Name`":`"customers`"}}" `
+  --permissions SELECT
+\end{lstlisting}
+
+\subsection*{Verification}
+Assume each role in turn (or use Athena workgroups mapped to roles) and run:
+\begin{itemize}
+    \item \textbf{Marketing, allowed:} \texttt{SELECT customer\_id, segment FROM week7\_lake.customers LIMIT 10;} --- succeeds.
+    \item \textbf{Marketing, denied:} \texttt{SELECT pii\_email FROM week7\_lake.customers LIMIT 1;} --- fails with an insufficient-permissions error naming the column.
+    \item \textbf{Marketing, sneaky:} \texttt{SELECT * FROM week7\_lake.customers LIMIT 1;} --- also fails; \texttt{*} expands to include the excluded column.
+    \item \textbf{Analytics:} both queries succeed.
+    \item \textbf{Audit:} CloudTrail Lake Formation events show the grants; \texttt{aws lakeformation list-permissions} confirms the exact grant set.
+\end{itemize}
+
+\begin{pitfall}
+\textbf{Testing only the happy path.} The security property is the \emph{denied} query. Always demonstrate both the permitted projection and the denied PII access from the restricted principal, plus the \texttt{SELECT *} case---that is where column leaks usually hide.
+\end{pitfall}
+
+\section{Friday Use Case: A Data Clean Room for Ad-Tech}
+\index{use case!data clean room}
+An advertising agency wants to measure campaign overlap between its clients' CRM data and a publisher's audience data. Neither party may see the other's raw customer records; both want aggregate answers like ``how many users who saw campaign A later purchased?'' and ``what is the overlap audience size?''
+
+\subsection{Why Not CSV Exchange}
+The legacy pattern---export hashed emails to CSV, send by SFTP---fails on every axis: hashing emails is trivially reversible by dictionary attack, the receiving party holds a copy it controls, and there is no audit trail of what questions were asked. A clean room replaces data \emph{movement} with query \emph{governance}.
+
+\subsection{Architecture with AWS Clean Rooms}
+\begin{figure}[H]
+    \centering
+    \resizebox{0.95\textwidth}{!}{%
+    \begin{tikzpicture}[
+        party/.style={rectangle, rounded corners, draw=primary, thick, fill=primary!6, align=center, minimum width=3.4cm, minimum height=1.6cm, font=\small\bfseries},
+        room/.style={rectangle, rounded corners, draw=red!60!black, thick, fill=red!5, align=center, minimum width=4.2cm, minimum height=2.0cm, font=\small\bfseries},
+        storebox/.style={cylinder, shape aspect=0.25, draw=primary, thick, fill=blue!6, shape border rotate=90, align=center, text width=2.4cm, minimum height=1.2cm, font=\footnotesize\bfseries},
+        arr/.style={-{Stealth[length=2.5mm]}, draw=primary, thick}
+    ]
+        \node[party] (agency) at (0,2.6) {Agency account\\CRM tables};
+        \node[party] (publisher) at (0,-2.6) {Publisher account\\audience tables};
+        \node[room] (clean) at (5.4,0) {AWS Clean Rooms\\collaboration\\(analysis rules)};
+        \node[storebox] (out) at (10.6,0) {Aggregates only\\S3 results};
+        \draw[arr] (agency) -- node[above,font=\scriptsize]{configured table + analysis rule} (clean);
+        \draw[arr] (publisher) -- node[below,font=\scriptsize]{configured table + analysis rule} (clean);
+        \draw[arr] (clean) -- node[above,font=\scriptsize]{allowed queries only} (out);
+    \end{tikzpicture}%
+    }
+    \caption{Clean-room collaboration: each party contributes a configured table behind analysis rules; only rule-compliant aggregate queries can run, and only aggregates leave.}
+    \label{fig:ch8-clean-room}
+\end{figure}
+
+Each party creates a \emph{configured table} over its catalog data and attaches an \emph{analysis rule}---typically an aggregation rule requiring \texttt{COUNT}, \texttt{SUM}, and friends with minimum group sizes, plus a list rule if overlap membership at the row level is contractually permitted. Queries can reference both configured tables only through the collaboration; results respect both rules; every query is logged to both parties. Differential-privacy options add mathematical noise where aggregate leakage is a concern.
+
+\subsection{Design Decisions}
+\textbf{Join keys without disclosure.} Overlap joins happen on the identifier column inside the collaboration; the aggregation rule prevents either side from selecting raw identifiers back out.
+
+\textbf{Minimum thresholds.} Set minimum aggregation group sizes (for example, no group smaller than 100 users) so a cleverly sliced query cannot isolate an individual.
+
+\textbf{Governance evidence.} Both parties retain query logs; the collaboration's rules are the contract, and CloudTrail plus Clean Rooms logs are the audit trail that the contract was honored.
+
+\begin{pitfall}
+\textbf{Hashing identifiers and calling it anonymization.} A salted or unsalted hash of a low-entropy identifier (email, phone) is reversible by enumeration. If raw linkage must not be reconstructible, keep identifiers inside the collaboration and export only aggregates---or use tokenization services whose mapping table never leaves the owning account.
+\end{pitfall}
+
+\section{Interview Q\&A}
+\subsection{Concepts and Trade-offs}
+\begin{enumerate}
+    \item \textbf{Q: What does the default \texttt{IAMAllowedPrincipals} grant do, and why revoke it?}\\
+    A: It makes new catalog objects governed by IAM alone, bypassing Lake Formation. Until revoked on the database and each table, column filters and LF-Tag policies do not actually restrict anyone.
+    \item \textbf{Q: How do LF-Tags differ from named-resource grants?}\\
+    A: Named grants bind permissions to specific resources; LF-Tag grants bind them to tag expressions, so every correctly tagged table inherits policy automatically. Tags scale with data classes; names scale with table count.
+    \item \textbf{Q: What does column-level security protect that table grants cannot?}\\
+    A: Sensitive attributes on an otherwise shareable table---marketing can analyze segments and cities while \texttt{pii\_email} is absent from their grant, with no view or copy required.
+    \item \textbf{Q: How does Redshift data sharing avoid copying data between accounts?}\\
+    A: The consumer queries the producer's managed storage through the datashare: live, read-only access with the producer owning storage, freshness, and inclusion. No ETL, no duplicate storage bill, no drift.
+    \item \textbf{Q: Why is a clean room safer than exchanging raw CSV exports?}\\
+    A: No party receives the other's records at all. Analysis rules restrict queries to approved aggregates with minimum group sizes, both sides get query logs, and raw identifiers never leave the owning account.
+    \item \textbf{Q: Why must both IAM and Lake Formation allow a lake query?}\\
+    A: Lake Formation grants are evaluated in addition to IAM. IAM governs API calls and service roles; Lake Formation governs catalog objects. The effective permission is the intersection.
+\end{enumerate}
+
+\section{Further Reading}
+The Lake Formation Developer Guide covers location registration, grants, LF-Tags, and data filters \cite{awsLakeFormationDocs}. The Redshift data sharing documentation covers producer/consumer setup and cross-account considerations \cite{awsRedshiftDataSharing}. The AWS Clean Rooms User Guide details collaborations, configured tables, and analysis rules \cite{awsCleanRoomsDocs}. For the governance review questions behind the Friday design, see the AWS Well-Architected Analytics Lens \cite{awsWellArchitectedAnalytics}.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item Lake Formation adds table-, column-, row-, and cell-level governance on top of the Glue catalog, enforced uniformly across engines.
+    \item Revoking \texttt{IAMAllowedPrincipals} is the step that turns governance on; automate it.
+    \item Column grants hide attributes; row filters hide records; LF-Tags make both scale with data classes instead of table counts.
+    \item Redshift data sharing publishes live warehouse data across accounts with zero copies and producer-controlled freshness.
+    \item Clean rooms replace risky data exchange with governed computation: analysis rules in, aggregates out, both sides audited.
+    \item Fine-grained controls are only real when the denied case is tested, not just the permitted one.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Explain why Lake Formation permissions and IAM permissions are both evaluated, and which one can scope to a column.
+    \item \textbf{(Conceptual)} A team grants \texttt{SELECT} on all columns to ``save time'' and plans to add masks later. Describe two ways this fails before later arrives.
+    \item \textbf{(Hands-on)} Run the Thursday project, then add an LF-Tag \texttt{sensitivity=pii} on the \texttt{pii\_email} column and re-express the marketing grant as a tag expression.
+    \item \textbf{(Hands-on)} Create a row filter limiting the marketing role to \texttt{region='EU'} and demonstrate two analysts receiving different row counts from the same query.
+    \item \textbf{(Hands-on)} Create the datashare from \cref{lst:ch8-datashare} between two sandbox accounts and query it from the consumer.
+    \item \textbf{(Design)} Design the LF-Tag taxonomy (keys, allowed values, ownership) for a lake with four domains and three sensitivity levels.
+    \item \textbf{(Design)} Specify the analysis rules for a clean-room query that measures campaign conversion overlap, including minimum group sizes and forbidden functions.
+    \item \textbf{(Architecture)} Draft the audit architecture for the clean room: which logs exist, who can see them, and how a disputed query is reconstructed.
+\end{enumerate}
+
+\section{Milestone 2 Capstone: Enterprise Data Lakehouse Build}\label{sec:ch8-capstone}
+\index{capstone project}\index{Milestone 2 capstone}\index{lakehouse!capstone}\index{Lake Formation!capstone}
+
+\begin{capstonebox}
+\textbf{Mission.} Deliver a governed enterprise lakehouse end to end: ingest five years of retail data into S3 as Parquet, catalog it with Glue, secure it with Lake Formation row/column policies per department, and serve executive dashboards through Redshift Spectrum materialized views.
+
+\textbf{Estimated time.} 6--8 hours in a sandbox AWS account, plus review time.
+
+\textbf{What you\textquotesingle{}ll practice.}
+\begin{itemize}
+    \item Zone design and Parquet conversion from Chapters~1 and~7.
+    \item Catalog operations: crawlers, databases, partition projection.
+    \item Lake Formation least-privilege: revoked defaults, named-column grants, LF-Tags, PII masks.
+    \item Spectrum external schemas and materialized views for dashboard economics.
+\end{itemize}
+\end{capstonebox}
+
+\subsection*{Scenario}
+A retail enterprise operates sales, inventory, and marketing domains. Five years of history (adapt the Chapter~5 generator) must become a governed analytical asset: raw and curated S3 zones, one catalog, department-scoped access (marketing never sees PII; finance sees everything), and executive dashboards cheap enough to refresh hourly.
+
+\subsection*{Requirements}
+\textbf{Functional requirements.}
+\begin{itemize}
+    \item Ingest five years of retail data into a raw zone; convert to curated Parquet partitioned by \texttt{year=/month=}.
+    \item Crawl the curated zone; hand-write the raw-zone DDL; enable partition projection where partition counts warrant.
+    \item Revoke \texttt{IAMAllowedPrincipals}; implement department policies with LF-Tags and named-column grants, including a mask on \texttt{pii\_email}.
+    \item Create a Spectrum external schema and at least two materialized views serving executive dashboard queries.
+\end{itemize}
+
+\textbf{Non-functional requirements.}
+\begin{itemize}
+    \item The build is reproducible from a clean environment following a committed README.
+    \item At least three automated data-quality checks (schema, null rate, row count) on the Parquet zones, with a failing-case demonstration.
+    \item A crawler/job failure alarm wired to SNS, with evidence.
+    \item A monthly cost estimate comparing Athena scanned bytes, Spectrum, and provisioned Redshift for the dashboard workload, with two optimization decisions documented.
+    \item A security review: least-privilege grants, column masks on PII, no hardcoded credentials.
+\end{itemize}
+
+\subsection*{Reference Architecture}
+\begin{figure}[H]
+    \centering
+    \resizebox{0.95\textwidth}{!}{%
+    \begin{tikzpicture}[
+        node distance=0.55cm and 1.1cm,
+        box/.style={rectangle, rounded corners, draw=teal!60!black, thick, fill=teal!10, align=center, font=\small, minimum height=0.9cm, inner sep=4pt},
+        side/.style={rectangle, rounded corners, draw=brown!70!black, thick, fill=brown!10, align=center, font=\footnotesize, inner sep=3pt},
+        arr/.style={-{Stealth}, thick}
+    ]
+    \node[box] (s3) {S3 Data Lake\\(Parquet zones)};
+    \node[box, right=of s3] (crawler) {Glue Crawlers\\+ Data Catalog};
+    \node[box, right=of crawler, yshift=1.0cm] (athena) {Athena\\(ad-hoc SQL)};
+    \node[box, right=of crawler, yshift=-1.0cm] (spectrum) {Redshift Spectrum\\(federated SQL)};
+    \node[box, right=of spectrum, yshift=1.0cm] (rs) {Redshift\\(MVs, dashboards)};
+    \node[side, below=0.6cm of crawler] (lf) {Lake Formation (row/column security)};
+    \draw[arr] (s3) -- (crawler);
+    \draw[arr] (crawler) -- (athena);
+    \draw[arr] (crawler) -- (spectrum);
+    \draw[arr] (spectrum) -- (rs);
+    \draw[arr, dashed] (lf) -- (crawler);
+    \draw[arr, dashed] (lf.east) -- (spectrum.south);
+    \end{tikzpicture}%
+    }
+    \caption{Milestone 2 reference architecture: governed enterprise lakehouse.}
+    \label{fig:ch8-capstone-arch}
+\end{figure}
+
+\subsection*{Implementation Steps}
+\begin{enumerate}
+    \item Land five years of retail data in the raw zone; convert to partitioned Parquet in the curated zone.
+    \item Run the crawler against the curated zone; validate schemas against the contract.
+    \item Register locations, revoke \texttt{IAMAllowedPrincipals}, and implement department policies with LF-Tags and named-column grants.
+    \item Create the Redshift external schema; build the two executive materialized views on top.
+    \item Wire the crawler failure alarm to SNS; add the three data-quality checks and demonstrate one failure.
+    \item Write the cost model and security review; tag all resources for cleanup.
+\end{enumerate}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item A committed architecture diagram covering S3, Glue Catalog, Lake Formation, and Redshift.
+    \item The grant inventory (\texttt{list-permissions} export) proving department-scoped access and the PII mask.
+    \item Data-quality check definitions with one failing-case run, and the SNS alarm evidence.
+    \item The cost comparison (Athena vs.\ Spectrum vs.\ provisioned) with two documented optimizations.
+    \item A README that rebuilds the lakehouse from a clean environment.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item A restricted department role demonstrably cannot select the PII column, including via \texttt{SELECT *}.
+    \item Dashboard queries hit materialized views, not raw Spectrum scans; refresh is scheduled and logged.
+    \item Every grant is expressible as least privilege: named columns or tag expressions, never \texttt{ALL} on a database.
+    \item The quality gate halts the pipeline on failure and pages via SNS.
+    \item The cost model uses measured bytes scanned, not assumptions.
+    \item No credentials appear in any artifact; all access resolves through the catalog.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Share the curated schema to a second account with a Redshift datashare and document the governance interplay.
+    \item Add cell-level filters combining region row restrictions with column exclusions for a field-operations role.
+    \item Convert the hottest curated table to Iceberg and demonstrate a schema-evolution event without breaking the crawler.
+    \item Prototype the Friday clean room: two sandbox accounts, one configured table each, one aggregation-rule query.
+    \item Add Storage Lens and Lake Formation audit dashboards to the monthly operations review.
+\end{itemize}

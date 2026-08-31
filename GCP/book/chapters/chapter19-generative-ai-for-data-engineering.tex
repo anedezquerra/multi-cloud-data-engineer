@@ -1,0 +1,263 @@
+\chapter{MLOps and Vertex AI Pipelines}
+\index{MLOps}\index{Vertex AI Pipelines}\index{Kubeflow}\index{Feature Store}\index{model monitoring}\index{data drift}\index{continuous training}
+
+\begin{objectives}
+\begin{itemize}
+    \item Serve features consistently through Vertex AI Feature Store's online and offline paths.
+    \item Compose Kubeflow pipelines (Extract, Train, Deploy) as versioned, reproducible components.
+    \item Gate model registration and deployment on evaluation metrics, not on hope.
+    \item Wire continuous-training triggers to model-monitoring drift and skew alerts.
+    \item Distinguish training-serving skew from production data drift and respond to each.
+    \item Architect the self-retraining MLOps lifecycle for a production recommendation engine.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+MLOps platforms converge on the same loop---features, pipelines, registry, monitoring, retraining---with different orchestration defaults.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{2.8cm}p{3.0cm}p{3.0cm}p{3.0cm}@{}} \\
+\toprule
+\textbf{Capability} & \textbf{GCP Vertex AI} & \textbf{AWS SageMaker} & \textbf{Azure ML / Databricks} \\
+\midrule
+Pipelines & Vertex Pipelines (KFP/TFX) & SageMaker Pipelines & Azure ML pipelines / MLflow + Workflows \\
+Feature store & Vertex AI Feature Store & SageMaker Feature Store & Feature Store (Databricks) \\
+Monitoring & Vertex Model Monitoring & Model Monitor & ML monitoring / Lakehouse monitoring \\
+Continuous training & Pipeline triggers + Functions & EventBridge + Pipelines & Event Grid triggers \\
+Metadata & ML Metadata lineage & SageMaker lineage & MLflow tracking \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+\textbf{Snowflake} users run ML workflows in Snowpark with tasks and streams as triggers; \textbf{MongoDB} users build feature pipelines over change streams. The portable principle: a model is a pipeline artifact with a lineage graph, and retraining is an \emph{event-driven reaction to evidence}, not a calendar entry.
+\end{crosscloud}
+
+\begin{keyterms}
+\textbf{Feature Store}: a managed store serving the same feature definitions offline (training datasets) and online (low-latency lookups), preventing training-serving skew by construction.
+\textbf{Kubeflow pipeline}: a DAG of containerized components with typed inputs/outputs, compiled to YAML and executed on Vertex AI Pipelines.
+\textbf{Component}: one reusable pipeline step---a container image plus an interface---with tracked artifacts in and out.
+\textbf{Continuous training (CT)}: event-triggered retraining, typically from drift or freshness signals.
+\textbf{Training-serving skew}: divergence between features as computed in training versus as served in production.
+\textbf{Data drift}: production input distributions diverging from the training distribution over time.
+\end{keyterms}
+
+\section{Week 19 Roadmap}
+Week~19 industrializes Part~V. Monday covers Feature Store's dual serving paths. Tuesday composes Kubeflow pipelines. Wednesday wires continuous training to model monitoring. Thursday builds and runs the Extract-Train-Deploy pipeline. Friday architects drift-triggered retraining for a recommendation engine.
+
+\begin{definitionbox}
+\textbf{MLOps} is the engineering discipline that makes model lifecycle---data, features, training, evaluation, deployment, monitoring, retraining---reproducible, automated, and observable. On GCP it assembles from Feature Store, Vertex AI Pipelines, Model Registry, endpoints, and Model Monitoring \cite{googlecloudvertexpipelines,googlecloudfeaturestore}.
+\end{definitionbox}
+
+\section{Monday: Vertex AI Feature Store---Online and Offline Serving}
+\index{Feature Store!online serving}\index{Feature Store!offline serving}\index{point-in-time correctness}
+
+\subsection{One Definition, Two Paths}
+Features computed twice---once in the training SQL, once in the serving application---will eventually diverge: a null-handling difference, a timezone, a library version. That divergence is \textbf{training-serving skew}, and it is the most common cause of ``the model was great in evaluation.'' Feature Store's answer is to make divergence structurally impossible: feature values live in the store; \textbf{offline serving} exports training datasets from historical values; \textbf{online serving} exposes the latest values through low-latency lookups to the prediction path. Training and serving read the same feature definitions from the same system.
+
+\subsection{Point-in-Time Correctness}
+Offline serving joins entity IDs and timestamps against feature history \emph{as of} each example's time---preventing the subtlest leakage, where a training row sees a feature value that did not exist yet (yesterday's training example joining today's aggregate). When you build training sets by hand, the point-in-time join is your responsibility; the store makes it the default.
+
+\begin{pitfall}
+The Feature Store stores \emph{values}, not \emph{computation}: feature engineering still lives upstream in BigQuery/Dataflow jobs you own (Chapters 14--17). Skew survives if those upstream jobs compute training features one way and the streaming featurization another---the store synchronizes reads, not logic. Keep one featurization codebase feeding both paths.
+\end{pitfall}
+
+\begin{tipbox}
+Register feature freshness as a first-class signal: each feature group should carry an expected update cadence, and staleness beyond it should alarm before it silently degrades predictions. Stale features are drift you can prevent.
+\end{tipbox}
+
+\section{Tuesday: Kubeflow Pipelines and Vertex AI Pipelines}
+\index{Kubeflow!components}\index{pipeline!compilation}\index{artifacts and lineage}
+
+\subsection{Components and Composition}
+A Kubeflow pipeline is a Python-authored DAG of components; each component is a container image with a typed interface (inputs, outputs, artifacts). Vertex AI Pipelines executes the DAG on managed GKE, tracking every artifact---dataset snapshots, metrics, models---into ML Metadata, so any produced model traces back through code, data, and parameters. Components are shareable: an ``extract features from BigQuery'' component written once becomes organizational vocabulary.
+
+\begin{lstlisting}[language=Python,caption={A minimal extract-train-deploy Kubeflow pipeline.}]
+from kfp import dsl
+from kfp.dsl import component
+
+@component(base_image="python:3.10", packages_to_install=["google-cloud-bigquery"])
+def extract_features(project: str, dataset: dsl.Output[dsl.Dataset]) -> None:
+    from google.cloud import bigquery
+    rows = bigquery.Client(project=project).query(
+        "SELECT * FROM analytics.churn_features").to_dataframe()
+    rows.to_csv(dataset.path, index=False)
+
+@component(base_image="python:3.10", packages_to_install=["scikit-learn", "pandas", "joblib"])
+def train_model(dataset: dsl.Input[dsl.Dataset],
+                model: dsl.Output[dsl.Model], metrics: dsl.Output[dsl.Metrics]) -> None:
+    import joblib, pandas as pd
+    from sklearn.linear_model import LogisticRegression
+    df = pd.read_csv(dataset.path)
+    X, y = df.drop(columns=["will_churn"]), df["will_churn"]
+    clf = LogisticRegression(max_iter=1000).fit(X, y)
+    metrics.log_metric("train_accuracy", float(clf.score(X, y)))
+    joblib.dump(clf, model.path)
+
+@dsl.pipeline(name="extract-train-deploy")
+def pipeline(project: str) -> None:
+    d = extract_features(project=project)
+    t = train_model(dataset=d.outputs["dataset"])
+    _ = t  # deploy component follows, gated on metrics
+\end{lstlisting}
+
+\begin{notebox}
+Every pipeline run is immutable evidence: input dataset snapshot, code image digests, parameters, metrics, produced model. When someone asks ``what changed between the model from March and the model from May,'' the lineage graph answers from facts, not memory.
+\end{notebox}
+
+\section{Wednesday: Continuous Training and Model Monitoring}
+\index{continuous training}\index{Model Monitoring}\index{drift vs skew}
+
+\subsection{Gates, Not Just Triggers}
+Automated retraining without a gate automates the shipping of bad models. The production pattern: monitoring raises a signal; a trigger launches the pipeline; the pipeline retrains \emph{and evaluates}; a gate component compares candidate metrics against the incumbent's (and against absolute thresholds); only a passing candidate registers and deploys, with notification either way.
+
+\begin{lstlisting}[language=Python,caption={An evaluation gate that blocks bad models from registration.}]
+@component(base_image="python:3.10")
+def register_gate(evaluation: dsl.Input[dsl.Metrics]) -> bool:
+    auc = evaluation.metadata["roc_auc"]
+    if auc < 0.80:
+        raise ValueError(f"ROC AUC {auc:.3f} below 0.80 gate")
+    return True  # downstream register/deploy tasks only run if this passes
+\end{lstlisting}
+
+\subsection{Skew versus Drift}
+\textbf{Training-serving skew}: serving features differ from training features \emph{right now}---a bug or divergence, detectable by comparing request features against the training distribution at deploy time. \textbf{Prediction/data drift}: production inputs diverge from training \emph{over time}---the world changed, detectable by monitoring input distributions against the training baseline. Vertex Model Monitoring computes both (categorical and numeric distribution distances) per feature and raises alerts on threshold breach. Skew says ``fix the pipeline''; drift says ``retrain the model''; confusing them pages the wrong responder.
+
+\begin{tipbox}
+Wire monitoring alerts to a notification channel \emph{and a runbook}: triage the drifting feature, validate upstream schema drift, then trigger retraining only after data-quality checks pass. The runbook---not the alert---is the automation's real content.
+\end{tipbox}
+
+\section{Thursday Hands-On Project: Build and Run an Extract-Train-Deploy Pipeline}
+\index{hands-on project}\index{Vertex AI Pipelines!lab}\index{pipeline run}
+This lab composes the extract and train components from Tuesday into a compiled pipeline, adds a register gate, and runs it on Vertex AI Pipelines.
+
+\subsection{Compile and Submit}
+\begin{lstlisting}[language=Python,caption={Compiling the pipeline and launching a run on Vertex AI.}]
+from google.cloud import aiplatform
+from kfp import compiler
+
+compiler.Compiler().compile(
+    pipeline_func=pipeline, package_path="extract_train_deploy.yaml")
+
+aiplatform.init(project="my-gcp-mlops-lab", location="us-central1",
+                staging_bucket="gs://my-gcp-mlops-lab-pipelines")
+
+job = aiplatform.PipelineJob(
+    display_name="churn-extract-train-deploy",
+    template_path="extract_train_deploy.yaml",
+    parameter_values={"project": "my-gcp-mlops-lab"})
+job.run()
+\end{lstlisting}
+
+\subsection{Inspect the Run}
+In the Vertex AI Pipelines console, open the run: the DAG shows each component's status; expanding the train component shows the logged accuracy metric; the lineage view links dataset artifact to model artifact. Deliberately degrade the gate (set the threshold above the achieved AUC), rerun, and confirm registration is skipped with a visible, explained failure.
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item The component definitions, pipeline DSL, compiled YAML, and submission script.
+    \item Console evidence of a successful run and of the gated run that correctly refused to register.
+    \item A lineage screenshot from dataset artifact to model artifact.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item The pipeline runs end-to-end from the compiled YAML with no console clicks.
+    \item Metrics are logged as artifacts, and registration is conditional on the gate.
+    \item Rerunning with the same parameters reproduces the run (data snapshot permitting).
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Add a deploy component with traffic splitting between incumbent and challenger.
+    \item Parameterize the BigQuery source query and feature snapshot date for backfills.
+    \item Trigger the pipeline from a Cloud Function on a Pub/Sub monitoring alert (rehearsing Friday).
+\end{itemize}
+
+\section{Friday Use Case and Architecture: Self-Retraining Recommendation Engine}
+\index{recommendation engine}\index{drift-triggered retraining}\index{MLOps lifecycle}
+
+\subsection{Scenario}
+A streaming service's recommendation model degrades as catalogs and tastes shift. The requirement: detect degradation automatically, retrain with human-auditable gates, and never ship a regression. Business stakeholders want a written account of when the system may act without a human.
+
+\subsection{Architecture}
+Feature engineering runs nightly in Dataflow/BigQuery into Feature Store (online and offline). Vertex Model Monitoring watches the production endpoint's request features and prediction distribution against the training baseline; drift beyond threshold publishes to a Pub/Sub topic; a Cloud Function validates preconditions (feature freshness, data-quality checks green, no active incident freeze) and launches the retraining pipeline. The pipeline extracts a fresh point-in-time training set, trains, evaluates on a recent holdout, gates against the incumbent's metrics, registers the challenger, deploys to 10\% traffic, and reports to a metrics dashboard. Weekly, a human reviews auto-promotions; a promotion to 100\% requires the review's sign-off in the early maturity phase and can relax to automatic-with-alerts as trust is earned.
+
+\begin{figure}[H]
+    \centering
+    \resizebox{0.95\textwidth}{!}{%
+    \begin{tikzpicture}[
+        svc/.style={rectangle, rounded corners, draw=primary, thick, fill=primary!6, text width=2.7cm, minimum height=1.0cm, align=center, font=\small\bfseries},
+        gate/.style={rectangle, rounded corners, draw=magenta, thick, fill=magenta!8, text width=2.7cm, minimum height=0.9cm, align=center, font=\footnotesize\bfseries},
+        arrow/.style={-{Stealth[length=2.5mm]}, draw=primary, thick},
+        dasharrow/.style={-{Stealth[length=2.5mm]}, draw=codegray, thick, dashed}
+    ]
+        \node[svc] (bq) at (0,0) {BigQuery\\features};
+        \node[svc] (fs) at (3.3,0) {Feature\\Store};
+        \node[svc] (train) at (6.6,0) {Vertex\\Training};
+        \node[svc] (reg) at (9.6,0) {Registry\\+ gate};
+        \node[svc] (ep) at (12.7,0) {Endpoint\\10/90 split};
+        \node[gate] (mon) at (9.6,-2.2) {Model Monitoring\\drift/skew alerts};
+        \node[gate] (fn) at (6.6,-2.2) {Cloud Function\\precondition checks};
+
+        \draw[arrow] (bq) -- (fs);
+        \draw[arrow] (fs) -- (train);
+        \draw[arrow] (train) -- (reg);
+        \draw[arrow] (reg) -- (ep);
+        \draw[dasharrow] (ep.south) -- (mon.east);
+        \draw[dasharrow] (mon) -- (fn);
+        \draw[dasharrow] (fn) -- (train.south);
+    \end{tikzpicture}%
+    }
+    \caption{Closed-loop MLOps: monitoring detects drift, a preconditioned trigger retrains, gates protect production.}
+    \label{fig:ch19-mlops-loop}
+\end{figure}
+
+\begin{pitfall}
+Auto-deploying without an evaluation gate ships regressions silently---and the first person to notice is a customer. The gate is not optional ceremony; it is the difference between automation and negligence. Page a human on gate failures: they mean either the world changed faster than the model could follow or the training data is broken.
+\end{pitfall}
+
+\begin{tipbox}
+Document the autonomy envelope in writing: which signals trigger retraining, which gates must pass, which promotions need human review, and the freeze conditions (incidents, holiday code freezes) that suspend automation. Regulators and incident reviewers will ask for exactly this document.
+\end{tipbox}
+
+\section{Interview Q\&A}
+\subsection{Concepts and Trade-offs}
+\begin{enumerate}
+    \item \textbf{Q: What problem does a Feature Store solve between training and serving?}\\
+    A: Training-serving skew and leakage: one feature definition serves offline point-in-time training sets and online lookups, so both paths read identical semantics.
+
+    \item \textbf{Q: Online versus offline serving: which backs a real-time recommender?}\\
+    A: Online serving---low-latency latest-value lookups per entity at request time; offline serving builds training datasets.
+
+    \item \textbf{Q: What does a Kubeflow pipeline component encapsulate?}\\
+    A: A containerized step with typed inputs, outputs, and artifacts---reusable, versioned, and lineage-tracked across runs.
+
+    \item \textbf{Q: Which signal should gate an automated retraining trigger?}\\
+    A: Preconditioned drift alerts (feature freshness and data-quality green first), and the candidate must beat the incumbent on evaluation metrics before registration.
+
+    \item \textbf{Q: How does prediction skew differ from training-data drift?}\\
+    A: Skew is a present mismatch between served and trained features (a pipeline bug); drift is the world's distribution moving away from training data over time (a model-freshness problem).
+\end{enumerate}
+
+\section{Further Reading}
+Read the Vertex AI Pipelines documentation for components, compilation, and lineage \cite{googlecloudvertexpipelines}, and the Feature Store documentation for online/offline serving and point-in-time lookups \cite{googlecloudfeaturestore}. Model Monitoring's skew and drift detection is covered in the Vertex AI documentation \cite{googlecloudvertexaidocs}. OpenLineage is worth reading for cross-platform lineage thinking \cite{googleclouddataplexdocs}, and Chapter~12's Composer patterns apply when orchestrating the surrounding data work \cite{googlecloudcomposerdocs}.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item Feature Store prevents skew by construction---but only if one featurization codebase feeds both paths.
+    \item Pipelines are immutable evidence: artifacts, parameters, and lineage per run.
+    \item Gates, not triggers, protect production: evaluation thresholds before registration, always.
+    \item Skew means fix the pipeline; drift means retrain the model---monitor distinguishes them.
+    \item The drift-to-retrain loop includes precondition checks and human-auditable promotion rules.
+    \item Write down the autonomy envelope; undocumented automation is unauditable automation.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Trace a skew incident: training reads a feature computed daily, serving reads it computed hourly. Describe the symptom and the permanent fix.
+    \item \textbf{(Conceptual)} Why is point-in-time correctness impossible to retrofit onto a naive join of features to labels?
+    \item \textbf{(Hands-on)} Reproduce the Thursday pipeline, then add a comparison component that logs challenger-versus-incumbent AUC as a metric.
+    \item \textbf{(Hands-on)} Configure Model Monitoring on a deployed endpoint and generate synthetic drift (shift one feature's distribution) to observe the alert.
+    \item \textbf{(Design)} Write the autonomy-envelope document for the Friday recommendation system, including freeze conditions and the promotion-review ritual.
+    \item \textbf{(Architecture)} Extend the loop with a champion-challenger analysis dashboard and an automatic rollback trigger on live-metric regression.
+\end{enumerate}

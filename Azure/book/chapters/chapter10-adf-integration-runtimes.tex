@@ -1,0 +1,378 @@
+\chapter{Azure Data Factory Foundations: Visual ETL at Scale}
+\index{Azure Data Factory}\index{linked service}\index{dataset}\index{pipeline}\index{Mapping Data Flows}\index{visual ETL}%
+\begin{objectives}
+\begin{itemize}
+    \item Explain ADF's object model---linked services, datasets, pipelines, activities, and triggers---and how the pieces compose into a data pipeline.
+    \item Choose between Copy activity, Mapping Data Flows, and code-based activities for a given transformation problem.
+    \item Author a Mapping Data Flow that joins two ADLS Gen2 datasets, filters nulls, transforms timestamps, and loads a clean result into Synapse.
+    \item Select the right Integration Runtime---Azure, Self-Hosted, or Azure-SSIS---for network, data-residency, and legacy-package requirements.
+    \item Parameterize pipelines and datasets so the same artifacts promote cleanly across dev, test, and prod.
+    \item Wire success and failure dependency paths, including notifications, instead of letting failures go dark.
+    \item Evaluate Mapping Data Flows versus Databricks notebooks for a team of business analysts.
+    \item Read and extend the JSON definition of an ADF pipeline artifact.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+Managed, visual ETL orchestration exists on every cloud, and ADF's four-part object model (connection, data pointer, activity graph, schedule) has a direct analog in each.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{3.0cm}p{2.9cm}p{3.1cm}p{3.2cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{AWS} & \textbf{Azure} & \textbf{GCP} \\
+\midrule
+Managed ETL service & AWS Glue & Azure Data Factory & Cloud Data Fusion \\
+Visual transform engine & Glue Studio / DataBrew & Mapping Data Flows & Data Fusion wrangler \\
+Orchestration & Step Functions / MWAA & ADF pipelines and triggers & Cloud Composer (Airflow) \\
+Serverless compute for transforms & Glue jobs (Spark) & Data Flows on managed Spark & Dataflow (Beam) \\
+Connection abstraction & Glue connections & Linked services & Data Fusion connections \\
+\addlinespace
+\multicolumn{4}{@{}l@{}}{\textbf{Fabric}: Data Factory pipelines + dataflows gen2; \textbf{Snowflake}: tasks/streams + partner tools; \textbf{MongoDB}: Atlas Triggers + Compass aggregation builder.} \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+Mapping Data Flows compile to Spark under the hood, so the execution concepts from Chapter 9 (partitions, shuffles) apply underneath the visual canvas---the abstraction leaks upward when performance matters.
+\end{crosscloud}
+
+\begin{keyterms}
+\textbf{Linked service}: a named connection (endpoint plus credential) to an external system.\quad
+\textbf{Dataset}: a named, parameterized pointer to data within a linked service.\quad
+\textbf{Pipeline}: a directed graph of activities with dependency edges and parameters.\quad
+\textbf{Mapping Data Flow}: a visual transformation graph compiled to Spark and executed on managed compute.\quad
+\textbf{Activity}: one step in a pipeline---copy, data flow, notebook call, stored procedure, control flow.\quad
+\textbf{Integration Runtime (IR)}: the compute ADF executes activities on---Azure-hosted, self-hosted, or SSIS.
+\end{keyterms}
+
+\section{Week 10 Overview: Orchestration as a First-Class Discipline}
+Part III moves from ``where data lives and is served'' to ``how data moves.'' Azure Data Factory (ADF) is the movement layer: a serverless orchestration and ETL service with ninety-plus connectors, a visual authoring canvas, and a JSON artifact model underneath everything \cite{microsoft2025adf}. Chapter 9 introduced Databricks as the heavy-compute engine; this week teaches ADF's object model, its visual transformation engine, and the compute substrate---integration runtimes---underneath it; Chapters 11 and 12 add change data capture and the orchestration patterns that tie everything together.
+
+The professional skill in ADF is not drawing pipelines---it is designing them for \emph{promotion} and \emph{failure}. A pipeline that hard-codes a storage account name cannot leave the dev environment. A pipeline with no failure path page-fails silently at 03:00. Parameterization and dependency design are this chapter's through-lines.
+
+\begin{definitionbox}
+\textbf{Azure Data Factory} is Azure's managed ETL/ELT and orchestration service. It executes pipelines---graphs of activities---on integration runtimes, moving and transforming data between connected systems without managing servers.
+\end{definitionbox}
+
+\section{Monday: The ADF Object Model}
+\index{Azure Data Factory!object model}\index{activity}
+
+\subsection{Linked Services and Datasets}
+A \textbf{linked service} answers ``where and how do I authenticate?''---an ADLS Gen2 account via managed identity, a SQL database via Key Vault-referenced credentials, a REST endpoint with a token. A \textbf{dataset} answers ``which data, in what shape?''---the \texttt{raw/orders/} folder as DelimitedText, the \texttt{dbo.Customers} table. Keeping the two separate is what makes pipelines reusable: ten pipelines share one linked service, and one dataset definition parameterizes across folders.
+
+\begin{tipbox}
+Authenticate linked services with the ADF managed identity wherever the target supports it. Every connection string embedded in a linked service is a secret that must be rotated and can leak into exported ARM templates; the managed identity eliminates both problems.
+\end{tipbox}
+
+\subsection{Pipelines, Activities, and Dependencies}
+A pipeline is a graph of activities with four dependency connectors: \textbf{on success}, \textbf{on failure}, \textbf{on completion}, and \textbf{on skip}. The failure connector is the one teams forget: with no failure path, a failed activity fails the pipeline run and---unless monitoring catches it---nothing else happens. The minimal professional pattern is: transform activity $\rightarrow$ on success: audit/logging activity; on failure: notification activity (Logic App, Chapter 12).
+
+\subsection{Triggers}
+Pipelines start from three trigger families: \textbf{schedule} (cron-like wall-clock), \textbf{tumbling window} (aligned, backfillable intervals with exactly-once-per-window semantics), and \textbf{event-based} (storage blob created/deleted, or custom events---Chapter 12 covers Event Grid wiring). Tumbling windows are the workhorse for periodic batch: they carry a window start/end that downstream activities can parameterize on, and they can be re-run for a historical window without touching the schedule.
+
+\section{Tuesday: Mapping Data Flows}
+\index{Mapping Data Flows}\index{Spark!behind data flows}
+
+\subsection{Visual Transformations on Managed Spark}
+Mapping Data Flows let you compose sources, filters, joins, derived columns, aggregates, and sinks on a canvas; ADF compiles the graph to a Spark job and runs it on a managed cluster sized by the data flow's compute settings. You get Spark's scale without writing Spark code---and you inherit Spark's physics, so a join in a data flow is a shuffle and behaves like one.
+
+\subsection{The Expression Language}
+Data flow logic lives in a small expression language: \texttt{toTimestamp(order\_ts, 'yyyy-MM-dd HH:mm:ss')}, \texttt{isNull(email)}, \texttt{iif(amount < 0, 'refund', 'sale')} \cite{microsoft2025adfDataFlowFunctions}. Learn twenty functions and you can read any data flow; learn the \textbf{derived column}, \textbf{conditional split}, \textbf{join}, \textbf{aggregate}, and \textbf{alter row} transformations and you can build most of them.
+
+\subsection{When Visual Beats Code---and When It Doesn't}
+Data flows shine for analysts and for standard shapes: join, clean, conform, load. They struggle with iterative algorithms, exotic file formats, complex error handling, and anything where you need a debugger and a stack trace. The Friday use case develops this comparison; the short version: \emph{data flows for the 80\% of pipelines that are structurally boring, notebooks for the 20\% that are not}.
+
+\begin{pitfall}
+\textbf{Big compute settings on small data.} Data flow debug sessions and executions spin up Spark clusters; an 8-core General cluster against 50~MB of CSVs bills cluster minutes to move kilobytes. Size compute to data, and prefer the Copy activity when no transformation is needed at all.
+\end{pitfall}
+
+\section{Wednesday: Integration Runtimes and Pipelines as Artifacts}
+\index{Integration Runtime}
+
+\subsection{The Three Integration Runtimes}
+\index{Integration Runtime!types}
+Every activity executes on an \textbf{integration runtime} (IR). Choosing among the three---Azure, Self-Hosted, and Azure-SSIS---is a decision about network reach, data residency, and legacy package investment.
+
+\subsection{Azure IR}
+The default. A fully managed, serverless compute pool in a chosen Azure region (or auto-resolve). It executes Copy activities between public or Private-Linked endpoints, runs Mapping Data Flows, and dispatches control activities. Choose the region deliberately: data movement crosses regions at egress prices and, for regulated data, possibly against residency policy.
+
+\subsection{Self-Hosted IR}
+The SHIR is an agent you install on Windows machines inside the network that holds the data. It initiates \emph{outbound-only} connections to ADF over TLS---no inbound firewall rules---and executes copy and dispatch activities locally \cite{microsoft2025adfIR}. Deploy at least two nodes for high availability; the agent load-balances and fails over between registered nodes sharing one logical IR. Patching, CPU headroom, and the credential store on SHIR nodes become your operational responsibility.
+
+\subsection{Azure-SSIS IR}
+A managed cluster that executes existing SQL Server Integration Services packages in the cloud---the lift-and-shift path for estates with hundreds of SSIS packages. You provision it into a VNet, point it at an SSIS catalog database, and run packages unchanged. It exists for migration velocity, not for new development.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{2.8cm}p{4.2cm}p{4.0cm}p{2.6cm}@{}}
+\toprule
+\textbf{Runtime} & \textbf{Runs where} & \textbf{Reaches} & \textbf{You manage} \\
+\midrule
+Azure IR & Microsoft-managed pool, chosen region & Cloud/public or Private-Link endpoints & Nothing \\
+Self-Hosted IR & Your VMs, on-prem or cloud VNet & Private networks, outbound-only & Nodes, HA, patching \\
+Azure-SSIS IR & Managed SSIS cluster in your VNet & Whatever the packages reach & Package compatibility \\
+\bottomrule
+\end{tabular}
+\caption{Integration runtime selection.}
+\label{tab:ch10-ir-selection}
+\end{table}
+
+\begin{pitfall}
+\textbf{One SHIR for everything.} A single SHIR node is a single point of failure and a throughput ceiling; a single logical IR shared by dev and prod pipelines lets a dev load starve prod. Minimum: two nodes per logical IR, separate logical IRs per environment.
+\end{pitfall}
+
+\index{pipeline JSON}\index{parameterization}
+
+\subsection{Everything Is an ARM-Deployable Artifact}
+Every ADF object is JSON. Reading the artifact model matters because code review, source control, and CI/CD (Chapter 24) operate on JSON, not the canvas. The pipeline below wraps a data flow execution with an audit step on success and a notification on failure:
+
+\begin{lstlisting}[language=json,caption={Pipeline JSON: execute a data flow, audit on success, notify on failure.},label={lst:ch10-pipeline-json}]
+{
+  "name": "pl_join_clean_load",
+  "properties": {
+    "activities": [
+      {
+        "name": "JoinCleanDataFlow",
+        "type": "ExecuteDataFlow",
+        "typeProperties": {
+          "dataflow": { "referenceName": "df_join_orders_customers" },
+          "compute": { "coreCount": 8, "computeType": "General" },
+          "staging": {
+            "linkedService": { "referenceName": "ls_adls_staging" },
+            "folderPath": "adf/staging"
+          }
+        },
+        "onSuccess": [{ "activity": "AuditRowCounts" }],
+        "onFailure": [{ "activity": "NotifyFailureLogicApp" }]
+      }
+    ]
+  }
+}
+\end{lstlisting}
+
+\subsection{Parameterization for Environment Promotion}
+Parameters are the promotion mechanism. A dataset whose folder path is \texttt{@dataset().folder}, a pipeline whose storage account comes from \texttt{@pipeline().parameters.env}, and global parameters per environment let one artifact set deploy to dev, test, and prod with only parameter files changing. Hard-coded values are technical debt that comes due at the first production deployment.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.2cm}p{4.9cm}p{5.4cm}@{}}
+\toprule
+\textbf{Element} & \textbf{Parameterize} & \textbf{Do not parameterize} \\
+\midrule
+Linked service & Endpoint, database, Key Vault reference & Credential type \\
+Dataset & Folder path, file name, table name & File format structure \\
+Pipeline & Environment name, batch size, window bounds & Activity graph shape \\
+Trigger & Window size, start time & Trigger type \\
+\bottomrule
+\end{tabular}
+\caption{Parameterization boundaries for promotable ADF artifacts.}
+\label{tab:ch10-parameterization}
+\end{table}
+
+\section{Thursday Hands-on Project: Join, Clean, and Load with Mapping Data Flows}
+\index{hands-on lab}\index{Mapping Data Flows!project}
+Build a visual pipeline that joins orders and customers from ADLS Gen2, drops nulls, normalizes timestamps, and loads the clean result into a Synapse dedicated pool.
+
+\subsection{Create the Factory and Connections}
+\begin{lstlisting}[language=bash,caption={Creating the data factory and granting its managed identity lake access.},label={lst:ch10-adf-create}]
+az login
+$rg = "rg-de-azure-book-week9"
+$loc = "eastus"
+$adf = "adf-week9-001"
+
+az group create --name $rg --location $loc
+az datafactory create --name $adf --resource-group $rg --location $loc
+
+# the factory's system-assigned identity needs lake and SQL access
+az datafactory show --name $adf --resource-group $rg --query identity.principalId
+az role assignment create `
+  --assignee-object-id "<principal-id>" --assignee-principal-type ServicePrincipal `
+  --role "Storage Blob Data Contributor" `
+  --scope "/subscriptions/<sub>/resourceGroups/$rg/providers/Microsoft.Storage/storageAccounts/<adls>"
+\end{lstlisting}
+
+\subsection{Author the Data Flow}
+In the ADF studio: create linked services to ADLS Gen2 and Synapse (managed identity); create datasets for \texttt{raw/orders/*.csv} and \texttt{raw/customers/*.csv}; create a data flow \texttt{df\_join\_orders\_customers} with source $\rightarrow$ filter (\texttt{not(isNull(customer\_id))}) $\rightarrow$ derived column (\texttt{toTimestamp(order\_ts, 'yyyy-MM-dd HH:mm:ss')}) $\rightarrow$ join on \texttt{customer\_id} $\rightarrow$ sink to a Synapse staging table.
+
+\subsection{Wrap, Trigger, and Break It}
+Wrap the data flow in the pipeline from Listing~\ref{lst:ch10-pipeline-json}; implement \texttt{AuditRowCounts} as a stored-procedure activity writing row counts to an audit table, and \texttt{NotifyFailureLogicApp} as a webhook activity. Run once on good data, then run on a file with malformed timestamps and confirm the failure path fires and the audit table records the rejection.
+
+\section{Friday Use Case: Mapping Data Flows vs.\ Databricks Notebooks for Business Analysts}
+\index{use case}\index{citizen developer}
+A retailer's analytics team---twenty business analysts, strong SQL, weak Python---needs to build daily reporting pipelines joining POS exports with product and store reference data.
+
+\subsection{Evaluation}
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.4cm}p{4.9cm}p{4.9cm}@{}}
+\toprule
+\textbf{Dimension} & \textbf{Mapping Data Flows} & \textbf{Databricks notebooks} \\
+\midrule
+Authoring & Visual canvas; expression language & PySpark/SQL code \\
+Skill floor & Low---SQL-adjacent analysts succeed & Requires Spark fluency \\
+Debuggability & Data preview per transformation & Full debugger, logs, REPL \\
+Ceiling & Standard transforms; struggles with exotic logic & Arbitrary code, ML, streaming \\
+Governance & ARM artifacts, visual review in PRs & Notebooks in git; reviewable as code \\
+Cost profile & Cluster warm-up per run & Job clusters; shared pools possible \\
+\bottomrule
+\end{tabular}
+\caption{Mapping Data Flows versus Databricks notebooks for analyst-built pipelines.}
+\label{tab:ch10-mdf-vs-dbx}
+\end{table}
+
+\subsection{Recommendation}
+Mapping Data Flows for this team, with two guardrails: a data engineer owns the shared linked services, datasets, and the Synapse sink contract; and a complexity tripwire---any pipeline needing custom logic beyond the expression language graduates to a Databricks notebook owned by engineering. The hybrid fails only when the tripwire is never enforced and analysts build unmaintainable visual spaghetti; the review process, not the tool, prevents that.
+
+\section{Architectural Decision Record Template}
+\index{architectural decision record}
+Per pipeline family record: linked-service authentication method, dataset parameterization boundary, trigger choice with the freshness requirement that drove it, the failure-path design, and the dev/test/prod parameter files. For data flows, additionally record the compute sizing and the measurement that justified it.
+
+\section{Operational Deep Dive: Idempotent Reruns and Audit Tables}
+\index{idempotency}\index{audit table}
+Batch pipelines get re-run---after failures, for backfills, during cutovers. Design for it: sinks that \emph{merge} or \emph{delete-then-insert} a known slice rather than blindly append; a pipeline-run audit table (pipeline name, run id, window, rows in/out, status) written on both success and failure; and alerts keyed on the audit table so a ``successful'' run that moved zero rows is still caught. ADF's tumbling window trigger plus a slice-scoped sink is the canonical idempotent pair.
+
+\section{Troubleshooting Patterns}
+\index{troubleshooting!ADF}
+Activity fails with unauthorized $\rightarrow$ the factory's managed identity lacks the data-plane role on the target. Data flow stuck at \emph{Starting} $\rightarrow$ cluster acquisition; check compute size and regional capacity. Pipeline succeeds but no rows land $\rightarrow$ source filter parameter mismatch; check the triggered window values. Trigger never fires $\rightarrow$ event triggers need the storage account's Event Grid system topic and the trigger published, not just saved.
+
+\section{Week 10 Lab Rubric}
+\index{rubric}
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.2cm}p{5.0cm}p{5.0cm}@{}}
+\toprule
+\textbf{Criterion} & \textbf{Meets expectation} & \textbf{Needs improvement} \\
+\midrule
+Object model & Linked services use managed identity; datasets parameterized & Connection strings embedded; hard-coded paths \\
+Failure design & On-failure notification and on-success audit both fire in tests & Happy path only; failures silent \\
+Promotion & Dev/test/prod run from one artifact set with parameter files & Separate factories per environment by copy-paste \\
+Transformation & Data flow handles nulls and timestamp normalization; bad file rejected & Malformed rows silently dropped or loaded \\
+\bottomrule
+\end{tabular}
+\caption{Week 10 rubric for the ADF foundations deliverables.}
+\label{tab:ch10-rubric}
+\end{table}
+
+\section{Interview Q\&A}
+\subsection{Concepts and Trade-offs}
+\begin{enumerate}
+    \item \textbf{Q: What is the difference between a linked service and a dataset?}\\
+    A: The linked service is the connection and credential to a system; the dataset is a parameterized pointer to specific data within it.
+    \item \textbf{Q: When do Mapping Data Flows beat hand-written Spark?}\\
+    A: For standard join/clean/conform transforms built by SQL-strong analysts; visual authoring and managed Spark beat code when the logic is boring.
+    \item \textbf{Q: What happens in ADF when no onFailure path is defined?}\\
+    A: The activity fails, the pipeline run fails, and nothing downstream runs---no notification unless external monitoring catches it.
+    \item \textbf{Q: How do you parameterize a pipeline for dev/test/prod promotion?}\\
+    A: Parameterize endpoints, paths, and environment names; keep one artifact set and swap parameter files per environment.
+\end{enumerate}
+
+\section{Further Reading}
+The ADF documentation hub \cite{microsoft2025adf} and the data-flow expression reference \cite{microsoft2025adfDataFlowFunctions} are the primary sources. Integration runtimes---this chapter's Wednesday subject---are covered in \cite{microsoft2025adfIR}. For the orchestration patterns that build on this chapter, see the pipeline execution and triggers documentation \cite{microsoft2025adfTriggers}.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item ADF's object model separates connection (linked service), data pointer (dataset), logic (pipeline of activities), and start condition (trigger).
+    \item Managed identity on linked services eliminates secret rotation and template-leak risk.
+    \item Mapping Data Flows are visual Spark: analyst-friendly authoring with Spark's execution physics underneath.
+    \item Every activity needs a failure path; every batch pipeline needs an idempotent sink and an audit table.
+    \item Parameterization is the promotion mechanism; one artifact set, many parameter files.
+    \item Choose tumbling-window triggers for backfillable batch, event triggers for arrival-driven processing.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Explain why separating linked services from datasets improves reuse and security.
+    \item \textbf{(Conceptual)} Compare tumbling-window and schedule triggers for a nightly load that may need backfills.
+    \item \textbf{(Conceptual)} Why does a Mapping Data Flow join behave like a Spark shuffle?
+    \item \textbf{(Hands-on)} Complete the Thursday project, including the induced failure, and capture the audit-table rows for both runs.
+    \item \textbf{(Hands-on)} Parameterize the lab pipeline for two environments and deploy both from one artifact set.
+    \item \textbf{(Hands-on)} Rebuild the same transform as a Copy activity with a pre-copy stored procedure. Which is simpler and why?
+    \item \textbf{(Design)} Design the audit-table schema for a 200-pipeline estate. What makes zero-row runs visible?
+    \item \textbf{(Design)} Write the ADR choosing Mapping Data Flows over Databricks for the analyst team, including the complexity tripwire.
+    \item \textbf{(Design)} Sketch the JSON for a pipeline that retries a flaky REST source three times with backoff.
+    \item \textbf{(Interview)} Prepare a two-minute answer to ``why not just write everything in notebooks?''
+\end{enumerate}
+
+\section{Capstone Project: Parameterized Visual ETL with Failure Discipline}\label{sec:ch10-capstone}
+\index{capstone project}\index{Azure Data Factory!capstone}
+
+\begin{capstonebox}
+\textbf{Mission:} Deliver a promotable ADF solution: a parameterized pipeline family that joins, cleans, and loads retail data from ADLS Gen2 into Synapse, with audited success paths, notifying failure paths, and one artifact set promoting across dev and prod.
+
+\textbf{Estimated time:} 4--5 hours.
+
+\textbf{What you will practice:}
+\begin{itemize}
+    \item Managed-identity linked services and parameterized datasets.
+    \item Mapping Data Flow authoring and validation.
+    \item Success/failure dependency design with an audit table.
+    \item Environment promotion through parameter files.
+\end{itemize}
+\end{capstonebox}
+
+\subsection*{Scenario}
+The retailer's analytics team needs a repeatable daily load: orders and customers land in the lake each night, must be joined and cleaned, and loaded into Synapse before 07:00. Failures must page someone; reruns must not duplicate rows.
+
+\subsection*{Requirements}
+\begin{itemize}
+    \item \textbf{Connections:} all linked services authenticate with the factory's managed identity.
+    \item \textbf{Transform:} data flow with null filtering, timestamp normalization, and the customer join; rejects auditable.
+    \item \textbf{Reliability:} on-success audit row with counts; on-failure notification; sink is idempotent for a rerun of the same window.
+    \item \textbf{Promotion:} identical artifacts deploy to a second environment via parameter files.
+\end{itemize}
+
+\subsection*{Reference Architecture}
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[node distance=1.3cm]
+        \node[store] (raw) {ADLS raw\\orders + customers};
+        \node[stage, right=1.5cm of raw] (adf) {ADF pipeline\\(tumbling window)};
+        \node[stage, right=1.5cm of adf] (df) {Mapping Data Flow\\join + clean};
+        \node[store, right=1.5cm of df] (syn) {Synapse\\staging $\rightarrow$ star};
+        \node[doc, above=0.9cm of adf] (audit) {Audit table\\(row counts)};
+        \node[doc, below=0.9cm of adf] (notify) {Logic App\\notify on failure};
+        \draw[arrow] (raw) -- (adf);
+        \draw[arrow] (adf) -- (df);
+        \draw[arrow] (df) -- (syn);
+        \draw[arrow] (adf) -- (audit);
+        \draw[arrow] (adf) -- (notify);
+    \end{tikzpicture}%
+    }
+    \caption{Capstone architecture: window-triggered ADF pipeline wrapping a Mapping Data Flow, with audit and notification paths.}
+    \label{fig:ch10-capstone-arch}
+\end{figure}
+
+\subsection*{Implementation Steps}
+\begin{enumerate}
+    \item Create the factory and managed-identity linked services (Listing~\ref{lst:ch10-adf-create}).
+    \item Author the data flow and the pipeline wrapper (Listing~\ref{lst:ch10-pipeline-json}).
+    \item Implement the audit and notification activities; test both paths.
+    \item Prove idempotency: run the same window twice; counts unchanged.
+    \item Deploy to the second environment from parameter files; run there.
+\end{enumerate}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item Exported ARM/JSON artifacts and both parameter files in the repo.
+    \item Audit-table evidence of a success run, a failure run, and an idempotent rerun.
+    \item A README that deploys the solution from a clean subscription.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item No credentials in any artifact; managed identity throughout.
+    \item A bad input file produces a notification and an audit row, not a silent success.
+    \item Re-running a window does not change the warehouse row count.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Add a second source (product reference data) and a three-way join in the data flow.
+    \item Emit a custom metric for rows-loaded per run and graph it in Azure Monitor.
+    \item Convert the schedule trigger to a tumbling window and demonstrate a 7-day backfill.
+\end{itemize}

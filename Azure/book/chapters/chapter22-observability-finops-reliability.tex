@@ -1,0 +1,273 @@
+\chapter{Observability, FinOps, and Governance at Scale}
+\index{Microsoft Purview}\index{data lineage}\index{data quality}\index{dbt tests}\index{FinOps}\index{data mesh}\index{observability}%
+\begin{objectives}
+\begin{itemize}
+    \item Operate Microsoft Purview beyond the basics: custom classification rules, sensitivity labels, data policies, and access provisioning.
+    \item Trace lineage from lake to report across Synapse, Databricks, ADF, and Power BI for impact analysis.
+    \item Gate pipeline loads with automated data-quality tests (dbt tests or Great Expectations checkpoints) and route failures to quarantine.
+    \item Build the observability layer: Azure Monitor metrics, Log Analytics diagnostics, and alerts for pipelines, streams, and warehouses.
+    \item Apply FinOps discipline: cost allocation by tags, anomaly alerts, and per-product unit economics.
+    \item Define reliability SLOs for data products---freshness, completeness, correctness---with error budgets.
+    \item Architect centralized governance over a decentralized data mesh for a five-domain conglomerate.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+Catalogs, lineage, quality gates, and cost observability are the cross-cloud operating layer; each cloud pairs a native catalog with the same open quality tooling.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{3.0cm}p{2.9cm}p{3.1cm}p{3.2cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{AWS} & \textbf{Azure} & \textbf{GCP} \\
+\midrule
+Catalog and governance & Glue Data Catalog / Lake Formation & Microsoft Purview & Dataplex \\
+Lineage & Glue / SageMaker lineage & Purview lineage & Dataplex lineage \\
+Data quality tests & dbt / Great Expectations / Deequ & dbt / Great Expectations in ADF or Databricks & dbt / Great Expectations / Dataplex rules \\
+Monitoring & CloudWatch & Azure Monitor + Log Analytics & Cloud Operations \\
+Cost management & Cost Explorer + budgets & Cost Management + budgets & Cloud Billing + budgets \\
+Sensitivity labels & Macie findings & Purview + MIP labels to Power BI & DLP inspection \\
+\addlinespace
+\multicolumn{4}{@{}l@{}}{\textbf{Fabric}: Purview hub + OneLake data catalog; \textbf{Snowflake}: Horizon Catalog + object tagging; \textbf{MongoDB}: Atlas data federation auditing.} \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+dbt and Great Expectations are deliberately platform-neutral: the same \texttt{dbt test} or GE checkpoint runs against Synapse, Snowflake, BigQuery, or Redshift---quality tooling is the one layer you can learn once \cite{dbtlabs2025core,greatexpectations2025}.
+\end{crosscloud}
+
+\begin{keyterms}
+\textbf{Purview data map}: the automatically scanned, searchable graph of data assets across the estate.\quad
+\textbf{Lineage}: the recorded flow of data from source through transformations to reports.\quad
+\textbf{Sensitivity label}: a classification (e.g., Confidential) that travels with data into Synapse and Power BI.\quad
+\textbf{Data quality gate}: automated tests that must pass before a load completes.\quad
+\textbf{FinOps}: the operating practice of making cloud cost an engineering metric with owners.
+\end{keyterms}
+
+\section{Week 22 Overview: The Operating Layer}
+By this point the platform ingests, stores, transforms, streams, trains, and serves. What remains is \emph{running it}: knowing what data exists and who touched it (governance), knowing when it breaks before users do (observability), knowing what it costs and why (FinOps), and knowing how reliable it promises to be (SLOs). These are not four disciplines but one: the operating layer of a data platform, and the difference between a platform that scales to fifty teams and one that collapses into tickets.
+
+\section{Monday: Purview Deep Dive---Classifications, Labels, Policies}
+\index{Microsoft Purview!classifications}\index{sensitivity labels}
+
+\subsection{Custom Classification Rules}
+Built-in classifiers recognize common PII (emails, credit cards, national IDs). Proprietary identifiers---your employee ID format, your claim numbers---need \textbf{custom classification rules}: regex or dictionary-based rules with a match-confidence threshold, applied during scans \cite{microsoft2025purview}. A rule that matches \texttt{EMP-\textbackslash d\{6\}} across the whole lake turns ``where does employee data live?'' from an audit-week archaeology project into a catalog query.
+
+\subsection{Sensitivity Labels That Travel}
+Purview sensitivity labels (via Microsoft Information Protection) attach to columns and assets and \emph{propagate}: a column labeled Confidential-PII in the lake carries the label into Synapse views and Power BI semantic models, where label-aware policies (export restrictions, watermarking) apply. The label is the governance mechanism that survives the journey from data to dashboard---without it, governance ends at the lake boundary.
+
+\subsection{Data Policies and Access Provisioning}
+Purview data policies let governance teams grant read access to registered sources through self-service access requests with approval workflows---access becomes a catalog operation with an audit trail, rather than a ticket that ends with an engineer hand-editing RBAC. Keep the platform team's role as policy \emph{approver}, not permission \emph{typist}.
+
+\begin{pitfall}
+\textbf{Scanning after serving.} Running the first Purview scan after dashboards ship means PII was discoverable only after it was already queryable by analysts. Scan and classify \emph{before} any serving view is published---Chapter 8's capstone enshrined this order.
+\end{pitfall}
+
+\section{Tuesday: Lineage and Quality Gates}
+\index{data lineage}\index{dbt tests}\index{Great Expectations}
+
+\subsection{Lineage for Impact Analysis}
+Purview ingests lineage from ADF pipelines, Databricks jobs, Synapse, and Power BI \cite{microsoft2025purviewLineage}. The payoff is impact analysis in both directions: \emph{upstream}---this report is wrong; which dataset fed it?---and \emph{downstream}---this schema change is proposed; which reports break? Chapter 24's expand--contract migrations depend on exactly this downstream query to know when the contract step is safe.
+
+\subsection{Quality Gates in the Pipeline}
+Lineage tells you what happened; quality gates decide what is \emph{allowed} to happen. Run \texttt{dbt test} or Great Expectations checkpoints as a pipeline step \emph{before} the load: uniqueness and not-null tests on keys, accepted-value tests on enums, referential tests on foreign keys, freshness tests on source arrival. A failed gate halts the load, routes the batch to quarantine, emits a metric, and pages on-call---silently loading bad data is worse than a delayed pipeline, because bad data compounds through every downstream product.
+
+\begin{lstlisting}[language=Python,caption={A Great Expectations checkpoint gate inside a Databricks job.},label={lst:ch22-ge}]
+import great_expectations as gx
+
+context = gx.get_context()
+batch = context.sources.spark_default.query_data_asset(
+    "orders_silver", query="SELECT * FROM silver.orders WHERE _batch_id = '{bid}'"
+)
+results = context.run_checkpoint("orders_silver_ckpt")  # keys unique, amounts >= 0
+if not results.success:
+    quarantine(batch_id="{bid}", results=results)
+    raise SystemExit(f"quality gate failed for batch {'{bid}'}")
+\end{lstlisting}
+
+\begin{tipbox}
+Start with five tests: primary key unique and not null, one referential check, one accepted-values check, one freshness check. A gate with five running tests beats a designed gate with fifty unwritten ones.
+\end{tipbox}
+
+\section{Wednesday: Observability and FinOps}
+\index{Azure Monitor}\index{FinOps}\index{SLO}
+
+\subsection{The Observability Baseline}
+Azure Monitor plus Log Analytics is the estate-wide telemetry plane \cite{microsoft2025azureMonitor}. The data-platform baseline, assembled from earlier chapters: ADF pipeline/trigger/activity diagnostics, Databricks job duration and cluster metrics, Synapse utilization and queue depth, Event Hubs throughput and lag, ASA watermark delay, endpoint SLIs, and---the one that catches what errors miss---\emph{silence alerts} for expected runs that never happened. One dashboard, one alert taxonomy (sev by domain criticality), one runbook index.
+
+\subsection{FinOps as Engineering}
+Cost Management with tags gives allocation: every resource tagged \texttt{product}, \texttt{environment}, \texttt{domain} so spend decomposes by owner \cite{microsoft2025costBudgets}. Budgets with action-group alerts make overruns events, not invoice surprises. The practices that move the number are the ones this book repeated: pause idle dedicated pools (Chapter 5), job clusters that terminate (Chapter 9), partition-pruned serverless queries (Chapter 7), scale-to-zero ML compute (Chapter 18). Review the top ten cost movers monthly with the same rigor as the top ten slow queries---they are often the same list.
+
+\subsection{Data Product SLOs}
+Define per product: \textbf{freshness} (data newer than X by time Y), \textbf{completeness} (row counts within band), \textbf{correctness} (quality tests green). Publish them, measure them, and let error budgets arbitrate: a product inside budget ships features; a product burning budget ships fixes. This is the SRE loop applied to data, and it converts ``the pipeline feels flaky'' into an engineering decision with a threshold.
+
+\section{Thursday Hands-on Project: Custom Classification and a Quality Gate}
+\index{hands-on lab}\index{Microsoft Purview!project}
+Define a custom Purview classification for a proprietary employee ID format, scan the lake so tagged columns appear automatically, then add a dbt-style quality gate to a pipeline and prove it blocks a bad batch.
+
+\subsection{Custom Classification}
+In the Purview portal: create classification \texttt{ContosoEmployeeId} with regex rule \texttt{EMP-\textbackslash d\{6\}} and a 85\% confidence threshold; create a scan rule set including it; scan the lab storage account. Verify that a column of synthetic employee IDs is discovered, classified, and searchable---and that the classification shows up in lineage and search results.
+
+\subsection{The Quality Gate}
+Add three dbt tests (or the GE checkpoint of Listing~\ref{lst:ch22-ge}) to the Chapter 10 pipeline's sink: \texttt{customer\_id} unique and not null, \texttt{status} in accepted values. Run the happy path (load succeeds), then a poisoned batch (duplicate keys): the gate must fail, the batch must land in quarantine, the alert must fire, and the audit row must record the failure reason. All four outcomes are the deliverable.
+
+\section{Friday Use Case: Governed Data Mesh for a Five-Domain Conglomerate}
+\index{use case}\index{data mesh}
+A conglomerate's five business units (retail, logistics, finance, insurance, media) each own their data engineering. Central IT is a bottleneck; a free-for-all is a compliance incident. The data mesh answer: \textbf{decentralized ownership, centralized governance}.
+
+\subsection{What Is Centralized, What Is Not}
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{5.2cm}p{7.6cm}@{}}
+\toprule
+\textbf{Centralized (platform team)} & \textbf{Decentralized (domain teams)} \\
+\midrule
+Purview catalog, classification rules, label taxonomy & Data product design, schemas, pipelines \\
+Self-service infrastructure (Terraform modules, CI templates) & Product-level SLOs within platform minimums \\
+Quality-gate framework and quarantine patterns & Test definitions per product \\
+Cross-domain access policies and audit & Domain-local access approval \\
+Cost guardrails (tags, budgets, alerts) & Cost within the domain's budget \\
+\bottomrule
+\end{tabular}
+\caption{The mesh boundary: the platform owns the rails; domains own the trains.}
+\label{tab:ch22-mesh}
+\end{table}
+
+Every domain publishes data products---versioned, SLO-bearing, cataloged assets---into the shared estate; every product passes the same gates and carries the same labels; access flows through Purview policies with domain-owner approval. The platform team's leverage is that compliance is the \emph{path of least resistance}: the self-service templates are already governed, so doing it right is easier than doing it around.
+
+\begin{pitfall}
+\textbf{Mesh as rebranded anarchy.} If domains can publish uncataloged, unlabeled, untested products, you have five data swamps with a governance slide deck. The mesh works only when the central mechanisms---catalog, gates, labels, budgets---are enforced by the delivery path, not by policy documents.
+\end{pitfall}
+
+\section{Architectural Decision Record Template}
+\index{architectural decision record}
+Record platform-wide: the classification taxonomy with custom rules, the label propagation policy, the quality-gate minimum test set, the alert taxonomy and runbook index, the tagging standard with budget thresholds, and the SLO template every product adopts.
+
+\section{Operational Deep Dive: The Monthly Platform Review}
+\index{platform review}
+One meeting, four pages: reliability (SLO attainment per product, top incidents), quality (gate failure rate, quarantine backlog age), governance (unclassified assets, unscanned sources, stale access reviews), and cost (top movers, budget variance, optimization actions). The review's power is cadence: the same four pages monthly make drift---in reliability, in cost, in classification coverage---visible while it is still cheap to fix.
+
+\section{Troubleshooting Patterns}
+\index{troubleshooting!governance}
+Assets missing from the catalog $\rightarrow$ the source was registered but the scan rule set excludes the file type or the managed identity lacks read. Lineage gaps $\rightarrow$ a transform ran outside ADF/Databricks (an ad-hoc notebook); lineage is only as complete as the execution paths you standardize. Gate always green $\rightarrow$ tests query a stale snapshot or the wrong environment; test the gate with a poisoned batch regularly, like a fire drill. Cost anomaly unexplained $\rightarrow$ untagged resources; make the tag policy deny untagged deployments.
+
+\section{Week 22 Lab Rubric}
+\index{rubric}
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.2cm}p{5.0cm}p{5.0cm}@{}}
+\toprule
+\textbf{Criterion} & \textbf{Meets expectation} & \textbf{Needs improvement} \\
+\midrule
+Classification & Custom rule discovered proprietary IDs across the lake & Only built-in classifiers used \\
+Quality gates & Poisoned batch blocked, quarantined, alerted, audited & Tests exist but never wired into the pipeline \\
+Lineage & Impact query answered from lake to report & Lineage partial, unexamined \\
+Cost & Tags, budget, and one optimization evidenced & Cost discovered at invoice time \\
+\bottomrule
+\end{tabular}
+\caption{Week 22 rubric for the operating-layer deliverables.}
+\label{tab:ch22-rubric}
+\end{table}
+
+\section{Interview Q\&A}
+\subsection{Concepts and Trade-offs}
+\begin{enumerate}
+    \item \textbf{Q: How do sensitivity labels flow from Purview to Synapse and Power BI?}\\
+    A: Labels attach to classified columns and propagate with the data, so label-aware policies apply at the semantic-model and report layer.
+    \item \textbf{Q: Why run dbt tests or GE checkpoints before the load step?}\\
+    A: Bad data compounds through every downstream product; a gate before load quarantines failures while a gate after load only documents them.
+    \item \textbf{Q: What does Purview lineage show when a report suddenly breaks?}\\
+    A: The upstream chain---which dataset, pipeline, and job fed the report---turning impact analysis from archaeology into a query.
+    \item \textbf{Q: In a data mesh, what stays centralized?}\\
+    A: The rails: catalog, classification, label taxonomy, delivery templates, gate framework, access policy, and cost guardrails. Domains own products.
+\end{enumerate}
+
+\section{Further Reading}
+The Purview documentation \cite{microsoft2025purview} and lineage guide \cite{microsoft2025purviewLineage} cover governance; dbt Core \cite{dbtlabs2025core} and Great Expectations \cite{greatexpectations2025} cover quality gates; Azure Monitor \cite{microsoft2025azureMonitor} and cost budgets \cite{microsoft2025costBudgets} cover observability and FinOps. The Data Engineer Handbook \cite{dataexpert2025handbook} collects mesh case studies.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item Custom classification rules turn ``where does our proprietary ID live'' into a catalog query.
+    \item Labels that propagate govern the dashboard; labels that stop at the lake govern nothing users touch.
+    \item Quality gates belong before the load; quarantine with reasons, alert, and audit every failure.
+    \item Observability's highest-value alert is the silence alert: the run that never happened.
+    \item FinOps is tags, budgets, and monthly review of the top movers---which are usually also the slowest queries.
+    \item A data mesh centralizes the rails and decentralizes the trains; enforced delivery paths, not policy PDFs, keep it honest.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Why must governance mechanisms be embedded in the delivery path in a mesh?
+    \item \textbf{(Conceptual)} Compare a quality gate before versus after the load in terms of blast radius.
+    \item \textbf{(Conceptual)} What does an error budget change about how teams respond to a flaky pipeline?
+    \item \textbf{(Hands-on)} Complete the Thursday project; capture classification results and the four gate outcomes.
+    \item \textbf{(Hands-on)} Build the silence alert for a daily pipeline and demonstrate it by disabling the trigger.
+    \item \textbf{(Hands-on)} Tag the lab estate, create a budget with an alert, and produce the cost-by-domain report.
+    \item \textbf{(Design)} Write the SLO definitions for three data products from earlier chapters, with measurement queries.
+    \item \textbf{(Design)} Design the conglomerate's self-service template: what is prefilled so compliance is the default?
+    \item \textbf{(Design)} Write the ADR for dbt tests versus Great Expectations for your platform.
+    \item \textbf{(Interview)} Prepare a two-minute answer to ``how do you know your data platform is healthy right now?''
+\end{enumerate}
+
+\section{Capstone Project: The Governed, Observable, Costed Platform}\label{sec:ch22-capstone}
+\index{capstone project}\index{observability!capstone}
+
+\begin{capstonebox}
+\textbf{Mission:} Retrofit the operating layer onto the Part II--III platform: Purview classification including one custom rule, lineage from lake to report, a quality gate with a proven poisoned-batch path, the observability baseline with a silence alert, and a tagged cost model with a budget.
+
+\textbf{Estimated time:} 5--7 hours.
+
+\textbf{What you will practice:}
+\begin{itemize}
+    \item Custom classification and label propagation.
+    \item Quality gates wired into a real pipeline.
+    \item Alert taxonomy including the silence case.
+    \item Cost allocation, budgets, and a documented optimization.
+\end{itemize}
+\end{capstonebox}
+
+\subsection*{Scenario}
+The retailer's platform works but is unopinionated: nothing is classified, quality is hoped for, failures are discovered by users, and the invoice is a surprise. You are the platform's first operations-focused engineer.
+
+\subsection*{Requirements}
+\begin{itemize}
+    \item \textbf{Governance:} full scan; built-in PII plus one custom rule; labels visible in a Power BI model.
+    \item \textbf{Quality:} at least three gating tests with quarantine, alert, and audit on the poisoned path.
+    \item \textbf{Observability:} diagnostic settings to Log Analytics; failure, drift, and silence alerts; one dashboard.
+    \item \textbf{FinOps:} tags on every resource; a budget with action group; one optimization with quantified impact.
+\end{itemize}
+
+\subsection*{Reference Architecture}
+The platform map of Parts II--III with the operating layer drawn as a horizontal band: Purview over the lake and warehouse; quality gates inside pipelines; Monitor/Log Analytics under everything; Cost Management beside everything.
+
+\subsection*{Implementation Steps}
+\begin{enumerate}
+    \item Scan and classify; create the custom rule; verify label propagation.
+    \item Wire the quality gate into one pipeline; run happy and poisoned batches.
+    \item Enable diagnostics; create the three alert classes; fire each once.
+    \item Tag the estate; create the budget; produce the cost report and the optimization.
+    \item Assemble the four-page monthly review from real outputs.
+\end{enumerate}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item Classification and label evidence; gate code and poisoned-batch evidence pack.
+    \item Alert definitions, the dashboard, and the Log Analytics queries.
+    \item The cost report, the budget export, and the first monthly review.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item A poisoned batch is blocked, quarantined, alerted, and audited---demonstrated.
+    \item A disabled trigger pages the silence alert within its evaluation window.
+    \item Every resource carries the tagging standard; the budget alert is armed.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Enforce tags with Azure Policy so untagged deployments are denied.
+    \item Add SLO attainment tracking for two products with error-budget burn rates.
+    \item Simulate a mesh handoff: a second ``domain'' onboards using only your templates.
+\end{itemize}

@@ -1,0 +1,281 @@
+\chapter{BigQuery ML: Machine Learning in SQL}
+\index{BigQuery ML}\index{BQML}\index{ARIMA\_PLUS}\index{logistic regression}\index{ML.EVALUATE}\index{churn prediction}
+
+\begin{objectives}
+\begin{itemize}
+    \item Train regression, classification, and clustering models in pure SQL where the data already lives.
+    \item Forecast time series with \texttt{ARIMA\_PLUS} and detect anomalies from residuals.
+    \item Evaluate models with \texttt{ML.EVALUATE}, read ROC and precision/recall, and detect overfitting.
+    \item Tune hyperparameters and understand BQML's automatic preprocessing and encoding.
+    \item Train a logistic-regression churn model on Google Analytics sample data and evaluate its ROC curve.
+    \item Architect a pure-SQL forecasting system for daily inventory needs across one thousand stores.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+In-warehouse machine learning eliminates the extract-train-reload loop; every major warehouse now ships a variant.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{2.8cm}p{3.0cm}p{3.0cm}p{3.0cm}@{}} \\
+\toprule
+\textbf{Capability} & \textbf{GCP BigQuery ML} & \textbf{Snowflake} & \textbf{Azure / Fabric} \\
+\midrule
+SQL-native training & CREATE MODEL & Snowpark ML / ML functions & Synapse/Fabric ML (Spark MLlib) \\
+Forecasting & ARIMA\_PLUS & Forecasting ML function & AutoML forecasting \\
+In-warehouse inference & ML.PREDICT & Snowpark ML inference & Synapse predictions \\
+Python escape hatch & Remote functions / Vertex AI & Snowpark Python & Spark notebooks \\
+Best fit & SQL-fluent teams, tabular data & SQL/Python teams & Fabric-native teams \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+\textbf{MongoDB Atlas} users export to analytical stores for ML; \textbf{Redshift ML} wraps SageMaker behind SQL similarly to BQML's managed training. The pattern's shared virtue: governance, lineage, and access control of the warehouse extend automatically to training data and models.
+\end{crosscloud}
+
+\begin{keyterms}
+\textbf{BQML}: BigQuery ML---model training, evaluation, and prediction expressed in GoogleSQL against warehouse tables.
+\textbf{CREATE MODEL}: the DDL statement that trains a model over a query result.
+\textbf{ARIMA\_PLUS}: BQML's managed time-series forecaster handling seasonality, holidays, and anomalies automatically.
+\textbf{ML.EVALUATE}: the function returning model quality metrics on held-out or supplied data.
+\textbf{ROC AUC}: area under the receiver operating characteristic curve; a threshold-independent classifier quality measure.
+\textbf{Feature preprocessing}: BQML's automatic one-hot encoding of categoricals and standardization of numerics.
+\end{keyterms}
+
+\section{Week 17 Roadmap}
+Week~17 opens Part~V with the fastest path from data to model: no exports, no notebooks, no infrastructure. Monday surveys BQML's model catalog. Tuesday forecasts with \texttt{ARIMA\_PLUS}. Wednesday evaluates and tunes. Thursday trains a churn classifier on the Google Analytics sample dataset. Friday architects thousand-store inventory forecasting in pure SQL.
+
+\begin{definitionbox}
+\textbf{BigQuery ML} executes machine learning inside the warehouse: \texttt{CREATE MODEL} trains over a SQL query, \texttt{ML.EVALUATE} scores it, \texttt{ML.PREDICT} serves it---with preprocessing, train/test splitting, and hyperparameter defaults managed by the service \cite{googlecloudbqmldocs}.
+\end{definitionbox}
+
+\section{Monday: The BQML Catalog---Regression, Classification, Clustering}
+\index{BQML!model types}\index{CREATE MODEL}
+
+\subsection{Model Types}
+The practical catalog: \textbf{linear and logistic regression} for numeric and binary targets; \textbf{boosted trees} (XGBoost-style) and \textbf{deep neural networks} for nonlinear tabular problems; \textbf{k-means} for segmentation; \textbf{matrix factorization} for recommendations; \textbf{ARIMA\_PLUS} for time series; and \textbf{AutoML Tables} integration when you want BQML syntax over Vertex's AutoML engine. Choosing is mostly standard ML judgment: start with the interpretable baseline (logistic regression), graduate to boosted trees when interactions matter, reach for DNNs last in SQL.
+
+\begin{lstlisting}[language=SQL,caption={Training a churn classifier in pure SQL.}]
+CREATE OR REPLACE MODEL analytics.churn_model
+OPTIONS(model_type = 'LOGISTIC_REG',
+        input_label_cols = ['will_churn'],
+        auto_class_weights = TRUE)
+AS
+SELECT
+  totals.visits,
+  totals.pageviews,
+  totals.timeonsite,
+  geoNetwork.country,
+  device.deviceCategory,
+  IF(totals.transactions IS NULL, 0, 1) AS will_churn
+FROM `bigquery-public-data.google_analytics_sample.ga_sessions_*`
+WHERE _TABLE_SUFFIX BETWEEN '20160801' AND '20170630';
+\end{lstlisting}
+
+\subsection{Why Train Where Data Lives}
+Moving data to a training silo costs pipeline code, freshness, and governance: the extract drifts from the warehouse, and the warehouse's access controls no longer apply. In-warehouse training keeps one copy, one permission model, one lineage graph---and makes retraining a scheduled SQL query (Chapter~24 makes it a Dataform model). The limits are equally real: exotic architectures, GPU-heavy training, and non-tabular data belong to Vertex AI (Chapters 18--19).
+
+\begin{pitfall}
+\texttt{CREATE MODEL} reads the whole training query every run. Point it at a four-year unfiltered scan and you pay for it repeatedly. Materialize a curated training table (partitioned, clustered) first, train from that, and version it so models are reproducible.
+\end{pitfall}
+
+\section{Tuesday: Time-Series Forecasting with ARIMA\_PLUS}
+\index{time series}\index{ARIMA\_PLUS!options}\index{anomaly detection}
+
+\subsection{Managed Forecasting}
+\texttt{ARIMA\_PLUS} automates the classical ARIMA workflow---differencing, seasonal decomposition, holiday effects, hyperparameter search---behind \texttt{OPTIONS(model\_type='ARIMA\_PLUS', time\_series\_timestamp\_col=..., time\_series\_data\_col=...)}. With \texttt{time\_series\_id\_col} it trains one model per series (per store, per SKU) in a single statement: the thousand-store forecast is one query, not one thousand jobs.
+
+\begin{lstlisting}[language=SQL,caption={Per-store daily demand forecasting and forecast inspection.}]
+CREATE OR REPLACE MODEL analytics.store_demand
+OPTIONS(model_type = 'ARIMA_PLUS',
+        time_series_timestamp_col = 'sale_date',
+        time_series_data_col = 'units_sold',
+        time_series_id_col = 'store_id',
+        holiday_region = 'US')
+AS SELECT sale_date, store_id, units_sold
+FROM analytics.daily_store_sales;
+
+SELECT store_id, forecast_timestamp, forecast_value,
+       prediction_interval_lower_bound, prediction_interval_upper_bound
+FROM ML.FORECAST(MODEL analytics.store_demand,
+                 STRUCT(30 AS horizon, 0.9 AS confidence_level))
+ORDER BY store_id, forecast_timestamp;
+\end{lstlisting}
+
+\subsection{Anomaly Detection from Residuals}
+\texttt{ML.DETECT\_ANOMALIES} flags points whose observed values fall outside the model's prediction interval---for ARIMA\_PLUS, anomalies in the \emph{history} (a demand spike the seasonality cannot explain) and, applied to new data, anomalies in \emph{operations} (today's sales diverging from forecast). The same primitive powers data-quality monitoring: forecast the row-count time series of a critical table and alert when reality leaves the interval.
+
+\begin{tipbox}
+Feed ARIMA\_PLUS clean, gap-filled daily series: missing dates become implicit zeros or gaps depending on options, and both distort seasonality. A \texttt{GENERATE\_DATE\_ARRAY} spine left-joined to actuals is the standard preprocessing idiom.
+\end{tipbox}
+
+\section{Wednesday: Evaluation and Hyperparameter Tuning}
+\index{ML.EVALUATE!metrics}\index{ROC curve}\index{precision and recall}\index{overfitting}
+
+\subsection{Reading ML.EVALUATE}
+For classifiers, \texttt{ML.EVALUATE} returns precision, recall, accuracy, F1, log loss, and ROC AUC. \texttt{ML.ROC\_CURVE} returns per-threshold true/false-positive rates for threshold selection. For imbalanced targets---churn, fraud---accuracy is a liar (predicting ``no churn'' everywhere scores high); precision/recall at the operating threshold and ROC AUC are the honest metrics. Evaluate on a time-split holdout for temporal problems: random splits leak future behavior into training and inflate every metric.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.4cm}p{4.6cm}p{4.6cm}@{}} \\
+\toprule
+\textbf{Metric} & \textbf{Question answered} & \textbf{Churn-model caution} \\
+\midrule
+ROC AUC & Ranking quality across all thresholds & Threshold-free; hides operating-point pain \\
+Precision & Of predicted churners, how many churn? & Low precision floods retention campaigns \\
+Recall & Of true churners, how many caught? & Low recall misses saveable customers \\
+Accuracy & Overall correctness & Misleading under class imbalance \\
+Log loss & Probability calibration quality & Penalizes confident wrongness; tuning target \\
+\bottomrule
+\end{tabular}
+\caption{Classifier evaluation metrics and their churn-prediction reading.}
+\label{tab:ch17-eval-metrics}
+\end{table}
+
+\subsection{Tuning and Overfitting}
+BQML supports hyperparameter tuning (\texttt{num\_trials}, \texttt{hparam\_tuning\_objectives}) over learning rate, regularization, and architecture knobs, reporting trials in \texttt{ML.TRIAL\_INFO}. Detect overfitting by comparing \texttt{ML.EVALUATE} on training versus held-out data: a wide gap (training AUC 0.99, holdout 0.78) says the model memorized; regularize, simplify features, or gather data. With \texttt{auto\_class\_weights=TRUE}, verify the implied threshold on the ROC curve rather than trusting the default 0.5 cutoff.
+
+\begin{pitfall}
+A model evaluated on the same period it trained on is a horoscope, not a forecast. For temporal problems, always hold out the most recent period and evaluate there---and repeat the evaluation after every data-pipeline change upstream, because feature drift silently invalidates yesterday's metrics.
+\end{pitfall}
+
+\section{Thursday Hands-On Project: Churn Prediction on Google Analytics Data}
+\index{hands-on project}\index{Google Analytics sample}\index{logistic regression!churn}
+This lab trains a logistic-regression churn model on the public Google Analytics sample dataset and evaluates its ROC curve, entirely in SQL.
+
+\subsection{Train}
+Run Wednesday's \texttt{CREATE MODEL} against \texttt{bigquery-public-data.google\_analytics\_sample.ga\_sessions\_*}, using the first eleven months for training. The label flags visitors with transactions; treat the exercise as churn-propensity scoring (high-transaction propensity as the positive class for a clean binary).
+
+\subsection{Evaluate and Predict}
+\begin{lstlisting}[language=SQL,caption={Evaluating the churn model and reading its ROC curve.}]
+SELECT *
+FROM ML.EVALUATE(MODEL analytics.churn_model, (
+  SELECT totals.visits, totals.pageviews, totals.timeonsite,
+         geoNetwork.country, device.deviceCategory,
+         IF(totals.transactions IS NULL, 0, 1) AS will_churn
+  FROM `bigquery-public-data.google_analytics_sample.ga_sessions_*`
+  WHERE _TABLE_SUFFIX BETWEEN '20170701' AND '20170801'));
+
+SELECT threshold, recall, true_positives, false_positives, true_negatives
+FROM ML.ROC_CURVE(MODEL analytics.churn_model, (
+  SELECT totals.visits, totals.pageviews, totals.timeonsite,
+         geoNetwork.country, device.deviceCategory,
+         IF(totals.transactions IS NULL, 0, 1) AS will_churn
+  FROM `bigquery-public-data.google_analytics_sample.ga_sessions_*`
+  WHERE _TABLE_SUFFIX BETWEEN '20170701' AND '20170801'))
+ORDER BY threshold;
+
+SELECT fullVisitorId, predicted_will_churn_probs
+FROM ML.PREDICT(MODEL analytics.churn_model, (
+  SELECT fullVisitorId, totals.visits, totals.pageviews, totals.timeonsite,
+         geoNetwork.country, device.deviceCategory
+  FROM `bigquery-public-data.google_analytics_sample.ga_sessions_20170801`))
+ORDER BY (SELECT prob FROM UNNEST(predicted_will_churn_probs) WHERE label = 1) DESC
+LIMIT 100;
+\end{lstlisting}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item The training, evaluation, and prediction SQL committed with a README on the time split.
+    \item The \texttt{ML.EVALUATE} output and the chosen operating threshold with justification.
+    \item A short paragraph comparing boosted-tree and logistic-regression results on the same data.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item Training and evaluation use disjoint time periods.
+    \item Metrics reported include ROC AUC and precision/recall at a stated threshold, not accuracy alone.
+    \item The prediction query produces calibrated probability output, not just labels.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Retrain with \texttt{BOOSTED\_TREE\_CLASSIFIER} and \texttt{ML.EXPLAIN\_PREDICT} for feature attributions.
+    \item Run a ten-trial hyperparameter search and report the trial table.
+    \item Schedule weekly retraining via a scheduled query and log metrics per run.
+\end{itemize}
+
+\section{Friday Use Case and Architecture: SQL-Only Forecasting for 1,000 Stores}
+\index{inventory forecasting}\index{SQL pipelines}\index{MLOps!BQML}
+
+\subsection{Scenario}
+A grocery chain must forecast daily unit demand per store per category---one thousand stores, fifty categories---for replenishment planning. The analytics team is SQL-fluent; there is no ML platform team; the forecast must refresh nightly and feed the ordering system by 05:00.
+
+\subsection{Architecture}
+The whole system is scheduled SQL: a Dataform or scheduled-query pipeline (1) rebuilds the gap-filled daily series per store-category from the sales replica, (2) retrains \texttt{ARIMA\_PLUS} weekly with \texttt{time\_series\_id\_col} covering store-category pairs, (3) nightly runs \texttt{ML.FORECAST} with a seven-day horizon into a forecast table partitioned by forecast date, (4) applies business rules (min/max stock, case-pack rounding) in SQL, and (5) exports the order file to the ERP landing bucket. Monitoring is itself a forecast: \texttt{ML.DETECT\_ANOMALIES} over realized-versus-forecast error, paged when sustained.
+
+\begin{figure}[H]
+    \centering
+    \resizebox{0.95\textwidth}{!}{%
+    \begin{tikzpicture}[
+        db/.style={cylinder, shape border rotate=90, aspect=0.25, draw=primary, thick, fill=primary!10, text width=2.9cm, minimum height=1.2cm, align=center, font=\small\bfseries},
+        svc/.style={rectangle, rounded corners, draw=primary, thick, fill=primary!6, text width=3.0cm, minimum height=1.0cm, align=center, font=\small\bfseries},
+        outbox/.style={rectangle, rounded corners, draw=codegreen!60!black, thick, fill=green!7, text width=2.9cm, minimum height=1.0cm, align=center, font=\small\bfseries},
+        arrow/.style={-{Stealth[length=2.5mm]}, draw=primary, thick}
+    ]
+        \node[db] (sales) at (0,0) {Sales replica\\(CDC, Ch. 11)};
+        \node[svc] (series) at (4.2,0) {Scheduled SQL\\series build\\(gap-filled)};
+        \node[svc] (model) at (8.4,0) {ARIMA\_PLUS\\weekly retrain\\50k series};
+        \node[svc] (forecast) at (12.4,0) {Nightly\\ML.FORECAST\\+ business rules};
+        \node[outbox] (erp) at (15.6,0) {ERP order\\file 05:00};
+
+        \draw[arrow] (sales) -- (series);
+        \draw[arrow] (series) -- (model);
+        \draw[arrow] (model) -- (forecast);
+        \draw[arrow] (forecast) -- (erp);
+    \end{tikzpicture}%
+    }
+    \caption{SQL-only inventory forecasting: CDC replica to nightly per-series forecasts to the ERP.}
+    \label{fig:ch17-inventory-forecast}
+\end{figure}
+
+\begin{tipbox}
+Fifty thousand series in one \texttt{CREATE MODEL} is normal for ARIMA\_PLUS, but watch the long tail: stores with sparse histories produce wide intervals. Segment by data sufficiency and route thin series to a simpler fallback (moving average) rather than trusting a heroic model.
+\end{tipbox}
+
+\begin{pitfall}
+A forecast table without a forecast-generation timestamp is unusable for accountability: you can never reconstruct ``what did we predict on Tuesday for Friday.'' Always persist \texttt{forecast\_for\_date}, \texttt{generated\_at}, and model version with every batch.
+\end{pitfall}
+
+\section{Interview Q\&A}
+\subsection{Concepts and Trade-offs}
+\begin{enumerate}
+    \item \textbf{Q: Which BQML model type fits customer churn prediction?}\\
+    A: Logistic regression as the interpretable baseline; boosted trees when nonlinear feature interactions justify the opacity.
+
+    \item \textbf{Q: What does ARIMA\_PLUS automate compared to classic ARIMA?}\\
+    A: Differencing, seasonality, holiday effects, hyperparameter search, and per-series parallelism via \texttt{time\_series\_id\_col}.
+
+    \item \textbf{Q: Which ML.EVALUATE metrics matter most for imbalanced churn?}\\
+    A: ROC AUC for ranking quality plus precision and recall at the chosen operating threshold; accuracy misleads under imbalance.
+
+    \item \textbf{Q: What is the advantage of training where the data already lives?}\\
+    A: No extract pipelines, one permission model, full lineage, and retraining as a scheduled SQL query.
+
+    \item \textbf{Q: How do you detect overfitting with BQML evaluation output?}\\
+    A: Compare ML.EVALUATE on training versus time-held-out data; a large quality gap indicates memorization.
+\end{enumerate}
+
+\section{Further Reading}
+Read the BigQuery ML introduction and model reference for model types, options, and evaluation functions \cite{googlecloudbqmldocs}. The BigQuery documentation covers scheduled queries that productionize retraining \cite{googlecloudbigquerydocs}. Vertex AI documentation previews the custom-training path for when BQML's catalog is insufficient \cite{googlecloudvertexaidocs}, and Chapter~24's Dataform reference covers SQL pipeline discipline \cite{googleclouddataformdocs}.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item BQML moves ML to the data: governance, freshness, and lineage come free.
+    \item \texttt{ARIMA\_PLUS} turns thousand-series forecasting into one query---given clean, gap-filled inputs.
+    \item Evaluate on time-held-out data; report threshold-aware metrics for imbalanced problems.
+    \item Materialize curated training tables; never train over raw multi-year scans.
+    \item Persist forecast provenance (generated-at, version) with every batch.
+    \item Know the boundary: exotic architectures and non-tabular data belong to Vertex AI.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} When does BQML's in-warehouse training lose to a Vertex AI custom job? Give three concrete cases.
+    \item \textbf{(Conceptual)} Explain why random train/test splits inflate metrics for temporal targets.
+    \item \textbf{(Hands-on)} Reproduce the Thursday lab, then build the ROC-based threshold analysis for a retention-budget constraint (campaign capacity of the top 5\%).
+    \item \textbf{(Hands-on)} Forecast one public time series with ARIMA\_PLUS and verify interval coverage on a held-out month.
+    \item \textbf{(Design)} Specify the anomaly-detection layer for the store forecasts: error metrics, alert thresholds, and the human triage loop.
+    \item \textbf{(Architecture)} Add a feedback table capturing realized orders versus forecasts, and design the weekly accuracy review query.
+\end{enumerate}

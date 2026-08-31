@@ -1,0 +1,253 @@
+\chapter{Data Governance and Data Mesh with Dataplex}
+\index{Dataplex}\index{data mesh}\index{lakes and zones}\index{Data Catalog}\index{tag templates}\index{AutoDQ}\index{data lineage}
+
+\begin{objectives}
+\begin{itemize}
+    \item Organize Dataplex lakes, zones (raw and curated), and assets over Cloud Storage and BigQuery.
+    \item Apply tag templates and policy tags for classification and column-level enforcement.
+    \item Run automatic data-quality (AutoDQ) scans and data profiling against governed assets.
+    \item Trace lineage from a broken dashboard back to the responsible source system.
+    \item Build a governed lake with assets, a tag template, and a protected Salary column.
+    \item Architect a five-domain data mesh with centralized governance and decentralized ownership.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+Governance fabrics attach metadata, quality, and policy to data wherever it lives; each platform's answer differs in scope and tightness of integration.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{2.8cm}p{3.0cm}p{3.0cm}p{3.0cm}@{}} \\
+\toprule
+\textbf{Capability} & \textbf{GCP Dataplex} & \textbf{AWS} & \textbf{Azure / Fabric} \\
+\midrule
+Governance fabric & Dataplex (lakes/zones) & Lake Formation & Microsoft Purview \\
+Catalog \& search & Data Catalog (in Dataplex) & Glue Data Catalog & Purview / Fabric OneLake catalog \\
+Lineage & Dataplex lineage & (partner/Glue) & Purview lineage \\
+Auto data quality & AutoDQ scans & Glue Data Quality & Purview / Fabric quality rules \\
+Data mesh units & Domains as lakes per team & Accounts per domain & Domains in Fabric/Purview \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+\textbf{Snowflake} governs through Horizon (tags, masking policies, lineage) inside its boundary; \textbf{MongoDB} relies on schema validation and Atlas governance. The mesh principle is platform-agnostic: domains own data products; the platform provides federated guardrails---discovery, quality, and policy enforcement---without centralizing every decision.
+\end{crosscloud}
+
+\begin{keyterms}
+\textbf{Lake}: a Dataplex top-level governance container for a domain or environment.
+\textbf{Zone}: a logical grouping within a lake (raw, curated) carrying its own policy posture.
+\textbf{Asset}: a resource mapped into a zone---a bucket or BigQuery dataset---whose metadata Dataplex discovers and governs.
+\textbf{Tag template}: a schema of business metadata fields (owner, classification, retention) attachable to catalog entries.
+\textbf{AutoDQ}: Dataplex's rule-based data-quality scanning with suggested and custom rules and score publication.
+\textbf{Lineage}: the recorded graph of how data moves and transforms across systems, queryable for impact analysis.
+\end{keyterms}
+
+\section{Week 22 Roadmap}
+Week~22 turns the platform into a governed system of record. Monday structures lakes, zones, and assets. Tuesday covers the catalog: tag templates, search, and lineage. Wednesday automates quality with AutoDQ and profiling. Thursday builds the governed lake with a protected Salary column. Friday architects the five-domain data mesh.
+
+\begin{definitionbox}
+\textbf{Dataplex} is Google Cloud's governance fabric: it organizes storage and warehouse resources into lakes and zones, discovers their metadata into a searchable catalog, enforces policy through tags and security bindings, profiles and quality-scans data automatically, and records lineage across pipelines \cite{googleclouddataplexdocs}.
+\end{definitionbox}
+
+\section{Monday: Lakes, Zones, and Assets}
+\index{Dataplex!lakes}\index{Dataplex!zones}\index{Dataplex!assets}
+
+\subsection{The Organizational Vocabulary}
+A \textbf{lake} scopes governance to a domain or environment (``sales,'' ``finance,'' ``nonprod''). \textbf{Zones} subdivide it by processing stage and trust: a \emph{raw} zone holding source-fidelity data with strict write access, a \emph{curated} zone holding modeled products with broader read access. \textbf{Assets} map physical resources---buckets, datasets---into zones; once mapped, Dataplex discovers tables and filesets, and zone-level IAM bindings govern access to everything the zone contains. The structure mirrors the zone discipline from Chapter~1, now with a governance control plane over it.
+
+\subsection{Design Consequences}
+Zone placement is a policy decision: attaching a bucket to a curated zone grants the zone's readers access to everything in the bucket---prefix-level exceptions belong in bucket design, not in workarounds. Lakes are the federation unit for the mesh: one lake per domain keeps ownership boundaries clean, while Dataplex's cross-lake catalog keeps discovery global.
+
+\begin{pitfall}
+Mapping one giant bucket into a curated zone because ``it is mostly curated'' leaks the raw prefixes it also contains to every curated-zone reader. Zone boundaries follow trust boundaries: split buckets first, map zones second.
+\end{pitfall}
+
+\begin{tipbox}
+Standardize zone names and their policy meaning across domains---\texttt{raw}, \texttt{staging}, \texttt{curated}---so a data engineer moving between teams reads any lake's structure instantly. Conventions are governance that costs nothing to enforce.
+\end{tipbox}
+
+\section{Tuesday: Data Catalog, Tag Templates, and Lineage}
+\index{tag templates!fields}\index{catalog search}\index{data lineage!impact analysis}
+
+\subsection{Searchable, Tagged Metadata}
+Every discovered asset becomes a catalog entry; \textbf{tag templates} attach business metadata---\texttt{owner}, \texttt{data\_classification}, \texttt{retention\_class}, \texttt{cost\_center}---as structured, searchable fields. The discipline that separates a useful catalog from a metadata swamp: a small, governed set of templates with controlled vocabularies, populated by pipeline automation (a Dataform or Composer step tags what it publishes), not by analyst goodwill.
+
+\subsection{Policy Tags versus Descriptive Tags}
+Chapter~8 used \textbf{policy tags} for enforcement: taxonomy-based labels on BigQuery columns that gate access at query time. Tag templates are descriptive metadata for discovery and stewardship. The two compose: a descriptive tag says \texttt{classification=PII-direct} for discovery and review; the policy tag on the same column enforces access. Healthy platforms generate one from the other in automation so discovery and enforcement never disagree.
+
+\subsection{Lineage}
+Dataplex records lineage from BigQuery jobs, Dataflow pipelines, and Composer runs: which tables a job read, which it wrote. The operational payoff is impact analysis---a broken executive dashboard traces upstream through views and models to the staging table whose CDC stream stalled (Chapter~11's freshness alert), turning a ``the number is wrong'' escalation into a named owner and a root cause in minutes.
+
+\begin{notebox}
+Lineage is only as complete as the paths that report it. Custom Python reading and writing tables outside known systems leaves gaps; document manual lineage for known gaps rather than pretending the graph is complete.
+\end{notebox}
+
+\section{Wednesday: Auto Data Quality and Profiling}
+\index{AutoDQ}\index{data profiling}\index{data quality rules}
+
+\subsection{Profiling}
+\textbf{Data profiling} scans tables for statistical fingerprints: null rates, distinct-value counts, min/max, string-length distributions, top values. Profiling is the cheapest data-quality investment: it finds the column that suddenly went 40\% null, the ID that stopped being unique, the country field that grew a new unexpected value---before the consumers do.
+
+\subsection{AutoDQ}
+\textbf{AutoDQ} evaluates declarative rules---completeness (\texttt{email IS NOT NULL}), validity (regex or range), uniqueness, freshness, consistency across tables---on a schedule, publishing a per-table quality score to the catalog and alerting on rule failures. Rules can be suggested from profiling output or authored explicitly. The platform pattern: every curated data product ships with its AutoDQ scan spec in version control, reviewed with the model code, with scores surfaced next to the product in the catalog \cite{googleclouddataplexdocs}.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.2cm}p{4.6cm}p{4.6cm}@{}} \\
+\toprule
+\textbf{Rule type} & \textbf{Example} & \textbf{Typical failure meaning} \\
+\midrule
+Completeness & Null rate $<$ 0.1\% on \texttt{order\_id} & Upstream extraction dropped a field \\
+Uniqueness & \texttt{customer\_key} distinct in dim & Duplicate-join regression in the model \\
+Validity & \texttt{country} in ISO list & New unmapped source value \\
+Freshness & Max \texttt{event\_ts} $<$ 2h old & CDC or stream stall \\
+Consistency & Order totals match across fact tables & Partial load or currency bug \\
+\bottomrule
+\end{tabular}
+\caption{AutoDQ rule types and what their failures usually mean.}
+\label{tab:ch22-autodq-rules}
+\end{table}
+
+\begin{pitfall}
+Quality rules without an incident path decay into ignored red tiles. Every rule needs a severity, an owner, and a response expectation; a page-worthy rule pages, a warning rule feeds a weekly review, and anything nobody would act on gets deleted.
+\end{pitfall}
+
+\section{Thursday Hands-On Project: A Governed Lake with a Protected Salary Column}
+\index{hands-on project}\index{Dataplex!lake}\index{policy tags!salary}
+This lab creates a Dataplex lake with raw and curated zones, maps a bucket and a BigQuery dataset as assets, defines a tag template, and protects an HR dataset's \texttt{salary} column with a policy tag verified by a negative test.
+
+\subsection{Create Lake, Zones, and Assets}
+\begin{lstlisting}[language=bash,caption={Creating the lake, zones, and attaching assets.}]
+$env:PROJECT_ID = "my-gcp-dataplex-lab"
+$env:REGION = "us-central1"
+gcloud config set project $env:PROJECT_ID
+gcloud services enable dataplex.googleapis.com
+
+gcloud dataplex lakes create hr-lake --location=$env:REGION `
+  --display-name="HR Lake"
+
+gcloud dataplex zones create hr-raw --location=$env:REGION `
+  --lake=hr-lake --type=RAW --resource-location-type=SINGLE_REGION `
+  --discovery-enabled
+
+gcloud dataplex zones create hr-curated --location=$env:REGION `
+  --lake=hr-lake --type=CURATED --resource-location-type=SINGLE_REGION `
+  --discovery-enabled
+
+gcloud dataplex assets create hr-dataset --location=$env:REGION `
+  --lake=hr-lake --zone=hr-curated `
+  --resource-type=BIGQUERY_DATASET `
+  --resource-name=projects/$env:PROJECT_ID/datasets/hr_data `
+  --discovery-enabled
+\end{lstlisting}
+
+\subsection{Tag Template and Policy Tag}
+Create a tag template \texttt{data\_product\_meta} with fields \texttt{owner} (string), \texttt{classification} (enum: public/internal/confidential), and \texttt{review\_date} (date); attach it to the discovered \texttt{employees} table entry. In Data Catalog, create a taxonomy \texttt{HR PII} with a policy tag \texttt{compensation}; apply it to \texttt{employees.salary}; grant Fine-Grained Reader on the tag only to the HR-analyst group. Run the negative test: a non-member queries \texttt{SELECT salary FROM hr\_data.employees} and is denied, while \texttt{SELECT name, department} succeeds.
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item The lake/zone/asset configuration with discovery enabled and findings visible in the catalog.
+    \item The tag template definition and the tagged table entry.
+    \item Negative- and positive-test query outputs proving the policy tag enforcement.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item Raw and curated zones carry distinct access bindings, verified by inspection.
+    \item The \texttt{salary} column is inaccessible without the Fine-Grained Reader grant on the policy tag.
+    \item The catalog entry is discoverable by searching the tag's classification value.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Add an AutoDQ scan over \texttt{hr\_data.employees} with completeness and uniqueness rules and a failing-case demonstration.
+    \item Trace lineage from a Looker dashboard field back through the curated table to the raw zone.
+    \item Automate tag application from the pipeline that publishes the curated table.
+\end{itemize}
+
+\section{Friday Use Case and Architecture: A Five-Domain Data Mesh}
+\index{data mesh!architecture}\index{domain ownership}\index{federated governance}
+
+\subsection{Scenario}
+A global conglomerate---retail, logistics, finance, manufacturing, and digital domains---has outgrown its central data team: every dataset change queues behind a team that owns neither the context nor the consequences. The target operating model: domains own and serve data products; a platform team provides the governed substrate; central standards keep products interoperable.
+
+\subsection{Mesh on GCP}
+Each domain runs its own project(s) and its own Dataplex lake with the standard raw/curated zones. Domains publish data products---BigQuery datasets or BigLake tables---with mandatory tag-template metadata (owner, classification, SLA), AutoDQ scores, and policy tags from the shared taxonomy. Discovery is global via the catalog; access is granted by domain owners through zone bindings and Analytics Hub listings (Chapter~8) for cross-domain consumption. The platform team owns the taxonomy, the tag templates, the AutoDQ rule minimums, and the audit dashboards---federated governance---while domains own schemas, quality, and documentation: decentralized accountability.
+
+\begin{figure}[H]
+    \centering
+    \resizebox{0.95\textwidth}{!}{%
+    \begin{tikzpicture}[
+        dom/.style={rectangle, rounded corners, draw=primary, thick, fill=primary!6, text width=2.7cm, minimum height=1.0cm, align=center, font=\small\bfseries},
+        plat/.style={rectangle, rounded corners, draw=magenta, thick, fill=magenta!8, text width=3.4cm, minimum height=1.0cm, align=center, font=\small\bfseries},
+        cat/.style={rectangle, rounded corners, draw=codegreen!60!black, thick, fill=green!7, text width=3.4cm, minimum height=1.0cm, align=center, font=\small\bfseries},
+        arrow/.style={-{Stealth[length=2.5mm]}, draw=primary, thick},
+        dasharrow/.style={-{Stealth[length=2.5mm]}, draw=codegray, thick, dashed}
+    ]
+        \node[dom] (d1) at (0,1.6) {Retail\\lake};
+        \node[dom] (d2) at (0,0.2) {Logistics\\lake};
+        \node[dom] (d3) at (0,-1.2) {Finance, Mfg,\\Digital lakes};
+        \node[cat] (catalog) at (5.2,0.2) {Dataplex catalog\\search + lineage\\+ quality scores};
+        \node[plat] (standards) at (10.4,0.2) {Platform team\\taxonomy, templates,\\rule minimums};
+
+        \draw[arrow] (d1) -- (catalog);
+        \draw[arrow] (d2) -- (catalog);
+        \draw[arrow] (d3) -- (catalog);
+        \draw[dasharrow] (standards) -- (catalog);
+        \draw[dasharrow] (standards.north) .. controls (10.4,2.4) and (0,3.0) .. (d1.north);
+    \end{tikzpicture}%
+    }
+    \caption{Data mesh on Dataplex: domain lakes publish governed products into one catalog under shared standards.}
+    \label{fig:ch22-data-mesh}
+\end{figure}
+
+\begin{tipbox}
+Fund the platform team as a product team with adoption metrics (products published, catalog search usage, mean time to discover), not as a ticket queue. Meshes fail when the platform's incentives reward gatekeeping instead of self-service.
+\end{tipbox}
+
+\begin{pitfall}
+Decentralized ownership without enforced minimum standards produces five incompatible definitions of ``customer'' wearing a mesh costume. The non-negotiables---tag template, taxonomy, quality floor, lineage reporting---must be platform-enforced, or the mesh decentralizes into silos with better branding.
+\end{pitfall}
+
+\section{Interview Q\&A}
+\subsection{Concepts and Trade-offs}
+\begin{enumerate}
+    \item \textbf{Q: What distinguishes a raw zone from a curated zone in Dataplex?}\\
+    A: Trust and processing stage: raw holds source-fidelity data with narrow write access; curated holds modeled products with broader read access---each carrying its own policy posture over attached assets.
+
+    \item \textbf{Q: What does a tag template attach to catalog entries?}\\
+    A: Structured business metadata---owner, classification, retention---as searchable, governed fields; distinct from policy tags, which enforce access.
+
+    \item \textbf{Q: What does AutoDQ check without you writing rules?}\\
+    A: Profiling surfaces statistics automatically; AutoDQ can suggest rules from them---but declared rules (completeness, uniqueness, freshness) are yours to author and own.
+
+    \item \textbf{Q: In a data mesh, who owns the data product---central team or domain?}\\
+    A: The domain: schema, quality, documentation, and SLAs. The central platform owns the federated guardrails---taxonomy, templates, minimum quality rules.
+
+    \item \textbf{Q: How does lineage help when a downstream dashboard breaks?}\\
+    A: Impact analysis runs upstream from the broken field through transformations to the responsible source and its owner, collapsing triage from archaeology to a lookup.
+\end{enumerate}
+
+\section{Further Reading}
+Read the Dataplex documentation for lakes, zones, assets, AutoDQ, profiling, and lineage \cite{googleclouddataplexdocs}. The Analytics Hub reference covers cross-domain sharing that the mesh relies on \cite{googlecloudanalyticshub}, and Chapter~8's policy-tag discussion covers the enforcement half of tagging \cite{googlecloudbigquerydocs}. DataHub is worth reading as the open-source catalog comparison point \cite{googlecloudarchitectureframework}.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item Lakes and zones make trust boundaries explicit and enforceable; map assets along those boundaries only.
+    \item Tag templates carry stewardship metadata; policy tags carry enforcement; automation keeps them in agreement.
+    \item Profiling is the cheapest anomaly detector you own; AutoDQ turns rules into published scores.
+    \item Lineage converts ``the number is wrong'' into an owner and a root cause.
+    \item A mesh is domain ownership plus platform-enforced standards---neither half works alone.
+    \item Catalogs succeed through automation and adoption metrics, not through documentation mandates.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} A domain asks to be exempt from the shared taxonomy ``because our data is special.'' Write the negotiation position.
+    \item \textbf{(Conceptual)} Explain the difference between a tag template and a policy tag to a new analyst, with one failure story of confusing them.
+    \item \textbf{(Hands-on)} Reproduce the Thursday lab, then add a second zone with stricter bindings and verify the boundary with two test identities.
+    \item \textbf{(Hands-on)} Author an AutoDQ scan with one suggested rule and one custom rule; capture the published quality score.
+    \item \textbf{(Design)} Define the minimum publishable standard for a data product in the five-domain mesh: required tags, quality floor, SLA fields, documentation.
+    \item \textbf{(Architecture)} Design the cross-domain consumption path (Analytics Hub listing versus direct grant) with the access-review cadence for each.
+\end{enumerate}

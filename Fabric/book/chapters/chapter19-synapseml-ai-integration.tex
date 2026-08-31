@@ -1,0 +1,297 @@
+\chapter{SynapseML and AI Integration}
+\index{SynapseML}\index{Azure OpenAI}\index{Cognitive Services}\index{Copilot in Fabric}\index{sentiment analysis}\index{batch enrichment}\index{API key management}%
+
+\begin{objectives}
+\begin{itemize}
+    \item Explain what SynapseML adds on top of Spark MLlib and when to reach for it.
+    \item Integrate pre-built AI services---Azure OpenAI and Cognitive Services---into Spark pipelines in batch.
+    \item Keep API keys and service credentials out of notebooks through proper secret management.
+    \item Enrich a column of customer reviews with sentiment from Azure OpenAI and publish results to Gold.
+    \item Use Copilot in Fabric to generate and explain code responsibly.
+    \item Design a scalable pipeline that processes terabytes of reviews into BI-consumable sentiment metadata.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+Calling managed AI services from distributed data pipelines---enrichment at scale---is a cross-cloud pattern with the same shape everywhere: batch the calls, vault the keys, land the results in the analytical store.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{2.8cm}p{3.2cm}p{3.2cm}p{3.2cm}p{3.2cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{Fabric} & \textbf{AWS} & \textbf{GCP} & \textbf{Snowflake} \\
+\midrule
+Distributed ML library & SynapseML on Spark & SageMaker SDK / EMR MLlib & Vertex AI / Dataproc MLlib & Snowpark ML \\
+Managed LLM calls & Azure OpenAI via SynapseML & Bedrock from Lambda/EMR & Vertex AI Gemini APIs & Cortex / external functions \\
+Cognitive AI services & Azure AI Services & Comprehend, Rekognition, Textract & Vision, Natural Language, Document AI & Cortex AI functions \\
+Secret management & Key Vault / workspace identity & Secrets Manager & Secret Manager & External access integrations \\
+AI-assisted coding & Copilot in Fabric & CodeWhisperer/Q Developer & Gemini Code Assist & Copilot integrations \\
+Cost model of enrichment & Service calls + CUs & Per-request pricing & Per-request pricing & Credits + external calls \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+Databricks runs the same SynapseML library---it originated in the Synapse ecosystem---and Mosaic AI for LLM work; MongoDB Atlas Vector Search occupies the adjacent retrieval niche. The portable rules: \emph{batch instead of row-by-row, vault instead of hardcode, and land enrichment in Gold where BI can reach it}.
+\end{crosscloud}
+
+\begin{keyterms}
+\textbf{SynapseML}: Microsoft's open-source distributed ML library extending Spark with AI service integrations and additional learners. \quad
+\textbf{Azure OpenAI}: managed access to OpenAI models inside Azure compliance and networking boundaries. \quad
+\textbf{Batch enrichment}: applying an AI service to a DataFrame column distributed across the cluster, rather than row-by-row. \quad
+\textbf{Copilot in Fabric}: the natural-language assistant that generates and explains code in notebooks and other items. \quad
+\textbf{Sentiment enrichment}: appending model-computed sentiment columns to review text at pipeline scale.
+\end{keyterms}
+
+\section{Week 19 Roadmap}
+Week~19 adds managed AI to the data engineer's toolbox. Monday introduces SynapseML. Tuesday covers the pre-built AI services---Azure OpenAI and Cognitive Services---and the secret-management discipline they demand. Wednesday covers Copilot in Fabric as a code-generation assistant, with its review obligations. Thursday is the hands-on project: a SynapseML notebook calling Azure OpenAI to append sentiment to customer reviews. Friday scales the pattern to terabytes of reviews feeding a Gold lakehouse for BI.
+
+The data engineer's role in AI integration is not prompt engineering; it is pipeline engineering around a non-deterministic, rate-limited, per-call-billed dependency \cite{synapseML,microsoftFabricAiServices}. This week teaches that plumbing.
+
+\begin{notebox}
+An LLM call inside a Spark pipeline is the most expensive function invocation in your estate by orders of magnitude. Batching, caching, retry policy, and result persistence are not optimizations here---they are the difference between a viable pipeline and a five-figure surprise.
+\end{notebox}
+
+\section{Monday: Introduction to SynapseML}
+\index{SynapseML!overview}
+SynapseML is an open-source library that extends Spark with distributed integrations the base MLlib does not ship: connectors to Azure OpenAI and Cognitive Services, additional learners (for example LightGBM at Spark scale), and utilities for distributed serving \cite{synapseML}. In Fabric it is preinstalled or one environment dependency away, and it runs on the same Spark pools as Chapter~3's notebooks.
+
+\begin{definitionbox}
+\textbf{SynapseML} is a Spark-library extension providing distributed transformers for Azure AI services, additional scalable learners, and serving utilities---so AI-service enrichment becomes a DataFrame operation.
+\end{definitionbox}
+
+The mental model: SynapseML turns ``call the API'' into a Spark transformer. A column of review text goes in; a column of sentiment comes out; the distribution, batching, and parallelism happen at the executor level. That is precisely what makes it the right tool for terabytes---and what makes its configuration (batch size, concurrency, retry) a production decision rather than a detail.
+
+\section{Tuesday: Azure OpenAI, Cognitive Services, and Secrets}
+\index{Azure OpenAI!integration}\index{Cognitive Services}\index{API key management}
+\subsection{Pre-Built AI in the Pipeline}
+The Azure AI services cover the common enrichment cases: language (sentiment, key phrases, entity recognition), vision, document intelligence, and speech. Azure OpenAI adds generative capability: classification with instructions, summarization, extraction into structured columns \cite{microsoftFabricAiServices,synapseML}. The integration choice is between the pre-built task APIs (cheaper, constrained) and the generative endpoint (flexible, pricier)---start with the task API when it fits.
+
+\subsection{Secret Management}
+Every one of these calls authenticates. The rule is absolute: \textbf{no keys in notebooks}. Options in order of preference: Fabric workspace identity / managed identity where the service accepts it; Key Vault references resolved at run time; environment variables injected by the environment or pipeline. Keys never appear in cell text, pipeline JSON, or---critically---in Git, because Week~23 will sync these notebooks to a repository verbatim.
+
+\begin{pitfall}
+A key pasted into a notebook ``temporarily'' is a key in Git permanently once Week~23's Git integration syncs the workspace. Treat any key that touched a cell as compromised: rotate it, then fix the plumbing.
+\end{pitfall}
+
+\section{Wednesday: Copilot in Fabric}
+\index{Copilot in Fabric}
+Copilot in Fabric generates and explains code from natural language inside notebooks and other items \cite{microsoftFabricCopilot}. For the data engineer it is a drafting accelerator: boilerplate PySpark, KQL first drafts, unfamiliar API usage, and explanation of inherited code.
+
+The engineering obligations do not change because the author was an assistant. Copilot-generated code gets the same review as any code: Does it read the table it claims to? Does the join key exist? Does it silently drop rows? Is it leakage-safe (Chapter~17's tests still apply)? Does it hardcode a path or secret? Copilot drafts; engineers own.
+
+\begin{tipbox}
+Copilot is strongest as a first-draft generator against a precise prompt that names tables, columns, and intent---``read \texttt{silver.reviews}, filter to 2026, dedupe on \texttt{review\_id}, write Delta to \texttt{gold.reviews\_clean}''---and weakest when the prompt is vague enough that you cannot review the output against it.
+\end{tipbox}
+
+\section{Thursday: Hands-on Project}
+\index{hands-on lab}\index{sentiment analysis!hands-on}
+The Week~19 lab uses SynapseML in a Spark notebook to call Azure OpenAI: a column of customer reviews goes in, and a sentiment column comes out, appended and landed for downstream use.
+
+\subsection{Goal and Architecture}
+Work in \texttt{fabric-de-week19} with a table \texttt{silver.reviews} (a few thousand synthetic reviews) and an Azure OpenAI deployment (or the instructor-provided endpoint). The notebook batches calls, persists raw responses, and writes the enriched result to \texttt{gold.review\_sentiment}.
+
+\subsection{Step-by-Step Actions}
+\begin{enumerate}
+    \item Configure the service connection: endpoint and key resolved from Key Vault / environment, never literals.
+    \item Build the SynapseML transformer for the chat completion with a constrained prompt: return one of \texttt{positive}, \texttt{neutral}, \texttt{negative}.
+    \item Run on a 50-row sample first; inspect raw outputs before scaling.
+    \item Set batch size and concurrency deliberately; record the measured cost per thousand rows.
+    \item Persist raw responses alongside parsed sentiment (debuggability and reprocessing).
+    \item Write the enriched table to Gold with a schema contract: \texttt{review\_id}, \texttt{sentiment}, \texttt{model\_version}, \texttt{scored\_ts}.
+    \item Validate: null rate, label distribution sanity, and a hand-checked sample of twenty.
+\end{enumerate}
+
+\begin{lstlisting}[language=Python,caption={SynapseML batch sentiment over a reviews DataFrame.},label={lst:chapter19-synapseml}]
+import os
+from pyspark.sql import functions as F
+from synapse.ml.services.openai import OpenAICompletion
+
+reviews = spark.read.table("silver.reviews").where("review_date = '2026-07-31'")
+
+completion = (
+    OpenAICompletion()
+    .setSubscriptionKey(os.environ["AZURE_OPENAI_KEY"])     # from Key Vault/env
+    .setUrl(os.environ["AZURE_OPENAI_ENDPOINT"])
+    .setDeploymentName("gpt-4o-mini")
+    .setPrompt(
+        "Classify the sentiment of this review as exactly one of "
+        "positive, neutral, negative. Review: ")
+    .setBatchSize(20)                                        # batch, never row-by-row
+    .setTextCol("review_text")
+    .setOutputCol("raw_response")
+)
+
+scored = (completion.transform(reviews.limit(50))
+          .withColumn("sentiment", F.lower(F.trim(F.col("raw_response.choices.text")[0])))
+          .withColumn("model_version", F.lit("gpt-4o-mini-2026-07"))
+          .withColumn("scored_ts", F.current_timestamp()))
+
+(scored.select("review_id", "sentiment", "model_version", "scored_ts")
+       .write.format("delta").mode("append")
+       .saveAsTable("gold.review_sentiment"))
+\end{lstlisting}
+
+\subsection{Validation Checklist}
+\begin{itemize}
+    \item No key or endpoint appears as a literal anywhere in the notebook.
+    \item The 50-row sample run is inspected before any scale-up.
+    \item Raw responses are persisted, not just parsed labels.
+    \item Batch size and concurrency are set explicitly with measured cost recorded.
+    \item The Gold table honors its schema contract including \texttt{model\_version}.
+    \item A hand-checked sample agrees with the model at a documented rate.
+\end{itemize}
+
+\section{Friday: Use Case and Architecture}
+\index{sentiment analysis!at scale}\index{batch enrichment!architecture}
+A consumer platform accumulates terabytes of user reviews. Product leadership wants sentiment metadata available in the Gold lakehouse for BI---trends by category, alerts on sentiment drops---processed continuously and affordably.
+
+\subsection{The Pipeline}
+New reviews land in Silver through the Part~III machinery. A scheduled Spark job scores the delta (reviews not yet in \texttt{gold.review\_sentiment}, joined on \texttt{review\_id}) with the SynapseML pattern, in bounded batches, within a capacity-friendly window. Results land in Gold with \texttt{model\_version}; the Chapter~8 Direct Lake model picks them up; a Chapter~15 Reflex rule watches the daily negative-share for a sustained climb. Cost control comes from three levers: scoring only the delta, batching aggressively, and routing the bulk to the cheaper task-appropriate deployment.
+
+\begin{figure}[H]
+    \centering
+    \begin{tikzpicture}[node distance=8mm and 9mm]
+        \node[store] (silver) at (0,0) {silver.reviews\\(delta)};
+        \node[stage] (syn) at (4.6,0) {SynapseML\\batch scoring};
+        \node[store] (gold) at (9.4,0) {gold.review\_\\sentiment};
+        \node[stage] (bi) at (13.6,0.9) {Direct Lake\\BI};
+        \node[stage, fill=orange!10] (reflex) at (13.6,-0.9) {Reflex\\(sentiment drop)};
+
+        \draw[arrow] (silver) -- (syn);
+        \draw[arrow] (syn) -- (gold);
+        \draw[arrow] (gold) -- (bi);
+        \draw[arrow] (gold) -- (reflex);
+
+        \node[note, text width=12.5cm, align=center] at (7.4,-2.5) {Score the delta, batch the calls, version the model, land in Gold---BI and alerts consume, never recompute.};
+    \end{tikzpicture}
+    \caption{Terabyte-scale sentiment enrichment feeding BI and alerting.}
+    \label{fig:chapter19-sentiment}
+\end{figure}
+
+\begin{pitfall}
+Re-scoring history on every run is the classic cost explosion: the delta join (``reviews with no sentiment row for the current model version'') is the single most important line in the pipeline. Note the qualifier: a model upgrade legitimately re-scores history, so key the delta on (\texttt{review\_id}, \texttt{model\_version}).
+\end{pitfall}
+
+\section{Operational Guidance for Week 19}
+Treat AI services as metered external dependencies inside your pipelines: budgeted, batched, cached where legal, retried with backoff, and always persisted with their raw output.
+
+\subsection{Performance and Reliability}
+Score deltas, not history. Batch and bound concurrency to the service's rate limits. Retry transient failures with backoff; quarantine persistent failures with the Chapter~10 pattern. Record cost per thousand rows and trend it.
+
+\subsection{Security and Governance Checklist}
+\begin{itemize}
+    \item Keys resolved from Key Vault or environment; nothing literal, ever.
+    \item Review text containing personal data classified before leaving the tenant boundary; the service's data-handling terms reviewed.
+    \item Model and deployment versions stamped on every scored row.
+    \item Copilot-generated code reviewed with the same rigor as human code.
+    \item Rate limits and quotas documented; alerts on throttling.
+    \item Raw responses retained per the privacy policy, not indefinitely by default.
+\end{itemize}
+
+\section{Interview Q\&A}
+\begin{enumerate}
+    \item \textbf{Q: What does SynapseML add on top of Spark MLlib?}\\
+    A: Distributed transformers for Azure AI services (OpenAI, Cognitive Services), additional scalable learners such as LightGBM, and serving utilities---turning AI-service calls into DataFrame operations.
+    \item \textbf{Q: How do you avoid hardcoding Azure OpenAI keys in a notebook?}\\
+    A: Managed identity where supported, otherwise Key Vault references or environment-injected secrets resolved at run time---never literals, because Git integration will eventually sync the notebook verbatim.
+    \item \textbf{Q: Why batch sentiment calls instead of calling the API row-by-row?}\\
+    A: Per-call latency and per-request pricing: batching amortizes both across rows, and bounded concurrency respects rate limits without serializing the cluster.
+    \item \textbf{Q: What can Copilot in Fabric generate from natural language?}\\
+    A: First-draft code and explanations---PySpark, KQL, API usage---which an engineer then reviews against the same correctness, leakage, and security standards as human code.
+    \item \textbf{Q: Where should sentiment results land to be usable by BI?}\\
+    A: In a Gold Delta table with a schema contract and \texttt{model\_version}, so Direct Lake models and Reflex rules consume them without recomputation.
+    \item \textbf{Q: Why key the scoring delta on (\texttt{review\_id}, \texttt{model\_version})?}\\
+    A: New reviews need scoring, and upgraded models legitimately re-score history; the composite key makes both behaviors correct and cheap.
+\end{enumerate}
+
+\section{Further Reading}
+Review the SynapseML repository and documentation \cite{synapseML} and Azure OpenAI/AI services in Fabric \cite{microsoftFabricAiServices}. Copilot capabilities are documented at \cite{microsoftFabricCopilot}. The pipeline disciplines reused here come from Chapters~9--12 \cite{microsoftFabricPipelines,microsoftFabricMonitoringHub}; the Gold consumption path from Chapter~8 \cite{microsoftDirectLake}.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item SynapseML makes AI-service enrichment a distributed DataFrame operation, which is what terabyte-scale requires.
+    \item Secrets come from Key Vault, identity, or environment---never cell text; Git integration makes ``temporary'' keys permanent.
+    \item Batch, bound concurrency, and persist raw responses: the three plumbing rules of pipeline AI.
+    \item Score deltas keyed on (entity, model version); re-scoring history is a deliberate, budgeted event.
+    \item Copilot drafts, engineers own---review generated code for correctness, leakage, and secrets.
+    \item Sentiment lands in Gold with a schema contract so BI and alerts consume without recompute.
+    \item AI calls are metered dependencies: budget them, measure cost per thousand rows, and trend it.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Compare the pre-built task APIs with generative endpoints for sentiment: cost, control, and fit.
+    \item \textbf{(Conceptual)} Why does Git integration change the severity of a hardcoded key from bad habit to incident?
+    \item \textbf{(Hands-on)} Extend the lab to a second language of reviews and document any label-distribution shift.
+    \item \textbf{(Hands-on)} Implement the delta join on (\texttt{review\_id}, \texttt{model\_version}) and prove a rerun scores nothing.
+    \item \textbf{(Design)} Design the retry-and-quarantine policy for the enrichment job: which failures retry, which quarantine, which page.
+    \item \textbf{(Design)} Write the Copilot usage policy for the team: what it may draft, what review it must pass, what it may never touch.
+    \item \textbf{(Interview)} In five sentences, explain the cost model of LLM enrichment to a product manager requesting ``real-time sentiment on everything.''
+    \item \textbf{(Operational)} Write the runbook for a sudden spike in throttling errors from the AI service.
+\end{enumerate}
+
+\section{Capstone Project: Budgeted AI Enrichment Pipeline}\label{sec:ch19-capstone}
+\index{capstone project}\index{SynapseML!capstone}\index{sentiment analysis!capstone}
+
+\begin{capstonebox}
+\textbf{Mission.} Productionize the Week~19 lab: a scheduled, delta-scoring sentiment pipeline over review data with vaulted secrets, bounded batches, quarantined failures, model-versioned Gold output, a cost report per run, and a Reflex alert on sustained negative-share climbs.
+
+\textbf{Estimated time.} 5--7 hours.
+
+\textbf{What you'll practice.}
+\begin{itemize}
+    \item Delta-keyed scoring with model-version awareness.
+    \item Secret resolution and cost instrumentation in a scheduled pipeline.
+    \item Failure quarantine and retry policy for a metered external dependency.
+    \item Closing the loop from enrichment to BI and alerting.
+\end{itemize}
+\end{capstonebox}
+
+\subsection*{Scenario}
+Contoso Reviews aggregates product feedback. Engineering owns the sentiment pipeline end to end: nightly delta scoring, monthly cost reporting, and an alert when any category's negative share climbs for three consecutive days.
+
+\subsection*{Requirements}
+\begin{itemize}
+    \item Scheduled pipeline scoring only the (\texttt{review\_id}, \texttt{model\_version}) delta.
+    \item Secrets resolved at run time; zero literals in code or config.
+    \item Quarantine table for persistently failing rows with error context.
+    \item \texttt{gold.review\_sentiment} honoring the schema contract.
+    \item A cost report: calls, estimated spend, cost per thousand rows, trend.
+    \item The Reflex rule with sustained condition and cooldown, proven with injected negativity.
+\end{itemize}
+
+\subsection*{Implementation Steps}
+\begin{enumerate}
+    \item Refactor the lab notebook into a parameterized, secret-resolving scoring notebook.
+    \item Implement the delta join and quarantine path.
+    \item Schedule via pipeline with Chapter~12 alerting.
+    \item Instrument and emit the cost report.
+    \item Configure and prove the Reflex rule.
+\end{enumerate}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item Scoring notebook and pipeline export in the repository.
+    \item Delta-rerun evidence: second run scores zero rows.
+    \item Quarantine evidence from an injected failure.
+    \item Cost report for a week of runs.
+    \item Reflex evidence from the injected negativity scenario.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item[\(\square\)] A rerun of the same batch scores zero rows; a model upgrade re-scores deliberately.
+    \item[\(\square\)] No secret appears in any artifact, log, or screenshot.
+    \item[\(\square\)] Persistent failures quarantine with context; transient failures retry with backoff.
+    \item[\(\square\)] Gold output carries \texttt{model\_version} and passes the schema contract.
+    \item[\(\square\)] The cost report computes per-thousand-row spend from measured calls.
+    \item[\(\square\)] The Reflex alert fires once on the sustained scenario and not on noise.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Add a second enrichment (key phrases) sharing the batch infrastructure.
+    \item Compare task-API versus generative-endpoint cost at one million rows; publish the break-even.
+    \item Add a daily Direct Lake sentiment dashboard consuming Gold.
+    \item Add an evaluation harness: a labeled sample re-scored per model version to catch quality regressions.
+\end{itemize}

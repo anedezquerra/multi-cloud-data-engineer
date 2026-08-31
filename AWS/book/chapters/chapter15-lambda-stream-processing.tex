@@ -1,0 +1,308 @@
+% NOTE: Filename is fixed by the book outline; content teaches Week 15
+% (Stream Processing with Apache Flink on AWS) of the syllabus.
+\chapter{Stream Processing with Apache Flink on AWS}
+\index{Apache Flink}\index{Managed Service for Apache Flink}\index{event time}\index{processing time}\index{watermarks}\index{windowing}\index{checkpoint}\index{savepoint}\index{exactly-once}%
+\begin{objectives}
+\begin{itemize}
+    \item Explain Managed Service for Apache Flink and its operational model versus self-managed Flink.
+    \item Distinguish event time from processing time and apply watermarks to bound lateness.
+    \item Implement tumbling, sliding, and session windows and stream--stream joins in Flink SQL.
+    \item Manage keyed state: the RocksDB state backend, state TTL, checkpoints versus savepoints.
+    \item Deliver end-to-end exactly-once with transactional or idempotent sinks---and know when at-least-once plus dedup is the wiser design.
+    \item Troubleshoot inaccurate aggregations caused by late-arriving mobile data.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+Stateful stream processing is the deepest discipline in this book, and the concepts---event time, watermarks, windows, state, checkpoints---are identical everywhere; only the managed packaging differs.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{2.8cm}p{3.0cm}p{3.0cm}p{3.0cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{AWS} & \textbf{Azure} & \textbf{GCP} \\
+\midrule
+Managed Flink & Managed Service for Apache Flink & HDInsight/AKS-hosted Flink & Self-managed on GKE / Dataflow (Beam model) \\
+Native stream SQL & Flink SQL & Stream Analytics query language & Dataflow SQL / Beam \\
+Event-time windows & Flink SQL TUMBLE/HOP/SESSION & ASA windowing & Beam windows \\
+State backend & RocksDB (managed) & Per platform & Per runner \\
+Exactly-once sink & Two-phase commit connectors & Idempotent sinks & Exactly-once in Dataflow \\
+\addlinespace
+Savepoint story & App snapshots + savepoints & Platform-specific & Job drain/update \\
+Kinesis connector & Native & Via Kafka bridge & Via Kafka/Pub/Sub IO \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+\textbf{Fabric} Real-Time Intelligence handles many windowed-analytics cases with KQL, trading Flink's control for simplicity. \textbf{Snowflake} approaches streaming through Snowpipe Streaming plus dynamic tables. \textbf{MongoDB} stream processing (Atlas) applies the same windowed ideas to change streams. Learn Flink's model once; everywhere else is a dialect.
+\end{crosscloud}
+
+\section{Week 15 Roadmap and Mental Model}
+Weeks 13--14 moved events and delivered them. Week~15 \emph{computes} over them: continuously, correctly, and at scale. Stream processing's hard questions are all about time and state. \emph{When} did this event happen versus when did we see it? \emph{How long} do we wait for stragglers? \emph{What} must we remember between events, and for how long? And when the job crashes mid-computation, \emph{what exactly} is recovered?
+
+Apache Flink is the industry's reference implementation of the answers \cite{apacheFlinkDocs,akidauStreamingSystems}. Amazon Managed Service for Apache Flink runs Flink applications for you---provisioning, scaling, checkpoint storage, and application snapshots---so the week's attention goes to the model, not the cluster \cite{awsManagedFlinkDocs}. Thursday builds a windowed aggregation in Flink SQL; Friday confronts the scenario that separates people who have run streams from people who have read about them: a dashboard that is wrong because phones went offline.
+
+\begin{definitionbox}
+\textbf{Stream processing} is continuous computation over unbounded event sequences, maintaining state across events and producing results with explicit semantics for time (event time versus processing time), lateness (watermarks and allowed lateness), and failure (checkpointed, exactly-once state).
+\end{definitionbox}
+
+\begin{keyterms}
+\textbf{Event time}: when the event happened (its embedded timestamp). \textbf{Processing time}: when the engine sees it. \textbf{Watermark}: a heuristic assertion that no event older than time $t$ will arrive; drives window firing and state cleanup. \textbf{Window}: tumbling (fixed, disjoint), sliding (fixed, overlapping), or session (gap-closed). \textbf{Keyed state}: per-key memory the engine checkpoints. \textbf{Checkpoint}: automatic, periodic, for failure recovery. \textbf{Savepoint}: manual, consistent, for upgrades and redeploys. \textbf{Two-phase commit}: transactional sink protocol for end-to-end exactly-once.
+\end{keyterms}
+
+\section{Monday: Managed Service for Apache Flink}
+\subsection{What the Service Manages}
+Managed Service for Apache Flink runs your Flink application (Java/Scala via the DataStream API, Python via PyFlink, or SQL via Studio notebooks and the SQL gateway pattern) on managed compute, with automatic checkpointing to service-managed storage, snapshots on demand, and autoscaling. You bring the application, the connector configuration, and the parallelism; the service brings the runtime, the durability of state, and the restart machinery \cite{awsManagedFlinkDocs}.
+\index{Managed Service for Apache Flink}
+
+The billing unit is the KPU (1 vCPU, 4 GB memory, 50 GB storage) per hour, including one for orchestration. Autoscaling adjusts KPUs to load---which makes \emph{backpressure} the metric to watch: an under-provisioned application falls behind, iterator age on the source stream climbs (Chapter~13's alarm), and the retention window becomes a deadline.
+
+\begin{tipbox}
+Treat snapshot discipline as part of deployment, not an afterthought: stop the application with a snapshot/savepoint, never with a plain cancel, and configure the next version to restore from it. Checkpoint state cannot survive code changes that alter the operator graph---a missed savepoint before redeploy means reprocessing or lost state.
+\end{tipbox}
+
+\section{Tuesday: Event Time, Processing Time, and Watermarks}
+\subsection{Two Clocks}
+Processing-time windows are trivially correct---the engine groups by its own clock---and trivially wrong for anything involving mobile devices, retries, or cross-region buffering, because arrival order is not event order. Event-time windows group by the timestamp inside the event, which is the time the business cares about. The cost of event time is the question processing time never asks: \emph{how long do we wait?}
+\index{event time}\index{processing time}
+
+\subsection{Watermarks: The Lateness Contract}
+A watermark is the engine's running estimate of event-time completeness: ``no event with timestamp earlier than $W$ will arrive.'' Windows fire when the watermark passes their end; state for a window is dropped once the watermark passes its end plus allowed lateness. Declaring a watermark of \texttt{event\_ts - INTERVAL '10' SECOND} says: we expect events up to ten seconds late, and we accept the risk of anything later being dropped (or routed to a side output). Choosing the bound is a business decision wearing a technical costume---ten seconds of dashboard latency versus the accuracy of late data \cite{apacheFlinkDocs,akidauStreamingSystems}.
+\index{watermark}\index{allowed lateness}
+
+\begin{pitfall}
+\textbf{Watermarks declared but never advancing.} In Kinesis sources, a watermark is per-shard; one idle shard (no traffic) can hold the global watermark back and stall every window in the job. Use idleness detection on the source and verify watermark metrics, not just throughput, when windows stop firing.
+\end{pitfall}
+
+\section{Wednesday: Windows, Joins, and State Management}
+\subsection{Windowing Strategies}
+\begin{itemize}
+    \item \textbf{Tumbling}: fixed-size, disjoint---``clicks per 5 minutes.'' Each event belongs to exactly one window; state is bounded.
+    \item \textbf{Sliding}: fixed-size, overlapping---``cross-city card use within any 10-minute span, evaluated every minute.'' Events belong to several windows; state multiplies by slide ratio.
+    \item \textbf{Session}: closed by inactivity gaps---``a user's session of activity.'' Windows vary in length; state depends on the gap timeout.
+\end{itemize}
+\index{tumbling window}\index{sliding window}\index{session window}
+
+\subsection{Stream--Stream Joins}
+Joining two unbounded streams requires bounding \emph{how long} an event waits for its partner. An interval join states it explicitly: clicks match impressions seen up to 15 minutes prior, and the watermarks on both inputs let Flink discard join state older than the interval. Without the bound, join state grows forever---which is the general law of streaming state: \textbf{unbounded state eventually kills every streaming job}, by checkpoint size, by restore time, or by heap.
+
+\begin{lstlisting}[language=SQL,caption={Watermarks declared in DDL and an interval join bounding state retention.},label={lst:ch15-interval-join}]
+-- Watermarks declared in DDL on both input streams
+CREATE TABLE impressions (
+  ad_id STRING, imp_ts TIMESTAMP(3),
+  WATERMARK FOR imp_ts AS imp_ts - INTERVAL '10' SECOND
+) WITH ('connector' = 'kinesis', 'stream' = 'imps' /*, ... */);
+
+CREATE TABLE clicks (
+  user_id STRING, ad_id STRING, click_ts TIMESTAMP(3),
+  WATERMARK FOR click_ts AS click_ts - INTERVAL '5' SECOND
+) WITH ('connector' = 'kinesis', 'stream' = 'clicks' /*, ... */);
+
+-- Interval join: attribute clicks to impressions seen up to 15 min prior.
+-- Watermarks let Flink drop state older than the join interval.
+SELECT i.ad_id, c.user_id, c.click_ts
+FROM impressions i
+JOIN clicks c ON i.ad_id = c.ad_id
+WHERE c.click_ts BETWEEN i.imp_ts AND i.imp_ts + INTERVAL '15' MINUTE;
+\end{lstlisting}
+\index{interval join}\index{stream-stream join}
+
+\subsection{State Backends, TTL, Checkpoints, and Savepoints}
+Keyed state lives in the configured state backend; at scale that is RocksDB---state on local disk with spill, checkpointed incrementally to durable storage. \textbf{State TTL} expires keys idle beyond a threshold, the finishing touch that turns ``bounded in theory'' into ``bounded in production.'' \textbf{Checkpoints} are the automatic, periodic consistency barriers that make failure recovery exactly-once \emph{within} the job: on restart, state rolls back to the last completed checkpoint and sources replay from the corresponding offsets. \textbf{Savepoints} are the same mechanism triggered manually with a stable identifier---the tool for upgrades, because a savepoint is a contract with your future code.
+\index{RocksDB state backend}\index{state TTL}\index{checkpoint}\index{savepoint}
+
+\subsection{End-to-End Exactly-Once}
+Internal exactly-once is table stakes; \emph{end-to-end} exactly-once requires the sink to participate: either a transactional sink that commits only on checkpoint completion (two-phase commit to Kafka, or Flink's S3 file sink committing files on checkpoint), or an idempotent sink (upsert by event ID) that makes duplicate writes harmless. When neither is available, at-least-once delivery plus downstream dedup (Chapter~13's pattern) is the honest architecture---often the right choice anyway when the sink cannot transact.
+\index{exactly-once}\index{two-phase commit}
+
+\section{Thursday Hands-on Project: A Flink SQL Tumbling-Window Counter}
+\index{hands-on project!Flink SQL windows}
+Write a Flink SQL application that reads clicks from a Kinesis stream, counts them in 5-minute tumbling windows, and writes results to a second stream.
+
+\subsection*{Lab Objectives}
+\begin{itemize}
+    \item Create source and sink streams and declare event-time tables over them.
+    \item Implement the tumbling-window count with a declared watermark.
+    \item Observe window firing behavior against the watermark, not the wall clock.
+    \item Demonstrate late-event handling within and beyond the watermark bound.
+\end{itemize}
+
+\subsection*{Procedure}
+Using a Studio notebook or a SQL application in Managed Service for Apache Flink:
+
+\begin{lstlisting}[language=SQL,caption={Tumbling-window click counter in Flink SQL.},label={lst:ch15-tumble}]
+CREATE TABLE clicks (
+  user_id   STRING,
+  page      STRING,
+  click_ts  TIMESTAMP(3),
+  WATERMARK FOR click_ts AS click_ts - INTERVAL '10' SECOND
+) WITH (
+  'connector' = 'kinesis',
+  'stream'    = 'user-clicks',
+  'aws.region' = 'us-east-1',
+  'format'    = 'json',
+  'scan.init.pos' = 'LATEST'
+);
+
+CREATE TABLE click_counts (
+  window_start TIMESTAMP(3),
+  window_end   TIMESTAMP(3),
+  page         STRING,
+  clicks       BIGINT
+) WITH (
+  'connector' = 'kinesis',
+  'stream'    = 'click-counts',
+  'aws.region' = 'us-east-1',
+  'format'    = 'json'
+);
+
+INSERT INTO click_counts
+SELECT window_start, window_end, page, COUNT(*) AS clicks
+FROM TABLE(
+  TUMBLE(TABLE clicks, DESCRIPTOR(click_ts), INTERVAL '5' MINUTES))
+GROUP BY window_start, window_end, page;
+\end{lstlisting}
+
+Drive it with an adapted Week~13 producer emitting click events with controllable timestamps, including deliberately late ones.
+
+\subsection*{Verification}
+\begin{itemize}
+    \item On-time events appear in the correct 5-minute window; the window fires when the watermark passes its end, measurably after wall-clock end.
+    \item An event 5 seconds late still lands in its correct window; an event 30 seconds late does not---the watermark contract made observable.
+    \item Application metrics show checkpoint completion and growing-then-cleaned window state.
+    \item A restart mid-window resumes without double-counting: internal exactly-once demonstrated.
+\end{itemize}
+
+\section{Friday Use Case: The Dashboard That Lied About Late Mobile Data}
+\index{use case!late mobile events}
+A gaming company's daily-engagement dashboard under-reports by up to 8\% every morning and ``catches up'' over the day. Investigation: mobile clients buffer events while offline and flush them hours later. The current job uses processing-time tumbling windows. Walk the failure and the fix.
+
+\subsection{The Failure Chain}
+Processing-time windows file a flushed event in the window of \emph{arrival}, not occurrence. An offline phone's afternoon activity arrives at midnight and counts as midnight activity. Worse, the downstream daily aggregation reads each window once, so late data changes nothing already reported. The dashboard is not wrong because of a bug; it is wrong because the time semantics of the job do not match the question.
+
+\subsection{The Fix}
+\begin{itemize}
+    \item \textbf{Event time.} Rebuild windows on the client-side event timestamp with a watermark reflecting realistic delivery (say, \texttt{- INTERVAL '2' MINUTE} for the online majority).
+    \item \textbf{Allowed lateness.} Permit windows to accept late events for a bounded period (e.g., 24 hours), re-firing with corrected counts---downstream must therefore handle \emph{updates}, which pushes the sink toward upsert-by-window-key rather than append.
+    \item \textbf{Side output.} Events later than the allowed lateness route to a side output (S3 prefix), where a daily batch correction reconciles them into the warehouse---the streaming job stays honest about its bound, and the batch layer owns the long tail.
+    \item \textbf{Metric honesty.} Publish a ``lateness distribution'' metric so the business sees how much of yesterday arrived late, instead of silently believing the first number.
+\end{itemize}
+
+\subsection{Exactly-Once, End to End}
+The corrected job writes window results keyed by \texttt{(window\_start, window\_end, page)}. With an upsert sink, re-fires are safe and exactly-once effects are achieved idempotently; with a transactional sink (two-phase commit to Kafka or the S3 file sink), results appear only on checkpoint completion. The team chose idempotent upserts: their sink (Redshift via a merge step) could not transact with Flink, and dedup-by-key made the pipeline correct \emph{and} simpler.
+
+\begin{pitfall}
+\textbf{Refiring windows into an append-only sink.} The moment allowed lateness lets a window emit twice, an append-only downstream has duplicates forever. Late-correcting streams require sinks that can update---upserts, transactions, or a reconciling batch layer. Choose the sink semantics before enabling refires.
+\end{pitfall}
+
+\section{Interview Q\&A}
+\subsection{Concepts and Trade-offs}
+\begin{enumerate}
+    \item \textbf{Q: Why does unbounded keyed state eventually kill a streaming job?}\\
+    A: State grows until checkpoints are too large to complete, restores take minutes to hours, and RocksDB spills beyond local disk. Every stateful operator needs a bound: window end, join interval, or TTL.
+    \item \textbf{Q: Checkpoint versus savepoint: which do you trigger before a redeployment, and why?}\\
+    A: A savepoint. Checkpoints are for automatic failure recovery and may be discarded or incompatible with a changed operator graph; a savepoint is a manual, stable, portable snapshot your new code restores from.
+    \item \textbf{Q: In a stream--stream interval join, what bounds how long join state is retained?}\\
+    A: The interval predicate plus the watermarks on both inputs: once the watermark passes the interval's reach, the state can never match again and is dropped.
+    \item \textbf{Q: Which two components combine for end-to-end exactly-once delivery to Kafka or S3?}\\
+    A: Checkpointing (internal state consistency) plus a transactional or two-phase-commit sink that only makes results visible on checkpoint completion---or an idempotent sink achieving the same effect by key.
+    \item \textbf{Q: When is at-least-once plus downstream dedup preferred over exactly-once?}\\
+    A: When the sink cannot participate in transactions, when throughput outweighs strictness, or when a dedup key already exists naturally. It is simpler, often faster, and honest about its semantics.
+    \item \textbf{Q: What does a watermark actually assert?}\\
+    A: ``No event older than this timestamp will arrive''---a heuristic contract that drives window firing and state cleanup, trading result latency against tolerance for late data.
+\end{enumerate}
+
+\section{Further Reading}
+The Apache Flink documentation covers the DataStream API, Flink SQL, windows, watermarks, and state backends \cite{apacheFlinkDocs}; the Managed Service for Apache Flink guide covers deployment, snapshots, autoscaling, and connectors \cite{awsManagedFlinkDocs}. Akidau, Chernyak, and Lax's \emph{Streaming Systems} is the definitive treatment of the what/where/when/how model this chapter operationalizes \cite{akidauStreamingSystems}.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item Stream processing is computation with explicit time and state semantics; the model matters more than the framework dialect.
+    \item Event time answers business questions; processing time answers arrival questions; confusing them produces dashboards that lie politely.
+    \item Watermarks are the lateness contract---window firing, join bounds, and state cleanup all follow from them.
+    \item All state must be bounded: by window, by join interval, or by TTL. Unbounded state is a time bomb.
+    \item Checkpoints recover from failures; savepoints survive redeploys. Snapshot discipline is deployment discipline.
+    \item End-to-end exactly-once is a property of the whole path: checkpointed state plus transactional or idempotent sinks, with dedup as the honest fallback.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Explain why a processing-time window is ``never late'' and why that is precisely its flaw.
+    \item \textbf{(Conceptual)} Why does a sliding window multiply state compared with a tumbling window of the same size?
+    \item \textbf{(Hands-on)} Run the Thursday application; then set the watermark to \texttt{- INTERVAL '60' SECOND} and measure the change in window-fire latency.
+    \item \textbf{(Hands-on)} Add \texttt{ALLOWED\_LATENESS} (via the DataStream API or SQL equivalent) and an upsert sink; demonstrate a corrected re-fire.
+    \item \textbf{(Hands-on)} Implement the interval join from \cref{lst:ch15-interval-join} with a synthetic click/impression producer and verify attribution counts.
+    \item \textbf{(Design)} Design watermark and lateness policy for three event classes with different delivery characteristics (online clicks, offline mobile batches, server logs).
+    \item \textbf{(Design)} Specify the side-output and batch-reconciliation contract for events later than the allowed lateness.
+    \item \textbf{(Architecture)} The job must now survive a region evacuation. Which components (state, source offsets, sink commits) make cross-region continuity hard, and what is the design?
+\end{enumerate}
+
+\section{Capstone Project: A Late-Data-Tolerant Sessionization Pipeline}\label{sec:ch15-capstone}
+\index{capstone project}\index{Flink!capstone}
+
+\begin{capstonebox}
+\textbf{Mission.} Build a production-shaped sessionization pipeline: event-time session windows over a clickstream, watermark and lateness policy for offline mobile clients, bounded state with TTL, savepoint-disciplined deployment, and an idempotent sink---with metrics that tell the business how late the data is.
+
+\textbf{Estimated time.} 6--8 hours in a sandbox AWS account.
+
+\textbf{What you\textquotesingle{}ll practice.}
+\begin{itemize}
+    \item Session windows keyed per user with realistic watermarks.
+    \item Allowed lateness with an update-capable sink, plus a side output for the long tail.
+    \item State TTL and RocksDB configuration, observed through checkpoint metrics.
+    \item Savepoint-based redeployment without state loss.
+\end{itemize}
+\end{capstonebox}
+
+\subsection*{Scenario}
+The gaming company from Friday wants user sessions---gap-closed at 30 minutes---computed continuously for engagement analytics, tolerant of phones going offline for hours, and safe to redeploy weekly. The sink is Redshift, so updates and merges are on you.
+
+\subsection*{Requirements}
+\textbf{Functional requirements.}
+\begin{itemize}
+    \item Event-time session windows (30-minute gap) over a Kinesis clickstream, keyed by user.
+    \item A documented watermark policy and allowed lateness of 24 hours with an upsert sink into Redshift.
+    \item A side output for events beyond allowed lateness and a batch reconciliation sketch.
+    \item A lateness-distribution metric published to CloudWatch.
+\end{itemize}
+
+\textbf{Non-functional requirements.}
+\begin{itemize}
+    \item State is provably bounded: TTL configured, checkpoint size stable over a 24-hour soak.
+    \item A redeployment drill restores from a savepoint with zero loss and zero duplicates downstream.
+    \item Iterator age on the source stays bounded under a 3$\times$ load test.
+\end{itemize}
+
+\subsection*{Implementation Steps}
+\begin{enumerate}
+    \item Implement the sessionization job (DataStream API or SQL) with the watermark policy.
+    \item Implement the Redshift upsert sink keyed by \texttt{(user\_id, session\_start)}.
+    \item Add allowed lateness, the side output, and the lateness metric.
+    \item Configure RocksDB, TTL, and checkpointing; run the soak test.
+    \item Perform the savepoint redeployment drill and document every step.
+    \item Write the operations runbook: watermark stalls, backpressure, savepoint procedure.
+\end{enumerate}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item The application code, connector configuration, and watermark/lateness rationale.
+    \item Soak-test evidence: checkpoint size and iterator age over 24 hours.
+    \item The redeployment drill record with savepoint ARNs and downstream dedup verification.
+    \item The runbook and the business-facing lateness dashboard.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item Sessions are correct under injected offline-device lateness, verified against a batch reference computation.
+    \item Window corrections update Redshift in place---no duplicate sessions after refires.
+    \item State size plateaus during the soak; TTL expiry is visible in metrics.
+    \item The redeployment drill completes with documented proof of no loss and no duplicates.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Replace the upsert sink with a two-phase-commit path to Kafka and compare latency and complexity.
+    \item Add a second stream and implement the attribution interval join in the same application.
+    \item Simulate an idle shard and implement watermark idleness handling; document the before/after.
+    \item Autoscale under a load ramp and characterize KPU scaling lag against iterator age.
+\end{itemize}

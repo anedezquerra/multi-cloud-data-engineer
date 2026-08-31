@@ -1,0 +1,356 @@
+\chapter{Redshift Optimization and Performance Modeling}
+\index{Amazon Redshift!performance}\index{distribution style}\index{sort key}\index{compression encoding}\index{workload management}\index{concurrency scaling}\index{materialized views}%
+\begin{objectives}
+\begin{itemize}
+    \item Choose distribution styles (EVEN, KEY, ALL, AUTO) that minimize data movement for join-heavy workloads.
+    \item Distinguish compound and interleaved sort keys, select compression encodings, and reason about zone-map pruning.
+    \item Configure workload management (WLM), concurrency scaling, and query monitoring rules for mixed BI workloads.
+    \item Decide when a materialized view beats a plain view or a dashboard-level cache.
+    \item Benchmark table designs empirically and diagnose CPU bottlenecks in daily aggregation workloads.
+    \item Re-architect a poorly performing multi-terabyte analytics table using distribution, sorting, and pre-aggregation.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+Every analytical engine faces the same physical problem---move less data, read less data, schedule work fairly---but each platform exposes different levers.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{2.8cm}p{3.0cm}p{3.0cm}p{3.0cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{AWS} & \textbf{Azure} & \textbf{GCP} \\
+\midrule
+Data distribution & DISTSTYLE EVEN/KEY/ALL & Synapse hash/round-robin/replicated & Automatic (BigQuery) \\
+Sort optimization & SORTKEY (compound/interleaved) & Clustered columnstore index & Clustering columns \\
+Result pre-computation & Materialized views & Materialized views / semantic models & Materialized views \\
+Workload governance & WLM + query monitoring rules & Workload groups / classifiers & Reservations \& slots \\
+Burst concurrency & Concurrency scaling & Scale-out / serverless burst & Autoscaling slots \\
+\addlinespace
+Manual tuning burden & Medium (AUTO helps) & Medium-high & Low (mostly automatic) \\
+Skew diagnosis & SVV\_TABLE\_INFO & DMVs & Query plan explanation \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+\textbf{Snowflake} removes most physical design levers---micro-partition pruning is automatic, and clustering keys are optional---trading control for operational simplicity. \textbf{Fabric} warehouse and lakehouse inherit SQL Server-style distribution choices on dedicated capacity. \textbf{MongoDB} offers a different instrument entirely: indexes and shard keys rather than distribution styles, because its workload is point lookups, not scans.
+\end{crosscloud}
+
+\section{Week 6 Roadmap and Mental Model}
+Chapter~5 built a correctly modeled warehouse; this chapter makes it fast. Redshift performance work reduces to three questions. Where does each row physically sit---\emph{distribution}? In what physical order is it stored---\emph{sorting}? And who gets compute when demand exceeds supply---\emph{workload management}? Everything else---compression, materialized views, concurrency scaling---is a refinement of those three \cite{awsRedshiftPerfTuning}.
+
+The discipline that separates professional tuning from superstition is measurement. Every recommendation in this chapter is testable: create the table two ways, run the query both ways, compare \texttt{SVL\_QUERY\_SUMMARY} and the execution plan. The Thursday project institutionalizes that discipline with a controlled distribution-style experiment.
+
+\begin{definitionbox}
+\textbf{Physical design} in Redshift is the choice of distribution style, distribution key, sort key, and compression encoding per table. These choices determine how much data moves across the cluster interconnect during joins, how many blocks zone maps can skip during scans, and how much I/O compression saves.
+\end{definitionbox}
+
+\begin{keyterms}
+\textbf{Distribution style}: rule placing rows on slices (EVEN, KEY, ALL, AUTO). \textbf{Distribution skew}: uneven row counts across slices. \textbf{Sort key}: column list controlling on-disk row order; compound or interleaved. \textbf{Zone map}: per-block min/max metadata enabling block skipping. \textbf{WLM}: workload management; queues, service classes, and routing rules. \textbf{Concurrency scaling}: automatic transient capacity added for queued queries. \textbf{Materialized view}: precomputed query result stored as a table and refreshed on demand or automatically.
+\end{keyterms}
+
+\section{Monday: Distribution Styles}
+\subsection{The Four Styles}
+Redshift places each row on one slice according to the table's distribution style \cite{awsRedshiftDocs}:
+\begin{itemize}
+    \item \textbf{KEY}: rows are hashed on the distribution key column; equal keys land on the same slice. Two large tables distributed on their join key \emph{collocate} the join---no data crosses the network.
+    \item \textbf{EVEN}: rows round-robin across slices regardless of content. Balanced, but every join redistributes one or both sides.
+    \item \textbf{ALL}: the entire table is copied to every node. Expensive in storage and load time, but joins against it never move data. Reserved for small, slowly changing dimensions.
+    \item \textbf{AUTO}: Redshift picks and evolves the style based on table size and query patterns---usually ALL for small tables and EVEN or KEY as tables grow. The right default for most tables.
+\end{itemize}
+\index{distribution style}\index{KEY distribution}\index{EVEN distribution}\index{ALL distribution}\index{AUTO distribution}\index{collocated join}
+
+\begin{definitionbox}
+\textbf{A collocated join} joins two tables distributed on the same key, so matching rows already share a slice and no data crosses the cluster interconnect. Collocation is the single largest join-performance lever in Redshift.
+\end{definitionbox}
+
+\subsection{Choosing the Distribution Key}
+Pick the column most frequently used to join the table to its largest partner---for \texttt{fact\_sales}, typically \texttt{customer\_key} or \texttt{date\_key} depending on the dominant join. The key must also have high cardinality and even value distribution: distributing on a low-cardinality or skewed column (a boolean flag, a region with 90\% of rows in one value) concentrates rows on a few slices, and the slowest slice determines query time. Check skew with \texttt{SVV\_TABLE\_INFO} and the \texttt{stv\_blocklist}-based admin views.
+\index{distribution key}\index{data skew}
+
+\begin{pitfall}
+\textbf{Distributing on a timestamp or an ever-increasing key.} High-cardinality does not imply good distribution if the column is never used in joins. The distribution key exists to collocate joins; if no join uses it, you have paid skew risk for nothing. Use EVEN instead.
+\end{pitfall}
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{2.4cm}p{4.6cm}p{5.4cm}@{}}
+\toprule
+\textbf{Style} & \textbf{Use it when} & \textbf{Risk to watch} \\
+\midrule
+KEY & Large fact/dimension pairs join on the key & Skewed or low-cardinality keys; key never used in joins \\
+EVEN & No dominant join column; staging tables & Every large join redistributes data \\
+ALL & Small dimensions (thousands of rows) joined everywhere & Storage and load cost per node; slow updates \\
+AUTO & Default; tables whose size or usage is evolving & Occasionally surprises after major growth; verify with the plan \\
+\bottomrule
+\end{tabular}
+\caption{Distribution-style selection guide.}
+\label{tab:ch6-dist-styles}
+\end{table}
+
+\section{Tuesday: Sort Keys and Compression Encodings}
+\subsection{Compound Versus Interleaved}
+A sort key orders rows on disk, which lets zone maps skip blocks when queries filter on leading sort columns. \textbf{Compound} sort keys behave like a phone book: excellent for filters on a prefix of the key (\texttt{date}, then \texttt{date+region}), useless for a filter that skips the leading column. They are the right choice for the common case of a date-ordered fact table. \textbf{Interleaved} sort keys give every column in the key roughly equal weight, helping workloads whose queries filter on unpredictable column combinations---at the cost of slower loads and vacuum operations. Interleaved keys are a legacy tool for genuinely varied access; start with compound.
+\index{sort key}\index{compound sort key}\index{interleaved sort key}\index{zone map}
+
+\begin{notebox}
+Modern Redshift with \texttt{SORTKEY AUTO} continuously learns the workload's filter patterns and adjusts. Manual sort keys remain worth understanding for the exam and for tables whose access pattern you know better than the optimizer does---and because you must explain \emph{why} a table is slow before you can trust automation to fix it.
+\end{notebox}
+
+\subsection{Compression Encodings}
+Each column gets an encoding---\texttt{raw}, \texttt{az64}, \texttt{lz4}, \texttt{delta}, \texttt{runlength}, and dictionary-style encodings among them. Encoding reduces storage and, more importantly, I/O: scanning a compressed column reads fewer blocks. COPY applies automatic compression analysis on first load; \texttt{ANALYZE COMPRESSION} reports what it chose. Two rules matter in practice: never compress the first sort-key column so aggressively that zone-map range comparison suffers (historically the guidance was \texttt{raw} on the leading sort column; current \texttt{az64} handles this well), and let automation run unless measurements disagree.
+\index{compression encoding}\index{az64}\index{ANALYZE COMPRESSION}
+
+\section{Wednesday: WLM, Concurrency Scaling, and Materialized Views}
+\subsection{Workload Management}
+WLM divides cluster capacity into queues (automatic WLM manages them as service classes) so that a runaway ad-hoc query cannot starve the executive dashboard \cite{awsRedshiftWLM}. Automatic WLM routes queries by user, role, or query group, assigns memory dynamically, and supports \emph{query monitoring rules}---for example, abort any query scanning more than a set number of rows or running longer than a threshold. Short Query Acceleration (SQA) automatically bumps genuinely short queries past long-running ones.
+\index{workload management}\index{WLM}\index{query monitoring rules}\index{short query acceleration}
+
+\begin{tipbox}
+Read WLM telemetry before changing WLM. Rising queue wait time means demand exceeds the capacity you have allocated to that workload class: either add concurrency scaling, raise the class's memory share, or make the queries cheaper. Guessing at queue counts without the wait-time data usually moves the bottleneck rather than removing it.
+\end{tipbox}
+
+\subsection{Concurrency Scaling}
+When queued queries pile up, concurrency scaling spins up transient, read-only capacity automatically, billed per second with a daily free allowance \cite{awsRedshiftWLM}. It exists for exactly the BI-dashboard pattern: fifty analysts hit refresh at 9:05~a.m. Enable it on the service classes that serve bursty read traffic, set usage limits so the burst is bounded, and remember that writes never use concurrency-scaling clusters.
+\index{concurrency scaling}
+
+\subsection{Materialized Views}
+A materialized view (MV) stores a precomputed query result \cite{awsRedshiftMVs}. Unlike a plain view---which is re-executed on every reference---an MV trades storage and refresh cost for query speed. MVs shine for the repeated, expensive aggregations that power dashboards: define \texttt{mv\_monthly\_sales} once, refresh after each load, and let a hundred dashboard queries scan a tiny pre-aggregated table. Redshift supports automatic and incremental refresh and can rewrite eligible queries against MVs automatically.
+
+\begin{lstlisting}[language=SQL,caption={Materialized view for a repeated month-end aggregation.},label={lst:ch6-mv}]
+CREATE MATERIALIZED VIEW mv_monthly_sales AS
+SELECT d.year, d.month, p.category, st.region,
+       SUM(f.amount) AS revenue,
+       SUM(f.qty)    AS units
+FROM fact_sales f
+JOIN dim_date d     ON f.date_key = d.date_key
+JOIN dim_product p  ON f.product_key = p.product_key
+JOIN dim_store st   ON f.store_key = st.store_key
+GROUP BY 1, 2, 3, 4;
+
+REFRESH MATERIALIZED VIEW mv_monthly_sales;
+\end{lstlisting}
+
+\begin{pitfall}
+\textbf{A materialized view per dashboard.} Each MV costs storage and refresh compute, and stale MVs answer yesterday's questions convincingly. Consolidate on a few shared, conformed MVs with a documented refresh schedule wired to the ETL calendar.
+\end{pitfall}
+
+\section{Thursday Hands-on Project: Benchmarking Distribution Styles}
+\index{hands-on project!distribution-style benchmark}
+Theory says KEY distribution collocates joins and avoids redistribution. This project proves it---and measures the size of the effect---by creating three identical fact tables with different distribution styles and timing the same complex join against each.
+
+\subsection*{Lab Objectives}
+\begin{itemize}
+    \item Create three copies of a large fact table with DISTSTYLE KEY, EVEN, and ALL.
+    \item Run an identical join-heavy aggregation against each and record elapsed time.
+    \item Inspect the query plan to confirm redistribution (\texttt{DS\_DIST\_OUTER} / broadcast steps) versus collocation.
+    \item Measure storage and load-time cost of ALL distribution.
+\end{itemize}
+
+\subsection*{Procedure}
+Use the Chapter~5 workgroup and a dimension large enough that redistribution is visible---regenerate \texttt{dim\_customer} with 500{,}000 rows if needed. Create the three experimental tables:
+
+\begin{lstlisting}[language=SQL,caption={Three identical tables, three distribution styles.},label={lst:ch6-bench-tables}]
+-- Baseline copy of the fact with KEY distribution on the join column
+CREATE TABLE bench_fact_key DISTSTYLE KEY DISTKEY (customer_key) SORTKEY (date_key)
+AS SELECT * FROM fact_sales;
+
+CREATE TABLE bench_fact_even DISTSTYLE EVEN SORTKEY (date_key)
+AS SELECT * FROM fact_sales;
+
+-- ALL is only meaningful for the small side; demonstrate with dim_store
+CREATE TABLE bench_store_all DISTSTYLE ALL AS SELECT * FROM dim_store;
+
+ANALYZE bench_fact_key;
+ANALYZE bench_fact_even;
+ANALYZE bench_store_all;
+\end{lstlisting}
+
+Run the benchmark query three times per table to warm caches, then record three timed runs. Wrap the timing in a script so results are comparable.
+
+\begin{lstlisting}[language=SQL,caption={Benchmark query and plan inspection.},label={lst:ch6-bench-query}]
+-- Time this identical aggregation against bench_fact_key and bench_fact_even
+\timing on
+SELECT c.segment, SUM(f.amount) AS revenue
+FROM bench_fact_key f          -- or bench_fact_even
+JOIN dim_customer c ON f.customer_key = c.customer_key
+WHERE c.is_current
+GROUP BY 1 ORDER BY 2 DESC;
+
+-- Inspect how data moved during execution:
+EXPLAIN
+SELECT c.segment, SUM(f.amount)
+FROM bench_fact_even f
+JOIN dim_customer c ON f.customer_key = c.customer_key
+WHERE c.is_current
+GROUP BY 1;
+
+-- Compare skew and storage across the three tables:
+SELECT "table", size, tbl_rows, skew_rows
+FROM svv_table_info
+WHERE "table" LIKE 'bench%' ORDER BY "table";
+\end{lstlisting}
+
+In the EVEN plan you should see redistribution steps (\texttt{DS\_DIST\_OUTER} or broadcast); the KEY plan joins collocated slices with no such step. Expect the KEY join to win by a margin that grows with table size---on small Serverless workgroups with ten million rows the difference may be modest; that is itself a finding worth recording.
+
+\subsection*{Verification}
+\begin{itemize}
+    \item A results table records three timed runs per style with the mean and the plan's distribution steps.
+    \item \texttt{svv\_table\_info} output shows roughly even slice distribution for the KEY and EVEN tables and the multiplied row count of the ALL table.
+    \item The report states a rule, derived from the measurements, for when this workload should use each style.
+\end{itemize}
+
+\begin{tipbox}
+Flush result caching between runs by varying an insignificant query comment or disabling the result cache for the session (\texttt{SET enable\_result\_cache\_for\_session = off;}), or your second run will measure the cache, not the engine.
+\end{tipbox}
+
+\section{Friday Use Case: Rescuing a Slow Multi-Petabyte Aggregation Table}
+\index{use case!warehouse performance rescue}
+A media company's central events table has grown past two petabytes of compressed storage. Daily dashboard aggregations that once took minutes now run for hours, pinning compute CPU near 100\% every morning and queuing every other workload behind them. You are asked to re-architect the table and the workload.
+
+\subsection{Diagnosis First}
+The engagement starts with evidence, not redesign. \texttt{SVL\_QUERY\_SUMMARY} shows the daily aggregation scans the full table; \texttt{svv\_table\_info} shows 40\% distribution skew on a \texttt{region} distribution key; the table has no sort key, so zone maps are useless; and the same aggregation runs 300 times a day from three dashboard tools---which no physical design will ever make cheap.
+
+\subsection{The Re-architecture}
+\textbf{Distribution.} The dominant join is to the customer dimension; redistribute the fact on \texttt{customer\_key} to collocate it. The skew came from distributing on \texttt{region}, a four-value column---an error the diagnosis makes obvious in hindsight.
+
+\textbf{Sorting.} Add a compound sort key on (\texttt{event\_date}, \texttt{event\_type}); every daily aggregation filters on \texttt{event\_date}, and zone-map pruning now skips roughly 364/365 of the blocks.
+
+\textbf{Pre-aggregation.} Replace the 300 identical daily scans with one materialized view refreshed after the nightly load. Dashboards query the MV; the two-petabyte scan happens once, not three hundred times.
+
+\textbf{Workload isolation.} Route ad-hoc queries and dashboard queries to separate WLM service classes with a query monitoring rule that aborts unbounded scans, and enable concurrency scaling for the dashboard class so the morning burst stops queuing.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{4.4cm}p{4.2cm}p{4.4cm}@{}}
+\toprule
+\textbf{Finding} & \textbf{Fix} & \textbf{Expected effect} \\
+\midrule
+40\% skew on \texttt{region} DISTKEY & Redistribute on \texttt{customer\_key} & Slowest-slice time drops to the average \\
+No sort key; full scans daily & Compound SORTKEY(date, type) & Zone maps skip $\sim$99\% of blocks \\
+300 identical aggregations/day & One shared materialized view & Scan cost divided by $\sim$300 \\
+Everything in one WLM class & Split classes + monitoring rule & Dashboards isolated from ad-hoc abuse \\
+Morning queue spikes & Concurrency scaling on BI class & Burst absorbed without resize \\
+\bottomrule
+\end{tabular}
+\caption{From diagnosis to design: each fix maps to a measured symptom.}
+\label{tab:ch6-rescue}
+\end{table}
+
+\begin{pitfall}
+\textbf{Optimizing the query when the workload is the problem.} No distribution style makes scanning two petabytes three hundred times a day cheap. When the same expensive query recurs at scale, the architectural answer is pre-computation (materialized views, summary tables), not more tuning of the scan.
+\end{pitfall}
+
+\section{Interview Q\&A}
+\subsection{Concepts and Trade-offs}
+\begin{enumerate}
+    \item \textbf{Q: Which distribution style avoids data movement when joining two large tables?}\\
+    A: KEY distribution on the join column for both tables. Matching rows share a slice, so the join is collocated and nothing crosses the interconnect.
+    \item \textbf{Q: Compound versus interleaved sort keys: which suits varied filter-column combinations?}\\
+    A: Interleaved---each column in the key carries roughly equal weight. Compound keys only help filters on a prefix of the key, which suits the far more common date-ordered access pattern.
+    \item \textbf{Q: What problem does concurrency scaling solve for BI dashboards?}\\
+    A: Bursty read demand that exceeds steady capacity---fifty analysts refreshing at once. Transient read-only clusters absorb the burst without a resize, billed per second.
+    \item \textbf{Q: When does a materialized view beat a plain view?}\\
+    A: When the same expensive aggregation is run repeatedly and results can tolerate the refresh cadence---classic dashboard workloads. A plain view re-executes the full query every time.
+    \item \textbf{Q: What does rising queue wait time in WLM tell you to change?}\\
+    A: Capacity for that workload class: enable concurrency scaling, adjust service-class memory, reduce query cost with sort keys or MVs, or throttle demand. Wait time is demand exceeding supply, not a query bug.
+    \item \textbf{Q: Why is ALL distribution dangerous for a large table?}\\
+    A: Every node stores a full copy: storage multiplies by node count, loads and updates rewrite every copy, and the benefit---collocated joins---rarely justifies that cost beyond small dimensions.
+\end{enumerate}
+
+\section{Further Reading}
+The Redshift performance tuning guide is the authoritative reference for distribution, sort keys, and query plan analysis \cite{awsRedshiftPerfTuning}; the workload management documentation covers automatic WLM, query monitoring rules, and concurrency scaling \cite{awsRedshiftWLM}; and the materialized views documentation covers refresh strategies and automatic query rewrite \cite{awsRedshiftMVs}. The Database Developer Guide documents the system views used in this chapter's diagnostics \cite{awsRedshiftDocs}. Kimball and Ross discuss aggregate tables---the dimensional ancestor of the materialized view---as a first-class design element \cite{kimballDWToolkit}.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item Distribution decides where rows sit: KEY collocates joins, EVEN balances scans, ALL replicates small dimensions, AUTO is the safe default.
+    \item Distribution skew and a join-free DISTKEY are the two classic distribution mistakes; both are visible in \texttt{svv\_table\_info} and the query plan.
+    \item Compound sort keys plus zone maps turn date-filtered scans into block-skipping exercises; interleaved keys are a niche tool for unpredictable filter combinations.
+    \item WLM routes and protects workloads; concurrency scaling absorbs read bursts; monitoring rules stop runaway queries.
+    \item Materialized views convert repeated expensive aggregation into refresh-once, read-many economics.
+    \item Tune from measurement: benchmark competing designs, read the plan, and let each fix map to a diagnosed symptom.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Explain why the slowest slice determines total query time when distribution is skewed.
+    \item \textbf{(Conceptual)} A fact table joins a different dimension in nearly every query. Which distribution style do you choose, and why?
+    \item \textbf{(Hands-on)} Run the Thursday benchmark and add a fourth variant: KEY distribution on \texttt{date\_key}. Predict the result before running it, then explain the measurement.
+    \item \textbf{(Hands-on)} Use \texttt{EXPLAIN} output to count redistribution steps for each benchmark table and correlate step count with elapsed time.
+    \item \textbf{(Hands-on)} Create the materialized view from \cref{lst:ch6-mv}, refresh it, and measure a dashboard-style query against it versus the base tables.
+    \item \textbf{(Design)} A table receives continuous small inserts and nightly large loads. Discuss how sort-key choice, vacuum strategy, and load order interact.
+    \item \textbf{(Design)} Write query monitoring rules for (a) the ad-hoc analyst class and (b) the nightly ETL user. Justify each threshold.
+    \item \textbf{(Architecture)} The Friday scenario's company grows to ten petabytes. Which of the five fixes scale, which need revisiting, and what new problem appears first?
+\end{enumerate}
+
+\section{Capstone Project: A Measured Performance Benchmark Harness for Redshift}\label{sec:ch6-capstone}
+\index{capstone project}\index{Redshift!performance capstone}
+
+\begin{capstonebox}
+\textbf{Mission.} Build a repeatable benchmarking harness that creates multiple physical designs of the same star schema, executes a standardized query workload against each, and produces an evidence-backed physical-design recommendation for a realistic BI workload.
+
+\textbf{Estimated time.} 3--5 hours in a sandbox AWS account.
+
+\textbf{What you\textquotesingle{}ll practice.}
+\begin{itemize}
+    \item Distribution and sort-key selection driven by measurement rather than folklore.
+    \item Plan reading: redistribution steps, zone-map elimination, and skew metrics.
+    \item WLM configuration and concurrency-scaling observation under a burst.
+    \item Materialized-view consolidation for repeated dashboard aggregations.
+\end{itemize}
+\end{capstonebox}
+
+\subsection*{Scenario}
+Your Chapter~5 retail warehouse is a success---which is the problem. Analyst headcount tripled, the events table doubled, and the CFO wants to know whether next year's warehouse bill should grow. Before any capacity purchase, you must prove which physical design and workload-management configuration serves the current workload most cheaply.
+
+\subsection*{Requirements}
+\textbf{Functional requirements.}
+\begin{itemize}
+    \item Automate creation of at least four physical variants of the fact table: KEY on \texttt{customer\_key}, KEY on \texttt{date\_key}, EVEN, and AUTO, each with and without a compound sort key.
+    \item Execute a standardized six-query workload (three joins, two aggregations, one filtered scan) three times per variant with result caching disabled.
+    \item Record elapsed time, redistribution steps, and rows scanned per query per variant.
+    \item Create one shared materialized view for the workload's repeated aggregation and measure its effect.
+\end{itemize}
+
+\textbf{Non-functional requirements.}
+\begin{itemize}
+    \item The harness is rerunnable from a clean schema and produces a results table, not screenshots alone.
+    \item A short written recommendation maps every design choice to a measured effect.
+    \item Cost guardrails: a query monitoring rule aborts any benchmark query exceeding a stated row-scan threshold.
+\end{itemize}
+
+\subsection*{Implementation Steps}
+\begin{enumerate}
+    \item Script the variant DDL as parameterized SQL (psql variables or a Python driver) so variants differ only in physical design.
+    \item Load each variant from the same staging table with \texttt{INSERT ... SELECT}, then \texttt{ANALYZE} all variants.
+    \item Run the workload with \texttt{SET enable\_result\_cache\_for\_session = off;} and capture timings into a \texttt{bench\_results} table.
+    \item Capture \texttt{EXPLAIN} plans per variant and tag redistribution steps.
+    \item Create and refresh the shared MV; rerun the aggregation queries against it.
+    \item Write the recommendation: winning design, expected monthly compute saving, and residual risks.
+\end{enumerate}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item The harness scripts, results table DDL, and the raw measurement data.
+    \item A comparison table of variants with mean elapsed time and redistribution step counts.
+    \item Annotated \texttt{EXPLAIN} excerpts showing collocation versus redistribution.
+    \item The materialized-view effect analysis and the final written recommendation.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item Variants differ only in physical design; data volume and query text are identical.
+    \item Every reported number is the mean of at least three uncached runs.
+    \item The recommendation cites \texttt{svv\_table\_info} skew metrics and plan evidence.
+    \item The MV analysis states refresh cost, not just query speedup.
+    \item The cost guardrail fired at least once during testing and the event is documented.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Repeat the benchmark at 10$\times$ data volume and identify which conclusions change.
+    \item Simulate the morning dashboard burst with fifty concurrent clients (e.g., \texttt{pgbench} or a Python thread pool) and observe concurrency scaling in the console.
+    \item Enable \texttt{AUTO} table optimization on all variants for a week and compare its choices with yours.
+    \item Port the harness to compare Redshift Serverless base capacities of 8, 32, and 128 RPUs on price-performance.
+\end{itemize}

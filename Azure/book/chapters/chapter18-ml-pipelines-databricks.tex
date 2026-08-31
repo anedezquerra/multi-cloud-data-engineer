@@ -1,0 +1,293 @@
+\chapter{Machine Learning Pipelines with Azure ML and Databricks}
+\index{Azure Machine Learning}\index{AML pipeline}\index{AutoML}\index{compute cluster}\index{managed feature store}\index{MLOps}%
+\begin{objectives}
+\begin{itemize}
+    \item Navigate the Azure Machine Learning workspace: studio, compute instances, compute clusters, datastores, and environments.
+    \item Choose among AutoML, the Designer, and custom notebooks for a given team and problem.
+    \item Register ADLS Gen2 data via datastores secured with the workspace managed identity.
+    \item Build an AML pipeline from versioned components---preprocess, train, evaluate, register---and execute it from the Python SDK.
+    \item Register features in the managed feature store so training and serving share one definition.
+    \item Integrate Databricks for heavy feature computation feeding AML training.
+    \item Design a secure workflow for data scientists training PyTorch models on GPU clusters over governed lake data.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+Managed ML platforms share a universal anatomy: a workspace, versioned data references, reusable environments, pipeline components, and a model registry.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{3.0cm}p{2.9cm}p{3.1cm}p{3.2cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{AWS} & \textbf{Azure} & \textbf{GCP} \\
+\midrule
+ML platform & SageMaker & Azure Machine Learning & Vertex AI \\
+AutoML & SageMaker Autopilot & Azure AutoML & Vertex AutoML \\
+Pipelines & SageMaker Pipelines & AML pipelines (components) & Vertex Pipelines (Kubeflow) \\
+Feature store & SageMaker Feature Store & AML managed feature store & Vertex AI Feature Store \\
+Model registry & SageMaker Model Registry & AML Model Registry & Vertex Model Registry \\
+Notebook compute & Studio notebooks & Compute instances & Workbench instances \\
+\addlinespace
+\multicolumn{4}{@{}l@{}}{\textbf{Fabric}: built-in ML with MLflow on lakehouses; \textbf{Snowflake}: Snowpark ML; \textbf{MongoDB}: partner MLOps over Atlas.} \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+MLflow is the lingua franca underneath: AML, Databricks, and Fabric all track experiments with it, so experiment-tracking skills transfer even where the platform does not.
+\end{crosscloud}
+
+\begin{keyterms}
+\textbf{Workspace}: the AML management boundary---compute, data, experiments, models, endpoints.\quad
+\textbf{Compute instance}: a managed single-node development VM; \textbf{compute cluster}: autoscaling multi-node training compute.\quad
+\textbf{Environment}: a versioned, reproducible software context (Docker image plus conda/pip spec).\quad
+\textbf{Component}: a reusable, versioned pipeline step with declared inputs, outputs, and environment.\quad
+\textbf{Datastore}: a registered, credential-managed reference to storage such as ADLS Gen2.
+\end{keyterms}
+
+\section{Week 18 Overview: The ML Platform Layer}
+Chapter 17 embedded a trained model into SQL. Chapters 18--19 build the platform that produces, ships, and watches such models continuously. Azure Machine Learning is that platform: a workspace unifying compute, data access, experiment tracking, pipelines, a model registry, and endpoints \cite{microsoft2025azureml}. Databricks remains in the picture where it belongs---heavy feature computation over the lake---with AML owning training orchestration, registration, and serving.
+
+The discipline of the week is \emph{reproducibility through versioning}: versioned data assets, versioned environments, versioned components, versioned models. A pipeline built from versioned pieces can answer the only question that matters when a model misbehaves in production: \emph{exactly what produced this artifact?}
+
+\section{Monday: Workspace, Compute, and Data Access}
+\index{Azure Machine Learning!workspace}\index{compute cluster}
+
+\subsection{Compute Instances vs.\ Compute Clusters}
+The \textbf{compute instance} is a per-developer managed VM for notebooks---always-on, single-node, your desk in the cloud. The \textbf{compute cluster} is the training fleet: autoscaling, multi-node, GPU-capable, and---critically---\emph{able to scale to zero}. The cost rule mirrors Chapter 9's job clusters: development on instances, training on clusters, and a zero minimum node count so idle time bills nothing.
+
+\subsection{Datastores and Managed Identity}
+A datastore registers ADLS Gen2 (or other storage) in the workspace. Register it with the workspace's \textbf{managed identity} and grant that identity \texttt{Storage Blob Data Reader} on the lake: training jobs then read governed data with no keys, no service-principal secrets, and an auditable identity \cite{microsoft2025rbac}. Data assets---named, versioned references over datastore paths---give pipelines stable inputs (\texttt{azureml:features:3}) even as the underlying folders change.
+
+\begin{pitfall}
+\textbf{Notebook-mounted storage with personal credentials.} A datastore with a personal account key in a notebook bypasses every governance control the lake has and dies when the person changes roles. Managed-identity datastores are the only production pattern.
+\end{pitfall}
+
+\section{Tuesday: AutoML, Designer, or Custom Code}
+\index{AutoML}\index{Azure ML Designer}
+
+\subsection{The Three Authoring Modes}
+\textbf{AutoML} sweeps algorithms and hyperparameters against a dataset and metric, producing a ranked leaderboard with explainability---the right tool for baselines and for teams establishing ``how hard is this problem, really.'' The \textbf{Designer} composes drag-and-drop pipelines from modules---accessible, but its artifacts are the least code-reviewable of the three. \textbf{Custom notebooks and components} give full control (PyTorch, custom losses, exotic features) at full responsibility. The mature pattern uses AutoML to set the baseline bar and custom components to beat it; a custom model that cannot beat AutoML's leaderboard entry has not earned its complexity.
+
+\subsection{The Thursday Preview: AutoML to Endpoint in One Afternoon}
+The fastest path through the platform: point AutoML at a registered data asset, let it sweep, deploy the best run to a \textbf{managed online endpoint}, and test with a REST payload. This is Week 18's original project, and it remains the fastest way to establish the end-to-end skeleton (data asset $\rightarrow$ trained model $\rightarrow$ registered model $\rightarrow$ endpoint) before replacing the middle with your own pipeline.
+
+\section{Wednesday: AML Pipelines---Components and Environments}
+\index{AML pipeline}\index{component}\index{environment}
+
+\subsection{Pipelines from Versioned Parts}
+An AML pipeline is a DAG of \textbf{components} \cite{microsoft2025amlPipelines}. Each component declares inputs, outputs, a command, and an \textbf{environment}; each is versioned independently and reused across pipelines. Environments pin the software world (base image plus dependencies) so a pipeline that ran in March reproduces in October. The canonical pipeline shape is Preprocess $\rightarrow$ Train $\rightarrow$ Evaluate $\rightarrow$ (conditionally) Register.
+
+\begin{lstlisting}[language=Python,caption={An AML pipeline assembled from registered components via the v2 SDK.},label={lst:ch18-pipeline}]
+from azure.ai.ml import dsl, Input
+from azure.ai.ml.entities import Environment
+
+env = Environment(
+    name="churn-env", version=3,
+    image="mcr.microsoft.com/azureml/openmpi4.1.0-ubuntu22.04",
+    conda_file="conda.yml",
+)
+
+@dsl.pipeline()
+def churn_pipeline(raw: Input):
+    prep  = preprocess_component(input_data=raw)
+    train = train_component(train_data=prep.outputs.clean)
+    eval_ = evaluate_component(model=train.outputs.model,
+                               test_data=prep.outputs.test)
+    return {"model": train.outputs.model}
+
+ml_client.jobs.create_or_update(
+    churn_pipeline(raw=Input(path="azureml:features:1")))
+\end{lstlisting}
+
+\subsection{The Managed Feature Store}
+AML's managed feature store operationalizes Chapter 17's contract: feature sets are versioned, materialized to offline (lake) and online (cache) stores, and carry point-in-time-correct retrieval for training-set assembly. Features stop being notebook-local code and become cataloged, monitored assets with owners---the ML counterpart of the medallion gold zone.
+
+\subsection{Databricks in the Picture}
+Where feature computation is heavy---sessionization over billions of events, graph features---Databricks does the work on the lake and writes the feature tables; AML pipelines then consume them as data assets. The boundary rule: Databricks owns \emph{feature materialization}, AML owns \emph{training orchestration and the registry}; the feature table in the governed lake is the contract between them.
+
+\section{Thursday Hands-on Project: Preprocess, Train, Evaluate, Register}
+\index{hands-on lab}\index{AML pipeline!project}
+Build the canonical AML pipeline from the Python SDK and execute it from a notebook: preprocess the churn features, train, evaluate, and register the model only if it clears a metric gate.
+
+\subsection{Provision the Workspace}
+\begin{lstlisting}[language=bash,caption={Workspace with a managed identity and a scale-to-zero training cluster.},label={lst:ch18-aml}]
+$rg = "rg-de-azure-book-week18"
+az group create --name $rg --location eastus
+az extension add --name ml
+az ml workspace create --name aml-week18 --resource-group $rg --location eastus
+
+az ml compute create --name cpu-cluster --resource-group $rg `
+  --workspace-name aml-week18 --type AmlCompute `
+  --size Standard_DS3_v2 --min-instances 0 --max-instances 4 `
+  --idle-time-before-scale-down 300
+\end{lstlisting}
+
+Register the ADLS datastore with the workspace managed identity and grant it read access to the feature container.
+
+\subsection{Author and Run the Pipeline}
+Define \texttt{preprocess}, \texttt{train}, and \texttt{evaluate} components (each a small script plus environment), assemble them as in Listing~\ref{lst:ch18-pipeline}, and submit. In the studio, inspect the pipeline graph, per-step logs, and the tracked metrics.
+
+\subsection{Gate Registration on a Metric}
+Extend the evaluate component to emit \texttt{auc}, and add a condition: register only when $\text{AUC} \ge 0.80$. Run once with a deliberately degraded feature set (drop the strongest feature) and confirm the gate blocks registration---the failing case is the deliverable that proves the gate exists.
+
+\section{Friday Use Case: GPU PyTorch over a Governed Lake}
+\index{use case}\index{GPU}\index{PyTorch}
+A media company's data scientists must train custom PyTorch recommendation models on GPU clusters against customer interaction data in the governed ADLS lake---without copying data to unmanaged storage and without any secrets in notebooks.
+
+\subsection{Design}
+Workspace managed identity holds \texttt{Storage Blob Data Reader} on the lake; a data asset versions each training snapshot. GPU compute clusters (NC-family) scale from zero per job. Environments pin CUDA/PyTorch versions; MLflow tracking captures every run; the registry holds promoted models with lineage back to the exact data asset, environment, and code version. Purview (Chapter 22) sees the lake side; AML's lineage covers the model side. The security review can trace every model to the data and identity that produced it---which is the actual requirement behind ``secure access to governed data.''
+
+\begin{pitfall}
+\textbf{Export-first workflows.} ``Export the lake to CSV for training'' breaks lineage, residency, and freshness in one step. The datastore pattern exists precisely so governed data is read \emph{in place} by an auditable identity.
+\end{pitfall}
+
+\section{Architectural Decision Record Template}
+\index{architectural decision record}
+Per pipeline record: component inventory with owners, environment pinning policy, data asset versions consumed, the metric gate and its threshold rationale, compute sizing (SKU, min/max nodes, idle scale-down), and the Databricks/AML responsibility boundary.
+
+\section{Operational Deep Dive: Pipeline Schedules and Reuse}
+\index{pipeline schedule}
+AML pipelines run on schedules or via Event Grid triggers (data-arrival-driven training). Because components are versioned and cached, unchanged steps reuse prior outputs---re-running a pipeline after a code change to \texttt{train} does not re-run \texttt{preprocess}. Monitor pipeline duration per step; the step that doubled is usually the one whose data doubled, which is a feature-table question, not an ML question.
+
+\section{Troubleshooting Patterns}
+\index{troubleshooting!AML}
+Job fails at environment build $\rightarrow$ dependency conflict in the conda spec; pin versions. Job fails on data access $\rightarrow$ the workspace identity lacks the lake RBAC role or the datastore fell back to key auth. Gate never passes after a data change $\rightarrow$ inspect the feature table before questioning the threshold. Cluster never scales $\rightarrow$ max instances or regional quota; check both before resizing the job.
+
+\section{Week 18 Lab Rubric}
+\index{rubric}
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.2cm}p{5.0cm}p{5.0cm}@{}}
+\toprule
+\textbf{Criterion} & \textbf{Meets expectation} & \textbf{Needs improvement} \\
+\midrule
+Reproducibility & Versioned data, environment, components; pipeline re-runs identically & Local notebooks and unpinned dependencies \\
+Security & Managed-identity datastore; no secrets in notebooks & Personal keys or mounted storage \\
+Gating & Metric gate blocks a demonstrated failing model & Every run registers a model \\
+Cost & Cluster scales to zero; idle time bounded & Always-on GPU cluster \\
+\bottomrule
+\end{tabular}
+\caption{Week 18 rubric for the AML pipeline deliverables.}
+\label{tab:ch18-rubric}
+\end{table}
+
+\section{Interview Q\&A}
+\subsection{Concepts and Trade-offs}
+\begin{enumerate}
+    \item \textbf{Q: When would you choose AutoML over a custom training notebook?}\\
+    A: For baselines and well-structured tabular problems---AutoML sets the bar a custom model must beat to justify its complexity.
+    \item \textbf{Q: Why use AML compute clusters instead of compute instances for training?}\\
+    A: Clusters autoscale across nodes for training and scale to zero when idle; instances are single-node development desks.
+    \item \textbf{Q: How does AML securely access governed ADLS training data?}\\
+    A: Through a datastore bound to the workspace managed identity with lake RBAC---no keys, full audit trail.
+    \item \textbf{Q: What does model registration give you beyond saving a file?}\\
+    A: Versioned identity with lineage to data, environment, code, and metrics---the answer to ``what exactly produced this artifact.''
+\end{enumerate}
+
+\section{Further Reading}
+The Azure ML overview \cite{microsoft2025azureml}, the pipelines concept guide \cite{microsoft2025amlPipelines}, and the examples repository \cite{microsoft2025azuremlExamples} are the primary sources. Chapter 19 continues with endpoints, drift, and the retraining loop; Chapter 17 supplies the feature contract this pipeline consumes.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item Instances for development, clusters for training, minimum nodes zero: ML compute economics mirror Spark's.
+    \item Managed-identity datastores are the only governed path from the lake to training.
+    \item AutoML sets the baseline; custom components must beat it to justify their complexity.
+    \item Versioned components plus pinned environments make pipelines reproducible and cache-efficient.
+    \item The managed feature store turns features into cataloged, point-in-time-correct assets.
+    \item Registration is lineage: every production model answers ``what data, code, and environment made me.''
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Explain why a zero-minimum-node cluster changes team behavior, not just cost.
+    \item \textbf{(Conceptual)} What breaks when two pipelines share a component version and one team edits it?
+    \item \textbf{(Conceptual)} Why does the Designer produce less reviewable artifacts than components-as-code?
+    \item \textbf{(Hands-on)} Complete the Thursday project, including the gated-registration failing case.
+    \item \textbf{(Hands-on)} Run an AutoML sweep on the same data asset and compare its best AUC against your pipeline's model.
+    \item \textbf{(Hands-on)} Change only the \texttt{train} component and observe step-level caching on re-run; record which steps executed.
+    \item \textbf{(Design)} Design the Databricks/AML boundary for the media company: which features are materialized where, and why.
+    \item \textbf{(Design)} Write the ADR for the metric gate: threshold, metric choice, and the override process.
+    \item \textbf{(Design)} Specify an Event Grid trigger that retrains when the feature table's drift metric crosses a threshold (preview Chapter 19).
+    \item \textbf{(Interview)} Prepare a two-minute answer to ``why did this model change behavior after a re-run with no code changes?''
+\end{enumerate}
+
+\section{Capstone Project: Gated Training Pipeline over Governed Features}\label{sec:ch18-capstone}
+\index{capstone project}\index{AML pipeline!capstone}
+
+\begin{capstonebox}
+\textbf{Mission:} Deliver a reproducible training pipeline: versioned data assets read via managed identity, pinned environments, componentized preprocess/train/evaluate steps, a metric-gated registration, and AutoML as the recorded baseline.
+
+\textbf{Estimated time:} 5--6 hours.
+
+\textbf{What you will practice:}
+\begin{itemize}
+    \item Workspace, compute, and datastore provisioning with identity-based access.
+    \item Component authoring and pipeline assembly with the v2 SDK.
+    \item Metric gates with a proven failing case.
+    \item Baseline discipline: AutoML versus custom, on record.
+\end{itemize}
+\end{capstonebox}
+
+\subsection*{Scenario}
+The subscription business graduates from Chapter 17's hand-run training to a pipeline the platform team can schedule. Data science owns components; the platform team owns the gate; compliance requires full lineage from model to training data.
+
+\subsection*{Requirements}
+\begin{itemize}
+    \item \textbf{Access:} all data read through the managed-identity datastore; zero secrets in code.
+    \item \textbf{Reproducibility:} pinned environment; versioned components and data assets; re-run produces identical metrics.
+    \item \textbf{Gate:} registration only at $\text{AUC} \ge 0.80$, with the failing case demonstrated.
+    \item \textbf{Baseline:} an AutoML run on the same asset, with the comparison recorded in the model description.
+\end{itemize}
+
+\subsection*{Reference Architecture}
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[node distance=1.2cm]
+        \node[store] (lake) {ADLS features\\(datastore, MI)};
+        \node[stage, right=1.3cm of lake] (pipe) {AML pipeline\\prep $\rightarrow$ train $\rightarrow$ eval};
+        \node[stage, right=1.3cm of pipe] (gate) {Metric gate\\AUC $\ge$ 0.80};
+        \node[store, right=1.3cm of gate] (reg) {Model\\Registry};
+        \node[tool, above=0.9cm of pipe] (automl) {AutoML\\baseline};
+        \node[doc, below=0.9cm of pipe] (cluster) {Compute cluster\\min 0 / max 4};
+        \draw[arrow] (lake) -- (pipe);
+        \draw[arrow] (pipe) -- (gate);
+        \draw[arrow] (gate) -- (reg);
+        \draw[arrow, dashed] (automl) -- (gate);
+        \draw[arrow, dashed] (cluster) -- (pipe);
+    \end{tikzpicture}%
+    }
+    \caption{Capstone architecture: governed features feed a gated pipeline; AutoML provides the recorded baseline.}
+    \label{fig:ch18-capstone-arch}
+\end{figure}
+
+\subsection*{Implementation Steps}
+\begin{enumerate}
+    \item Provision workspace and compute (Listing~\ref{lst:ch18-aml}); register the datastore and data asset.
+    \item Author the three components and assemble the pipeline (Listing~\ref{lst:ch18-pipeline}).
+    \item Add the metric gate; demonstrate pass and fail runs.
+    \item Run the AutoML baseline; record the comparison in the registry description.
+    \item Verify lineage: registry entry resolves to data asset, environment, code, and metrics.
+\end{enumerate}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item Component and pipeline code, environment specs, and provisioning scripts.
+    \item Gate pass/fail evidence and the AutoML comparison record.
+    \item A README that reproduces the pipeline from a clean workspace.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item A re-run with unchanged inputs reuses cached steps and reproduces metrics.
+    \item A degraded feature set is blocked from registration by the gate.
+    \item Every registered model traces to its data asset version and environment.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Add the managed feature store and swap the pipeline input to a versioned feature set.
+    \item Schedule the pipeline and add step-duration regression alerting.
+    \item Move feature materialization to a Databricks job and consume its output as the data asset.
+\end{itemize}

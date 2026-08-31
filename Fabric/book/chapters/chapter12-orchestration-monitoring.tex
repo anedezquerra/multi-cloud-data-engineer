@@ -1,0 +1,337 @@
+\chapter{Orchestration and Monitoring}
+\index{orchestration}\index{Monitoring Hub}\index{dependency management}\index{On Failure}\index{alerting}\index{runbook}\index{pipeline!master}\index{idempotent rerun}%
+
+\begin{objectives}
+\begin{itemize}
+    \item Invoke notebooks and Dataflows Gen2 from pipelines as orchestrated activities.
+    \item Manage dependencies with On Success, On Failure, On Completion, and On Skip paths.
+    \item Monitor runs in the Monitoring Hub and route alerts with runbook links to Teams or Outlook.
+    \item Build a master orchestration pipeline that sequences a dataflow, a notebook, and failure alerting.
+    \item Make every rerun idempotent so failed batches can be retried without data repair.
+    \item Design a self-healing orchestration layer for a 15-system banking reconciliation.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+Orchestration with dependency graphs, retries, and alerting is the most tool-shaped yet conceptually stable layer of the stack. The concepts---DAGs, trigger rules, compensating actions---transfer verbatim.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{2.8cm}p{3.2cm}p{3.2cm}p{3.2cm}p{3.2cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{Fabric} & \textbf{AWS} & \textbf{GCP} & \textbf{Snowflake} \\
+\midrule
+Orchestrator & Pipelines (master/child) & Step Functions / MWAA (Airflow) & Cloud Composer (Airflow) & Task graphs \\
+Dependency edges & On Success/Failure/Completion/Skip & States, catch/ retry & Airflow trigger rules & \texttt{AFTER} task deps \\
+Cross-workload invoke & Notebook, dataflow, pipeline activities & Lambda, Glue, Batch & Cloud Run, Dataflow & Snowpark, external functions \\
+Monitoring & Monitoring Hub + run history & CloudWatch + Step Functions console & Cloud Monitoring / Airflow UI & Task history, resource monitors \\
+Alerting & Teams/Outlook activities, Activator & SNS / EventBridge & Alerting policies & Notifications / alerts \\
+Lineage hooks & Fabric lineage view & OpenLineage (MWAA) & OpenLineage (Composer) & Access history \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+Databricks Workflows and MongoDB Atlas Triggers round out the series' family. The portable discipline: \emph{an alert without a runbook is noise; a retry without idempotence is corruption}.
+\end{crosscloud}
+
+\begin{keyterms}
+\textbf{Orchestration}: sequencing and governing dependent workloads---pipelines, notebooks, dataflows---as one operable system. \quad
+\textbf{Dependency condition}: the edge type between activities: On Success, On Failure, On Completion, On Skip. \quad
+\textbf{Monitoring Hub}: Fabric's central view of runs across pipelines, notebooks, dataflows, and semantic models. \quad
+\textbf{Compensating action}: the corrective step an On Failure path executes---quarantine, rollback, requeue---beyond mere notification. \quad
+\textbf{Runbook}: the linked operational document an alert carries: rerun steps, backfill procedure, escalation owner.
+\end{keyterms}
+
+\section{Week 12 Roadmap}
+Week~12 closes Part~III by turning the previous three weeks' artifacts into one operable system. Monday covers invoking notebooks and dataflows from pipelines. Tuesday formalizes dependency management. Wednesday covers the Monitoring Hub, alert routing, and run history. Thursday is the hands-on project: a master pipeline that triggers a dataflow, waits, runs a notebook, and alerts on failure. Friday designs the self-healing orchestration layer for a 15-system banking reconciliation. The chapter closes with the Milestone~3 capstone.
+
+Orchestration is where reliability is won or lost. Chapters~9--11 built movers, shapers, and connectors; this week decides what happens when they fail at 3 a.m.\ \cite{microsoftFabricMonitoringHub,microsoftFabricPipelines}.
+
+\begin{notebox}
+Production rule for the week: route pipeline failures to Teams/Outlook and attach a runbook link to every alert---expected rerun steps, backfill procedure, and escalation owner. An alert without a runbook creates a 3 a.m.\ archaeology session. Use On Failure paths for compensating actions, not just notifications.
+\end{notebox}
+
+\section{Monday: Invoking Notebooks and Dataflows from Pipelines}
+\index{notebook activity}\index{dataflow activity}
+Pipelines orchestrate the platform's other workloads as first-class activities \cite{microsoftFabricPipelines}. The \emph{Notebook activity} executes a Spark notebook with parameters---this is how Chapter~10's quality gate and Week~3's transformation notebooks become production steps. The \emph{Dataflow activity} triggers a Dataflows Gen2 refresh and waits for completion. A pipeline can also invoke another pipeline, which is how master/worker designs (Chapter~9) compose.
+
+\begin{definitionbox}
+An \textbf{orchestration pipeline} is a pipeline whose primary purpose is sequencing other workloads---dataflows, notebooks, child pipelines---with dependency conditions, rather than moving data itself.
+\end{definitionbox}
+
+Parameter passing is the critical skill: the pipeline computes values (batch date, watermark, config row) and hands them to the notebook as parameters; the notebook reads them through its parameter cell and must never assume defaults in production. The return path matters too: notebooks signal failure by failing (an unhandled assertion, per Chapter~10's gate), and the pipeline's dependency edges translate that failure into compensating action.
+
+\begin{tipbox}
+Keep notebooks idempotent by contract: same parameters in, same final state out. The pipeline's job is to call them with the right parameters; the notebook's job is to be safely callable twice.
+\end{tipbox}
+
+\section{Tuesday: Dependency Management}
+\index{dependency management}\index{On Failure}\index{compensating actions}
+Every activity edge carries a condition \cite{microsoftFabricPipelines}:
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.2cm}p{5.0cm}p{5.6cm}@{}}
+\toprule
+\textbf{Condition} & \textbf{Fires when} & \textbf{Canonical use} \\
+\midrule
+On Success & Predecessor succeeded & The happy path: gate passes, Gold publishes \\
+On Failure & Predecessor failed & Compensating action + alert with runbook link \\
+On Completion & Predecessor finished either way & Cleanup that must always run (temp tables, session teardown) \\
+On Skip & Predecessor was skipped & Rare; explicit handling of conditional branches \\
+\bottomrule
+\end{tabular}
+\caption{Dependency conditions and their canonical uses.}
+\label{tab:chapter12-dependencies}
+\end{table}
+
+The discipline that separates operable pipelines from fragile ones: \textbf{every activity that can fail has an explicit On Failure path}. Minimum viable failure path: write the ledger row, execute the compensating action (quarantine partial output, reset state), and send the alert with its runbook link. ``Do nothing and check the portal tomorrow'' is not a failure path; it is an outage schedule.
+
+\begin{pitfall}
+On Completion is not On Success. Wiring a downstream step to On Completion because ``it should usually work'' makes partial failures propagate silently---the classic way corrupted staging becomes published Gold. Publish on success; clean up on completion.
+\end{pitfall}
+
+\section{Wednesday: Monitoring Hub and Alert Routing}
+\index{Monitoring Hub}\index{alerting}\index{run history}
+The Monitoring Hub is Fabric's cross-workload run observatory: pipeline runs, notebook executions, dataflow refreshes, and semantic model refreshes appear with status, duration, capacity, and error detail \cite{microsoftFabricMonitoringHub}. It answers the daily questions---what ran, what failed, what is slow---without portal archaeology.
+
+Run history per pipeline provides the forensic view: activity-level durations and errors, input and output payloads, and retry trails. Paired with Chapter~9's run ledger (which is queryable), the hub (which is visual) covers both operations and audit.
+
+Alert routing closes the loop. Pipelines send Teams or Outlook messages from activities on the On Failure path; Data Activator (Chapter~15) can alert on capacity and platform events. Every alert carries: what failed, when, which batch, the runbook link, and the escalation owner.
+
+\begin{notebox}
+A good alert is a work order, not a scream. ``PL\_Master\_Ingest failed at 03:12 on batch 2026-07-31; runbook: \texttt{docs/runbooks/master-ingest.md}; owner: DE on-call'' lets a half-awake engineer act. ``Pipeline failed'' starts an investigation.
+\end{notebox}
+
+\section{Thursday: Hands-on Project}
+\index{hands-on lab}\index{orchestration!hands-on}
+The Week~12 lab builds the master orchestration pipeline: it triggers a Dataflow Gen2, waits for completion, triggers a Spark notebook (the Chapter~10 quality gate), and sends a Teams/Outlook alert on failure.
+
+\subsection{Goal and Architecture}
+Reuse the Week~10 estate: dataflow \texttt{df\_api\_products}, gate notebook, lakehouse \texttt{lh\_products}. Create pipeline \texttt{PL\_Master\_Daily} in workspace \texttt{fabric-de-week12} that sequences them with explicit dependency paths and a ledger write for every outcome.
+
+\subsection{Step-by-Step Actions}
+\begin{enumerate}
+    \item Create the pipeline with a \texttt{batch\_date} parameter (default: UTC today).
+    \item Add the Dataflow activity; wire its On Success to the Notebook activity.
+    \item Configure the Notebook activity with the gate notebook, passing \texttt{batch\_date} as a parameter.
+    \item Wire the notebook's On Success to a ledger write (status \texttt{Succeeded}).
+    \item Wire On Failure of both activities to a shared failure branch: ledger write (status \texttt{Failed}, error detail), then a Teams/Outlook activity with the runbook link.
+    \item Run the happy path; verify the ledger and the Gold table.
+    \item Break the gate deliberately (inject a duplicate key into staging); verify the alert fires with runbook link and the ledger records the failure.
+    \item Fix staging, rerun with the same \texttt{batch\_date}, and prove the rerun is clean and duplicate-free.
+\end{enumerate}
+
+\subsection{Validation Checklist}
+\begin{itemize}
+    \item The pipeline sequences dataflow $\rightarrow$ gate with explicit dependency edges.
+    \item Every activity that can fail has a wired On Failure path.
+    \item The alert message names the pipeline, batch, runbook link, and owner.
+    \item The ledger holds exactly one row per run outcome.
+    \item The rerun after failure is idempotent---no duplicate Gold rows.
+    \item Run history in the Monitoring Hub matches the ledger's account.
+\end{itemize}
+
+\section{Friday: Use Case and Architecture}
+\index{self-healing orchestration}\index{banking reconciliation}
+A bank runs a daily reconciliation spanning 15 dependent systems: core banking, cards, payments, general ledger, and eleven satellite feeds. The current estate is a cron-and-hope collection of scripts. The task: a resilient, self-healing orchestration layer in Fabric pipelines.
+
+\subsection{The Design}
+\begin{itemize}
+    \item \textbf{Layered pipelines.} A master pipeline per business day dispatches to system-level child pipelines, which dispatch to table-level workers (Chapter~9's framework, now fully operationalized).
+    \item \textbf{Dependency maps, not chains.} Each system's pipeline declares its upstream dependencies; the master waits on completion conditions, not wall-clock schedules.
+    \item \textbf{Compensating actions.} On Failure paths quarantine partial batches, mark the business day \texttt{degraded} in the recon ledger, and page with a runbook---they do not merely email.
+    \item \textbf{Idempotent everything.} Watermarks advance on success; rerunning any system replays exactly its missing slice; the reconciliation report compares, never assumes.
+    \item \textbf{Degraded-mode operation.} When a satellite feed misses its window, the master proceeds with a documented \texttt{degraded} flag and auto-backfills on the feed's recovery---self-healing by design.
+\end{itemize}
+
+\begin{figure}[H]
+    \centering
+    \begin{tikzpicture}[node distance=8mm and 9mm]
+        \node[stage, minimum width=2.8cm] (master) at (0,0) {Master pipeline\\(business day)};
+        \node[stage] (sys1) at (5.4,1.6) {System pipeline\\core banking};
+        \node[stage] (sys2) at (5.4,0) {System pipeline\\cards};
+        \node[stage] (sys3) at (5.4,-1.6) {System pipeline\\satellites (12)};
+        \node[store] (ledger) at (10.6,0) {Recon ledger\\+ run rows};
+        \node[doc, minimum width=2.6cm, minimum height=1.0cm] (alerts) at (10.6,-2.6) {Teams alerts\\+ runbooks};
+
+        \draw[arrow] (master) -- (sys1);
+        \draw[arrow] (master) -- (sys2);
+        \draw[arrow] (master) -- (sys3);
+        \draw[arrow] (sys1) -- (ledger);
+        \draw[arrow] (sys2) -- (ledger);
+        \draw[arrow] (sys3) -- (ledger);
+        \draw[arrow, dashed] (sys3.south) to[out=-30,in=180] (alerts.west);
+
+        \node[note, text width=13cm, align=center] at (5.4,-3.8) {Self-healing: degraded-mode proceeds with flags; recovered feeds backfill automatically; every outcome is a ledger row.};
+    \end{tikzpicture}
+    \caption{Self-healing reconciliation orchestration across 15 systems.}
+    \label{fig:chapter12-recon}
+\end{figure}
+
+\begin{pitfall}
+Wall-clock scheduling (``system B starts at 04:00 because system A usually finishes by 03:50'') fails on the first slow night. Express real dependencies and let completion conditions drive; reserve clocks for windows and deadlines, not sequencing.
+\end{pitfall}
+
+\section{Operational Guidance for Week 12}
+Orchestration quality is measured on the worst night, not the average one. Drill failure paths monthly: kill a gateway, inject a contract violation, miss a feed window---and watch the estate heal itself or page correctly.
+
+\subsection{Performance and Reliability}
+Monitor duration trends, not just failures; a pipeline slowing 10\% weekly is a failure in advance. Cap master-pipeline parallelism against capacity reality. Keep run history retention aligned with audit requirements. Prefer few, well-instrumented master pipelines over dozens of overlapping schedulers.
+
+\subsection{Security and Governance Checklist}
+\begin{itemize}
+    \item Every failure alert carries a runbook link and an owner; no orphan alerts.
+    \item Compensating actions are least-privilege and auditable---they write to the ledger and quarantine, never to Gold.
+    \item Runbook documents are versioned beside the pipelines they serve.
+    \item Access to retry, skip, and force-run controls is restricted and logged.
+    \item The reconciliation ledger is immutable---corrections are new rows, not edits.
+    \item Scheduling identities are service principals, not personal accounts.
+\end{itemize}
+
+\section{Interview Q\&A}
+\begin{enumerate}
+    \item \textbf{Q: What is the difference between On Failure and On Completion paths?}\\
+    A: On Failure fires only when the predecessor failed---the right edge for compensating actions and alerts. On Completion fires either way---the right edge for unconditional cleanup. Publishing on On Completion propagates partial failures; that confusion corrupts data.
+    \item \textbf{Q: What does the Monitoring Hub show per pipeline run?}\\
+    A: Status, timing, duration, capacity consumption, and error detail across pipelines, notebooks, dataflows, and refreshes, with activity-level drill-down for forensics.
+    \item \textbf{Q: Why attach a runbook link to every alert?}\\
+    A: The alert arrives at 3 a.m.\ to a half-awake human; the runbook turns it from an investigation into a procedure---rerun steps, backfill path, escalation owner.
+    \item \textbf{Q: How do you make a rerun of a failed batch idempotent?}\\
+    A: Watermarks advance only on success; writes are merge- or partition-scoped; the batch re-executes exactly its missing slice, producing the same final state as a single clean run.
+    \item \textbf{Q: What is a compensating action in an On Failure path?}\\
+    A: The corrective work beyond notification: quarantining partial output, marking the business day degraded, resetting control state---so the estate is consistent before the alert is even read.
+    \item \textbf{Q: Why are dependencies better than wall-clock schedules?}\\
+    A: Clocks encode assumptions about duration that fail exactly on slow nights; completion conditions encode actual readiness, so the graph self-adjusts.
+\end{enumerate}
+
+\section{Further Reading}
+Review the Monitoring Hub documentation \cite{microsoftFabricMonitoringHub} and pipeline dependency and activity references \cite{microsoftFabricPipelines,microsoftFabricDataFactory}. The ledger patterns extend Chapter~9 \cite{microsoftFabricCopyInto}, and Data Activator-based platform alerting previews Chapter~15 \cite{microsoftDataActivator}. For lineage as an observability complement, see OpenLineage \cite{openlineage}.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item Pipelines orchestrate notebooks, dataflows, and child pipelines; parameters flow down, failures flow up through dependency edges.
+    \item On Success publishes, On Failure compensates, On Completion cleans up---confusing them is a corruption vector.
+    \item The Monitoring Hub is the visual observatory; the run ledger is the queryable one; you need both.
+    \item Every alert is a work order: what failed, which batch, runbook link, owner.
+    \item Idempotent reruns make 3 a.m.\ failures boring; design for the retry, not the apology.
+    \item Self-healing orchestration declares real dependencies, operates degraded with flags, and backfills on recovery.
+    \item Drill the failure paths; orchestration quality is defined by the worst night.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Justify ``publish on success, clean up on completion'' with a concrete corruption scenario for the reverse.
+    \item \textbf{(Conceptual)} Why does the recon ledger forbid edits? What audit property does append-only provide?
+    \item \textbf{(Hands-on)} Add an Until loop to the lab pipeline that waits for a late satellite feed with a documented deadline and degraded-mode exit.
+    \item \textbf{(Hands-on)} Build the duration-trend query over the run ledger: per pipeline, weekly average duration and week-over-week delta.
+    \item \textbf{(Design)} Map the dependency graph for five of the bank's fifteen systems, marking which can run degraded and which halt the business day.
+    \item \textbf{(Design)} Design the alerting severity ladder: which failures page, which email, which merely log---and who decided?
+    \item \textbf{(Interview)} In five sentences, explain how compensating actions and idempotent reruns together make an orchestration layer ``self-healing.''
+    \item \textbf{(Operational)} Write the runbook for the lab pipeline's most likely failure, then have a teammate execute it cold.
+\end{enumerate}
+
+\section{Milestone 3 Capstone: Automated Batch ELT Pipeline}\label{sec:ch12-capstone}
+\index{Milestone 3 capstone}\index{capstone project!Part III}\index{metadata-driven ingestion!capstone}\index{quarantine!capstone}
+
+\begin{capstonebox}
+\textbf{Mission.} Close Part~III by building the complete batch ELT system: a config-table-driven Fabric pipeline family (Lookup $\rightarrow$ ForEach Copy) ingesting from REST APIs and Azure SQL, Dataflows Gen2 for visual cleansing, Spark notebooks for ML feature engineering, a contract gate with quarantine, and a master orchestration pipeline with failure alerts wired to a runbook---scheduled, monitored, and documented.
+
+\textbf{Estimated time.} 10--12 hours across the milestone's components.
+
+\textbf{What you'll practice.}
+\begin{itemize}
+    \item Metadata-driven ingestion with watermark-safe incremental loads.
+    \item Contract validation distinguishing breaking from additive schema changes.
+    \item Dataflow $\rightarrow$ gate $\rightarrow$ notebook sequencing under one master pipeline.
+    \item Data-quality assertions with quarantine and failing-case evidence.
+    \item Alerting with runbook links, plus the capacity cost estimate and security review rubric artifacts.
+\end{itemize}
+\end{capstonebox}
+
+\subsection*{Scenario}
+Contoso's operations analytics program must absorb REST API feeds and Azure SQL extracts nightly, cleanse them through analyst-owned dataflows, engineer ML features in Spark, and publish Gold tables that Chapter~8's Direct Lake reports consume---all self-healing, all observable, all rerun-safe.
+
+\subsection*{Requirements}
+\begin{itemize}
+    \item \texttt{cfg.ingest\_config} with watermark and \texttt{is\_active} columns, and the \texttt{cfg.ingest\_run} ledger.
+    \item The dynamic pipeline family with a schema-validation gate rejecting breaking contract changes.
+    \item Bronze landing, Dataflow Gen2 cleansing to Silver, notebook feature engineering and DQ assertions with quarantine before Gold.
+    \item Master pipeline wiring: On Failure $\rightarrow$ Teams/Outlook alert with runbook link; watermarks advance only on success.
+    \item The six rubric artifacts: clean-environment README, architecture diagram, three DQ tests with failing cases, alert evidence, cost estimate, security review.
+\end{itemize}
+
+\subsection*{Reference Architecture}
+\begin{figure}[H]
+    \centering
+    \begin{tikzpicture}[node distance=8mm and 9mm]
+        \node[doc, minimum width=2.6cm, minimum height=1.0cm] (api) at (0,0) {REST API /\\Azure SQL DB};
+        \node[stage] (pl) at (4.2,0) {Fabric Pipeline\\(orchestrator)};
+        \node[stage] (df) at (8.4,1.2) {Dataflow Gen2\\(Power Query)};
+        \node[stage] (nb) at (8.4,-1.2) {Spark Notebook\\(feature eng.)};
+        \node[store] (lh) at (13.0,0) {Lakehouse\\Bronze/Silver/Gold};
+        \node[doc, minimum width=2.6cm, minimum height=1.0cm] (mon) at (4.2,-2.8) {Monitoring Hub\\+ Teams alerts};
+
+        \draw[arrow] (api) -- (pl);
+        \draw[arrow] (pl) -- (df);
+        \draw[arrow] (pl) -- (nb);
+        \draw[arrow] (df) -- (lh);
+        \draw[arrow] (nb) -- (lh);
+        \draw[arrow, dashed] (pl) -- (mon);
+
+        \node[note, text width=12.5cm, align=center] at (7,-3.9) {One orchestrator, three workload types, one observable estate.};
+    \end{tikzpicture}
+    \caption{Milestone 3 reference architecture: orchestrated batch ELT.}
+    \label{fig:chapter12-capstone-architecture}
+\end{figure}
+
+\subsection*{Implementation Steps}
+\begin{enumerate}
+    \item Create the config and ledger tables; seed sources including at least one REST feed.
+    \item Build the worker pipeline with the contract gate; build the master with bounded parallelism.
+    \item Build the cleansing dataflow with named steps and a staging destination.
+    \item Implement the feature-engineering notebook and the DQ gate with quarantine.
+    \item Wire the master pipeline's On Failure branch to the alert with runbook link.
+    \item Run the deliberate-failure drill; capture the alert and the clean rerun.
+    \item Produce the cost estimate and security review; finalize the README.
+\end{enumerate}
+
+\begin{lstlisting}[language=SQL,caption={Milestone 3: watermarks advance only after a successful batch.},label={lst:chapter12-capstone-watermark}]
+-- Advance the watermark only after a successful batch
+UPDATE cfg.ingest_config
+SET watermark = @max_ts
+WHERE schema_name = @sch AND table_name = @tbl
+  AND @batch_status = 'Succeeded';
+-- On rerun, the source query reads WHERE ts > @watermark,
+-- so a retried batch never re-copies committed rows.
+\end{lstlisting}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item Repository that runs end-to-end from a clean environment on schedule.
+    \item Architecture diagram showing pipeline, dataflow, notebook, and lakehouse flow.
+    \item Three automated DQ tests including a quarantined-row case, each with failing-case evidence.
+    \item Teams/Outlook alert evidence from the deliberate-failure drill, with the runbook.
+    \item Monthly capacity cost estimate with two documented optimization decisions.
+    \item Security review: gateway credentials vaulted, least-privilege connection identities, no hardcoded secrets.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item[\(\square\)] The scheduled end-to-end run completes from a clean environment using only the README.
+    \item[\(\square\)] New tables onboard via config insert; no pipeline edits.
+    \item[\(\square\)] Breaking schema changes reject and quarantine; additive changes flow and are logged.
+    \item[\(\square\)] Every run---success, rejection, failure---produces exactly one ledger row.
+    \item[\(\square\)] The failure drill fires the alert with its runbook link, and the rerun is duplicate-free.
+    \item[\(\square\)] Watermarks advance only on success, proven by a killed mid-run retry.
+    \item[\(\square\)] No credentials or personal paths appear anywhere in submitted artifacts.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Enable ForEach parallelism with a documented bound and show the duration improvement.
+    \item Add a duration-trend report over the ledger and alert on 30\% week-over-week regression.
+    \item Add degraded-mode operation for one satellite feed with automatic backfill on recovery.
+    \item Publish the operations dashboard (run health, quarantine volumes) as a Direct Lake report.
+\end{itemize}

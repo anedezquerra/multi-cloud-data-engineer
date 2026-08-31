@@ -1,0 +1,319 @@
+\chapter{Data Integration and Connectivity}
+\index{on-premises data gateway}\index{VNet data gateway}\index{hybrid connectivity}\index{SQL Server!on-premises}\index{Oracle}\index{SAP}\index{REST API ingestion}\index{webhooks}\index{gateway cluster}%
+
+\begin{objectives}
+\begin{itemize}
+    \item Distinguish the on-premises data gateway from the VNet data gateway and select the correct one per scenario.
+    \item Connect Fabric to hybrid sources including SQL Server, Oracle, and SAP.
+    \item Ingest REST APIs and webhooks with sound credential and paging patterns.
+    \item Install and configure an on-premises data gateway and run a daily extraction pipeline through it.
+    \item Design gateway clusters for high availability and load balancing.
+    \item Architect a secure hybrid connectivity pattern for a bank that forbids public endpoints on transactional databases.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+Hybrid connectivity---reaching data behind corporate networks and inside VNets without exposing it publicly---is a universal enterprise requirement with remarkably similar shapes across clouds.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{2.8cm}p{3.2cm}p{3.2cm}p{3.2cm}p{3.2cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{Fabric} & \textbf{AWS} & \textbf{GCP} & \textbf{Snowflake} \\
+\midrule
+On-prem relay/agent & On-premises data gateway & DMS agents, DataSync agents, Storage Gateway & Transfer appliance / Database Migration Service & External access via connectors, Snowpipe through private links \\
+VNet/VPC private path & VNet data gateway & VPC endpoints, PrivateLink & Private Service Connect, VPC peering & PrivateLink / Private Service Connect \\
+Outbound-only pattern & Gateway initiates outbound 443 & Agents poll outbound & Agents/connectors outbound & Outbound from customer network \\
+HA model & Gateway clusters (2+ nodes) & Multi-AZ services & Regional redundancy & Multi-AZ by default \\
+API ingestion & Copy/Web activities, eventstreams & API Gateway + Lambda, AppFlow & Cloud Functions / Workflows & External functions, connectors \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+Databricks reaches private sources through VPC peering and PrivateLink; MongoDB Atlas through private endpoints and VPC peering. The invariant across clouds: \emph{the private side initiates the connection outbound}, so no inbound firewall rule ever exposes the database.
+\end{crosscloud}
+
+\begin{keyterms}
+\textbf{On-premises data gateway}: an agent installed inside the corporate network that brokers outbound-only connections between Fabric and local sources. \quad
+\textbf{VNet data gateway}: a Microsoft-managed gateway that lets Fabric reach sources inside an Azure virtual network without a customer-managed VM. \quad
+\textbf{Gateway cluster}: two or more gateway nodes providing high availability and load distribution. \quad
+\textbf{Webhook}: an HTTP callback a source system invokes to push events, rather than waiting to be polled. \quad
+\textbf{Private endpoint}: a network interface that gives a service a private IP inside a VNet, removing public exposure.
+\end{keyterms}
+
+\section{Week 11 Roadmap}
+Week~11 connects Fabric to the enterprise as it actually exists: databases behind firewalls, services inside VNets, and APIs that push as well as pull. Monday compares the on-premises data gateway with the VNet data gateway. Tuesday connects the classic hybrid sources---SQL Server, Oracle, SAP. Wednesday covers REST APIs and webhooks. Thursday is the hands-on project: install the on-premises gateway against a mock SQL Server and run a daily extraction to OneLake. Friday architects the bank scenario: strict hybrid connectivity with zero public endpoints.
+
+Connectivity is where elegant cloud architectures meet organizational reality. The pipelines of Chapter~9 assume reachability; this week supplies it, securely, with the operational discipline (clustering, patching, monitoring) that makes a gateway production infrastructure rather than a developer's side install \cite{microsoftOnPremGateway,microsoftVNetGateway}.
+
+\begin{notebox}
+Gateways are identity-bearing infrastructure: the gateway's registered connections carry credentials to your most sensitive systems. Treat a gateway server with the same change control as a database server, because that is effectively what it fronts.
+\end{notebox}
+
+\section{Monday: On-Premises versus VNet Data Gateways}
+\index{on-premises data gateway!versus VNet}
+Both gateway types solve the same problem---Fabric is a SaaS platform; your data is not---but for different network topologies \cite{microsoftOnPremGateway,microsoftVNetGateway}.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.6cm}p{5.0cm}p{5.0cm}@{}}
+\toprule
+\textbf{Aspect} & \textbf{On-premises data gateway} & \textbf{VNet data gateway} \\
+\midrule
+Where it runs & Customer-managed Windows machine inside the corporate network & Microsoft-managed compute attached to your Azure VNet \\
+Reaches & SQL Server, Oracle, file shares, SAP---anything the host can route to & Azure services inside the VNet (Azure SQL MI, VMs, private endpoints) \\
+Management burden & You patch, monitor, and cluster the host(s) & Microsoft manages the nodes; you manage the VNet attachment \\
+Best for & True on-premises estates, non-Azure networks & Azure-resident private sources; no VM to maintain \\
+\bottomrule
+\end{tabular}
+\caption{Choosing between the two gateway types.}
+\label{tab:chapter11-gateways}
+\end{table}
+
+\begin{definitionbox}
+An \textbf{on-premises data gateway} is a customer-installed agent that creates outbound-only, encrypted connections to the cloud relay, so cloud services can query on-premises sources without any inbound firewall opening.
+\end{definitionbox}
+
+The outbound-only property is the security cornerstone: the gateway initiates every connection over TLS to the Azure relay; the corporate firewall sees ordinary outbound 443 traffic; no public IP, no inbound rule, no port forwarding ever touches the database network segment.
+
+\begin{pitfall}
+Installing the gateway on a random analyst workstation is the classic anti-pattern: the machine sleeps, gets patched at whim, and leaves the estate when the analyst does. Gateway hosts are servers---dedicated, patched, monitored, and clustered.
+\end{pitfall}
+
+\section{Tuesday: Connecting Hybrid Sources}
+\index{SQL Server!gateway}\index{Oracle!gateway}\index{SAP!gateway}
+\subsection{SQL Server}
+The reference case. Create a connection in Fabric bound to the gateway cluster, supplying server, database, and a least-privilege SQL identity. Pipelines, dataflows, and semantic models then reference the connection by name; the gateway handles the wire. For extraction to OneLake, pair the connection with Chapter~9's metadata-driven Copy pattern.
+
+\subsection{Oracle and SAP}
+Oracle connects through the same gateway with the Oracle client or managed provider installed on the gateway host---which makes the host's software inventory part of the integration contract. SAP arrives through the SAP connectors (for example SAP HANA, SAP BW, or SAP Table/BW Open Hub patterns), typically with additional licensing and driver considerations on the gateway host. In both cases, the driver's version and bitness on the host are first-class deployment dependencies.
+
+\subsection{Connection Hygiene}
+\begin{itemize}
+    \item One logical connection per source per environment (dev/test/prod), named consistently.
+    \item Least-privilege identities: read-only accounts for extraction, scoped to required schemas.
+    \item Credential rotation procedures documented per connection; a gateway connection with a dead password pages someone at 3 a.m.
+\end{itemize}
+
+\begin{tipbox}
+Keep a connection inventory table---source, environment, gateway cluster, identity, owner, rotation date---in the same config database as Chapter~9's ingestion config. Connections are configuration, and configuration belongs in tables, not in portal archaeology.
+\end{tipbox}
+
+\section{Wednesday: REST APIs and Webhooks}
+\index{REST API ingestion}\index{webhooks}\index{pagination}
+Not every source is a database. REST APIs and webhooks move an increasing share of enterprise data, and both have discipline requirements that naive pipelines ignore.
+
+\subsection{REST APIs}
+Ingest APIs with the Copy activity's REST connector or a Web activity followed by processing. The four recurring concerns: \emph{authentication} (OAuth2 client credentials or managed identity---never API keys pasted into pipeline JSON); \emph{pagination} (follow \texttt{next} links or page parameters until exhaustion; a pipeline that reads page one is a pipeline that loses data); \emph{rate limits} (honor \texttt{429} responses with backoff, or the API will do the throttling for you); and \emph{schema drift} (JSON responses evolve silently---apply Week~9's contract gate to the parsed result).
+
+\subsection{Webhooks}
+Webhooks invert the flow: the source pushes events to an endpoint you expose. In Fabric, eventstreams (Chapter~13) and custom endpoints receive such pushes. The credential pattern matters: validate shared secrets or tokens on receipt, and design the receiver to be idempotent because push sources retry.
+
+\begin{pitfall}
+Webhook receivers without authentication are open write endpoints into your lake. Validate a shared secret or signature on every request, log rejected calls, and rotate the secret on a schedule.
+\end{pitfall}
+
+\section{Thursday: Hands-on Project}
+\index{hands-on lab}\index{on-premises data gateway!installation}
+The Week~11 lab stands up the full hybrid path: a mock on-premises SQL Server, the on-premises data gateway, and a daily Fabric pipeline extracting through it to OneLake.
+
+\subsection{Goal and Architecture}
+Use a local SQL Server (Developer edition, a Docker container, or an instructor VM) seeded with a \texttt{sales.orders} table. Install the on-premises data gateway on a suitable host (your machine is acceptable \emph{for the lab}; note explicitly why it would not be in production). Create the Fabric connection, then build pipeline \texttt{PL\_daily\_orders\_extract} running the extraction on a schedule.
+
+\subsection{Step-by-Step Actions}
+\begin{enumerate}
+    \item Seed the mock SQL Server with \texttt{sales.orders} (a few thousand rows) and create a read-only login \texttt{fabric\_reader}.
+    \item Download and install the on-premises data gateway; register it to your tenant with a recovery key stored in the team vault.
+    \item In Fabric, create the connection: gateway, server, database, and the \texttt{fabric\_reader} identity.
+    \item Build the pipeline: Copy activity from the gateway connection to \texttt{bronze.orders\_onprem} in the lakehouse, partitioned by load date.
+    \item Add the watermark pattern: \texttt{WHERE order\_ts > @watermark} with the watermark advanced only on success.
+    \item Schedule the pipeline daily; run it manually once and validate row counts.
+    \item Simulate failure (stop the gateway service), observe the pipeline failure, restart, and verify the rerun is idempotent.
+\end{enumerate}
+
+\begin{lstlisting}[language=SQL,caption={Mock source setup for the Week 11 lab.},label={lst:chapter11-lab-setup}]
+CREATE LOGIN fabric_reader WITH PASSWORD = '<from-vault>';
+CREATE USER fabric_reader FOR LOGIN fabric_reader;
+EXEC sp_addrolemember 'db_datareader', 'fabric_reader';
+
+CREATE TABLE sales.orders (
+    order_id     INT IDENTITY PRIMARY KEY,
+    customer_id  INT,
+    order_ts     DATETIME2,
+    net_amount   DECIMAL(18,2)
+);
+\end{lstlisting}
+
+\subsection{Validation Checklist}
+\begin{itemize}
+    \item The gateway registers and shows online in the Fabric portal.
+    \item The connection uses the read-only identity, never a personal or admin account.
+    \item The pipeline extracts incrementally and the watermark advances only on success.
+    \item Gateway-down produces a clear pipeline failure; recovery replays without duplicates.
+    \item The gateway recovery key is vaulted, and the host appears in the connection inventory.
+    \item You can articulate why the same setup on an analyst laptop would be a production incident waiting to happen.
+\end{itemize}
+
+\section{Friday: Use Case and Architecture}
+\index{hybrid connectivity!bank}\index{security!network perimeter}
+A retail bank's policy is absolute: transactional databases never have public endpoints---no public IP, no inbound firewall exceptions, no exceptions. Core banking runs on on-premises SQL Server and Oracle. The analytics program needs daily extracts into Fabric.
+
+\subsection{The Pattern}
+A clustered on-premises data gateway---two nodes minimum, in the bank's data-center network segment---initiates outbound-only TLS connections to the Azure relay. Fabric connections bind to the cluster with least-privilege, read-only identities per source. Pipelines extract on schedule to OneLake Bronze; Week~9's contract gates validate; the run ledger records every attempt. No packet ever flows inbound to the bank's network; no database listens publicly; the firewall policy sees only outbound 443.
+
+\begin{figure}[H]
+    \centering
+    \begin{tikzpicture}[node distance=8mm and 9mm]
+        \node[store] (db) at (0,0) {SQL Server /\\Oracle (private)};
+        \node[stage, minimum width=2.8cm] (gw) at (4.6,0) {Gateway cluster\\(2+ nodes)};
+        \node[stage, minimum width=2.6cm] (relay) at (9.4,0) {Azure relay\\(outbound 443)};
+        \node[stage] (pl) at (13.8,0) {Fabric\\pipelines};
+        \node[store] (lh) at (17.6,0) {OneLake\\Bronze};
+
+        \draw[arrow] (db) -- (gw);
+        \draw[arrow] (gw) -- node[above, font=\scriptsize]{outbound only} (relay);
+        \draw[arrow] (relay) -- (pl);
+        \draw[arrow] (pl) -- (lh);
+
+        \node[note, text width=14cm, align=center] at (8.8,-1.8) {The bank's perimeter sees only outbound TLS. No inbound rule, no public IP, no exposed listener.};
+    \end{tikzpicture}
+    \caption{Bank-grade hybrid pattern: outbound-only gateway cluster.}
+    \label{fig:chapter11-bank}
+\end{figure}
+
+\subsection{Hardening the Pattern}
+\begin{itemize}
+    \item \textbf{Cluster for availability.} A single-node gateway is a single point of failure for every hybrid pipeline; install two or more nodes for high availability and load balancing \cite{microsoftOnPremGateway}.
+    \item \textbf{Patch within one release of current.} Gateway software carries credentials in motion; unpatched gateways are both reliability and security debt.
+    \item \textbf{Monitor node health centrally.} Node offline, version drift, and relay connectivity are alertable conditions, not portal trivia.
+    \item \textbf{Restrict outbound destinations.} Where policy demands, egress-filter the gateway segment to the documented Azure relay endpoints.
+    \item \textbf{Separate duties.} Gateway admins, connection owners, and pipeline developers are distinct roles---Chapter~21 formalizes this.
+\end{itemize}
+
+\begin{pitfall}
+The gateway breaks mid-pipeline more often than teams expect---host reboots, Windows updates, certificate renewals. The lab's deliberate gateway-down test is not theater: every hybrid pipeline needs a designed answer to ``the gateway vanished halfway,'' and the answer is watermark-safe idempotent rerun.
+\end{pitfall}
+
+\section{Operational Guidance for Week 11}
+Gateways and connections are the least visible and most critical infrastructure in a hybrid Fabric estate. Inventory them, cluster them, patch them, and monitor them.
+
+\subsection{Performance and Reliability}
+Place gateway hosts near the sources (latency dominates extraction throughput). Size hosts for concurrent query load. Prefer incremental extraction to keep gateway sessions short. Test failover by stopping a node during a run; the cluster should absorb it.
+
+\subsection{Security and Governance Checklist}
+\begin{itemize}
+    \item Gateway clusters of two or more nodes for every production estate; single nodes are lab-only.
+    \item Least-privilege, read-only source identities; rotation dates in the connection inventory.
+    \item Recovery keys vaulted at registration time, not after the first rebuild.
+    \item Webhook endpoints authenticated and idempotent.
+    \item Gateway host patching cadence documented and monitored.
+    \item No public endpoints on any source database, verified by network scan, not by assumption.
+\end{itemize}
+
+\section{Interview Q\&A}
+\begin{enumerate}
+    \item \textbf{Q: When do you need a VNet data gateway instead of an on-premises gateway?}\\
+    A: When sources live inside an Azure VNet (Azure SQL MI, VMs, private-endpoint services) and you want Microsoft-managed gateway compute without maintaining a Windows host.
+    \item \textbf{Q: Why cluster gateway nodes for production workloads?}\\
+    A: A single node is a single point of failure for every hybrid pipeline; clusters provide high availability during patches and failures plus load distribution across concurrent extractions.
+    \item \textbf{Q: Which credential pattern should webhook/API ingestion use?}\\
+    A: OAuth2 client credentials or managed identity, stored in managed connections or Key Vault, with webhook receivers validating a shared secret or signature on every call---never static keys embedded in pipeline JSON.
+    \item \textbf{Q: How does a gateway keep data inside the bank's network perimeter?}\\
+    A: The gateway initiates every connection outbound over TLS to the Azure relay; the bank's firewall sees only outbound 443 traffic, and no inbound rule or public endpoint ever exists on the database segment.
+    \item \textbf{Q: What breaks if the gateway machine goes offline mid-pipeline?}\\
+    A: The in-flight activity fails; because extraction is watermark-based and the watermark advances only on success, the rerun replays the same slice idempotently---which is why the failure drill is part of the lab.
+    \item \textbf{Q: Why does driver inventory on the gateway host matter for Oracle and SAP?}\\
+    A: The host executes the provider code; driver version and bitness are deployment dependencies, and an unmanaged host upgrade can break every Oracle or SAP connection simultaneously.
+\end{enumerate}
+
+\section{Further Reading}
+Review the on-premises data gateway documentation \cite{microsoftOnPremGateway} and the VNet data gateway documentation \cite{microsoftVNetGateway}. Pipeline mechanics come from Chapter~9 \cite{microsoftFabricPipelines}; eventstream-based webhook reception previews Chapter~13 \cite{microsoftFabricEventstreams}. Security principles here are deepened in Chapter~21 \cite{microsoftFabricSecurity}.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item On-premises gateways are customer-managed agents for corporate networks; VNet gateways are Microsoft-managed attachments for Azure VNets.
+    \item The outbound-only relay pattern is why gateway-based hybrid connectivity passes bank-grade security review.
+    \item Connections are configuration: inventory them, scope them least-privilege, and rotate their credentials on schedule.
+    \item API ingestion demands pagination, rate-limit handling, credential discipline, and schema-drift gates; webhooks demand authentication and idempotent receivers.
+    \item Single-node gateways are lab conveniences and production liabilities; cluster everything that matters.
+    \item Gateway failure mid-pipeline is a designed-for scenario, not an edge case---watermark-safe reruns absorb it.
+    \item The gateway host's patch level and driver inventory are part of the integration contract.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Explain the outbound-only relay pattern to a network engineer skeptical of ``cloud access to our database.''
+    \item \textbf{(Conceptual)} Contrast the on-premises and VNet gateways across management burden, reachable sources, and failure domains.
+    \item \textbf{(Hands-on)} Add a second gateway node, form a cluster, and stop one node during an extraction; document the observed behavior.
+    \item \textbf{(Hands-on)} Extend the lab pipeline to call a paginated REST API, following \texttt{next} links to exhaustion.
+    \item \textbf{(Design)} Design the connection inventory schema: columns, ownership, rotation tracking, and the query that lists connections overdue for rotation.
+    \item \textbf{(Design)} The bank acquires a subsidiary whose sources sit in AWS. Propose the connectivity pattern and name every trust boundary crossed.
+    \item \textbf{(Interview)} In five sentences, defend gateway clustering as an availability requirement rather than an optimization.
+    \item \textbf{(Operational)} Write the runbook for ``gateway node reports unhealthy''---detection, failover verification, patching, and rejoin.
+\end{enumerate}
+
+\section{Capstone Project: Clustered Hybrid Extraction with Failover Evidence}\label{sec:ch11-capstone}
+\index{capstone project}\index{on-premises data gateway!capstone}\index{hybrid connectivity!capstone}
+
+\begin{capstonebox}
+\textbf{Mission.} Build the bank-grade hybrid pattern end to end: a two-node gateway cluster fronting a mock on-premises SQL Server, a scheduled incremental extraction to OneLake, a connection inventory, and documented failover evidence proving the estate survives a node loss mid-run.
+
+\textbf{Estimated time.} 5--7 hours (a second node may be a VM or a second machine; document your topology either way).
+
+\textbf{What you'll practice.}
+\begin{itemize}
+    \item Registering and clustering gateway nodes with vaulted recovery keys.
+    \item Building watermark-safe incremental extraction through the cluster.
+    \item Executing and documenting a mid-run failover drill.
+    \item Operating connections as inventoried, least-privilege configuration.
+\end{itemize}
+\end{capstonebox}
+
+\subsection*{Scenario}
+Contoso Bank's analytics platform must extract nightly from an on-premises core system under a no-public-endpoint policy. The platform team must demonstrate---to the security review board, with evidence---that extraction is outbound-only, survives a gateway node failure, and never double-counts after a mid-run outage.
+
+\subsection*{Requirements}
+\begin{itemize}
+    \item Two-node gateway cluster registered to the tenant; recovery keys vaulted.
+    \item Least-privilege read-only source identity; connection recorded in the inventory table.
+    \item Pipeline \texttt{PL\_nightly\_core\_extract}: watermark-incremental, success-only advance, ledger row per run.
+    \item Failover drill: stop one node mid-run, capture the outcome, and prove the retry is duplicate-free.
+    \item A network-evidence appendix: firewall or connection logs showing outbound-only flows.
+    \item Security review narrative suitable for the bank's review board.
+\end{itemize}
+
+\subsection*{Implementation Steps}
+\begin{enumerate}
+    \item Install and register both gateway nodes; form the cluster; vault the recovery keys.
+    \item Create the least-privilege identity and the Fabric connection bound to the cluster.
+    \item Build and schedule the incremental extraction pipeline with ledger logging.
+    \item Run the failover drill; capture pipeline and gateway evidence.
+    \item Assemble the network evidence and the security narrative.
+\end{enumerate}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item Cluster topology diagram and node inventory.
+    \item Pipeline export and ledger contents across the drill.
+    \item Failover evidence: timestamps, affected run, clean retry.
+    \item Network evidence and the review-board narrative.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item[\(\square\)] Both nodes serve the cluster; stopping either one does not lose a night's data.
+    \item[\(\square\)] The mid-run failure produces a visible failure and a duplicate-free retry.
+    \item[\(\square\)] The source identity is read-only and schema-scoped.
+    \item[\(\square\)] Network evidence shows outbound-only flows; no inbound rule exists.
+    \item[\(\square\)] The connection inventory row is complete, including rotation date.
+    \item[\(\square\)] No secrets appear in the repository, pipeline JSON, or screenshots.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Add node-health alerting so the drill's failure would have paged the on-call.
+    \item Add a second source (Oracle XE or a container) to the same cluster and document the driver dependency.
+    \item Automate the connection-inventory freshness check as a scheduled notebook.
+    \item Extend the security narrative with an egress-filtering design for the gateway segment.
+\end{itemize}

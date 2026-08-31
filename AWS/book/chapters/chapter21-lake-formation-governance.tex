@@ -1,0 +1,322 @@
+% NOTE: Filename is fixed by the book outline; content teaches Week 21
+% (Security, IAM & Networking) of the syllabus.
+\chapter{Security, IAM, and Networking for Data Platforms}
+\index{AWS IAM}\index{permissions boundary}\index{service control policy}\index{VPC endpoint}\index{AWS PrivateLink}\index{AWS KMS}\index{Secrets Manager}\index{data perimeter}%
+\begin{objectives}
+\begin{itemize}
+    \item Apply least-privilege IAM: roles, policies, permissions boundaries, and service control policies (SCPs).
+    \item Keep data traffic off the public internet with gateway and interface VPC endpoints and PrivateLink.
+    \item Manage encryption keys with AWS KMS and application secrets with Secrets Manager, including rotation.
+    \item Build and verify an S3 gateway endpoint and access a bucket from EC2 without an internet gateway.
+    \item Design an anti-exfiltration data perimeter that holds even when IAM credentials are compromised.
+    \item Reason about the cost of the perimeter itself: endpoint-hours, KMS requests, and budget alarms.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+Identity, private networking, and key management form the security substrate of every cloud; the concepts are identical, the acronyms differ.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{2.8cm}p{3.0cm}p{3.0cm}p{3.0cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{AWS} & \textbf{Azure} & \textbf{GCP} \\
+\midrule
+Identity and access & IAM roles/policies & Entra ID + Azure RBAC & Cloud IAM \\
+Org-wide guardrails & SCPs (Organizations) & Azure Policy & Organization Policy \\
+Permissions ceiling & Permissions boundaries & Management groups + deny & IAM deny policies \\
+Private service access & VPC endpoints / PrivateLink & Private Endpoints / Private Link & Private Service Connect \\
+Key management & AWS KMS & Azure Key Vault & Cloud KMS \\
+Secrets management & Secrets Manager & Key Vault secrets & Secret Manager \\
+\addlinespace
+Free S3-class endpoint & Gateway endpoint & Service endpoints & Private Google Access \\
+Anti-exfiltration primitive & Endpoint policy + SCP + aws:PrincipalOrgID & Private Link + policy & VPC Service Controls \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+\textbf{Snowflake} adds account-level network policies and external-private-endpoint rules; \textbf{MongoDB} Atlas uses private endpoints and IP access lists; \textbf{Fabric} centralizes on Entra conditional access and tenant-level perimeter settings. The pattern---identity plus network plus keys---is universal.
+\end{crosscloud}
+
+\section{Week 21 Roadmap and Mental Model}
+Every chapter so far ended with an implicit question: who is allowed to touch this, and over what network path? Week~21 makes the answers explicit. The week's stack has three layers: \textbf{identity} (IAM roles and policies, bounded by permissions boundaries and SCPs), \textbf{network} (VPC endpoints and PrivateLink so traffic never leaves the AWS backbone), and \textbf{cryptography} (KMS keys and Secrets Manager so access requires more than a stolen credential).
+
+The mental model that organizes all three is the \emph{data perimeter}: a set of controls ensuring that data can only be accessed by expected identities, from expected networks, within the expected organization \cite{awsIAMDocs}. A data platform that is fast, cheap, and exfiltratable is a liability; this week is how you make it merely fast and cheap.
+
+\begin{definitionbox}
+\textbf{A data perimeter} is the combination of identity, network, and organization-boundary controls that constrains data access to expected principals, expected networks, and the expected organization---designed to hold even if a credential is stolen.
+\end{definitionbox}
+
+\begin{keyterms}
+\textbf{Role}: an assumable identity with temporary credentials---the default way workloads authenticate. \textbf{Permissions boundary}: a maximum-permissions ceiling on a role, regardless of its policies. \textbf{SCP}: an Organizations-level guardrail bounding what accounts may do. \textbf{Gateway endpoint}: free VPC route-table entry for S3/DynamoDB. \textbf{Interface endpoint}: PrivateLink-backed ENI for most other services, billed per AZ-hour plus data. \textbf{KMS}: managed key service with envelope encryption and key policies. \textbf{Secrets Manager}: secrets storage with automatic rotation.
+\end{keyterms}
+
+\section{Monday: IAM Deep Dive---Roles, Boundaries, and SCPs}
+\subsection{Least Privilege as an Engineering Practice}
+The unit of AWS authorization is the \emph{role}: workloads assume roles and receive temporary credentials---never long-lived access keys. Least privilege is an iterative practice, not a one-time design: start from the actions the workload provably needs (from CloudTrail or Access Analyzer), scope resources by ARN and prefix, add conditions (\texttt{aws:SourceVpc}, \texttt{aws:PrincipalTag}), and re-review on a cadence \cite{awsIAMDocs}.
+\index{least privilege}\index{IAM role}
+
+\subsection{Ceilings: Permissions Boundaries and SCPs}
+Two mechanisms bound what even a misconfigured policy can grant. A \emph{permissions boundary} caps a role's maximum permissions---delegated role-creation (developers create their own Glue job roles) is safe only because the boundary prevents those roles from exceeding their lane. An \emph{SCP} applies at the AWS Organizations level and cannot be overridden by any account administrator: ``deny all S3 access from outside our VPC endpoints,'' ``deny leaving the organization,'' ``restrict regions.'' Boundaries protect role hygiene; SCPs protect the organization.
+\index{permissions boundary}\index{service control policy}
+
+\begin{pitfall}
+\textbf{An allow without a ceiling.} IAM evaluates identity policies \emph{and} boundaries \emph{and} SCPs---the effective permission is the intersection. Teams that only write identity policies leave both ceiling mechanisms empty, so any future over-broad grant is instantly effective. Deploy the ceilings first; they are cheap and invisible until the day they save you.
+\end{pitfall}
+
+\section{Tuesday: VPC Endpoints and PrivateLink}
+\subsection{Gateway Versus Interface}
+A \emph{gateway endpoint} (S3 and DynamoDB only) adds a route-table entry directing service traffic over the AWS backbone---no ENI, no hourly charge, and an endpoint policy that can restrict which buckets are reachable. An \emph{interface endpoint} places an elastic network interface in your subnet backed by AWS PrivateLink, available for most AWS services and for third-party/private services---billed per AZ-hour plus per-GB processed \cite{awsPrivateLinkDocs}.
+\index{gateway endpoint}\index{interface endpoint}\index{PrivateLink}
+
+The data-platform consequence: with an S3 gateway endpoint, a VPC with \emph{no internet gateway at all} can still reach the lake---which is exactly the posture regulated workloads want. Glue, Redshift, Athena, KMS, and the rest get interface endpoints; traffic to AWS APIs never touches the public internet.
+
+\begin{notebox}
+\textbf{Cost guardrail:} interface endpoints bill per AZ-hour plus per-GB. For high-volume S3 traffic always prefer the free gateway endpoint, and consolidate interface endpoints (one shared-services VPC) instead of one per workload VPC. Set AWS Budgets alerts per account \emph{before} the hardening project, so the perimeter itself never produces a surprise bill.
+\end{notebox}
+
+\subsection{Endpoint Policies: The Network Half of the Perimeter}
+An endpoint policy restricts what the endpoint will carry: ``this S3 endpoint serves only these buckets, only for principals in our organization.'' Endpoint policies are how the network layer enforces the data perimeter independently of IAM---a stolen credential used from a laptop cannot route through your endpoint, and your endpoint will not carry data to a stranger's bucket.
+\index{endpoint policy}
+
+\section{Wednesday: KMS and Secrets Manager}
+\subsection{KMS: Keys as Policy Objects}
+AWS KMS provides envelope encryption: data keys encrypt data; KMS customer master keys encrypt data keys \cite{awsKMSDocs}. For the data engineer, the essentials are: customer-managed keys (CMKs) when you need key policy control, rotation evidence, and cross-account sharing (the lake's key must allow the analytics account to decrypt); per-domain keys to bound blast radius; and CloudTrail logging of every key use, which makes ``who decrypted what'' an answerable question. Grants and key policies together decide whether a stolen credential can decrypt anything---with a per-service, per-bucket key policy, often it cannot.
+\index{KMS}\index{envelope encryption}\index{customer-managed key}
+
+\subsection{Secrets Manager: No More Static Credentials}
+Database passwords, API keys, and JDBC strings live in AWS Secrets Manager, retrieved at runtime by IAM-authenticated callers, and---the point---\emph{rotated automatically} on a schedule with Lambda rotators that update both the secret and the target database \cite{awsSecretsManagerDocs}. Static credentials in environment variables, DAG code, or \texttt{.env} files are the most common real-world data-platform breach vector; rotation converts a leaked credential from a breach into an incident ticket.
+\index{Secrets Manager}\index{rotation}
+
+\begin{tipbox}
+Redshift, RDS, and document databases have native Secrets Manager rotation integrations. For anything else, the pattern is: secret in Secrets Manager, application fetches at startup and caches briefly, rotation Lambda updates both sides, and CloudTrail alarms on unusual \texttt{GetSecretValue} patterns.
+\end{tipbox}
+
+\section{Thursday Hands-on Project: Private S3 Access with No Internet Route}
+\index{hands-on project!VPC endpoint for S3}
+Create a VPC endpoint for S3, then access a bucket from an EC2 instance in a VPC with no internet gateway---proving the private path works and the public path does not exist.
+
+\subsection*{Lab Objectives}
+\begin{itemize}
+    \item Build a VPC with a private subnet and no internet gateway.
+    \item Add an S3 gateway endpoint with a restrictive endpoint policy.
+    \item From EC2 (via Systems Manager Session Manager, since there is no inbound path), copy a file to the bucket.
+    \item Demonstrate that the endpoint policy blocks access to a non-authorized bucket.
+\end{itemize}
+
+\subsection*{Procedure}
+\begin{lstlisting}[language=bash,caption={Private VPC, gateway endpoint, and the proof.},label={lst:ch21-endpoint}]
+# 1. VPC with a private subnet; deliberately no IGW is created or attached.
+$VpcId = (aws ec2 create-vpc --cidr-block 10.21.0.0/16 `
+  --query Vpc.VpcId --output text)
+$SubnetId = (aws ec2 create-subnet --vpc-id $VpcId `
+  --cidr-block 10.21.1.0/24 --query Subnet.SubnetId --output text)
+$RtId = (aws ec2 describe-route-tables --filters Name=vpc-id,Values=$VpcId `
+  --query 'RouteTables[0].RouteTableId' --output text)
+
+# 2. Gateway endpoint for S3, scoped by endpoint policy to one bucket.
+$Policy = @"
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Principal": "*",
+    "Action": ["s3:GetObject", "s3:PutObject", "s3:ListBucket"],
+    "Resource": [
+      "arn:aws:s3:::week21-private-bucket-123456789012",
+      "arn:aws:s3:::week21-private-bucket-123456789012/*"
+    ]
+  }]
+}
+"@
+$Policy | Set-Content -Path endpoint-policy.json -Encoding ascii
+
+aws ec2 create-vpc-endpoint --vpc-id $VpcId `
+  --service-name com.amazonaws.us-east-1.s3 `
+  --route-table-ids $RtId `
+  --policy-document file://endpoint-policy.json
+
+# 3. EC2 in the private subnet (SSM-enabled role; no public IP, no IGW).
+aws ec2 run-instances --image-id ami-0abcdef1234567890 `
+  --instance-type t3.micro --subnet-id $SubnetId `
+  --iam-instance-profile Name=Week21SSMRole --no-associate-public-ip-address
+
+# 4. From the instance (via Session Manager):
+#    aws s3 cp test.txt s3://week21-private-bucket-123456789012/   # succeeds
+#    aws s3 ls s3://some-other-bucket/                             # denied by endpoint policy
+\end{lstlisting}
+
+\subsection*{Verification}
+\begin{itemize}
+    \item The copy to the authorized bucket succeeds with no internet gateway attached---traffic used the gateway endpoint.
+    \item Access to any other bucket fails with an explicit endpoint-policy denial.
+    \item VPC flow logs (or S3 server access logs with \texttt{vpce} source) evidence the private path.
+    \item A Route53/hosted check confirms no public DNS egress path exists from the subnet.
+\end{itemize}
+
+\section{Friday Use Case: A Healthcare Data Perimeter That Survives Credential Theft}
+\index{use case!data perimeter}
+A healthcare provider's threat model states: \emph{assume an IAM credential will eventually be compromised; no data may leave to an outside AWS account even then.} Design the perimeter for the analytics platform.
+
+\subsection{The Layered Design}
+\begin{figure}[H]
+    \centering
+    \resizebox{0.95\textwidth}{!}{%
+    \begin{tikzpicture}[
+        layer/.style={rectangle, rounded corners, draw=red!60!black, thick, fill=red!4, align=center, minimum width=3.6cm, minimum height=1.15cm, font=\footnotesize\bfseries},
+        data/.style={cylinder, shape aspect=0.25, draw=primary, thick, fill=blue!6, shape border rotate=90, align=center, text width=2.6cm, minimum height=1.3cm, font=\small\bfseries},
+        arr/.style={-{Stealth[length=2.5mm]}, draw=red!60!black, thick}
+    ]
+        \node[data] (lake) at (0,0) {Lake + warehouse\\(KMS-encrypted)};
+        \node[layer] (id) at (5.0,2.2) {Identity perimeter\\roles only, no keys\\aws:PrincipalOrgID conditions};
+        \node[layer] (net) at (5.0,0) {Network perimeter\\VPC endpoints only\\endpoint policies};
+        \node[layer] (org) at (5.0,-2.2) {Organization perimeter\\SCPs: deny external share\\deny non-endpoint S3};
+        \node[layer] (keys) at (-0.2,2.2) {Key perimeter\\KMS key policies\\org-only decrypt};
+        \draw[arr] (id) -- (lake);
+        \draw[arr] (net) -- (lake);
+        \draw[arr] (org) -- (lake);
+        \draw[arr] (keys) -- (lake);
+    \end{tikzpicture}%
+    }
+    \caption{The four perimeters: identity, network, organization, and keys. A stolen credential must defeat all four to exfiltrate data.}
+    \label{fig:ch21-perimeter}
+\end{figure}
+
+\textbf{Identity perimeter.} All access via roles with conditions requiring the organization (\texttt{aws:PrincipalOrgID}) and, where applicable, the expected network (\texttt{aws:SourceVpce}). No IAM users with long-lived keys exist to steal in the first place; workforce access is federated.
+
+\textbf{Network perimeter.} Data services are reachable only through VPC endpoints whose policies allow only the organization's buckets and only expected actions. There is no internet gateway in data subnets. A credential used from an attacker's laptop satisfies no network condition.
+
+\textbf{Organization perimeter (SCP).} An SCP denies \texttt{s3:PutObject} to any bucket where the destination account is outside the organization, denies disabling CloudTrail, and confines regions. Even a fully compromised account admin cannot exceed an SCP.
+
+\textbf{Key perimeter.} Bucket-default KMS keys whose policies allow decrypt only for organization principals. Data copied out---if every other layer somehow failed---arrives as ciphertext without a usable key.
+
+\begin{lstlisting}[language=json,caption={The anti-exfiltration SCP: deny S3 writes to non-organization accounts.},label={lst:ch21-scp}]
+{
+  "Effect": "Deny",
+  "Action": ["s3:PutObject", "s3:PutObjectAcl"],
+  "Resource": "arn:aws:s3:::*/*",
+  "Condition": {
+    "StringNotEquals": {
+      "aws:PrincipalAccount": ["111111111111", "222222222222"]
+    }
+  }
+}
+\end{lstlisting}
+
+\subsection{Verification and Operations}
+The perimeter is tested like code: a red-team drill attempts exfiltration with a deliberately ``leaked'' sandbox credential and must fail at a named layer, with the CloudTrail event captured. Continuously, Config rules check for internet gateways in data VPCs and for buckets without org-scoped key policies, and CloudTrail Lake Formation/S3 data events alarm on access patterns outside the endpoint set.
+
+\begin{pitfall}
+\textbf{A perimeter that exists only in diagrams.} Each layer must have a test that would fail if the layer were removed. Untested SCPs have typos; untested endpoint policies have wildcards; untested key policies allow \texttt{*}. The red-team drill is the unit test of the perimeter.
+\end{pitfall}
+
+\section{Interview Q\&A}
+\subsection{Concepts and Trade-offs}
+\begin{enumerate}
+    \item \textbf{Q: Gateway versus interface VPC endpoint: which is free for S3 traffic?}\\
+    A: The gateway endpoint---a route-table entry for S3 and DynamoDB with no hourly or per-GB charge. Interface endpoints (PrivateLink) cover other services and bill per AZ-hour plus data.
+    \item \textbf{Q: What does a permissions boundary limit on a role?}\\
+    A: The role's maximum permissions regardless of its identity policies---the intersection of policy and boundary is effective. It makes delegated role creation safe.
+    \item \textbf{Q: Why is automatic Secrets Manager rotation better than static keys?}\\
+    A: Rotation bounds the value of any leaked credential to the rotation window and updates the target system automatically; static keys leak forever and rotate never.
+    \item \textbf{Q: How do SCPs differ from IAM policies?}\\
+    A: SCPs apply at the Organizations level and cap what any account---including its administrators---may do. IAM policies grant within an account; SCPs bound the account itself.
+    \item \textbf{Q: What exfiltration path does PrivateLink close that security groups cannot?}\\
+    A: Security groups control instance traffic but not which \emph{service endpoints} data flows to. Endpoint policies on PrivateLink/gateway endpoints restrict the destinations themselves---your network cannot be used to write to a stranger's bucket.
+    \item \textbf{Q: Why does KMS complete the perimeter?}\\
+    A: Key policies can restrict decryption to organization principals, so data copied past every other control arrives as unusable ciphertext.
+\end{enumerate}
+
+\section{Further Reading}
+The IAM User Guide covers roles, boundaries, and policy evaluation \cite{awsIAMDocs}; the PrivateLink guide covers both endpoint types and endpoint policies \cite{awsPrivateLinkDocs}; KMS and Secrets Manager documentation cover envelope encryption, key policies, and rotation \cite{awsKMSDocs,awsSecretsManagerDocs}. The Config and CloudTrail guides support the verification layer \cite{awsConfigDocs,awsCloudTrailDocs}.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item Roles everywhere, users never; least privilege iterated from observed usage.
+    \item Boundaries and SCPs are ceilings that make every future grant safer; deploy them first.
+    \item Gateway endpoints make private S3 free; interface endpoints privatize everything else---with a price to watch.
+    \item Endpoint policies are the network half of the perimeter, independent of IAM.
+    \item KMS key policies are the final layer: ciphertext without an org key is not exfiltration.
+    \item Perimeters are tested by drills, not diagrams; every layer needs a test that would fail without it.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Walk the IAM evaluation logic for a role with an allow policy, a boundary, and an SCP. What wins in a conflict?
+    \item \textbf{(Conceptual)} Why does the identity-perimeter condition on \texttt{aws:SourceVpce} defeat a stolen credential used from an attacker's machine?
+    \item \textbf{(Hands-on)} Run the Thursday lab; then tighten the endpoint policy to read-only and demonstrate the write failing.
+    \item \textbf{(Hands-on)} Create a Secrets Manager secret for a database, wire automatic rotation, and verify a rotation cycle.
+    \item \textbf{(Hands-on)} Use IAM Access Analyzer to generate a least-privilege policy from a role's CloudTrail history and diff it against the hand-written policy.
+    \item \textbf{(Design)} Write the SCP set for a three-account data estate: region restriction, CloudTrail protection, and exfiltration denial.
+    \item \textbf{(Design)} Price the perimeter for the Friday scenario: endpoints per AZ, KMS request volume, Config rules, and CloudTrail data events.
+    \item \textbf{(Architecture)} Design break-glass access for the perimeter: who can bypass, how is it alarmed, and how does it expire?
+\end{enumerate}
+
+\section{Capstone Project: A Tested Data Perimeter for the Analytics Estate}\label{sec:ch21-capstone}
+\index{capstone project}\index{data perimeter!capstone}
+
+\begin{capstonebox}
+\textbf{Mission.} Wrap the course's analytics estate in a tested perimeter: org-scoped SCPs, endpoint-privatized networking, org-scoped KMS keys, rotated secrets---and prove it with a red-team drill that fails at a named layer.
+
+\textbf{Estimated time.} 6--8 hours in a sandbox organization.
+
+\textbf{What you\textquotesingle{}ll practice.}
+\begin{itemize}
+    \item SCP authoring and attachment with safe rollout.
+    \item Gateway and interface endpoint design with endpoint policies.
+    \item KMS key policy design for cross-account analytics.
+    \item Evidence-driven verification: drills, Config rules, CloudTrail alarms.
+\end{itemize}
+\end{capstonebox}
+
+\subsection*{Scenario}
+The healthcare provider from Friday approves a proof-of-concept on two sandbox accounts (data and analytics). Your job: the estate must hold against a simulated credential leak, and every control must come with its test.
+
+\subsection*{Requirements}
+\textbf{Functional requirements.}
+\begin{itemize}
+    \item SCPs: region restriction, anti-exfiltration (\cref{lst:ch21-scp} generalized to \texttt{aws:PrincipalOrgID}), CloudTrail protection.
+    \item S3 gateway endpoint plus interface endpoints for the services in use, with bucket-scoped endpoint policies.
+    \item Bucket-default KMS with organization-scoped decrypt; Secrets Manager with rotation for the database credential.
+    \item The red-team drill: a ``leaked'' sandbox credential attempting console and API exfiltration.
+\end{itemize}
+
+\textbf{Non-functional requirements.}
+\begin{itemize}
+    \item Every layer has a test that demonstrably fails when the control is removed (in the sandbox).
+    \item Config rules and CloudTrail alarms watch the perimeter continuously.
+    \item A cost statement covers the perimeter's own monthly bill.
+\end{itemize}
+
+\subsection*{Implementation Steps}
+\begin{enumerate}
+    \item Stand up the two-account organization; attach SCPs progressively and test each.
+    \item Build the private networking per \cref{lst:ch21-endpoint}, extended to the used services.
+    \item Re-key the buckets to org-scoped CMKs; migrate the database credential into Secrets Manager with rotation.
+    \item Author the drill script and run it; capture the layer and CloudTrail event of each failure.
+    \item Deploy the Config rules and alarms; document the cost statement.
+\end{enumerate}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item SCPs, endpoint policies, and key policies as code.
+    \item The drill report: attempted actions, blocking layer, evidence events.
+    \item Config rule set and alarm definitions with one fired example.
+    \item The perimeter cost statement and the operations runbook.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item The drill's exfiltration attempts all fail at named, evidenced layers.
+    \item Cross-account analytics (the lake read from the analytics account) still works---the perimeter permits the intended path.
+    \item Rotation demonstrably invalidates the previous database credential.
+    \item Removing any single control in the sandbox is detected by its test.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Add Macie (Chapter~23) to close the loop on what the perimeter protects.
+    \item Implement network-perimeter exceptions as time-boxed, alarmed break-glass roles.
+    \item Extend the drill to an insider scenario: an authorized analyst exceeding their normal pattern.
+    \item Codify the whole perimeter in Terraform (Chapter~24) with policy tests in CI.
+\end{itemize}

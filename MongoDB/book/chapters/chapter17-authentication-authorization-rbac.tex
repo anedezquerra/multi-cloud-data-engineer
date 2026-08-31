@@ -1,0 +1,266 @@
+\chapter{Authentication, Authorization, and RBAC}
+\index{authentication}\index{SCRAM}\index{x.509}\index{LDAP}\index{RBAC}\index{custom roles}\index{least privilege}\index{auditing}\index{OIDC}%
+
+\begin{objectives}
+\begin{itemize}
+    \item Configure and compare authentication mechanisms: SCRAM-SHA-256, x.509 certificates, LDAP, Kerberos, and OIDC.
+    \item Design least-privilege role hierarchies with built-in and custom roles scoped to collections and actions.
+    \item Restrict service accounts to specific pipeline stages and collections using fine-grained privileges.
+    \item Detect authorization-failure anomalies as both a security signal and a release-quality signal.
+    \item Deploy an x.509-authenticated cluster with custom RBAC in the Thursday lab.
+    \item Architect an Active Directory-integrated enterprise security model for Atlas.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+Identity and access design is the same discipline on every cloud: central identity, least privilege, auditable grants. The product names differ; the review questions are identical.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{2.9cm}p{3.0cm}p{3.0cm}p{3.0cm}@{}} 
+\toprule
+\textbf{Capability} & \textbf{AWS} & \textbf{Azure} & \textbf{GCP} \\
+\midrule
+Cloud identity & IAM users/roles & Microsoft Entra ID & Cloud IAM \\
+Workload identity & IAM roles for pods/EC2 & Managed identities & Workload Identity Federation \\
+DB-level RBAC & DocumentDB users / IAM DB auth & Cosmos DB RBAC & Firestore security rules \\
+Directory integration & AD Connector / LDAP & Native Entra & Cloud Identity \\
+Audit & CloudTrail + engine audit & Diagnostic settings & Cloud Audit Logs \\
+Certificate auth & ACM-issued client certs & Key Vault certs & Certificate Authority Service \\
+\addlinespace
+Snowflake / Fabric & \multicolumn{3}{l}{SCIM + SSO (SAML/OIDC), role hierarchy with inheritance, network policies; Fabric layers on Entra conditional access} \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+MongoDB's distinctive surface is its \emph{in-database} RBAC: privileges named by resource (database.collection) and action (down to pipeline-stage granularity), composable into custom roles---closer to Snowflake's role model than to IAM policies \cite{mongodbSecurityChecklistDocs,mongodbRBACDocs}.
+\end{crosscloud}
+
+\section{Week 17 Roadmap: Identity as Architecture}
+Security chapters in this book are deliberately late: you cannot meaningfully scope privileges until you know the access patterns (Part III), the cluster topology (Part II), and the operational surfaces (Part IV). This week builds the identity layer: who can authenticate, what they may do, and how every consequential action is recorded \cite{mongodbSecurityChecklistDocs}.
+
+\begin{definitionbox}
+\textbf{Role-Based Access Control (RBAC)} in MongoDB assigns privileges---an action set on a resource---to roles, and roles to users or external identity groups. \textbf{Least privilege} means every account holds exactly the privileges its function requires, no more.
+\end{definitionbox}
+
+\begin{keyterms}
+\textbf{SCRAM-SHA-256}: the default password challenge-response mechanism. \textbf{x.509}: certificate-based authentication from a PKI. \textbf{LDAP/Kerberos/OIDC}: enterprise directory and token integrations. \textbf{Privilege action}: a granular permission (e.g. \texttt{find}, \texttt{changeStream}, \texttt{collMod}). \textbf{Audit filter}: the JSON predicate selecting which events to record. \textbf{Service account}: a non-human identity with a fixed function.
+\end{keyterms}
+
+\section{Monday: Authentication Mechanisms}
+\subsection{Choosing the Mechanism}
+\textbf{SCRAM-SHA-256} is the default: salted, iterated password challenge-response; correct for development and small services, with the operational burden of credential rotation and per-database user stores. \textbf{x.509} authenticates clients by certificate from your PKI: no passwords to leak, rotation via certificate lifecycle, ideal for service-to-service at scale---and the reason Thursday's lab exists. \textbf{LDAP and Kerberos} delegate to the enterprise directory (MongoDB Enterprise), centralizing lifecycle: disable the employee in AD and database access dies with it. \textbf{OIDC} (workload identity federation in Atlas) lets cloud workloads authenticate with short-lived tokens instead of stored secrets.
+
+\subsection{The Service-Account Rule}
+Human users authenticate through the directory (LDAP/OIDC with MFA at the IdP). Services authenticate with x.509 or workload identity. Nothing authenticates with a password embedded in a configuration file---every SCRAM credential in source control or a config repo is an audit finding waiting to be written. Credentials live in the secrets manager (Chapter 18's KMS neighbors), injected at runtime, rotated on schedule.
+
+\begin{pitfall}
+\textbf{x.509 without revocation planning.} Certificate authentication is only as strong as the revocation path: publish CRLs or OCSP, set conservative validity periods, and drill the ``laptop with a service cert is lost'' scenario before you need it.
+\end{pitfall}
+
+\section{Tuesday: RBAC in Depth}
+\subsection{Built-in Roles and Their Gravity}
+Built-in roles span from \texttt{read} to \texttt{root}. Their gravity well is \texttt{readWriteAnyDatabase} and \texttt{dbAdminAnyDatabase}: convenient in demos, indefensible for service accounts in production. A service that reads \texttt{shop.orders} and writes \texttt{shop.events} should hold exactly those privileges on exactly those collections---so that a compromised service token yields an attacker one bounded capability, not the cluster.
+
+\subsection{Custom Roles with Pipeline-Stage Granularity}
+Custom roles compose privilege actions on resources, and MongoDB's privilege model is granular enough to express ``may run aggregations but not \texttt{\$out}/\texttt{\$merge}'' or ``may open change streams on this collection only.'' This is how an analytics service gets read-everything-it-needs without becoming a write-capable exfiltration path.
+
+\begin{lstlisting}[language=JavaScript, caption={Custom role: read orders, stream events, no writes, no destructive stages.}]
+use admin;
+db.createRole({
+  role: "analyticsReader",
+  privileges: [
+    { resource: { db: "shop", collection: "orders" },
+      actions: ["find"] },
+    { resource: { db: "shop", collection: "events" },
+      actions: ["find", "changeStream"] },
+    { resource: { db: "shop", collection: "" },          // whole db
+      actions: ["listCollections"] }
+  ],
+  roles: []
+});
+db.createUser({ user: "analytics-svc", roles: [{ role: "analyticsReader", db: "admin" }],
+                mechanisms: ["SCRAM-SHA-256"] , pwd: passwordPrompt() });
+\end{lstlisting}
+
+\subsection{Role Review as a Control}
+Roles drift: emergency grants become permanent, departing employees retain access, service accounts accumulate privileges ``temporarily.'' The control is a quarterly role review driven by evidence: dump role definitions (\texttt{db.getRoles(\{showPrivileges: true\})}), diff against the reviewed baseline in Git, and reconcile grants against the actual access log. In Atlas, manage roles through the API or Terraform so the reviewed state is the deployed state (Chapter 21).
+
+\section{Wednesday: Database-Level Privileges and Service Accounts}
+\subsection{Scoping to Collections and Actions}
+The privilege resource can be as broad as a cluster or as narrow as one collection; the action list is equally granular---\texttt{find}, \texttt{insert}, \texttt{update}, \texttt{remove}, \texttt{changeStream}, \texttt{collMod}, \texttt{createIndex}, and pipeline-stage-restricting actions such as \texttt{out} and \texttt{merge} controls. Wednesday's design exercise is to take each service account and write the smallest privilege set that supports its documented access patterns (Chapters 9--11's query shapes are the specification): the read path's collections with \texttt{find} only, the write path's collections with \texttt{insert}/\texttt{update} but never \texttt{remove}, and no administrative actions anywhere.
+
+\begin{lstlisting}[language=JavaScript, caption={Extending a role with grantPrivilegesToRole---reviewed, scripted, attributable.}]
+use admin;
+db.grantPrivilegesToRole("analyticsReader", [
+  { resource: { db: "shop", collection: "daily_metrics" }, actions: ["find"] }
+]);
+// In production this line lives in a reviewed migration (Chapter 21),
+// never in an ad-hoc shell session.
+\end{lstlisting}
+
+\subsection{Detecting Authorization-Failure Anomalies}
+A spike in authorization failures is both a security signal (a probing attacker or a leaked token being tried) and a release-quality signal (a new service version shipping with a wrong role assumption). The control is an alert on the failure rate---wired into the monitoring stack of Chapter 23---with a runbook that distinguishes the two deliberately: check the source service and deployment timeline first, then treat unexplained sources as security events.
+
+\begin{pitfall}
+\textbf{Broad roles ``temporarily.''} Every incident-response grant without an expiry date becomes permanent by default. Grant with a ticket, an expiry, and a removal reminder; the quarterly review catches what slips.
+\end{pitfall}
+
+\section{Thursday Hands-On Project: x.509 Cluster with Least-Privilege Roles}
+Deploy a lab replica set requiring x.509 client certificates, define custom roles, and demonstrate both a permitted and a rejected operation per service account.
+
+\subsection{Lab Outline}
+Generate a local CA and member/client certificates (\texttt{openssl} or PowerShell PKI), configure \texttt{mongod} with \texttt{net.tls.mode: requireTLS}, \texttt{clusterAuthMode: x509}, and certificate file paths, then authenticate clients with \texttt{--tlsCertificateKeyFile}. Create two service accounts: \texttt{orders-reader} (find on \texttt{shop.orders} only) and \texttt{pipeline-worker} (find + changeStream on \texttt{shop.events}, with \texttt{\$merge} privileges explicitly absent). The demonstration: each account performs its permitted operation and its forbidden one, and the audit log captures both the authorization failure and the successful operations.
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item CA/certificate generation scripts and the \texttt{mongod} TLS configuration.
+    \item Role definitions as idempotent scripts, plus the grant matrix documenting intent.
+    \item The permit/deny demonstration log and the corresponding audit-log excerpts.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item Clients without valid certificates cannot connect at all.
+    \item Each service account's forbidden operation is denied with an audit-recorded authorization failure.
+    \item Role scripts re-run idempotently and match the documented grant matrix.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Rotate a client certificate without downtime and document the procedure.
+    \item Alert on the injected authorization-failure spike using Chapter 23's monitoring stack.
+\end{itemize}
+
+\section{Friday Use Case and Architecture: Enterprise Identity for a Global Bank}
+\subsection{Scenario and Requirements}
+A bank runs MongoDB Atlas for forty services. Requirements: humans authenticate via Active Directory with MFA; services authenticate without stored passwords; every privilege grant is reviewed quarterly; and a SIEM consumes authentication, authorization-failure, and sensitive-collection events in near-real time.
+
+\subsection{Architecture}
+Human access flows through OIDC federation to the corporate IdP (conditional access and MFA enforced there), with Atlas organization roles mapped to directory groups---the joiner/mover/leaver process is the directory's, not the DBA's. Service accounts use x.509 certificates issued by the bank's PKI with 90-day validity and automated rotation; Kubernetes workloads use OIDC workload identity where available (Chapter 22). All roles are Terraform-managed custom roles with a documented grant matrix; the quarterly review diffs deployed privileges against the matrix. Audit events stream to the SIEM; the detection content includes the authorization-failure-spike rule and an impossible-travel rule on administrative logins.
+
+\begin{figure}[H]
+    \centering
+    \resizebox{0.95\textwidth}{!}{%
+    \begin{tikzpicture}[
+        box/.style={rectangle, rounded corners, draw=primary, fill=primary!6, minimum width=2.7cm, minimum height=1.1cm, align=center, font=\small\bfseries},
+        sec/.style={rectangle, rounded corners, draw=red!60!black, fill=red!5, minimum width=2.7cm, minimum height=1.1cm, align=center, font=\small\bfseries},
+        arrow/.style={-{Stealth[length=2.5mm]}, draw=primary, thick}
+    ]
+        \node[box] (idp) at (0,1.6) {Corporate IdP\\(AD + MFA)};
+        \node[box] (pki) at (0,-1.6) {PKI / cert\\lifecycle};
+        \node[sec] (atlas) at (4.6,0) {Atlas cluster\\OIDC + x.509\\custom RBAC};
+        \node[box] (audit) at (9.2,0) {Audit pipeline\\$\to$ SIEM};
+        \node[box] (review) at (9.2,-2.2) {Quarterly role\\review (Git diff)};
+        \draw[arrow] (idp) -- (atlas);
+        \draw[arrow] (pki) -- (atlas);
+        \draw[arrow] (atlas) -- (audit);
+        \draw[arrow] (atlas) -- (review);
+    \end{tikzpicture}%
+    }
+    \caption{Enterprise identity architecture: directory-authenticated humans, certificate-authenticated services, code-managed roles, SIEM-shipped audit.}
+    \label{fig:ch17-identity}
+\end{figure}
+
+\subsection{Guardrails}
+Three controls keep the model honest: no standing production human access (break-glass accounts are vaulted, alarmed, and tested), every role change ships via pull request with the grant matrix updated, and the quarterly review produces a signed evidence artifact listing every privilege change and its approver.
+
+\section{Interview Q\&A}
+\subsection{Identity and Access}
+\begin{enumerate}
+    \item \textbf{Q: SCRAM versus x.509 for services at scale?}\\
+    A: x.509: certificates rotate via PKI automation, there are no passwords to leak or store, and revocation is a PKI primitive. SCRAM is simpler to start with but leaves credential hygiene to you.
+
+    \item \textbf{Q: Why are \texttt{AnyDatabase} roles indefensible for services?}\\
+    A: They collapse blast radius to zero containment: one leaked service token equals full-cluster access. Per-collection privileges bound what a compromise yields.
+
+    \item \textbf{Q: What does \texttt{grantPrivilegesToRole} change operationally?}\\
+    A: It mutates a role in place---every holder gains the privilege immediately. That is why role definitions belong in reviewed code, not ad-hoc shell sessions.
+
+    \item \textbf{Q: What is the least-privilege rule for service accounts?}\\
+    A: Per-collection, per-action privileges matching the documented access patterns---read paths get \texttt{find}, write paths get \texttt{insert}/\texttt{update}, nothing gets administrative actions. Auditing of these grants is Chapter 19''s subject.
+
+    \item \textbf{Q: Why alert on spikes of authorization failures?}\\
+    A: Because they are ambiguous in the useful direction: either a misconfigured role shipped in a release, or a probing attacker. The runbook distinguishes release timelines from unexplained sources.
+\end{enumerate}
+
+\section{Further Reading}
+Start with the MongoDB security checklist and RBAC documentation \cite{mongodbSecurityChecklistDocs,mongodbRBACDocs} and the authentication-mechanism reference \cite{mongodbAuthDocs}. Chapter 18 adds encryption in use, Chapter 19 adds the network perimeter and auditing, and Chapter 20's governance controls build on this chapter's role-review discipline. The zero-trust framing transfers to the cloud IAM references cited in the sibling tracks \cite{cosmosPartitionDocs}.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item Humans authenticate via the directory with MFA; services via x.509 or workload identity; passwords in config are findings.
+    \item Least privilege is per-collection, per-action, per-pipeline-stage; \texttt{AnyDatabase} roles are for demos only.
+    \item Roles are code: reviewed, versioned, Terraform-managed, and diffed quarterly against a grant matrix.
+    \item Authorization-failure spikes are both a security signal and a release-quality signal; audit design is Chapter 19.
+    \item Authorization-failure spikes are both a security signal and a release-quality signal.
+    \item Break-glass access exists, is vaulted, is alarmed, and is drilled.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Design the role set for a three-service shop: orders API, analytics job, and support console (read-only, masked PII).
+    \item \textbf{(Conceptual)} Why does certificate rotation without revocation still leave a risk window?
+    \item \textbf{(Conceptual)} Which privilege changes must be captured to prove who granted a role, and where are they recorded (Chapter 19)?
+    \item \textbf{(Hands-on)} Extend the lab with LDAP or OIDC federation in a sandbox IdP and document the login flow.
+    \item \textbf{(Hands-on)} Script the authorization-failure-spike detection and test it with a scripted probe (alert wiring is Chapter 23).
+    \item \textbf{(Design)} Produce the quarterly role-review procedure: inputs, diff method, evidence artifact, sign-off.
+    \item \textbf{(Design)} Design break-glass access for a hospital's production cluster: vaulting, alarming, expiry, drill schedule.
+    \item \textbf{(Interview)} ``An ex-employee's service token still works.'' Enumerate the control failures that sentence implies.
+\end{enumerate}
+
+\section{Capstone Project: Least-Privilege Identity Baseline}\label{sec:ch17-capstone}
+
+\begin{capstonebox}
+\textbf{Mission:} produce the identity baseline for a new production cluster: x.509 or OIDC service authentication, custom roles per service with a grant matrix, scoped auditing with SIEM shipping, and the quarterly-review tooling---all deployed from reviewed code.
+
+\textbf{Estimated time:} 5--7 hours.
+
+\textbf{What you will practice:}
+\begin{itemize}
+    \item Certificate-based authentication end to end.
+    \item Privilege design at collection and pipeline-stage granularity.
+    \item Evidence-producing security controls (deny logs, review diffs).
+\end{itemize}
+\end{capstonebox}
+
+\subsection*{Scenario}
+Your platform's security review board requires that no new cluster enters production without the baseline: identity, roles, audit, and review tooling. You are delivering the reference implementation other teams will clone.
+
+\subsection*{Requirements}
+\begin{itemize}
+    \item Lab cluster with TLS required and x.509 (or OIDC workload) service authentication; no password-based service accounts.
+    \item At least three custom roles with collection-scoped privileges and a documented grant matrix in Git.
+    \item Scoped audit filter capturing identity events plus one sensitive collection (configured per Chapter 19), with logs shipped to a separate destination.
+    \item A review script that diffs deployed privileges against the Git baseline and fails on drift.
+    \item A deny-test suite: every role's forbidden operations scripted and asserted to fail with audit evidence.
+\end{itemize}
+
+\subsection*{Implementation Steps}
+\begin{enumerate}
+    \item \textbf{Certificates.} Automate CA, member, and client certificate issuance and rotation documentation.
+    \item \textbf{Roles.} Implement roles as code; wire the grant matrix as the review artifact.
+    \item \textbf{Audit.} Configure the identity-event filter (Chapter 19), ship logs off-host, and test the audit-gap alert.
+    \item \textbf{Drift.} Implement and demonstrate the privilege-drift check (inject a manual grant; catch it).
+    \item \textbf{Deny tests.} Script the forbidden-operation suite with audit-log assertions.
+\end{enumerate}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item All configuration and role code, the grant matrix, and the drift-check script.
+    \item The deny-test suite output and audit-log excerpts as evidence.
+    \item The cloning guide for the next team.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item Certificate-less and wrong-privilege access demonstrably fail, with audit evidence.
+    \item The drift check catches an injected manual grant and passes on a clean cluster.
+    \item The entire baseline rebuilds from the repo on a fresh cluster.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Add the authorization-failure-spike alert wired to Chapter 23's monitoring stack.
+    \item Automate certificate rotation with zero client downtime and document the overlap window.
+\end{itemize}

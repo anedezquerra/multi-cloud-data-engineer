@@ -1,0 +1,370 @@
+\chapter{Synapse Serverless SQL and the Data Lakehouse}
+\index{serverless SQL pool}\index{lakehouse}\index{OPENROWSET}\index{CETAS}\index{Delta Lake}\index{logical data warehouse}%
+\begin{objectives}
+\begin{itemize}
+    \item Explain how the Synapse serverless SQL pool queries files in ADLS Gen2 without provisioned compute, and how per-TB billing changes cost engineering.
+    \item Query CSV, JSON, Parquet, and Delta folders in place with OPENROWSET, controlling schema inference, file parsing, and partition elimination.
+    \item Materialize query results back to the lake with CETAS and choose when to persist versus recompute.
+    \item Build a logical data warehouse from external tables and views that serve BI tools without duplicating data.
+    \item Describe what Delta Lake adds to plain files---ACID transactions, a transaction log, time travel, and schema enforcement.
+    \item Cut serverless scan cost an order of magnitude with columnar formats, partition pruning, and right-sized files.
+    \item Design a 50 PB log-analytics lakehouse that keeps raw data in ADLS Gen2 while querying alongside curated business data.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+Querying the lake in place, without loading a warehouse first, exists on every major cloud. The billing model---pay per byte scanned---is also shared, which makes format and partitioning discipline a cross-cloud skill, not a Synapse trick.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{3.0cm}p{2.9cm}p{3.1cm}p{3.2cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{AWS} & \textbf{Azure} & \textbf{GCP} \\
+\midrule
+Serverless lake SQL & Amazon Athena & Synapse serverless SQL pool & BigQuery external tables \\
+Query-in-place API & S3 SELECT / Athena & OPENROWSET & External data sources \\
+Materialize to lake & CTAS into S3 & CETAS & Export / CREATE TABLE AS \\
+Open table format & Delta Lake / Iceberg / Hudi on S3 & Delta Lake on ADLS Gen2 & BigLake tables / Iceberg \\
+Logical warehouse & Athena views & Serverless views + external tables & BigQuery logical views \\
+Billing lever & Per TB scanned & Per TB scanned & Per TB scanned (on-demand) \\
+\addlinespace
+\multicolumn{4}{@{}l@{}}{\textbf{Fabric}: SQL analytics endpoint over OneLake; \textbf{Snowflake}: external tables / Iceberg; \textbf{MongoDB}: Atlas Data Federation over S3.} \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+The lakehouse thesis---warehouse-class reliability on lake storage---originated with Delta Lake \cite{armbrust2020delta,armbrust2021lakehouse} and is now the default architecture vocabulary across all six platforms in this series.
+\end{crosscloud}
+
+\begin{keyterms}
+\textbf{Serverless SQL pool}: the per-query-billed T-SQL endpoint built into every Synapse workspace, with no provisioned compute.\quad
+\textbf{OPENROWSET}: the T-SQL rowset function that reads files directly from ADLS Gen2.\quad
+\textbf{CETAS}: CREATE EXTERNAL TABLE AS SELECT---persisting a query result to the lake as Parquet or Delta.\quad
+\textbf{Logical data warehouse}: a serving layer of views and external tables over lake files instead of copied warehouse tables.\quad
+\textbf{Transaction log}: Delta Lake's \texttt{\_delta\_log} that records every commit and enables ACID behavior and time travel.
+\end{keyterms}
+
+\section{Week 7 Overview: Warehousing Without a Warehouse}
+Chapter 5 built a provisioned MPP warehouse. This chapter asks when you do not need one. Every Synapse workspace includes a \textbf{serverless SQL pool}: a shared, always-available T-SQL endpoint that reads files directly from ADLS Gen2 and bills only for data processed \cite{microsoft2025synapseServerless}. There is nothing to pause, nothing to scale, and nothing to size---and also nothing holding data close to compute. Every query re-reads the lake.
+
+That trade defines the lakehouse serving pattern: keep one governed copy of data in ADLS Gen2 as Delta tables, and let serverless SQL---plus Power BI---query it logically through views. When it works, you delete an entire copy of the data estate and its refresh pipelines. When it fails, it fails in one of two predictable ways: queries that scan too many bytes (a cost problem) and queries that need sub-second latency or heavy concurrency (a provisioned-compute problem). Chapter 6 returned to both.
+
+\begin{definitionbox}
+A \textbf{lakehouse} is an architecture that stores all data once in open formats on object storage and serves warehouse workloads---SQL, BI, and ML---directly from it, using a table format such as Delta Lake for ACID guarantees \cite{armbrust2021lakehouse}.
+\end{definitionbox}
+
+\section{Monday: Querying the Lake with OPENROWSET}
+\index{OPENROWSET}\index{serverless SQL pool!billing}
+
+\subsection{How Serverless SQL Executes}
+A serverless query is compiled into a distributed plan executed over stateless compute that reads the lake files at query time. Because nothing is provisioned, the unit of cost is \textbf{data processed}: the bytes the engine must read to answer the query. Three levers reduce that number: columnar formats (read only referenced columns), partition pruning (read only matching folders), and file sizing (avoid millions of tiny files that force metadata overhead).
+
+\subsection{OPENROWSET Patterns}
+\begin{lstlisting}[language=SQL,caption={OPENROWSET over CSV, Parquet, and Delta folders.},label={lst:ch7-openrowset}]
+-- CSV with an explicit schema (inference reads the whole file)
+SELECT *
+FROM OPENROWSET(
+    BULK 'https://stadls.dfs.core.windows.net/raw/logs/year=2026/month=08/*.csv',
+    FORMAT = 'CSV', PARSER_VERSION = '2.0', HEADER_ROW = TRUE
+) WITH (
+    device_id  VARCHAR(50),
+    event_ts   DATETIME2,
+    temp_c     FLOAT
+) AS rows;
+
+-- Parquet: schema comes from the file footer; wildcards prune partitions
+SELECT device_id, AVG(temp_c) AS avg_temp
+FROM OPENROWSET(
+    BULK 'https://stadls.dfs.core.windows.net/silver/telemetry/year=*/month=*/*.parquet',
+    FORMAT = 'PARQUET'
+) AS t
+WHERE t.filepath(1) = '2026'
+GROUP BY device_id;
+
+-- Delta Lake: point at the table folder, not individual files
+SELECT *
+FROM OPENROWSET(
+    BULK 'https://stadls.dfs.core.windows.net/gold/fact_sales/',
+    FORMAT = 'DELTA'
+) AS f;
+\end{lstlisting}
+
+\begin{tipbox}
+Use the \texttt{filepath()} function in \texttt{WHERE} clauses over wildcarded paths. Partition columns encoded in folder names (\texttt{year=/month=}) are not real columns; \texttt{filepath(n)} exposes them so the engine can prune folders before reading data.
+\end{tipbox}
+
+\begin{pitfall}
+\textbf{Schema inference on CSV.} Without an explicit \texttt{WITH} clause, serverless SQL reads the data to infer types---you pay to scan the file once for inference and again for the query. Always declare schemas for CSV.
+\end{pitfall}
+
+\section{Tuesday: The Logical Data Warehouse Pattern}
+\index{logical data warehouse}\index{external table}
+
+\subsection{Views and External Tables as the Serving Layer}
+A logical data warehouse organizes lake data into a SQL-consumable layer without copying it. The building blocks are \textbf{external data sources} (named connections to lake containers with a credential), \textbf{external tables} (schema-bound references to folders), and \textbf{views} (named queries over external tables or OPENROWSET). BI tools connect to the serverless endpoint and see an ordinary database; the data never leaves the lake.
+
+\begin{lstlisting}[language=SQL,caption={Building a logical warehouse: data source, view, and a gold-zone star query.},label={lst:ch7-logicaldw}]
+CREATE EXTERNAL DATA SOURCE ds_lake
+WITH (LOCATION = 'https://stadls.dfs.core.windows.net/gold');
+GO
+
+CREATE VIEW gold.vw_sales_by_region AS
+SELECT s.region, d.year, SUM(f.net_amount) AS revenue
+FROM OPENROWSET(
+        BULK 'https://stadls.dfs.core.windows.net/gold/fact_sales/',
+        FORMAT = 'DELTA') AS f
+JOIN gold.dim_store s ON f.store_key = s.store_key
+JOIN gold.dim_date  d ON f.date_key  = d.date_key
+GROUP BY s.region, d.year;
+GO
+\end{lstlisting}
+
+\begin{definitionbox}
+A \textbf{logical data warehouse} exposes a warehouse-shaped SQL interface---schemas, views, security---over data that physically remains in the data lake, eliminating the copy pipeline between lake and warehouse.
+\end{definitionbox}
+
+\subsection{When the Logical Pattern Breaks Down}
+The pattern is excellent for curated, read-mostly, moderate-concurrency serving. It degrades when queries demand interactive latency under heavy concurrency (no local caching or indexes), when tables are mutated frequently (external tables are read-only), or when scan cost exceeds provisioned cost. Those are the cases Chapter 5's dedicated pool---or Chapter 6's optimization toolkit---exists for.
+
+\section{Wednesday: Delta Lake---ACID on the Data Lake}
+\index{Delta Lake!transaction log}\index{ACID!data lake}\index{time travel}
+
+\subsection{The Problem with Plain Files}
+Object stores offer atomic single-object writes but no multi-object transactions. A Spark job writing 200 Parquet files can fail halfway, leaving a corrupt ``table.'' Concurrent readers see partial state. There is no schema enforcement, no rollback, and no history. Delta Lake fixes this with a \textbf{transaction log}: a folder of JSON commit files (compacted periodically into Parquet checkpoints) that records exactly which data files belong to the table at each version \cite{armbrust2020delta,deltaio2025delta}.
+
+\subsection{What the Log Buys}
+\begin{itemize}
+    \item \textbf{ACID transactions:} a commit is one atomic log entry; readers always see a consistent snapshot.
+    \item \textbf{Time travel:} \texttt{VERSION AS OF} and \texttt{TIMESTAMP AS OF} query prior states---auditing, debugging, and reproducible training sets.
+    \item \textbf{Schema enforcement and evolution:} writes that violate the table schema fail; additive changes are made explicitly.
+    \item \textbf{Upserts:} \texttt{MERGE} brings warehouse semantics to lake files.
+\end{itemize}
+
+\subsection{File Hygiene: OPTIMIZE and VACUUM}
+Frequent small appends produce the \textbf{small-file problem}: thousands of tiny files that every query must open. \texttt{OPTIMIZE} compacts small files into ~1~GB targets; \texttt{VACUUM} deletes files no longer referenced by the log beyond the retention horizon. Schedule both. A lakehouse that never compacts gets slower every week while looking healthy in every status dashboard.
+
+\begin{pitfall}
+\textbf{Serving gold as CSV.} Serverless billing is per byte scanned; CSV forces full-row reads and type parsing. The same data as Delta/Parquet with partition pruning routinely cuts scan volume---and cost---by 10$\times$ or more.
+\end{pitfall}
+
+\section{Thursday Hands-on Project: CSV In, Parquet Out with CETAS}
+\index{hands-on lab}\index{CETAS}
+This lab reads raw CSVs in ADLS Gen2 with the serverless pool, transforms them in SQL, and writes the result back to the lake as partitioned Parquet with CETAS---the standard ``serverless ETL'' pattern. Use the workspace and storage account from Chapter 5.
+
+\subsection{Create the Scoped Credential and Data Sources}
+\begin{lstlisting}[language=SQL,caption={Credential and data sources for the raw and curated containers.},label={lst:ch7-creds}]
+-- in the built-in serverless pool's database
+CREATE DATABASE SCOPED CREDENTIAL lake_identity
+WITH IDENTITY = 'Managed Identity';
+GO
+CREATE EXTERNAL DATA SOURCE ds_raw
+WITH (LOCATION = 'https://stadls.dfs.core.windows.net/raw',
+      CREDENTIAL = lake_identity);
+CREATE EXTERNAL DATA SOURCE ds_curated
+WITH (LOCATION = 'https://stadls.dfs.core.windows.net/curated',
+      CREDENTIAL = lake_identity);
+GO
+\end{lstlisting}
+
+Grant the workspace managed identity \texttt{Storage Blob Data Contributor} on the storage account first, or both reads and the CETAS write will fail with authorization errors.
+
+\subsection{Transform and Materialize}
+\begin{lstlisting}[language=SQL,caption={CETAS: transform raw CSV into curated Parquet partitioned by year and month.},label={lst:ch7-cetas}]
+CREATE EXTERNAL TABLE curated.orders_clean
+WITH (
+    LOCATION = 'orders_clean/',
+    DATA_SOURCE = ds_curated,
+    FILE_FORMAT = parquet_snappy_ff   -- defined via CREATE EXTERNAL FILE FORMAT
+) AS
+SELECT
+    CAST(order_id AS BIGINT)            AS order_id,
+    TRY_CAST(order_ts AS DATETIME2)     AS order_ts,
+    UPPER(TRIM(status))                 AS status,
+    CAST(amount AS DECIMAL(18,2))       AS amount,
+    YEAR(TRY_CAST(order_ts AS DATETIME2))  AS order_year,
+    MONTH(TRY_CAST(order_ts AS DATETIME2)) AS order_month
+FROM OPENROWSET(
+        BULK 'orders/year=*/month=*/*.csv',
+        DATA_SOURCE = ds_raw,
+        FORMAT = 'CSV', PARSER_VERSION = '2.0', HEADER_ROW = TRUE
+    ) WITH (
+        order_id VARCHAR(32), order_ts VARCHAR(32),
+        status VARCHAR(20), amount VARCHAR(20)
+    ) AS r
+WHERE TRY_CAST(order_ts AS DATETIME2) IS NOT NULL;
+\end{lstlisting}
+
+\subsection{Verify the Round Trip}
+Query the new external table, then query the underlying folder with \texttt{FORMAT = 'PARQUET'} and confirm the results match. Compare \texttt{DATA\_PROCESSED} from the serverless query stats between a query with and without a \texttt{filepath()} partition filter---that number is your invoice.
+
+\section{Friday Use Case: A 50 PB Log Lakehouse for a Media Company}
+\index{use case}\index{lakehouse!architecture}
+A media company accumulates 50~PB of CDN, player, and application logs and wants analysts to query them alongside curated subscription and advertising data---without maintaining a 50~PB warehouse.
+
+\subsection{Target Architecture}
+Keep all 50~PB in ADLS Gen2 in Delta format across bronze, silver, and gold zones. Serve the hot analytical slice---the last 90 days of gold-zone aggregates---through serverless SQL views for dashboards, and let data science teams query deep history with Synapse Spark on demand. Purview (Chapter 8) catalogs everything; serverless views give BI a stable contract.
+
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[node distance=1.4cm]
+        \node[stage] (cdn) {CDN, player,\\app logs};
+        \node[store, right=1.5cm of cdn] (bronze) {Bronze\\raw Delta};
+        \node[store, right=1.5cm of bronze] (silver) {Silver\\conformed Delta};
+        \node[store, right=1.5cm of silver] (gold) {Gold\\aggregates};
+        \node[stage, above=1.2cm of gold] (sql) {Serverless SQL\\views};
+        \node[stage, below=1.2cm of gold] (spark) {Synapse Spark\\deep history};
+        \node[stage, right=1.5cm of gold] (bi) {Power BI};
+        \node[doc, below=1.0cm of silver] (ops) {OPTIMIZE + VACUUM\\schedule};
+        \draw[arrow] (cdn) -- (bronze);
+        \draw[arrow] (bronze) -- (silver);
+        \draw[arrow] (silver) -- (gold);
+        \draw[arrow] (gold) -- (sql);
+        \draw[arrow] (gold) -- (spark);
+        \draw[arrow] (sql) -- (bi);
+        \draw[arrow] (ops) -- (silver);
+    \end{tikzpicture}%
+    }
+    \caption{50 PB lakehouse: one copy of data in Delta zones; serverless views serve the hot slice; Spark handles deep-history scans.}
+    \label{fig:ch7-media-lakehouse}
+\end{figure}
+
+\subsection{Cost Reasoning}
+At 50~PB, storing the data twice (lake plus warehouse) is untenable; the logical pattern wins by construction. The remaining cost fight is bytes scanned: partition gold tables by date, keep file sizes near 1~GB with \texttt{OPTIMIZE}, enforce partition filters in the view definitions, and monitor \texttt{data\_processed} per query in Log Analytics. A full-table ad-hoc query against 50~PB of Parquet is a five-figure query; partition pruning makes the same question a two-figure one.
+
+\begin{pitfall}
+\textbf{Treating serverless as free because there is no cluster.} Per-TB billing means the most expensive query is the one nobody scoped. Publish per-view scan budgets and alert on queries that blow past them.
+\end{pitfall}
+
+\section{Architectural Decision Record Template}
+\index{architectural decision record}
+For each lakehouse serving decision, record: which zones exist and what formats they use; which entities are served logically (views) versus materially (dedicated pool); the partition scheme per gold table and the evidence it matches query filters; the OPTIMIZE/VACUUM schedule; and the monthly scan budget with the alert that enforces it.
+
+\section{Operational Deep Dive: Scan Budgets and View Contracts}
+\index{scan cost}\index{data quality!serving layer}
+Treat every published view as a product with a contract: columns, types, freshness, and a \emph{scan budget} in GB per execution. Review the top ten queries by data processed monthly---they are usually a handful of views missing partition predicates. When a view must change, version it (\texttt{vw\_sales\_v2}) rather than breaking consumers silently; the logical warehouse has no deployment transaction, so compatibility is a discipline, not a feature.
+
+\section{Troubleshooting Patterns}
+\index{troubleshooting!serverless SQL}
+\texttt{Cannot bulk load} errors are almost always RBAC: the managed identity lacks \texttt{Storage Blob Data Reader} (or Contributor for CETAS). Wrong results on Delta folders usually mean pointing OPENROWSET at a subfolder instead of the table root. Sudden cost jumps trace to one query---find it in the request DMVs or Log Analytics and look for a missing partition filter. Type errors on CSV mean inference crept back in; check that the \texttt{WITH} clause is still present after a view edit.
+
+\section{Week 7 Lab Rubric}
+\index{rubric}
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.2cm}p{5.0cm}p{5.0cm}@{}}
+\toprule
+\textbf{Criterion} & \textbf{Meets expectation} & \textbf{Needs improvement} \\
+\midrule
+Querying & Explicit schemas on CSV; \texttt{filepath()} pruning used & Inference left on; full-folder scans \\
+Materialization & CETAS writes partitioned Parquet; round trip verified & Output unpartitioned or never validated \\
+Delta fluency & Log, time travel, OPTIMIZE/VACUUM explained with evidence & Delta treated as ``just Parquet'' \\
+Cost & \texttt{data\_processed} compared with and without pruning & No scan measurement in the submission \\
+\bottomrule
+\end{tabular}
+\caption{Week 7 rubric for the serverless lakehouse deliverables.}
+\label{tab:ch7-rubric}
+\end{table}
+
+\section{Interview Q\&A}
+\subsection{Concepts and Trade-offs}
+\begin{enumerate}
+    \item \textbf{Q: How is serverless SQL billed, and how do you cut that cost?}\\
+    A: Per TB of data processed. Use Parquet/Delta, partition pruning via \texttt{filepath()}, explicit schemas, and appropriately sized files.
+    \item \textbf{Q: What is the logical data warehouse pattern?}\\
+    A: A serving layer of external tables and views over lake files, so BI queries a warehouse-shaped interface without copying data out of the lake.
+    \item \textbf{Q: What does Delta Lake add to plain files on ADLS Gen2?}\\
+    A: A transaction log that provides ACID commits, time travel, schema enforcement, and MERGE upserts over object storage.
+    \item \textbf{Q: What does CETAS do?}\\
+    A: CREATE EXTERNAL TABLE AS SELECT materializes a serverless query result back to the lake as Parquet or Delta---serverless ETL.
+\end{enumerate}
+
+\section{Further Reading}
+Begin with the serverless SQL pool overview \cite{microsoft2025synapseServerless} and the CETAS guide \cite{microsoft2025cetas}. The Delta Lake papers explain the transaction log and the lakehouse thesis \cite{armbrust2020delta,armbrust2021lakehouse}; the Delta Lake project site tracks the open format \cite{deltaio2025delta}. Chapter 6's workload-management material and the dedicated-pool best practices \cite{microsoft2025synapseDedicatedBest} complete the serving-layer picture.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item The serverless SQL pool queries ADLS Gen2 in place and bills per TB processed; the cost levers are columnar formats, partition pruning, and file sizing.
+    \item OPENROWSET with explicit schemas and \texttt{filepath()} predicates is the core skill; schema inference on CSV is a silent tax.
+    \item CETAS turns a serverless query into persisted, partitioned Parquet or Delta---the serverless ETL pattern.
+    \item A logical data warehouse serves BI through views over lake data, deleting the lake-to-warehouse copy pipeline.
+    \item Delta Lake's transaction log brings ACID, time travel, and upserts to object storage; OPTIMIZE and VACUUM are mandatory hygiene.
+    \item At 50 PB scale, one governed copy in Delta zones plus logical serving beats any duplicated warehouse design on cost.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Explain why a dedicated pool and a serverless pool fail in opposite ways under heavy concurrency.
+    \item \textbf{(Conceptual)} Why does CSV schema inference double the scan cost of a query?
+    \item \textbf{(Conceptual)} What breaks if you \texttt{VACUUM} a Delta table with a zero-hour retention while a long-running reader holds an old snapshot?
+    \item \textbf{(Hands-on)} Run the CETAS lab, then measure \texttt{data\_processed} for a query with and without a \texttt{filepath(1)} filter. Report both numbers.
+    \item \textbf{(Hands-on)} Create an external table over a Delta folder and query two historical versions. Explain what the log files contain.
+    \item \textbf{(Hands-on)} Append 500 small files to a Delta table, time a count query, run \texttt{OPTIMIZE}, and time it again.
+    \item \textbf{(Design)} Design the gold-zone views for the media company's executives. Specify partition filters and a scan budget per view.
+    \item \textbf{(Design)} Decide for three workloads---executive dashboard, data-science exploration, regulatory audit---whether each uses serverless views, Spark, or a dedicated pool. Justify.
+    \item \textbf{(Design)} Write an ADR for keeping the 50 PB estate in Delta rather than loading 5 PB of hot data into a dedicated pool.
+    \item \textbf{(Interview)} Prepare a two-minute explanation of why ``the lakehouse deleted our warehouse'' is a cost statement, not a latency statement.
+\end{enumerate}
+
+\section{Capstone Project: Logical Lakehouse Serving Layer}\label{sec:ch7-capstone}
+\index{capstone project}\index{logical data warehouse}\index{Delta Lake}
+
+\begin{capstonebox}
+\textbf{Mission:} Build a governed, serverless serving layer over a Delta lakehouse: land raw CSVs, transform them with CETAS into partitioned Parquet, publish a versioned set of gold views with scan budgets, and demonstrate a 10$\times$ cost reduction from format and partition discipline.
+
+\textbf{Estimated time:} 3--5 hours.
+
+\textbf{What you will practice:}
+\begin{itemize}
+    \item Serverless credentials, data sources, external file formats, and external tables.
+    \item OPENROWSET with explicit schemas and \texttt{filepath()} partition pruning.
+    \item CETAS materialization with partitioning.
+    \item Measuring and reducing data processed per query.
+\end{itemize}
+\end{capstonebox}
+
+\subsection*{Scenario}
+A retailer has five years of order CSVs landing nightly in \texttt{raw/}. Analysts currently export data to spreadsheets because there is no warehouse. Leadership wants governed SQL access \emph{without} provisioning one, and finance wants proof that the per-TB bill is under control.
+
+\subsection*{Requirements}
+\begin{itemize}
+    \item \textbf{Ingestion:} raw CSVs in \texttt{raw/orders/year=/month=/}; malformed rows rejected by explicit \texttt{TRY\_CAST} filters.
+    \item \textbf{Curation:} CETAS writes \texttt{curated/orders\_clean/} as Parquet, partitioned by year and month.
+    \item \textbf{Serving:} a \texttt{gold} schema of views with documented columns and per-view scan budgets.
+    \item \textbf{Cost evidence:} \texttt{data\_processed} measurements showing the pruning/format improvement.
+    \item \textbf{Security:} managed-identity credential only; no keys in any script.
+\end{itemize}
+
+\subsection*{Reference Architecture}
+Reuse Figure~\ref{fig:ch7-media-lakehouse} at retail scale: bronze CSV $\rightarrow$ CETAS to curated Parquet $\rightarrow$ gold views $\rightarrow$ Power BI, with the OPTIMIZE/VACUUM schedule annotated on the curated zone.
+
+\subsection*{Implementation Steps}
+\begin{enumerate}
+    \item Create the scoped credential and data sources (Listing~\ref{lst:ch7-creds}).
+    \item Run the CETAS transformation (Listing~\ref{lst:ch7-cetas}) and verify the round trip.
+    \item Publish three gold views; record their scan footprints with and without partition filters.
+    \item Version one view (\texttt{\_v2}) to demonstrate the compatibility discipline.
+    \item Write the one-page scan-budget report as the cost deliverable.
+\end{enumerate}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item All SQL scripts (credential, data sources, file format, CETAS, views).
+    \item The scan-budget report with before/after measurements.
+    \item A README stating the view contracts and the versioning policy.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item Curated Parquet row counts reconcile with valid raw rows.
+    \item Every gold view carries a declared scan budget and measured footprint.
+    \item No credentials in code; the managed identity performs all lake access.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Convert the curated zone to Delta and add a time-travel query to the audit story.
+    \item Add a Log Analytics alert on any single query exceeding 500 GB processed.
+    \item Compare the same workload's cost against a DW100c dedicated pool for one month and write the recommendation.
+\end{itemize}

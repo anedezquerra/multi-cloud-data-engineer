@@ -1,0 +1,290 @@
+\chapter{Cluster Balancing and Shard Key Optimization}
+\index{shard key}\index{balancer}\index{refineCollectionShardKey}\index{scatter-gather}\index{targeted query}\index{hot shard}\index{reshardCollection}\index{distributed transaction}%
+
+\begin{objectives}
+\begin{itemize}
+    \item Score candidate shard keys on cardinality, frequency, and rate of change before committing to one.
+    \item Refine a shard key live with \texttt{refineCollectionShardKey} and know when \texttt{reshardCollection} or a collection migration is required instead.
+    \item Distinguish targeted from scatter-gather queries with \texttt{explain("executionStats")} shard counts and design for single-shard routing.
+    \item Reason about chunk splits, balancer windows, and migration cost as operational levers.
+    \item Understand when multi-document transactions cross shards and how shard-key design keeps them single-shard.
+    \item Re-architect a 50 TB telemetry cluster to eliminate scatter-gather for 90\% of analytical reads.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+Shard-key optimization is the same discipline as partition-key tuning on the managed key-value stores: the key decides distribution, and a wrong key surfaces as throttling on one partition while the rest idle.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{2.9cm}p{3.0cm}p{3.0cm}p{3.0cm}@{}} 
+\toprule
+\textbf{Capability} & \textbf{AWS} & \textbf{Azure} & \textbf{GCP} \\
+\midrule
+Key change after creation & Not possible (rebuild table) & Not possible (new container) & Not possible (new table) \\
+Hot-key mitigation & Adaptive capacity + DAX & RU redistribution, synthetic keys & Tablet splits + salting \\
+Skew observability & Contributor Insights & Partition-key-metrics logs & Key Visualizer \\
+Balancing & Automatic partition split & Physical partition split & Automatic tablet rebalance \\
+Cross-partition txn & TransactWrite (bounded) & Not supported across partitions & Spanner synchronous commit \\
+\addlinespace
+Snowflake / Fabric & \multicolumn{3}{l}{Clustering keys guide micro-partition layout; reclustering runs in background with credit cost} \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+MongoDB is uniquely forgiving here: \texttt{refineCollectionShardKey} and \texttt{reshardCollection} allow online key evolution that DynamoDB and Cosmos DB simply do not offer---but the scoring discipline that avoids needing them is identical across all six platforms \cite{mongodbShardKeyDocs,cosmosPartitionDocs,dynamodbSingleTableDocs}.
+\end{crosscloud}
+
+\section{Week 7 Roadmap: The Key You Can Actually Change}
+Chapter 6 built the cluster and showed the \texttt{createdAt} hot-shard failure. This week is the optimization discipline that failure demands: how to evaluate a shard key before committing, how to refine one live when the evaluation was wrong, how to prove targeting with evidence, and how the shard-key boundary determines whether your transactions stay cheap. The week closes with the 50 TB telemetry re-architecture as the Friday engagement \cite{mongodbShardKeyDocs,mongodbShardingDocs}.
+
+\begin{definitionbox}
+\textbf{Shard-key optimization} is the iterative, evidence-driven process of scoring candidate keys on cardinality, frequency, and monotonicity; validating routing with execution statistics; and correcting the key in production with refinement or migration when measurement disagrees with the design.
+\end{definitionbox}
+
+\begin{keyterms}
+\textbf{Cardinality}: distinct key values, bounding chunk count. \textbf{Frequency}: how often the most common value appears, bounding per-chunk load. \textbf{Monotonicity}: whether new writes land on a moving edge of the key space. \textbf{Refinement}: adding suffix fields to an existing shard key without downtime. \textbf{Resharding}: a full online re-key of a collection. \textbf{Scatter-gather}: a query broadcast to all shards because the predicate lacks the shard key.
+\end{keyterms}
+
+\section{Monday: Evaluating Shard Keys}
+\subsection{The Scoring Rubric}
+Every candidate key is scored on three axes before any collection is sharded. \textbf{Cardinality}: enough distinct values that the balancer can carve the key space into many chunks---rules of thumb say thousands of distinct values minimum, and the ceiling on useful shards is roughly the distinct-value count. \textbf{Frequency}: no single value may dominate writes; a key where 40\% of documents share one value creates an unsplittable hot chunk no balancer can fix. \textbf{Rate of change}: monotonically increasing keys (timestamps, ObjectIds, sequence numbers) route every insert to the current maximum chunk, concentrating 100\% of writes on one shard regardless of cluster size.
+
+\begin{pitfall}
+\textbf{A low-cardinality prefix defeats everything after it.} In \texttt{\{status: 1, createdAt: 1\}} with five statuses, the key space has five first-level regions; chunk splits can only subdivide within a status, and a hot status stays hot forever. When you add a prefix for targeting, verify its cardinality and frequency first.
+\end{pitfall}
+
+\subsection{The Access-Pattern Fit Test}
+Scoring alone is not enough: the key must also match how the application reads. Write the five hottest query shapes, and for each ask whether the predicate includes the key (targeted) or not (scatter-gather). A perfect distribution key that no query predicates on turns every read into a broadcast. The compromise patterns from Chapter 6---compound keys pairing a high-cardinality targeting field with a locality field, or bucketed keys like \texttt{\{bucket: 1, createdAt: 1\}} with \texttt{bucket = hash(deviceId) \% 64}---exist to satisfy both halves of the test.
+
+\begin{table}[H]
+\centering\footnotesize
+\begin{tabular}{@{}p{3.4cm}p{2.6cm}p{2.6cm}p{3.6cm}@{}}
+\toprule
+\textbf{Candidate key} & \textbf{Cardinality} & \textbf{Monotonicity} & \textbf{Verdict} \\
+\midrule
+\texttt{\{createdAt: 1\}} & High & Monotonic & Hot shard on writes \\
+\texttt{\{country: 1\}} & Low & No & Few unsplittable chunks \\
+\texttt{\{userId: hashed\}} & High & No & Even; range reads scatter \\
+\texttt{\{tenantId: 1, ts: 1\}} & Per-tenant & Per-tenant edge & Good if tenants are many \\
+\texttt{\{bucket: 1, ts: 1\}} & 64 buckets & Per-bucket edge & Bounded spread, tunable \\
+\bottomrule
+\end{tabular}
+\caption{Shard-key scoring: distribution properties before access-pattern fit.}
+\label{tab:ch7-scoring}
+\end{table}
+
+\section{Tuesday: Refining and Resharding Live}
+\subsection{\texttt{refineCollectionShardKey}: The Surgical Option}
+Refinement appends suffix fields to an existing shard key---\texttt{\{tenantId: 1\}} becomes \texttt{\{tenantId: 1, bucket: 1\}}---without downtime and without moving data wholesale. It exists for exactly the low-cardinality-prefix failure: the prefix provided targeting, and the new suffix restores chunk divisibility. Requirements and limits: the collection needs a supporting index whose leading fields match the new key, all documents must eventually carry the suffix field (missing values are treated as null and can re-concentrate load if the suffix is sparse), and refinement cannot \emph{change} the existing prefix---only extend it.
+
+\begin{lstlisting}[language=JavaScript, caption={Live refinement: adding a suffix to break a hot chunk.}]
+// Supporting index first (leading fields must match the new key):
+db.events.createIndex({ tenantId: 1, bucket: 1 });
+
+db.adminCommand({
+  refineCollectionShardKey: "lab.events",
+  key: { tenantId: 1, bucket: 1 }
+});
+
+// Verify: chunk count grows as splits subdivide the old hot ranges.
+sh.status();
+\end{lstlisting}
+
+\subsection{\texttt{reshardCollection} and Collection Migration}
+When the prefix itself is wrong, refinement cannot help; the options are \texttt{reshardCollection} (online re-key, requiring roughly 1.2$\times$ storage headroom and a write-quiet window for the final catch-up) or an application-level migration: create the re-keyed collection, dual-write, backfill with a throttled resumable job, verify parity, cut over. The operational comparison is honest: \texttt{reshardCollection} is simpler but heavyweight and all-or-nothing; manual migration is more work but incremental, reversible at every step, and the only option when you also need to re-model documents along the way.
+
+\begin{tipbox}
+Rehearse the change on a production-scale clone first. The metric that decides between refine, reshard, and migrate is measured write distribution during the operation, not the command's convenience.
+\end{tipbox}
+
+\section{Wednesday: Targeted Queries, Scatter-Gather, and the Transaction Boundary}
+\subsection{Counting Shards, Not Milliseconds}
+On a sharded cluster, \texttt{explain("executionStats")} reports a \texttt{shards} section with a sub-plan per shard contacted. The optimization metric is the \emph{count of shards hit} per query shape: a targeted shape touches one shard; scatter-gather touches all of them and lets \texttt{mongos} merge. Latency alone hides the difference at small scale---two shards scattering looks fine---but every shard you add multiplies the cost of every scattered query. The review rule: every OLTP endpoint's explain evidence must show \texttt{shardsHit: 1} (or the shard count of its zone), and analytical shapes must state their expected fan-out explicitly.
+
+\subsection{Keeping Transactions Single-Shard}
+MongoDB's multi-document transactions (snapshot isolation, all-or-nothing commit, labeled retry) work across shards via a coordinator-driven two-phase commit---and that is precisely what to avoid on hot paths. Cross-shard commit adds network rounds, a durable recovery document on the coordinator, and an availability dependency on every participant. The design rule ties the week's themes together: \textbf{choose the shard key so transactional invariants live on one shard}. A payments platform that shards by \texttt{merchantId} keeps capture-plus-ledger-post single-shard; one that shards by timestamp pays two-phase commit on every capture.
+
+\begin{notebox}
+When a transaction is unavoidable, keep it short (seconds, not minutes), small (tens of documents), and wrapped in the labeled-retry loop: \texttt{TransientTransactionError} retries the body, \texttt{UnknownTransactionCommitResult} retries the commit. Long transactions pin WiredTiger snapshots and degrade eviction for the entire replica set.
+\end{notebox}
+
+\begin{pitfall}
+\textbf{Judging scatter-gather by latency alone.} A scattered query can be fast on a quiet cluster while consuming every shard's CPU budget. Count shards in the explain evidence and multiply by projected shard count before calling a query ``fast enough.''
+\end{pitfall}
+
+\section{Thursday Hands-On Project: Break a Hot Shard, Then Refine It Live}
+Simulate a low-cardinality hot shard, measure it, and fix it with \texttt{refineCollectionShardKey} without cluster downtime.
+
+\subsection{Lab Protocol}
+On the Chapter 6 two-shard cluster, shard \texttt{lab.tasks} on \texttt{\{status: 1\}} with statuses drawn from a five-value set and 80\% of writes on \texttt{"active"}. Drive a scripted writer and capture the evidence: per-shard operation counters, the chunk map (few chunks, one hot), and jumbo-chunk warnings. Then fix it live:
+
+\begin{lstlisting}[language=JavaScript, caption={Adding a bucket suffix to a live, hot collection.}]
+// Pre-computed bucket field, backfilled in throttled batches:
+db.tasks.updateMany(
+  { bucket: { $exists: false } },
+  [ { $set: { bucket: { $mod: [ { $toInt: "$seq" }, 32 ] } } } ],
+  { writeConcern: { w: "majority" } } );
+
+db.tasks.createIndex({ status: 1, bucket: 1 });
+db.adminCommand({ refineCollectionShardKey: "lab.tasks",
+                  key: { status: 1, bucket: 1 } });
+
+// Re-run the writer: per-shard write distribution should converge.
+\end{lstlisting}
+
+The lab succeeds when the post-refinement write distribution across shards is within 20\% and no write unavailability was observed by the client during the change.
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item The hot-shard evidence pack: chunk map, per-shard counters, jumbo warnings.
+    \item The refinement script and the post-refinement distribution measurement.
+    \item A short note on what refinement could \emph{not} have fixed (e.g. a wrong prefix).
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item The pre-refinement hotspot is measured, not asserted (at least 3$\times$ skew).
+    \item Refinement completes with zero client-visible write errors.
+    \item Post-refinement distribution converges within 20\% across shards.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Repeat with \texttt{reshardCollection} on a second collection and compare operational burden.
+    \item Restrict the balancer to a window and quantify the latency effect of migrations during load.
+\end{itemize}
+
+\section{Friday Use Case and Architecture: Eliminating Scatter-Gather on 50 TB of Telemetry}
+\subsection{Engagement Brief}
+The telemetry platform from Chapter 6's incident review has grown: 50 TB across six shards, and an analytics team whose dashboards scatter-gather on every query. The engagement target: 90\% of analytical read requests become targeted single-shard operations.
+
+\subsection{The Re-Architecture}
+Analysis of the query log shows the dominant analytical shape is per-device recent history (\texttt{deviceId} + time range)---90\% of requests---plus a long tail of genuinely global aggregations. The re-architecture shards on \texttt{\{deviceId: 1, ts: 1\}}: device cardinality is two million, frequency is uniform enough after two hot devices get bucketed suffixes, and the dominant shape carries the full key in its predicate, making it targeted by construction. The global tail is not shamed into targeting; it is moved off the OLTP path onto a materialized-views layer (Chapter 11) refreshed from change streams (Chapter 16), so the remaining scatter happens against precomputed aggregates, not raw events. Evidence plan: per-shape \texttt{explain()} shard counts before and after, per-shard CPU and IOPS timelines, and a 30-day \texttt{\$indexStats}/query-shape audit to prove the 90\% figure.
+
+\begin{figure}[H]
+    \centering
+    \resizebox{0.92\textwidth}{!}{%
+    \begin{tikzpicture}[
+        box/.style={rectangle, rounded corners, draw=primary, fill=primary!6, minimum width=2.7cm, minimum height=1.05cm, align=center, font=\small\bfseries},
+        good/.style={rectangle, rounded corners, draw=green!45!black, fill=green!8, minimum width=2.7cm, minimum height=1.05cm, align=center, font=\small\bfseries},
+        arrow/.style={-{Stealth[length=2.5mm]}, draw=primary, thick}
+    ]
+        \node[box] (q1) at (0,1.3) {Per-device history\\(90\% of reads)};
+        \node[box] (q2) at (0,-1.3) {Global aggregates\\(10\% tail)};
+        \node[good] (shard) at (5.2,1.3) {Targeted:\\one shard,\\key in predicate};
+        \node[good] (mv) at (5.2,-1.3) {Materialized views\\(precomputed,\\stream-refreshed)};
+        \node[box] (evid) at (10.3,0) {\texttt{explain()} shard\\counts + per-shard\\metrics};
+        \draw[arrow] (q1) -- (shard);
+        \draw[arrow] (q2) -- (mv);
+        \draw[arrow] (shard) -- (evid);
+        \draw[arrow] (mv) -- (evid);
+    \end{tikzpicture}%
+    }
+    \caption{Telemetry re-architecture: the dominant shape targets one shard; the global tail reads precomputed aggregates.}
+    \label{fig:ch7-telemetry}
+\end{figure}
+
+\subsection{Guardrails}
+The engagement closes with three standing controls: a CI check that flags any new query shape whose explain plan fans out to all shards, a balancer-window policy so migrations never run during peak ingest, and a quarterly shard-key review that re-scores the key against measured cardinality and frequency drift.
+
+\section{Interview Q\&A}
+\subsection{Shard-Key Judgment}
+\begin{enumerate}
+    \item \textbf{Q: Name the three properties of a good shard key.}\\
+    A: High cardinality (many chunks possible), low frequency concentration (no single value dominates writes), and non-monotonic inserts (new writes do not pile onto one edge of the key space)---plus the fourth implicit property: your hot queries predicate on it.
+
+    \item \textbf{Q: What does \texttt{refineCollectionShardKey} allow without downtime?}\\
+    A: Appending suffix fields to the existing key---restoring chunk divisibility under a targeting prefix. It cannot change the prefix; that requires resharding or migration.
+
+    \item \textbf{Q: Why are scatter-gather queries expensive?}\\
+    A: Every shard executes the query and \texttt{mongos} merges results; adding shards multiplies total work per query instead of dividing it. The cost is invisible in latency at small scale---count shards hit.
+
+    \item \textbf{Q: Why does a low-cardinality key create permanent skew?}\\
+    A: Chunks cannot split between identical key values, so one value's entire chunk---however hot---is indivisible and immovable (jumbo).
+
+    \item \textbf{Q: What does the shard key have to do with transaction cost?}\\
+    A: If the documents a transaction touches live on one shard, commit is local; across shards, two-phase commit adds rounds, coordination state, and coupled availability. The shard key decides which world you live in.
+\end{enumerate}
+
+\section{Further Reading}
+MongoDB's shard-key selection guidance is the canonical reference \cite{mongodbShardKeyDocs}, with chunk and balancer mechanics in the sharding manual \cite{mongodbShardingDocs} and transaction semantics in the transactions documentation \cite{mongodbTransactionsDocs}. Kleppmann's partitioning chapter provides the vendor-neutral theory \cite{kleppmann2017ddia}, and the DynamoDB and Cosmos DB partition-key guides make the cross-platform translation explicit \cite{dynamodbSingleTableDocs,cosmosPartitionDocs}.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item Score keys on cardinality, frequency, and monotonicity---then validate against the real query log.
+    \item A low-cardinality prefix defeats every suffix; verify prefix quality first.
+    \item \texttt{refineCollectionShardKey} fixes divisibility live; a wrong prefix needs \texttt{reshardCollection} or migration.
+    \item Optimize by shards-hit per shape, not by latency; scatter-gather hides until you scale.
+    \item Align shard boundaries with transactional invariants so hot-path transactions stay single-shard.
+    \item Balancer windows, CI fan-out checks, and quarterly key re-scoring keep the optimization permanent.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Score \texttt{\{storeId: 1, ts: 1\}}, \texttt{\{ts: 1\}}, and \texttt{\{uuid: hashed\}} for a retail chain's sales collection; pick one and defend it.
+    \item \textbf{(Conceptual)} Explain why refinement cannot fix a wrong shard-key prefix, and enumerate the two alternatives with their trade-offs.
+    \item \textbf{(Conceptual)} A query fans out to 12 shards at 8 ms each and returns in 12 ms. Why is this still a problem at 40 shards?
+    \item \textbf{(Hands-on)} Reproduce the Thursday lab and capture the before/after distribution evidence.
+    \item \textbf{(Hands-on)} Write the CI fan-out check: parse \texttt{explain()} output and fail when an OLTP shape touches more than one shard.
+    \item \textbf{(Design)} Design the shard key for a multi-tenant SaaS where three whales produce 60\% of writes; show the bucketing math.
+    \item \textbf{(Design)} Write the quarterly shard-key review agenda: inputs, metrics, and decision criteria.
+    \item \textbf{(Interview)} ``We picked the shard key by hashing \texttt{\_id} and now every report is slow.'' Diagnose and prescribe.
+\end{enumerate}
+
+\section{Capstone Project: Shard-Key Forensics and Redesign}\label{sec:ch7-capstone}
+
+\begin{capstonebox}
+\textbf{Mission:} reproduce a monotonic-key hot shard in your local cluster, prove it with per-shard metrics, then execute a live redesign to a compound or hashed key using \texttt{refineCollectionShardKey} or a collection migration---with scatter-gather reduction measured before and after.
+
+\textbf{Estimated time:} 4--6 hours.
+
+\textbf{What you will practice:}
+\begin{itemize}
+    \item Deploying and scripting a full sharded cluster locally.
+    \item Diagnosing hot shards from chunk maps and per-shard operation counters.
+    \item Executing a shard-key change with zero downtime and measured results.
+\end{itemize}
+\end{capstonebox}
+
+\subsection*{Scenario}
+You inherit the telemetry cluster from this week's incident review: events sharded on \texttt{createdAt}, writes hot on one shard, analytical reads scattering. Leadership wants evidence that the redesign fixes both problems before approving the production change.
+
+\subsection*{Requirements}
+\begin{itemize}
+    \item Script the two-shard cluster (CSRS, shards, \texttt{mongos}) so it builds from one PowerShell command.
+    \item Reproduce the hot shard with a monotonic-keyed collection under a scripted write load; capture per-shard metrics.
+    \item Execute the fix: for a low-stakes collection, use \texttt{refineCollectionShardKey} to add a suffix field live; for the main collection, script a dual-write + backfill migration to a re-keyed collection.
+    \item Measure: per-shard write distribution, chunk count, migration rate, and shards-hit per query shape, before and after.
+    \item Deliver a migration runbook suitable for the 50 TB production system, including rollback.
+\end{itemize}
+
+\subsection*{Implementation Steps}
+\begin{enumerate}
+    \item \textbf{Reproduce.} Build the cluster, shard on \texttt{createdAt}, drive the write generator, and capture the hotspot evidence.
+    \item \textbf{Refine.} Apply \texttt{refineCollectionShardKey} on a test collection; document what refinement can and cannot change.
+    \item \textbf{Migrate.} Create the re-keyed collection, start dual-writes, backfill with a throttled, resumable script, verify counts and sample equality.
+    \item \textbf{Measure.} Re-run the workload; tabulate per-shard distribution and scatter-gather counts before/after.
+    \item \textbf{Runbook.} Write the production plan: headroom requirements, throttle rates, verification gates, rollback triggers.
+\end{enumerate}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item Cluster scripts, load generator, migration scripts, and the measurement harness.
+    \item The before/after evidence pack (chunk maps, per-shard metrics, explain shard counts).
+    \item The production migration runbook with rollback section.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item The reproduced hotspot is visible in per-shard metrics with at least a 3$\times$ write skew.
+    \item Post-migration write distribution is within 15\% across shards.
+    \item Counts and sampled documents match between old and new collections before cutover.
+    \item The runbook's rollback path is executed once in the lab.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Repeat the migration using \texttt{reshardCollection} and compare operational burden with the manual path.
+    \item Add balancer-window configuration and quantify the latency effect of migrations during load.
+\end{itemize}

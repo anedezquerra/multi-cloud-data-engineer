@@ -1,0 +1,327 @@
+\chapter{Azure Databricks and Apache Spark}
+\index{Azure Databricks}\index{Apache Spark}\index{DataFrame}\index{shuffle}\index{Delta Live Tables}\index{DBFS}%
+\begin{objectives}
+\begin{itemize}
+    \item Explain the Databricks workspace model: clusters (all-purpose versus job), notebooks, DBFS, and Unity Catalog governance.
+    \item Describe Spark's execution model---driver, executors, partitions, stages, tasks, and shuffles---and read a physical plan.
+    \item Author PySpark notebooks that read ADLS Gen2 via ABFS, perform distributed aggregations, and write Delta tables.
+    \item Diagnose and mitigate skew, spill, and small-file pathologies in Spark jobs.
+    \item Build a Delta Live Tables pipeline with expectations that quarantine bad records declaratively.
+    \item Choose job clusters with cluster policies for production workloads and all-purpose clusters for development.
+    \item Design a migration strategy for a 100-node on-premises Hadoop cluster to Azure Databricks.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+Spark is the most portable compute engine in this series---the same API runs everywhere---but each cloud wraps it in a different management and billing model.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{3.0cm}p{2.9cm}p{3.1cm}p{3.2cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{AWS} & \textbf{Azure} & \textbf{GCP} \\
+\midrule
+Managed Spark & EMR / Glue jobs & Azure Databricks / Synapse Spark & Dataproc / Serverless Spark \\
+Interactive notebooks & EMR Studio / SageMaker & Databricks notebooks & Dataproc Jupyter \\
+Declarative pipelines & Glue workflows (imperative) & Delta Live Tables & Dataflow (Beam model) \\
+Table format & Iceberg/Hudi on S3 & Delta Lake on ADLS Gen2 & BigLake / Iceberg \\
+Legacy Hadoop migration & EMR (direct lift) & Databricks / HDInsight (retiring) & Dataproc (direct lift) \\
+\addlinespace
+\multicolumn{4}{@{}l@{}}{\textbf{Fabric}: Spark pools on OneLake; \textbf{Snowflake}: Snowpark (not Spark) or external engines; \textbf{MongoDB}: Atlas Spark Connector.} \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+The execution model taught here---partitions, shuffles, the Catalyst optimizer---is identical on EMR, Dataproc, Fabric, and self-managed Spark. Learn it once; only the billing changes.
+\end{crosscloud}
+
+\begin{keyterms}
+\textbf{Workspace}: the Databricks management boundary---clusters, notebooks, jobs, repos, and catalog.\quad
+\textbf{Cluster}: the Spark compute; \textbf{all-purpose} for interactive work, \textbf{job} clusters for scheduled production runs.\quad
+\textbf{DBFS}: the Databricks File System abstraction over the workspace's root storage.\quad
+\textbf{Shuffle}: the exchange of rows across executors when a wide transformation (join, groupBy) requires re-partitioning.\quad
+\textbf{Delta Live Tables}: declarative pipelines where you define tables and expectations; the engine manages execution.
+\end{keyterms}
+
+\section{Week 9 Overview: The Compute Engine of the Lakehouse}
+Part III moves from serving data to moving and transforming it at scale, and Databricks is the compute engine at the center. Some transformations outgrow visual tools: skewed joins, iterative feature engineering, ML scoring, exotic file formats. That is Spark's territory, and Azure Databricks is Microsoft's first-party, jointly engineered Spark service---the reference implementation of the lakehouse pattern on Azure \cite{microsoft2025databricks}.
+
+The chapter runs on two tracks. The conceptual track teaches Spark's execution model well enough to \emph{predict} performance instead of discovering it: what a partition is, when a shuffle happens, why skew is fatal. The operational track teaches Databricks discipline: job clusters for production, cluster policies as guardrails, DBFS as scratch space rather than a data home, and Delta Live Tables when the pipeline shape is standard.
+
+\section{Monday: Workspace, Clusters, and DBFS}
+\index{Azure Databricks!workspace}\index{cluster!all-purpose vs job}
+
+\subsection{Clusters: The Cost Center You Configure}
+A cluster is a driver node plus worker nodes, sized by VM type and count, with optional autoscaling. The production rule is absolute: \textbf{scheduled workloads run on job clusters}, which spin up for the run and terminate on completion at 2--3$\times$ lower DBU cost than all-purpose clusters \cite{microsoft2025databricks}. All-purpose clusters are for humans exploring. \textbf{Cluster policies} enforce the boundary: maximum size, mandatory auto-termination, allowed VM families, and tagging---the difference between a governed platform and a surprise invoice.
+
+\subsection{DBFS Is Not Your Data Lake}
+Every workspace has a DBFS root backed by a workspace storage account. It is the right place for libraries, init scripts, and scratch; it is the wrong place for production data, because it is tied to the workspace lifecycle, shares the workspace's blast radius, and is invisible to your lake governance. Production data lives in your ADLS Gen2 accounts, accessed over ABFS with the workspace's managed identity or Unity Catalog credential:
+
+\begin{lstlisting}[language=Python,caption={Reading the governed lake over ABFS; DBFS only for scratch.},label={lst:ch9-abfs}]
+LAKE = "abfss://curated@stadls.dfs.core.windows.net"
+
+orders = spark.read.parquet(f"{LAKE}/orders_clean/")
+
+# scratch output goes to DBFS; durable output goes to the lake
+orders.write.format("delta").mode("overwrite").save(f"{LAKE}/orders_v2/")
+\end{lstlisting}
+
+\subsection{Unity Catalog}
+Unity Catalog is Databricks' governance layer: catalogs, schemas, tables, volumes, and the permissions over them, shared across workspaces. Register lake tables once and every cluster, notebook, and job sees the same governed view---the Databricks-side complement to Purview's estate-wide catalog (Chapter 8).
+
+\section{Tuesday: Spark Internals---Partitions, Stages, Shuffles}
+\index{Spark!execution model}\index{partition}\index{shuffle}
+
+\subsection{The Execution Model}
+A Spark application is a driver coordinating executors. DataFrames are partitioned into slices processed in parallel as \textbf{tasks}; tasks are grouped into \textbf{stages} separated by \textbf{shuffles}. Narrow transformations (filter, select, map) stay within a partition; wide transformations (groupBy, join, distinct) require a shuffle that re-partitions data across the network. The physical plan---visible via \texttt{.explain()}---shows this: scan, narrow ops, an \texttt{Exchange} (the shuffle), then the next stage.
+
+\begin{definitionbox}
+A \textbf{partition} is the unit of parallelism: one task processes one partition per stage. Too few partitions waste executors; too many drown the driver in task scheduling. The default shuffle partition count (200) is wrong for both a 1~MB and a 1~TB shuffle---tune \texttt{spark.sql.shuffle.partitions} or enable adaptive query execution.
+\end{definitionbox}
+
+\subsection{Skew, Spill, and Small Files}
+The three recurring Spark pathologies:
+\begin{itemize}
+    \item \textbf{Skew:} one key holds 40\% of rows; one task runs for an hour while 199 finish in a minute. Fixes: salting the skewed key, broadcast joins when one side is small, or skew hints in adaptive execution.
+    \item \textbf{Spill:} partitions exceed executor memory and overflow to disk---visible as spill metrics in the UI; fix with more memory per partition or more partitions.
+    \item \textbf{Small files:} ten thousand 50~KB Parquet files cost more in planning and open overhead than the data is worth; fix at write time with \texttt{repartition}/\texttt{coalesce} and Delta's \texttt{OPTIMIZE}.
+\end{itemize}
+
+\begin{tipbox}
+When a job is slow, open the Spark UI and ask three questions in order: which stage is slowest, does one task dominate it (skew), and is spill non-zero. That sequence resolves most Spark performance mysteries in minutes.
+\end{tipbox}
+
+\section{Wednesday: Delta Live Tables}
+\index{Delta Live Tables}\index{expectations}
+
+\subsection{Declarative Pipelines}
+Delta Live Tables (DLT) inverts control: you declare \emph{what} the tables are---including data-quality \textbf{expectations}---and the engine decides how to compute, order, retry, and incrementally refresh them. A DLT pipeline is a directed graph of live tables over streaming or batch sources, with expectations that \texttt{warn}, \texttt{drop}, or \texttt{fail} on bad records.
+
+\begin{lstlisting}[language=Python,caption={A Delta Live Tables bronze-to-silver hop with expectations.},label={lst:ch9-dlt}]
+import dlt
+from pyspark.sql import functions as F
+
+@dlt.table(comment="Raw order events")
+def orders_bronze():
+    return spark.readStream.format("cloudFiles") \
+        .option("cloudFiles.format", "json") \
+        .load("abfss://raw@stadls.dfs.core.windows.net/orders/")
+
+@dlt.table(comment="Validated orders")
+@dlt.expect_or_drop("valid_amount", "amount >= 0")
+@dlt.expect_or_fail("has_id", "order_id IS NOT NULL")
+def orders_silver():
+    return (dlt.read_stream("orders_bronze")
+              .withColumn("order_ts", F.to_timestamp("order_ts")))
+\end{lstlisting}
+
+DLT is the right tool when the pipeline is structurally standard---medallion hops with quality gates---because the engine absorbs orchestration, incrementalization, and quality reporting. Hand-written Structured Streaming (Chapter 15) is the right tool when you need control over state, triggers, and sinks that DLT does not expose.
+
+\begin{pitfall}
+\textbf{Expectations without a quarantine view.} \texttt{expect\_or\_drop} silently deletes bad records. Pair drops with a DLT event-log query or a quarantine table so dropped volume is visible; data quality that cannot be measured cannot be defended.
+\end{pitfall}
+
+\section{Thursday Hands-on Project: Distributed Aggregation to Delta}
+\index{hands-on lab}\index{PySpark}
+Deploy a Databricks workspace, mount the governed lake, run a distributed aggregation in PySpark, and write the result as a Delta table---the minimal loop every later Spark chapter extends.
+
+\subsection{Create the Workspace and Cluster}
+\begin{lstlisting}[language=bash,caption={Provisioning the workspace; cluster creation happens in the UI or via the clusters API.},label={lst:ch9-dbx}]
+$rg = "rg-de-azure-book-week11"
+az group create --name $rg --location eastus
+az databricks workspace create --name dbx-week11 --resource-group $rg `
+  --location eastus --sku premium
+\end{lstlisting}
+
+Create a small cluster (for example, 2 workers, autoscaling to 4, 30-minute auto-termination) and assign the workspace identity \texttt{Storage Blob Data Contributor} on the lab storage account.
+
+\subsection{The Notebook}
+\begin{lstlisting}[language=Python,caption={Distributed aggregation: lake in, Delta out, plan inspected.},label={lst:ch9-notebook}]
+LAKE = "abfss://raw@stadls.dfs.core.windows.net"
+CURATED = "abfss://curated@stadls.dfs.core.windows.net"
+
+orders = (spark.read.parquet(f"{LAKE}/orders/")
+          .filter("amount IS NOT NULL")
+          .withColumn("order_date", F.to_date("order_ts")))
+
+# inspect the plan BEFORE running: find the Exchange (shuffle)
+daily = (orders.groupBy("order_date", "region")
+         .agg(F.count("*").alias("orders"),
+              F.sum("amount").alias("revenue")))
+daily.explain(True)
+
+(daily.write.format("delta").mode("overwrite")
+      .option("overwriteSchema", "true")
+      .save(f"{CURATED}/daily_revenue/"))
+
+spark.sql(f"CREATE TABLE IF NOT EXISTS daily_revenue "
+          f"USING DELTA LOCATION '{CURATED}/daily_revenue/'")
+\end{lstlisting}
+
+\subsection{Observe, Then Break It}
+Find the \texttt{Exchange hashpartitioning} line in the explained plan and match it to a stage boundary in the Spark UI. Then re-run with \texttt{spark.conf.set("spark.sql.shuffle.partitions", 8)} versus 2000 and compare stage times---the tuning knob made physical.
+
+\section{Friday Use Case: Migrating a 100-Node Hadoop Cluster}
+\index{use case}\index{Hadoop migration}
+A bank runs a 100-node on-premises Hadoop cluster: HDFS storage, Hive tables, 400 nightly MapReduce and Hive jobs. Hardware is due for refresh; leadership wants cost reduction and an exit from cluster administration.
+
+\subsection{Assessment and Strangler Pattern}
+Inventory first: classify jobs by engine (Hive SQL $\rightarrow$ Spark SQL is usually mechanical), data sensitivity, and dependency depth. Migrate in \textbf{strangler} waves: move storage to ADLS Gen2 (one-time bulk copy with Data Box, then DMS-style delta sync), point Hive jobs at the lake via Databricks' Hive-metastore-compatible tables, convert MapReduce jobs to Spark on job clusters, and decommission nodes wave by wave. The cluster shrinks; it never big-bangs.
+
+\subsection{The Cost Case}
+The on-prem cluster is sized for the month-end peak and idle 80\% of the month. Job clusters invert that: 400 nightly jobs run on clusters that exist only while running. The honest cost model includes engineering time---expect 70\% of Hive jobs to convert trivially, 25\% to need SQL dialect work, and 5\% (the MapReduce ones with side effects) to need real engineering. The migration is justified by eliminating capacity planning, patching, and the hardware refresh; not by pretending conversion is free.
+
+\begin{pitfall}
+\textbf{Lifting HDFS habits into the lake.} Small-file flushes, per-job temp tables in the system storage, and interactive all-purpose clusters running overnight are on-prem habits that become cloud bills. Cluster policies and DBFS discipline are migration deliverables, not afterthoughts.
+\end{pitfall}
+
+\section{Architectural Decision Record Template}
+\index{architectural decision record}
+Per Spark workload record: cluster type and policy with the cost ceiling, shuffle partition strategy, skew handling, small-file policy at write time, and the job-cluster schedule with its SLA. For migrations, additionally record the wave plan and the per-job conversion class.
+
+\section{Operational Deep Dive: Job Reliability and Photon}
+\index{Photon}\index{job scheduling}
+Production jobs need retries with backoff, timeout caps, and alerting on duration regression---a job that usually takes 20 minutes and now takes 60 is a data-shape change announcing itself. Enable \textbf{Photon}, Databricks' vectorized C++ execution engine, for SQL-heavy and Parquet-heavy workloads; it accelerates the scans and joins that dominate ETL with no code change. Keep init scripts minimal: every init-script dependency is a cold-start failure mode.
+
+\section{Troubleshooting Patterns}
+\index{troubleshooting!Spark}
+Job stuck with 199/200 tasks done $\rightarrow$ skew; look at the task time distribution. \texttt{OutOfMemoryError} with spill $\rightarrow$ partitions too large; raise shuffle partitions or executor memory. Writes producing thousands of files $\rightarrow$ missing \texttt{coalesce}/\texttt{repartition} or a high shuffle partition count at write time. Table reads suddenly slow $\rightarrow$ the Delta small-file problem; run \texttt{OPTIMIZE} and check your append frequency.
+
+\section{Week 9 Lab Rubric}
+\index{rubric}
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.2cm}p{5.0cm}p{5.0cm}@{}}
+\toprule
+\textbf{Criterion} & \textbf{Meets expectation} & \textbf{Needs improvement} \\
+\midrule
+Execution literacy & Plan inspected; shuffle identified; partition tuning measured & Job run blind; ``it worked'' \\
+Discipline & Job cluster + policy; lake via ABFS; DBFS for scratch only & All-purpose cluster left running; data in DBFS \\
+Quality & Expectations or explicit validation with visible bad-record counts & Silent drops; no quality evidence \\
+Cost & Auto-termination set; cluster sizing justified & Max-size cluster for a toy job \\
+\bottomrule
+\end{tabular}
+\caption{Week 9 rubric for the Databricks deliverables.}
+\label{tab:ch9-rubric}
+\end{table}
+
+\section{Interview Q\&A}
+\subsection{Concepts and Trade-offs}
+\begin{enumerate}
+    \item \textbf{Q: Why use job clusters instead of all-purpose clusters in production?}\\
+    A: They terminate on completion and bill 2--3$\times$ less per DBU; all-purpose clusters are priced for interactivity and keep billing while idle.
+    \item \textbf{Q: What does a Spark partition control during a shuffle?}\\
+    A: Parallelism and memory per task: each shuffle partition becomes one task; too few causes spill, too many floods the driver.
+    \item \textbf{Q: How do Delta Live Tables differ from plain Delta tables?}\\
+    A: DLT is a declarative pipeline framework---you define tables and expectations, the engine orchestrates computation, retries, and incremental refresh.
+    \item \textbf{Q: What is DBFS, and why should production data not live there?}\\
+    A: The workspace's root storage abstraction. Production data belongs in governed ADLS accounts over ABFS, not in workspace-scoped storage.
+\end{enumerate}
+
+\section{Further Reading}
+The Azure Databricks documentation \cite{microsoft2025databricks} covers workspaces, clusters, and Unity Catalog. The Apache Spark project \cite{apache2025spark} and the Delta Lake paper \cite{armbrust2020delta} explain the engine and the table format. The Data Engineer Handbook \cite{dataexpert2025handbook} collects migration playbooks relevant to the Friday use case.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item Job clusters for production, all-purpose for humans, cluster policies to enforce the boundary.
+    \item DBFS is scratch space; production data lives in governed ADLS Gen2 over ABFS.
+    \item Spark performance is partitions, shuffles, and skew; the UI answers ``which stage, which task, how much spill.''
+    \item The default 200 shuffle partitions is wrong at both extremes; tune it or enable adaptive execution.
+    \item Delta Live Tables trade control for declarative pipelines with built-in quality expectations.
+    \item Hadoop migrations succeed as strangler waves with an honest conversion-class estimate, not as big-bang rewrites.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Walk a \texttt{groupBy} aggregation through partitions, stages, and the shuffle.
+    \item \textbf{(Conceptual)} Why does salting fix skew, and what does it cost?
+    \item \textbf{(Conceptual)} When is DLT the wrong choice for a pipeline?
+    \item \textbf{(Hands-on)} Complete the Thursday notebook and capture the explained plan with the Exchange highlighted.
+    \item \textbf{(Hands-on)} Reproduce the shuffle-partitions experiment and graph stage time versus partition count.
+    \item \textbf{(Hands-on)} Convert the notebook's quality checks into a DLT pipeline with \texttt{expect\_or\_drop} and a dropped-records report.
+    \item \textbf{(Design)} Write the wave plan for the 400-job Hadoop migration, classifying each job type.
+    \item \textbf{(Design)} Define the cluster policies for a data platform team: sizes, auto-termination, tags, job-cluster enforcement.
+    \item \textbf{(Design)} Write the ADR choosing Databricks over Synapse Spark for the bank's migration.
+    \item \textbf{(Interview)} Prepare a two-minute answer to ``your Spark job takes an hour; the data doubled. What breaks first?''
+\end{enumerate}
+
+\section{Capstone Project: Production-Shaped Spark Aggregation Platform}\label{sec:ch9-capstone}
+\index{capstone project}\index{Azure Databricks!capstone}
+
+\begin{capstonebox}
+\textbf{Mission:} Deliver a governed, job-cluster-based Spark aggregation pipeline: lake input over ABFS, distributed aggregation with a tuned shuffle, Delta output registered in the catalog, quality expectations with visible drop counts, and a cluster policy that would survive a real team.
+
+\textbf{Estimated time:} 4--6 hours.
+
+\textbf{What you will practice:}
+\begin{itemize}
+    \item Workspace, cluster policy, and job-cluster discipline.
+    \item Plan reading and shuffle tuning with measurements.
+    \item Delta output hygiene: right-sized files, catalog registration.
+    \item Declarative quality with DLT expectations.
+\end{itemize}
+\end{capstonebox}
+
+\subsection*{Scenario}
+The retailer's data platform team is standardizing daily aggregations (revenue, order counts, basket sizes) as curated Delta tables. Today each analyst runs personal notebooks on shared all-purpose clusters; costs are opaque and quality checks are absent.
+
+\subsection*{Requirements}
+\begin{itemize}
+    \item \textbf{Compute:} scheduled job cluster created by policy-compliant configuration; auto-termination enforced.
+    \item \textbf{Storage:} all durable data in the governed lake over ABFS; DBFS used only for libraries and scratch.
+    \item \textbf{Quality:} expectations on \texttt{order\_id} presence and non-negative amounts, with dropped-record counts exported.
+    \item \textbf{Evidence:} explained plan, shuffle tuning comparison, and post-write file-size histogram.
+\end{itemize}
+
+\subsection*{Reference Architecture}
+\begin{figure}[H]
+    \centering
+    \resizebox{0.95\textwidth}{!}{%
+    \begin{tikzpicture}[node distance=1.3cm]
+        \node[store] (lake) {ADLS Gen2\\raw (ABFS)};
+        \node[stage, right=1.6cm of lake] (job) {Job cluster\\(policy-compliant)};
+        \node[stage, right=1.6cm of job] (dlt) {DLT pipeline\\expectations};
+        \node[store, right=1.6cm of dlt] (delta) {Curated Delta\\catalog tables};
+        \node[doc, above=0.9cm of job] (pol) {Cluster policy\\auto-termination};
+        \node[doc, below=0.9cm of dlt] (dq) {Drop-count\\report};
+        \draw[arrow] (lake) -- (job);
+        \draw[arrow] (job) -- (dlt);
+        \draw[arrow] (dlt) -- (delta);
+        \draw[arrow] (pol) -- (job);
+        \draw[arrow] (dlt) -- (dq);
+    \end{tikzpicture}%
+    }
+    \caption{Capstone architecture: policy-governed job clusters running a DLT aggregation into cataloged Delta tables.}
+    \label{fig:ch9-capstone-arch}
+\end{figure}
+
+\subsection*{Implementation Steps}
+\begin{enumerate}
+    \item Create the workspace, cluster policy, and job cluster configuration.
+    \item Port the Thursday notebook to a scheduled job; verify ABFS access with the workspace identity.
+    \item Run the shuffle-partition experiment; set the final value with evidence.
+    \item Add DLT expectations; export drop counts to an audit table.
+    \item Register output tables; verify file sizing; document the cost per run.
+\end{enumerate}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item Notebooks, job definition JSON, and cluster policy JSON in the repo.
+    \item The plan/tuning evidence pack and the drop-count report.
+    \item A README that recreates workspace configuration from scratch.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item The job runs to completion on a fresh job cluster with no manual steps.
+    \item Dropped records are counted and explained, not invisible.
+    \item No durable data resides in DBFS; all tables resolve through the catalog.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Enable Photon and measure the delta on the aggregation stage.
+    \item Add a duration-regression alert on the daily job.
+    \item Convert one aggregation to a DLT streaming live table with \texttt{cloudFiles} ingestion.
+\end{itemize}

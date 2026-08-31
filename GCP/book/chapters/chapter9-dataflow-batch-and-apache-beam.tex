@@ -1,0 +1,291 @@
+\chapter{Managed Hadoop and Spark with Cloud Dataproc}
+\index{Cloud Dataproc}\index{Apache Spark}\index{Hadoop migration}\index{ephemeral clusters}\index{preemptible VMs}\index{HDFS}
+
+\begin{objectives}
+\begin{itemize}
+    \item Explain Dataproc cluster architecture, the role of ephemeral clusters, and preemptible/spot secondary workers.
+    \item Plan the migration of on-premises HDFS data to Cloud Storage and decouple compute from storage.
+    \item Compare cluster-based Dataproc with Dataproc Serverless for interactive and batch Spark workloads.
+    \item Tune Spark memory, parallelism, and autoscaling policies for batch ETL jobs.
+    \item Deploy an ephemeral cluster, run a PySpark sales aggregation, and self-delete the cluster.
+    \item Design a migration strategy for a 100-node on-premises Cloudera cluster prioritizing cost reduction.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+Managed Hadoop/Spark platforms converge on the same modernization story: decouple storage from compute, make clusters ephemeral, and let a serverless layer absorb cluster administration.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{2.8cm}p{3.0cm}p{3.0cm}p{3.0cm}@{}} \\
+\toprule
+\textbf{Capability} & \textbf{GCP Dataproc} & \textbf{AWS EMR} & \textbf{Azure} \\
+\midrule
+Managed Spark/Hadoop & Dataproc clusters & EMR on EC2 & HDInsight / Synapse Spark / Fabric Spark \\
+Serverless Spark & Dataproc Serverless & EMR Serverless & Synapse serverless Spark pools \\
+Object storage for HDFS & Cloud Storage (GCS connector) & S3 (EMRFS) & ADLS Gen2 (ABFS) \\
+Cheap workers & Preemptible/spot secondary workers & Spot task nodes & Low-priority/spot nodes \\
+Autoscaling & Autoscaling policies & Managed scaling & Autoscale pools \\
+Cluster lifecycle & Ephemeral per job & Transient clusters & Job-scoped pools \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+\textbf{Databricks} (available on all three clouds) and \textbf{Snowflake}'s Snowpark absorb the same Spark workloads into a managed notebook/runtime model; \textbf{MongoDB}'s aggregation framework answers smaller analytical questions without a cluster at all. The migration question is always the same: which workloads need the full Spark ecosystem, and which can be rewritten into SQL or serverless engines entirely.
+\end{crosscloud}
+
+\begin{keyterms}
+\textbf{Dataproc}: Google Cloud's managed service for Hadoop, Spark, Hive, Flink, and related ecosystem clusters.
+\textbf{Ephemeral cluster}: a cluster created for a single job or workflow and deleted immediately after.
+\textbf{Preemptible/spot VM}: deeply discounted compute that Google can reclaim with short notice; used for secondary workers only.
+\textbf{Dataproc Serverless}: a fully managed Spark runtime that executes batches and sessions without a user-managed cluster.
+\textbf{GCS connector}: the Hadoop-compatible filesystem layer that lets Spark read and write Cloud Storage as if it were HDFS.
+\textbf{Autoscaling policy}: declarative rules that grow and shrink worker counts based on YARN memory and pending resources.
+\end{keyterms}
+
+\section{Week 9 Roadmap}
+Week~9 opens Part~III by confronting the workload type most enterprises actually have: years of Hadoop and Spark investment running on-premises. Monday establishes Dataproc architecture and the ephemeral-cluster discipline. Tuesday migrates HDFS data to Cloud Storage. Wednesday covers Dataproc Serverless and Spark tuning. Thursday runs a PySpark aggregation on a self-deleting cluster. Friday designs the migration of a 100-node Cloudera estate.
+
+\begin{definitionbox}
+\textbf{Cloud Dataproc} is a managed Hadoop ecosystem service. It provisions clusters in about ninety seconds, integrates natively with Cloud Storage through the GCS connector, and supports per-job ephemeral clusters, autoscaling policies, and a serverless Spark runtime \cite{googleclouddataprocdocs}.
+\end{definitionbox}
+
+\section{Monday: Dataproc Architecture, Ephemeral Clusters, and Preemptible VMs}
+\index{Dataproc!architecture}\index{ephemeral clusters!rationale}\index{preemptible VMs!trade-offs}
+
+\subsection{Cluster Anatomy}
+A Dataproc cluster has a master node (running YARN ResourceManager, HDFS NameNode for scratch, and job drivers) and worker nodes (running NodeManagers and DataNodes). Initialization actions run at creation to install libraries. Component gateways expose web UIs such as the Spark History Server and Jupyter. Critically, HDFS on a Dataproc cluster is \emph{scratch space}: durable data belongs in Cloud Storage, read and written through the GCS connector.
+
+\subsection{The Ephemeral Discipline}
+The pivotal mental shift from on-premises Hadoop is ephemerality. A long-lived shared cluster accumulates snowflake configuration, contends between teams, and bills around the clock. An ephemeral cluster exists for exactly one job or workflow template: created with precisely the machine types, image version, and initialization actions the job needs, then deleted. Dataproc's ninety-second provisioning makes this practical; workflow templates and Composer operators (Chapter~12) make it routine.
+
+\begin{pitfall}
+Never use preemptible or spot VMs as primary workers holding HDFS data or as master nodes. Reclamation kills in-flight tasks; as \emph{secondary} workers they are pure elastic capacity, but as primaries they can fail the entire job and corrupt scratch state.
+\end{pitfall}
+
+\subsection{Cost Anatomy}
+Dataproc bills the underlying Compute Engine VMs plus a small per-vCPU Dataproc premium. The cost levers, in descending order of impact: ephemeral clusters (pay per job, not per day), preemptible/spot secondary workers (up to roughly 80\% cheaper), autoscaling policies (right-size through the job's life), and custom machine types (match memory-to-core ratios to the workload instead of accepting family defaults).
+
+\begin{tipbox}
+Label every cluster (\texttt{team}, \texttt{job}, \texttt{env}) at creation. Dataproc cost is dominated by forgotten long-lived ``temporary'' clusters; labels make them visible in billing export within a day.
+\end{tipbox}
+
+\section{Tuesday: Migrating from HDFS to Cloud Storage}
+\index{HDFS!migration}\index{GCS connector}\index{decoupled storage}
+
+\subsection{Why the Move Matters}
+On-premises Hadoop couples storage and compute in the same nodes: capacity planning means buying disks to get CPUs or CPUs to get disks. Moving data to Cloud Storage decouples the two---storage scales and is billed independently, clusters size to the compute a job actually needs, and multiple clusters (or BigQuery, or Dataproc Serverless) read the same data concurrently. Cloud Storage's eleven-nines durability also replaces three-way HDFS replication, shrinking both hardware and operational burden \cite{googlecloudstorageoverview}.
+
+\subsection{Migration Mechanics}
+The standard tool is \texttt{hadoop distcp} between the on-premises HDFS and \texttt{gs://} targets, throttled to protect the WAN link, run in incremental passes. For large estates, sequence it: bulk-copy cold data first, then run repeated incremental syncs of changing datasets, then cut over producers. Preserve Hive metadata separately---the Hive Metastore schema migrates to a Cloud SQL instance or Dataproc Metastore, with table locations rewritten from \texttt{hdfs://} to \texttt{gs://}.
+
+\begin{lstlisting}[language=bash,caption={Representative distcp from on-premises HDFS to Cloud Storage.}]
+hadoop distcp -update -delete \
+  -bandwidth 200 \
+  hdfs://nn1.prod.local:8020/data/warehouse/orders \
+  gs://my-migration-bucket/warehouse/orders
+\end{lstlisting}
+
+\begin{notebox}
+Validate every dataset with both counts and checksums (\texttt{distcp -update} compares size and CRC). A silent partial copy discovered during cutover rehearsal is embarrassing; the same discovery during real cutover is an incident.
+\end{notebox}
+
+\section{Wednesday: Dataproc Serverless and Spark Tuning}
+\index{Dataproc Serverless}\index{Spark tuning}\index{executor memory}\index{autoscaling policies}
+
+\subsection{Serverless Spark}
+Dataproc Serverless runs Spark batches and interactive sessions without any cluster: you submit a batch, the service provisions capacity, executes, and tears down, billing for the compute consumed. It removes image management, node sizing, and idle cost, at the price of less control over machine shapes and startup latency. Use it for scheduled batch ETL and ad hoc analysis; keep managed clusters for workloads needing specific images, GPU attachment, long-lived sessions, or deep ecosystem components.
+
+\subsection{The Tuning Shortlist}
+Most Spark performance problems on Dataproc reduce to a handful of properties. \texttt{spark.executor.memory} and \texttt{spark.executor.cores} set the container shape; oversizing executors wastes YARN scheduling granularity, undersizing them causes spills and out-of-memory kills. \texttt{spark.sql.shuffle.partitions} (default 200) is routinely wrong in both directions. \texttt{spark.dynamicAllocation} lets the cluster breathe with the job. On the platform side, an autoscaling policy watches YARN's pending and available memory to add or remove workers.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{4.6cm}p{4.2cm}p{4.6cm}@{}} \\
+\toprule
+\textbf{Symptom} & \textbf{Likely cause} & \textbf{First response} \\
+\midrule
+Executor OOM, fetch failures & Memory too small for skewed partition & Raise \texttt{executor.memory}; fix skew (salting) \\
+Hours in a single long stage & Too few shuffle partitions & Raise \texttt{spark.sql.shuffle.partitions} \\
+Thousands of tiny tasks & Too many partitions, small files & Coalesce inputs; lower shuffle partitions \\
+Workers idle, driver saturated & Over-broadcast or collect to driver & Remove \texttt{collect}; check broadcast hints \\
+Cluster never scales down & dynamicAllocation off; sticky policy & Enable dynamic allocation; review policy cooldown \\
+\bottomrule
+\end{tabular}
+\caption{Common Spark-on-Dataproc symptoms and first responses \cite{apachesparkdocs}.}
+\label{tab:ch9-spark-symptoms}
+\end{table}
+
+\begin{pitfall}
+A job that reads hundreds of thousands of tiny files spends its life in listing and task-scheduling overhead, not computation. Compact small files upstream (or read with tuned split sizing) before touching executor settings.
+\end{pitfall}
+
+\section{Thursday Hands-On Project: Ephemeral PySpark Sales Aggregation}
+\index{hands-on project}\index{PySpark}\index{workflow template}
+This lab creates an ephemeral Dataproc cluster, submits a PySpark job that reads sales data from Cloud Storage, aggregates it, writes results back, and deletes the cluster. Run in a sandbox project and replace all placeholders.
+
+\subsection{Stage Data and Job Code}
+\begin{lstlisting}[language=bash,caption={Staging sample sales data and the PySpark job.}]
+$env:PROJECT_ID = "my-gcp-dataproc-lab"
+$env:BUCKET = "my-gcp-dataproc-lab-data"
+$env:REGION = "us-central1"
+
+@'
+order_id,store_id,amount,order_date
+1,S01,19.99,2026-07-01
+2,S02,149.50,2026-07-01
+3,S01,5.25,2026-07-02
+'@ | Set-Content -Path .\sales.csv
+
+gcloud storage cp .\sales.csv gs://$env:BUCKET/raw/sales/sales.csv
+\end{lstlisting}
+
+\begin{lstlisting}[language=Python,caption={PySpark job aggregating daily sales per store (save as sales\_agg.py).}]
+import sys
+
+from pyspark.sql import SparkSession
+from pyspark.sql import functions as F
+
+input_uri, output_uri = sys.argv[1], sys.argv[2]
+
+spark = SparkSession.builder.appName("sales-agg").getOrCreate()
+
+(spark.read.option("header", True).csv(input_uri, inferSchema=True)
+      .groupBy("store_id", "order_date")
+      .agg(F.count("*").alias("orders"),
+           F.round(F.sum("amount"), 2).alias("revenue"))
+      .write.mode("overwrite").parquet(output_uri))
+
+spark.stop()
+\end{lstlisting}
+
+\subsection{Create, Run, Self-Delete}
+\begin{lstlisting}[language=bash,caption={Ephemeral cluster lifecycle around the PySpark job.}]
+$env:CLUSTER = "ephemeral-sales-lab"
+
+gcloud dataproc clusters create $env:CLUSTER `
+  --region=$env:REGION `
+  --single-node `
+  --image-version=2.2-debian12 `
+  --labels=env=lab,job=sales-agg
+
+gcloud storage cp .\sales_agg.py gs://$env:BUCKET/code/sales_agg.py
+
+gcloud dataproc jobs submit pyspark `
+  gs://$env:BUCKET/code/sales_agg.py `
+  --cluster=$env:CLUSTER --region=$env:REGION `
+  -- gs://$env:BUCKET/raw/sales/ gs://$env:BUCKET/out/sales_agg/
+
+gcloud dataproc clusters delete $env:CLUSTER --region=$env:REGION --quiet
+
+gcloud storage ls --long gs://$env:BUCKET/out/sales_agg/
+\end{lstlisting}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item The PySpark job and the command transcript showing cluster creation, job success, and deletion.
+    \item The output Parquet listing and a sample of aggregated rows.
+    \item A cost note: total job wall time and the vCPU-hours consumed.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item The cluster is created for this job and verifiably deleted afterward.
+    \item The job reads from and writes to Cloud Storage, not cluster HDFS.
+    \item Re-running the job overwrites the deterministic output path instead of appending duplicates.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Re-implement the run as a Dataproc workflow template with automatic cluster teardown on failure.
+    \item Add two preemptible secondary workers and observe the cost and stability effects.
+    \item Port the same job to Dataproc Serverless with \texttt{gcloud dataproc batches submit} and compare cold-start latency.
+\end{itemize}
+
+\section{Friday Use Case and Architecture: Migrating a 100-Node Cloudera Estate}
+\index{Cloudera migration}\index{migration strategy}\index{workload assessment}
+
+\subsection{Scenario}
+An enterprise runs a 100-node Cloudera cluster: 1.5~PB in HDFS, 400 Hive tables, 60 production Spark jobs, 25 Oozie workflows, and a mix of ad hoc analyst notebooks. The directive: reduce cost and operational burden, prioritizing decoupling compute from storage.
+
+\subsection{Migration Waves}
+Assess first, move second. Inventory every job, table, and workflow; classify each as \emph{rehost} (runs as-is on Dataproc), \emph{replatform} (Spark job moved to Dataproc Serverless with modest changes), or \emph{retire/rewrite} (Hive queries that belong in BigQuery SQL, Oozie workflows that become Composer DAGs). Typical estates retire 20--40\% of jobs outright---duplicates, dead reports, and workloads trivially expressible in BigQuery.
+
+\begin{figure}[H]
+    \centering
+    \resizebox{0.95\textwidth}{!}{%
+    \begin{tikzpicture}[
+        src/.style={rectangle, rounded corners, draw=codegray, thick, fill=white, text width=3.4cm, minimum height=1.1cm, align=center, font=\small\bfseries},
+        wave/.style={rectangle, rounded corners, draw=primary, thick, fill=primary!6, text width=3.4cm, minimum height=1.1cm, align=center, font=\small\bfseries},
+        dst/.style={rectangle, rounded corners, draw=codegreen!60!black, thick, fill=green!7, text width=3.4cm, minimum height=1.1cm, align=center, font=\small\bfseries},
+        arrow/.style={-{Stealth[length=2.5mm]}, draw=primary, thick}
+    ]
+        \node[src] (cloudera) at (0,0) {Cloudera estate\\100 nodes, 1.5 PB};
+        \node[wave] (assess) at (4.8,0) {Assess\\inventory \& classify};
+        \node[wave] (data) at (9.6,1.8) {Wave 1: data\\distcp to GCS};
+        \node[dst] (batch) at (9.6,-0.2) {Wave 2: batch jobs\\ephemeral / serverless};
+        \node[dst] (sql) at (9.6,-2.2) {Wave 3: SQL \& BI\\rewrite to BigQuery};
+        \node[dst] (target) at (14.0,-0.2) {Target state\\GCS + Dataproc\\+ BigQuery + Composer};
+
+        \draw[arrow] (cloudera) -- (assess);
+        \draw[arrow] (assess) -- (data);
+        \draw[arrow] (assess) -- (batch);
+        \draw[arrow] (assess) -- (sql);
+        \draw[arrow] (data) -- (target);
+        \draw[arrow] (batch) -- (target);
+        \draw[arrow] (sql) -- (target);
+    \end{tikzpicture}%
+    }
+    \caption{Cloudera-to-GCP migration waves: assess, move data, move compute, retire what BigQuery absorbs.}
+    \label{fig:ch9-cloudera-migration}
+\end{figure}
+
+\subsection{Cost and Risk}
+The economic case rests on ephemerality: the 100-node cluster runs 24/7 for jobs that occupy it perhaps 15\% of the day; ephemeral clusters and serverless Spark bill only for execution. De-risk with a parallel-run period for Tier-1 jobs (both estates produce outputs; reconcile counts and checksums), a rehearsed rollback per wave, and explicit ownership for the Hive Metastore migration, which touches every table reference at once.
+
+\begin{tipbox}
+Make idempotency a migration exit criterion, not an afterthought: deterministic output paths and write-then-swap loads mean a preemptible reclamation or retry never double-loads data---the property that makes ephemeral infrastructure safe.
+\end{tipbox}
+
+\section{Interview Q\&A}
+\subsection{Concepts and Trade-offs}
+\begin{enumerate}
+    \item \textbf{Q: Why should Dataproc clusters be ephemeral for scheduled jobs?}\\
+    A: Per-job clusters bill only for execution, carry exactly the configuration the job needs, and avoid the snowflake drift and inter-team contention of long-lived shared clusters.
+
+    \item \textbf{Q: What is the cost trade-off of preemptible VMs in a Spark cluster?}\\
+    A: They cost up to roughly 80\% less but can be reclaimed at any time; use them only as secondary workers and make jobs retry- and idempotency-safe.
+
+    \item \textbf{Q: Why migrate HDFS data to Cloud Storage instead of keeping HDFS?}\\
+    A: Decoupling storage from compute lets clusters size to compute need, multiple engines share one copy, and Cloud Storage durability replaces three-way replication.
+
+    \item \textbf{Q: What Spark property most often explains executor out-of-memory errors?}\\
+    A: \texttt{spark.executor.memory} sized too small for the largest (often skewed) partition---though the real fix is frequently fixing skew, not adding memory.
+
+    \item \textbf{Q: How do autoscaling policies decide when to add workers?}\\
+    A: They watch YARN metrics---pending versus available memory and containers---and add or remove workers within configured bounds and cooldowns.
+\end{enumerate}
+
+\section{Further Reading}
+Read the Dataproc documentation for cluster configuration, serverless batches, and autoscaling policies \cite{googleclouddataprocdocs}, and the Apache Spark documentation for tuning properties and the memory model \cite{apachesparkdocs}. Review the Cloud Storage overview for the durability and connector model that replaces HDFS \cite{googlecloudstorageoverview}. Chapter~12's Composer documentation covers orchestrating the ephemeral-cluster pattern at scale \cite{googlecloudcomposerdocs}.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item Ephemeral, per-job clusters are the central discipline: pay per job, configure per job, delete after the job.
+    \item Cloud Storage plus the GCS connector replaces HDFS and decouples storage economics from compute economics.
+    \item Preemptible/spot VMs belong in secondary workers only, paired with idempotent job design.
+    \item Dataproc Serverless removes cluster management for batch Spark; managed clusters remain for specialized images and long sessions.
+    \item Spark tuning starts with executor shape, shuffle partitions, and input file sizing---in that order.
+    \item Hadoop migrations succeed in waves: assess, move data, move batch compute, rewrite what SQL engines absorb.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Argue both sides: when is a long-lived Dataproc cluster legitimately better than ephemeral clusters?
+    \item \textbf{(Conceptual)} Explain why idempotent writes make preemptible workers safe, with a concrete double-load failure story for the non-idempotent case.
+    \item \textbf{(Hands-on)} Reproduce the Thursday lab, then wrap it in a workflow template that guarantees teardown on job failure.
+    \item \textbf{(Hands-on)} Run the aggregation on Dataproc Serverless and compare submission-to-first-task latency with the managed cluster.
+    \item \textbf{(Analysis)} Given a Spark UI showing one task processing 40\% of a stage's rows, diagnose and propose two fixes.
+    \item \textbf{(Design)} Write the wave plan for the 100-node Cloudera migration: assessment criteria, wave membership rules, parallel-run reconciliation, and rollback triggers.
+\end{enumerate}

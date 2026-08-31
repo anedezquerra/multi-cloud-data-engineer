@@ -1,0 +1,287 @@
+\chapter{Certification Readiness and the Production Data Platform}
+\index{capstone}\index{production platform}\index{certification}\index{GitOps}\index{portfolio}\index{data platform engineering}%
+
+\begin{objectives}
+\begin{itemize}
+    \item Integrate every part of the book---storage, modeling, indexing, aggregation, distribution, performance, CDC, security, governance, DataOps---into one production-grade platform.
+    \item Deliver the Milestone 6 system: GitOps-managed Atlas production, operator-managed Kubernetes staging, CI/CD change management, PITR-protected data, and monitored SLOs.
+    \item Assemble the capstone portfolio that demonstrates senior-level competence to reviewers and interviewers.
+    \item Map the book's six milestones to certification exam domains and execute a readiness plan.
+    \item Defend every architectural decision in the platform with measured evidence.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+The final architecture is deliberately platform-shaped rather than vendor-shaped: the same skeleton---declarative infrastructure, versioned migrations, CDC-fed analytics, layered security, drilled recovery---rebuilds on any cloud with only the control-plane names changing.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{2.9cm}p{3.0cm}p{3.0cm}p{3.0cm}@{}} 
+\toprule
+\textbf{Platform layer} & \textbf{AWS flavor} & \textbf{Azure flavor} & \textbf{GCP flavor} \\
+\midrule
+Operational store & DocumentDB / Atlas & Cosmos DB / Atlas & Firestore / Atlas \\
+IaC control plane & Terraform + AWS & Terraform + azurerm & Terraform + google \\
+K8s staging & EKS + operator & AKS + operator & GKE + operator \\
+CDC backbone & MSK / Kinesis & Event Hubs & Pub/Sub \\
+Analytics sink & Redshift / S3+Athena & Fabric / Synapse & BigQuery \\
+Governance & CloudTrail + Config & Purview + Policy & Dataplex + Audit Logs \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+If you can defend the MongoDB version of this platform with evidence, you can rebuild it on any row of that table---which is precisely the competence the certification and the interview loop are testing for \cite{mongodbUniversityDocs,kleppmann2017ddia}.
+\end{crosscloud}
+
+\section{Week 24 Roadmap: Integration Is the Skill}
+Twenty-three chapters built components; this week ships the system. The deliverable is the Milestone 6 capstone: a production-grade GitOps data platform where a commit to the repository is the only path to change, staging rehearses production faithfully, data is provably recoverable, and every SLO is measured. The chapter is organized as the build itself: the platform review (Monday), the exam-domain consolidation (Tuesday--Wednesday), the full-length practice evaluation (Thursday), and the portfolio assembly (Friday).
+
+\begin{definitionbox}
+A \textbf{production data platform} is the integrated whole: the operational database, its change pipeline, its observability and security controls, its recovery machinery, and the evidence that all of them work---operated as one system with one lifecycle.
+\end{definitionbox}
+
+\begin{keyterms}
+\textbf{Portfolio}: the curated, evidence-backed collection of capstones demonstrating competence. \textbf{Exam domain}: a weighted competency area of the certification blueprint. \textbf{Readiness review}: the structured self-assessment mapping evidence to domains. \textbf{Golden path}: the platform's single supported way to ship a change.
+\end{keyterms}
+
+\section{Monday: The Production Platform, End to End}
+\subsection{The Reference Architecture}
+The platform assembles as one diagram, each box a chapter's discipline made operational:
+
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[
+        layer/.style={rectangle, rounded corners, draw=primary, thick, fill=primary!6, minimum width=3.0cm, minimum height=1.05cm, align=center, font=\scriptsize\bfseries},
+        ctl/.style={rectangle, rounded corners, draw=orange!85!black, fill=orange!10, minimum width=3.0cm, minimum height=1.05cm, align=center, font=\scriptsize\bfseries},
+        sec/.style={rectangle, rounded corners, draw=red!60!black, fill=red!5, minimum width=3.0cm, minimum height=1.05cm, align=center, font=\scriptsize\bfseries},
+        arrow/.style={-{Stealth[length=2.5mm]}, draw=primary, thick}
+    ]
+        \node[ctl] (git) at (0,0) {Git repo\\HCL + YAML +\\migrations};
+        \node[ctl] (ci) at (3.6,0) {CI/CD\\plan, contract\\tests, gates};
+        \node[ctl] (tf) at (7.2,0) {Terraform\\Atlas provider};
+        \node[ctl] (op) at (7.2,-2.0) {K8s Operator\\staging};
+        \node[layer] (atlas) at (10.9,0) {Atlas prod\\sharded, zoned,\\PITR, QE};
+        \node[layer] (cdc) at (14.4,1.2) {CDC / streams\\$\to$ analytics};
+        \node[sec] (sec) at (14.4,-0.4) {Security\\RBAC, TLS,\\audit $\to$ SIEM};
+        \node[sec] (obs) at (14.4,-2.0) {SLOs, alerts,\\runbooks, drills};
+        \draw[arrow] (git) -- (ci);
+        \draw[arrow] (ci) -- (tf);
+        \draw[arrow] (ci) -- (op);
+        \draw[arrow] (tf) -- (atlas);
+        \draw[arrow] (op) -- (atlas);
+        \draw[arrow] (atlas) -- (cdc);
+        \draw[arrow] (atlas) -- (sec);
+        \draw[arrow] (atlas) -- (obs);
+    \end{tikzpicture}%
+    }
+    \caption{The production data platform: one repository drives infrastructure, migrations, and staging; one Atlas system serves, protects, and proves.}
+    \label{fig:ch24-platform}
+\end{figure}
+
+The platform review walks the data classes and asks, for each: what is its model (Part I), its index set (Part III), its distribution and residency (Part II), its freshness and pipeline (Parts III--IV), its protection (Part V), and its change and recovery path (Part VI)? A platform where every data class has six written answers is a platform that can be handed to a new engineer---or an auditor---without a narrator.
+
+\subsection{The Golden Path}
+The developer experience of the platform is one command surface: open a PR against the repo. Contract tests, plan output, migration lint, and staging rehearsal all happen in CI; merge gates prod on staging evidence (Chapter 21). New services scaffold from a template carrying the Part V security defaults and the Chapter 16 observability pack, so the secure, monitored path is also the easiest path---the only sustainable form of governance.
+
+\section{Tuesday--Wednesday: Certification Domain Consolidation}
+\subsection{Mapping the Book to the Blueprint}
+The certification blueprint's domains map onto the book's milestones, and the readiness score is evidence-weighted, not reading-weighted: for each domain, name the capstone or lab artifact that proves you can execute it.
+
+\begin{table}[H]
+\centering\footnotesize
+\begin{tabular}{@{}p{5.4cm}p{4.2cm}p{3.6cm}@{}}
+\toprule
+\textbf{Exam domain} & \textbf{Book coverage} & \textbf{Evidence artifact} \\
+\midrule
+Storage engine, memory, performance & Ch.\ 1, 12 & Cache-tuning lab, audit toolkit \\
+Replication, consensus, sharding & Ch.\ 5--8 & Failover certification, zone lab \\
+Aggregation, indexes, search & Ch.\ 9--11, 13, 14 & Analytical engine, RAG capstone \\
+Security, encryption, compliance & Ch.\ 17--20 & Identity baseline, erasure pack \\
+DataOps, backup, DR, K8s & Ch.\ 15, 16, 21--23 & GitOps platform, resilience cert. \\
+\bottomrule
+\end{tabular}
+\caption{Domain-to-artifact mapping: readiness is a pointer to evidence per domain.}
+\label{tab:ch24-domains}
+\end{table}
+
+\subsection{The Practice-Exam Discipline}
+Thursday's timed 60-question practice exam is a measurement instrument, not a ritual. The method: sit it under real time conditions (90 minutes, no notes); triage every incorrect answer to its source domain; re-read that domain's chapter sections and re-run its smallest lab; and record the domain scores so the second attempt measures learning rather than luck. A passing readiness bar is 75\%+ with no domain below 60\%---averages hide the weakness that the real exam will find \cite{mongodbUniversityDocs}.
+
+\begin{tipbox}
+Wrong answers are the syllabus. Keep an error log: question topic, why the wrong option seduced you, and the chapter section that corrects it. The log, not the score, is what makes the second attempt different from the first.
+\end{tipbox}
+
+\section{Thursday Hands-On Project: The Timed Evaluation and Gap Sprints}
+Execute the practice evaluation and convert its output into targeted lab work.
+
+\subsection{Protocol}
+\begin{enumerate}
+    \item Sit the 60-question practice exam in one 90-minute block; export or transcribe results per domain.
+    \item Build the error log: every miss triaged to a domain and a chapter section.
+    \item For each weak domain, run the gap sprint: the smallest hands-on artifact that exercises the weakness (e.g. miss on elections $\to$ re-run the Chapter 5 stepdown drill and explain each \texttt{rs.status()} field aloud).
+    \item One week later, re-sit a fresh practice set; readiness is declared only when the 75\%/60\% bar holds on the second attempt.
+\end{enumerate}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item The domain-scored results from both attempts.
+    \item The error log with per-miss triage.
+    \item The gap-sprint artifacts for each weak domain.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item Second attempt at 75\%+ overall with no domain below 60\%.
+    \item Every first-attempt miss has a logged triage and a remediation artifact.
+    \item The gap sprints are hands-on, not re-reading.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Write ten original exam-style questions with answer rationales from your own capstone evidence.
+    \item Pair-review another candidate's error log and teach one weak domain each.
+\end{itemize}
+
+\section{Friday: The Capstone Portfolio}
+\subsection{What Reviewers Actually Evaluate}
+Interviewers and review boards read capstone portfolios for three signals: integration (do the parts form one system?), evidence (are claims measured?), and judgment (are trade-offs named with their costs?). The portfolio is therefore not a code dump but a curated walk: one architecture diagram per capstone, one measured result per claim, one ``what I would do differently'' per project. The six milestone capstones of this book, assembled, tell exactly that story.
+
+\subsection{The Portfolio Skeleton}
+\begin{enumerate}
+    \item \textbf{Platform overview}: the Figure~\ref{fig:ch24-platform} diagram with a one-page narrative.
+    \item \textbf{Six capstone exhibits}: each with problem, architecture, measured outcome, and retrospective.
+    \item \textbf{The evidence appendix}: drill reports, explain packs, audit excerpts, cost models.
+    \item \textbf{The judgment memo}: five decisions you would make differently now, with reasons---the strongest seniority signal in the document.
+\end{enumerate}
+
+\begin{pitfall}
+\textbf{Claiming scale you did not run.} ``Designed for 100M documents'' with a 1M-document lab is fine---if stated. Reviewers forgive scaled-down labs; they do not forgive measurements presented as production results. Label every number with its environment.
+\end{pitfall}
+
+\section{Interview Q\&A}
+\subsection{The Synthesis Questions}
+\begin{enumerate}
+    \item \textbf{Q: Walk me through your platform's write path for a payment.}\\
+    A: From Chapter 17's authenticated service, through Chapter 7's single-shard transaction at \texttt{w:majority}, into Chapter 1's journaled write path, replicated per Chapter 5, streamed by Chapter 16's CDC, monitored by Chapter 23's SLOs, and recoverable per Chapter 23's PITR drill---each hop with its measured cost.
+
+    \item \textbf{Q: What breaks first at 10$\times$ scale?}\\
+    A: The honest answer names your platform's own constraint (e.g. single-region write throughput or the analytics secondary) and the Chapter 12 measurement that tells you it's coming.
+
+    \item \textbf{Q: How do you change the schema of a 2-billion-document collection?}\\
+    A: Expand--migrate--contract (Chapter 21): dual-write, throttled resumable backfill, feature-flagged reads, contract last---never the same-release rename.
+
+    \item \textbf{Q: A regulator asks you to prove one user's data is gone.}\\
+    A: Chapter 18's crypto-shredding: per-subject DEK destruction, KMS audit record, and the unreadability evidence pack across live data, streams, and backups.
+
+    \item \textbf{Q: Your biggest production incident---and what changed after?}\\
+    A: Answer with a drill or real postmortem from Chapter 23: timeline, detection, the systemic fix, and the re-drill evidence. Judgment is demonstrated, never asserted.
+\end{enumerate}
+
+\section{Further Reading}
+The certification catalog and practice materials are at MongoDB University \cite{mongodbUniversityDocs}. Revisit the foundational papers with production eyes---B-trees \cite{bayer1972organization}, ARIES \cite{mohan1992aries}, Raft \cite{ongaro2014raft}, HNSW \cite{malkov2020hnsw}---and keep Kleppmann \cite{kleppmann2017ddia} and the SRE book \cite{sreBook} as permanent desk references. The sibling platform books in this series extend every chapter to AWS, Azure, Fabric, GCP, and Snowflake.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item The platform is the product: integration, evidence, and judgment outrank any single component.
+    \item One repository is the only path to change; staging rehearses production; recovery is drilled.
+    \item Certification readiness is evidence-weighted: every domain maps to an artifact you built.
+    \item The error log, not the score, drives the second practice attempt.
+    \item Portfolios demonstrate judgment through retrospectives, not just successes.
+    \item Every number is labeled with its environment; every claim has its measurement.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Synthesis)} Write your platform's data-class matrix: every class $\times$ the six review questions from Monday.
+    \item \textbf{(Synthesis)} Present the Figure~\ref{fig:ch24-platform} walk-through in fifteen minutes to a peer; log every question you could not answer.
+    \item \textbf{(Exam)} Complete the timed evaluation protocol and publish your domain table.
+    \item \textbf{(Portfolio)} Assemble the portfolio skeleton with real artifacts from your six capstones.
+    \item \textbf{(Judgment)} Write the five-decision retrospective memo.
+    \item \textbf{(Design)} Extend the platform with one sibling-track service (e.g. Snowflake analytics sink) and document the integration boundary.
+    \item \textbf{(Operations)} Schedule next quarter's drills and the re-certification review date.
+    \item \textbf{(Interview)} Record yourself answering the five synthesis questions; revise until each is under two minutes with one measured number.
+\end{enumerate}
+
+\section{Milestone 6 Capstone: Production-Grade GitOps Data Platform Deployment}\label{sec:ch24-capstone}
+
+\begin{capstonebox}
+\textbf{Mission:} ship the whole book as one system: Terraform-deployed Atlas production, operator-managed Kubernetes staging, CI/CD for index and schema migrations, continuous backup with verified PITR, SLO monitoring with drills, and the certification practice evaluation---deployable from a clean environment following your README alone.
+
+\textbf{Estimated time:} 12--16 hours across the week (the integration tax is real).
+
+\textbf{What you will practice:}
+\begin{itemize}
+    \item Integrating infrastructure, data, security, and operations into one reviewed pipeline.
+    \item Proving the platform with drills, parity checks, and measured SLOs.
+    \item Presenting the system as a portfolio-grade engineering artifact.
+\end{itemize}
+\end{capstonebox}
+
+\subsection*{Scenario}
+You are the founding data engineer of the platform team. The deliverable is not a demo but the operating platform itself, with the evidence pack that lets a reviewer trust it and a new engineer run it.
+
+\subsection*{Requirements}
+\begin{itemize}
+    \item \textbf{Repository structure}: \texttt{infra/} (Terraform, remote locked state), \texttt{migrations/} (numbered, idempotent), \texttt{k8s/} (operator manifests), \texttt{docs/} (runbooks, SLOs, decisions).
+    \item \textbf{Pipeline}: plan on PR $\to$ contract tests $\to$ staging apply on the operator $\to$ smoke tests $\to$ manual gate $\to$ prod apply---all stages evidenced.
+    \item \textbf{Data protection}: continuous backup with PITR on prod; a scheduled restore-verification job restoring to a scratch cluster nightly, alerting on failure.
+    \item \textbf{Quality gates}: at least three automated data-quality tests in CI (schema-drift contract test, post-deploy connectivity check, restore-verification) with a failing-case demonstration.
+    \item \textbf{Observability}: the Chapter 23 alert set (lag, connections, backup failures) exported as code; the layered dashboard; one executed drill with postmortem.
+    \item \textbf{Economics and security}: monthly cost estimate across environments with two documented optimizations; least-privilege CI service account, secrets in the CI vault, PII handling noted.
+    \item \textbf{Certification}: the timed practice evaluation with the domain table and error log.
+\end{itemize}
+
+\subsection*{Reference Data Model}
+The platform's own control plane is document-modeled---a fitting close: projects, clusters, snapshots, and alert policies as collections, tracked by the same discipline the platform enforces on product data.
+
+\begin{figure}[H]
+    \centering
+    \resizebox{0.9\textwidth}{!}{%
+    \begin{tikzpicture}[
+        ent/.style={doc, align=left, minimum width=3.6cm, minimum height=1.5cm},
+        arrow/.style={-{Stealth[length=2mm]}, draw=primary, thick},
+        lbl/.style={font=\scriptsize\itshape}
+    ]
+        \node[ent] (projects) at (0,0) {\textbf{projects}\\ \_id: ObjectId\\ name: string\\ owners: [embedded]};
+        \node[ent] (clusters) at (6.4,0) {\textbf{clusters}\\ project\_id: ref\\ tier, region\\ backup\_enabled: bool};
+        \node[ent] (snaps) at (0,-2.7) {\textbf{backup\_snapshots}\\ cluster\_id: ref\\ created\_at: date\\ pit\_window\_hours: int};
+        \node[ent] (alerts) at (6.4,-2.7) {\textbf{alert\_policies}\\ project\_id: ref\\ metric, threshold\\ notify: [embedded]};
+        \draw[arrow] (clusters) -- node[lbl, above] {N:1} (projects);
+        \draw[arrow] (snaps) -- node[lbl, left] {N:1} (clusters);
+        \draw[arrow] (alerts) -- node[lbl, right] {N:1} (projects);
+    \end{tikzpicture}%
+    }
+    \caption{The platform models itself: control-plane metadata as documents under the same governance as product data.}
+    \label{fig:ch24-model}
+\end{figure}
+
+\subsection*{Implementation Steps}
+\begin{enumerate}
+    \item \textbf{Scaffold.} Repository, remote state, CI skeleton, operator staging environment.
+    \item \textbf{Prod path.} Terraform prod cluster with backup, PITR, alerts, and network controls.
+    \item \textbf{Change path.} Migrations runner plus the three quality gates; demonstrate the failing case of each.
+    \item \textbf{Proof.} Restore-verification job, one chaos drill with postmortem, the SLO dashboard.
+    \item \textbf{Certify.} The practice evaluation; assemble the portfolio exhibit for this capstone.
+\end{enumerate}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item The complete repository deploying end-to-end from its README.
+    \item The evidence pack: pipeline runs, drill artifacts, restore verifications, cost model, security review.
+    \item The portfolio exhibit and the certification results with error log.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item A clean environment reaches a running prod+staging platform from the README without oral help.
+    \item Every quality gate has a demonstrated failing case that blocked promotion.
+    \item The nightly restore verification has run green for a week, with failures alerting.
+    \item The practice evaluation meets the 75\%/60\% readiness bar.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Add the Chapter 14 hybrid-search service as a tenant of the platform, end to end through the golden path.
+    \item Publish the platform's README and one capstone exhibit as your public portfolio piece.
+\end{itemize}

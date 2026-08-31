@@ -1,0 +1,342 @@
+% NOTE: Filename is fixed by the book outline; content teaches Week 16
+% (Business Intelligence with Amazon QuickSight & Reverse ETL), plus the
+% Milestone 4 capstone.
+\chapter{Business Intelligence with QuickSight and Reverse ETL}
+\index{Amazon QuickSight}\index{SPICE}\index{row-level security}\index{reverse ETL}\index{UNLOAD}\index{identity resolution}\index{anomaly detection}%
+\begin{objectives}
+\begin{itemize}
+    \item Explain Amazon QuickSight architecture and the SPICE in-memory engine's role and limits.
+    \item Connect QuickSight to Redshift, Athena, and S3 with appropriate refresh and direct-query trade-offs.
+    \item Enforce row-level security on shared datasets and apply ML Insights for anomaly detection.
+    \item Implement reverse ETL: Redshift UNLOAD to S3, Lambda push to a CRM/marketing API, with identity resolution upstream.
+    \item Reason about sync-frequency trade-offs: freshness versus API rate limits and cost.
+    \item Design the BI access layer for 500 analysts with region-scoped visibility, and assemble the Milestone~4 real-time fraud capstone.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+The serving layer---dashboards for humans, operational pushes back to business systems---closes the analytics loop on every platform.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{2.8cm}p{3.0cm}p{3.0cm}p{3.0cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{AWS} & \textbf{Azure} & \textbf{GCP} \\
+\midrule
+Managed BI & Amazon QuickSight & Power BI (Fabric) & Looker / Looker Studio \\
+In-memory acceleration & SPICE & Power BI import/semantic models & BI Engine \\
+Row-level security & QuickSight RLS rules & Power BI RLS & Looker access filters \\
+ML-assisted insights & QuickSight ML Insights & Copilot / Smart visuals & Gemini in Looker \\
+Warehouse export & Redshift UNLOAD & COPY INTO / Fabric export & BigQuery EXPORT DATA \\
+Reverse-ETL glue & Lambda + API calls & Logic Apps / Functions & Cloud Run functions \\
+\addlinespace
+Reader pricing & Per-reader session & Per-user / capacity & Per-user \\
+Sharing unit & Dashboard / analysis & Workspace app / semantic model & Look / dashboard \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+\textbf{Snowflake} hosts dashboards in Snowsight and streams reverse ETL through external functions; the ecosystem (Census, Hightouch) serves all platforms. \textbf{MongoDB} Charts covers operational BI directly on collections.
+\end{crosscloud}
+
+\section{Week 16 Roadmap and Mental Model}
+Everything before this week moved data toward analytical truth; Week~16 moves it toward \emph{decisions and actions}. That happens in two directions. Outward to humans: dashboards, reports, and governed self-service---Amazon QuickSight's territory. And outward to systems: pushing curated segments and scores back into the operational tools where work happens---reverse ETL.
+
+The engineering shift is from correctness to \emph{governance at scale}. A dashboard seen by 500 analysts with different entitlements is an access-control system with charts attached. A reverse-ETL pipeline writing to a CRM is a production integration with rate limits, identity ambiguity, and business consequences. This week treats both with the same rigor as the ingestion side \cite{awsQuickSightDocs}.
+
+\begin{definitionbox}
+\textbf{Reverse ETL} is the practice of syncing curated warehouse data---segments, scores, aggregates---back into operational systems (CRMs, marketing platforms, support tools) so that analytics directly drives business processes.
+\end{definitionbox}
+
+\begin{keyterms}
+\textbf{SPICE}: QuickSight's in-memory calculation engine; datasets imported into SPICE serve fast, cheap dashboard queries. \textbf{Direct query}: QuickSight querying the source (Redshift/Athena) live instead of SPICE. \textbf{RLS}: row-level security via a rules dataset mapping users/groups to allowed dimension values. \textbf{ML Insights}: QuickSight's built-in anomaly detection, forecasting, and auto-narratives. \textbf{UNLOAD}: Redshift's parallel export command to S3. \textbf{Identity resolution}: matching records for the same person across systems before syncing.
+\end{keyterms}
+
+\section{Monday: QuickSight Architecture and SPICE}
+\subsection{The Serving Layer, Managed}
+QuickSight is serverless BI: no servers, per-reader pricing, browser-based authoring, and embedding APIs for application dashboards. A \emph{dataset} defines a source and its preparation; an \emph{analysis} is the author-facing canvas; a \emph{dashboard} is the published, shared, read-only product. Because it is serverless, the capacity question moves from ``how many nodes'' to ``SPICE or direct query?''
+\index{QuickSight}
+
+\subsection{SPICE: The Acceleration Decision}
+SPICE (Super-fast, Parallel, In-memory Calculation Engine) imports dataset snapshots into managed memory. Dashboards against SPICE respond in sub-seconds without touching the source, which is both a performance and a cost story: a thousand dashboard loads do not become a thousand Redshift queries. The limits are the dataset capacity per account and the \emph{refresh} cadence---SPICE data is only as fresh as its last refresh, so freshness-hungry dashboards either schedule tight refreshes (which do hit the source) or use direct query and pay the source for every interaction \cite{awsQuickSightDocs}.
+\index{SPICE}
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.4cm}p{4.4cm}p{4.4cm}@{}}
+\toprule
+\textbf{Criterion} & \textbf{SPICE import} & \textbf{Direct query} \\
+\midrule
+Freshness & As of last refresh & Live \\
+Dashboard latency & Sub-second, load-independent & Source-dependent \\
+Load on source & Refresh schedule only & Every interaction \\
+Capacity limit & SPICE allocation per account & Source concurrency \\
+Best for & Shared executive/operational dashboards & Live operational monitoring \\
+\bottomrule
+\end{tabular}
+\caption{SPICE versus direct query.}
+\label{tab:ch16-spice}
+\end{table}
+
+\begin{pitfall}
+\textbf{Defaulting everything to direct query.} Five hundred analysts on live Redshift queries re-creates the Chapter~6 concurrency problem at the BI layer. Default to SPICE for shared dashboards; reserve direct query for the few views whose freshness requirement is measured in minutes.
+\end{pitfall}
+
+\section{Tuesday: Connecting QuickSight to Redshift, Athena, and S3}
+QuickSight connects natively to the week's familiar sources. \textbf{Redshift} connections support both SPICE and direct query and can target Serverless workgroups. \textbf{Athena} connections query the Glue catalog directly---the governed lake from Chapters~7--8 becomes a dashboard source with no data movement, and Lake Formation column masks apply through the Athena path. \textbf{S3} manifests allow file-set datasets for simple cases. Cross-account patterns matter here: dashboards in a central BI account can query Redshift datashares (Chapter~8) and catalogs shared via RAM, keeping data in domain accounts while the BI layer centralizes.
+\index{Athena data source}\index{cross-account BI}
+
+\begin{tipbox}
+Give QuickSight its own Redshift user or IAM-identity-mapped role and a dedicated WLM service class. Then the Chapter~6 telemetry answers ``what did the BI layer do to the warehouse at 9:05 a.m.?'' without archaeology.
+\end{tipbox}
+
+\section{Wednesday: Row-Level Security, ML Insights, and Reverse ETL}
+\subsection{Row-Level Security on Shared Datasets}
+QuickSight RLS attaches a \emph{rules dataset} to a shared dataset: rows map users or groups to allowed values of a column (\texttt{region = 'EU'} for the EU managers group). Every visual, filter, and export from that dataset applies the restriction. The alternative---duplicating datasets per region---is a maintenance failure waiting for its second region. RLS keeps one dataset, one definition of the metrics, and per-viewer data \cite{awsQuickSightDocs}.
+\index{row-level security}
+
+\subsection{ML Insights}
+QuickSight's built-in ML features---anomaly detection on time series, forecasting, and auto-generated narratives---run on SPICE datasets without a modeling pipeline. For data engineers they are the fastest way to put a drift tripwire on a business metric: configure anomaly detection on daily revenue, and the first day the pipeline breaks, the \emph{business} metric alarms too, complementing the infrastructure alarms from earlier chapters.
+\index{ML Insights}\index{anomaly detection}
+
+\subsection{Reverse ETL: Closing the Loop}
+Reverse ETL pushes warehouse truth back to operational tools. The AWS-native shape: \textbf{UNLOAD} a curated segment query from Redshift to S3 \cite{awsRedshiftUNLOAD}, an S3 event triggers a \textbf{Lambda} that batches records to the CRM/marketing API with rate-limit-aware throttling and dead-letter capture, and a run-log table records what was synced when.
+
+Two disciplines separate a pipeline from a liability. \textbf{Identity resolution} comes first: the warehouse row must map to the right person in the CRM---matching on a stable identity key established upstream, not on email strings that differ in case and era. And \textbf{sync frequency} is a budget: hourly syncs against a rate-limited API can cost more in calls than the value of the freshness; state the freshness requirement, then engineer down to it.
+\index{reverse ETL}\index{identity resolution}\index{sync frequency}
+
+\begin{lstlisting}[language=SQL,caption={UNLOAD a churn-risk segment for reverse ETL.},label={lst:ch16-unload}]
+UNLOAD ($$
+  SELECT customer_id, churn_score, segment
+  FROM analytics.customer_scores
+  WHERE score_date = CURRENT_DATE AND churn_score > 0.7
+$$)
+TO 's3://acme-analytics-raw-123456789012/reverse-etl/churn/'
+IAM_ROLE 'arn:aws:iam::123456789012:role/RedshiftS3ReadRole'
+FORMAT AS CSV
+HEADER
+PARALLEL OFF;
+\end{lstlisting}
+
+\begin{pitfall}
+\textbf{Syncing duplicates to systems of engagement.} A warehouse join bug that double-counts is embarrassing; the same bug reverse-ETLed emails a customer twice or double-books a discount. Treat reverse ETL as a production integration: idempotency keys on the push, dry-run modes, and reconciliation counts between UNLOAD output and API acknowledgments.
+\end{pitfall}
+
+\section{Thursday Hands-on Project: A Monitored Sales Dashboard}
+\index{hands-on project!QuickSight dashboard}
+Connect QuickSight to the Redshift warehouse from Part~2, build a sales monitoring dashboard, apply a filter, and configure an ML anomaly-detection alert on the revenue trend.
+
+\subsection*{Lab Objectives}
+\begin{itemize}
+    \item Create a QuickSight dataset from Redshift over \texttt{fact\_sales} and its dimensions.
+    \item Build a dashboard with a KPI, a trend line, and a working region filter.
+    \item Configure anomaly detection on daily revenue with an alert to email/SNS.
+    \item Compare SPICE import and direct query on the same dataset.
+\end{itemize}
+
+\subsection*{Procedure}
+\begin{enumerate}
+    \item In QuickSight, create a dataset from the Redshift Serverless workgroup: a join of \texttt{fact\_sales} to \texttt{dim\_date}, \texttt{dim\_product}, and \texttt{dim\_store}.
+    \item Choose SPICE import; schedule a daily refresh after the ETL window.
+    \item Build the analysis: KPI of month-to-date revenue, line chart of daily revenue, bar of revenue by category, and a \texttt{region} filter control affecting all visuals.
+    \item Add an anomaly-detection insight on daily revenue and configure a threshold alert.
+    \item Duplicate the dataset as direct query; compare dashboard interaction latency and observe the Redshift query log entries per interaction.
+    \item Publish as a dashboard shared with a test reader group.
+\end{enumerate}
+
+\subsection*{Verification}
+\begin{itemize}
+    \item The region filter restricts every visual; exported data respects it.
+    \item The anomaly alert fires when a synthetic revenue dip is injected into the fact table and the refresh runs.
+    \item The SPICE dashboard is materially faster than direct query under ten concurrent viewers; the direct-query variant shows per-interaction queries in \texttt{SVL\_QUERY\_SUMMARY}.
+    \item Refresh timestamps on the dashboard match the scheduled cadence.
+\end{itemize}
+
+\section{Friday Use Case: Governed BI for 500 Analysts}
+\index{use case!enterprise BI access layer}
+An enterprise rolls out QuickSight to 500 analysts across five regions. Every analyst queries centralized warehouse data; regional sales managers must see only their region's rows. Data engineering owns the datasets; analysts own their analyses. Design the access layer.
+
+\subsection{Design Decisions}
+\textbf{One governed dataset per domain.} Curated, documented datasets (sales, inventory, marketing) are built by data engineering on conformed warehouse marts; analysts build analyses on top but cannot redefine the metrics layer. This is the semantic-layer bargain: consistency in exchange for a backlog.
+
+\textbf{RLS from the identity source.} The rules dataset maps IAM-Identity-Center groups (\texttt{sales-eu}, \texttt{sales-na}, \ldots) to region values. Group membership is managed in the identity provider, so access reviews and joiner/mover/leaver processes inherit the existing HR workflow---no BI-side access list to drift.
+
+\textbf{SPICE with staggered refreshes.} All shared datasets use SPICE, refreshed after the nightly ETL and again midday for the operational domain. Direct query is an exception requiring a freshness justification, protecting the warehouse from the 9:05 a.m.\ refresh storm.
+
+\textbf{Cost visibility.} Per-reader session pricing makes adoption cheap to start; the platform team dashboards monthly reader-session counts per department so finance sees BI cost as a function of actual usage.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.6cm}p{4.4cm}p{4.2cm}@{}}
+\toprule
+\textbf{Requirement} & \textbf{Mechanism} & \textbf{Failure it prevents} \\
+\midrule
+Region-scoped visibility & RLS rules dataset by IdP group & Per-region dataset forks \\
+Consistent metric definitions & Governed datasets only & Competing revenue numbers \\
+Warehouse protection & SPICE default, staggered refresh & 9:05 a.m.\ query storms \\
+Access lifecycle & Group membership via IdP & Orphaned access after transfers \\
+Adoption cost control & Per-reader session reporting & Silent license sprawl \\
+\bottomrule
+\end{tabular}
+\caption{The 500-analyst BI access layer.}
+\label{tab:ch16-bi-access}
+\end{table}
+
+\begin{pitfall}
+\textbf{RLS rules managed by hand in a spreadsheet.} The rules dataset \emph{is} the authorization system for the BI layer. Derive it from the identity provider's groups with a small pipeline, review its diffs like code, and alert when a user appears in no rule (fail-closed: they see nothing) versus in a wildcard rule (fail-open: they see everything).
+\end{pitfall}
+
+\section{Interview Q\&A}
+\subsection{Concepts and Trade-offs}
+\begin{enumerate}
+    \item \textbf{Q: What does SPICE accelerate, and what is its capacity limit?}\\
+    A: Dataset queries for dashboards---imported in-memory snapshots answer in sub-seconds without touching the source. Capacity is bounded by the SPICE allocation per account, and freshness by the refresh schedule.
+    \item \textbf{Q: How does QuickSight row-level security filter a shared dataset?}\\
+    A: A rules dataset maps users/groups to allowed column values; every visual and export applies the restriction at query time, so one dataset serves many audiences.
+    \item \textbf{Q: What is reverse ETL, and which operational systems does it feed?}\\
+    A: Syncing curated warehouse results---segments, scores---back into operational tools: CRMs, marketing platforms, support systems. Analytics becomes action inside the systems where work happens.
+    \item \textbf{Q: Why must identity resolution happen before syncing audiences to a CRM?}\\
+    A: The warehouse key must map to the correct person in the target system; syncing on uncontrolled identifiers creates duplicate or mis-targeted outreach with real business consequences.
+    \item \textbf{Q: Hourly versus daily sync: which trade-offs decide the frequency?}\\
+    A: API rate limits and call cost against the business value of freshness. State the freshness requirement first; then engineer to the loosest cadence that meets it.
+    \item \textbf{Q: When is direct query justified over SPICE?}\\
+    A: When freshness requirements are measured in minutes and the source can bear per-interaction load---typically operational monitors with small audiences, not company-wide dashboards.
+\end{enumerate}
+
+\section{Further Reading}
+The QuickSight User Guide covers SPICE, data sources, RLS rules datasets, ML Insights, and embedding \cite{awsQuickSightDocs}. The UNLOAD reference covers parallel export options for reverse ETL \cite{awsRedshiftUNLOAD}; the Lambda guide covers the throttled-push pattern to external APIs \cite{awsLambdaDocs}. The Well-Architected Analytics Lens frames the governed-self-service balance \cite{awsWellArchitectedAnalytics}.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item QuickSight makes BI serverless; the real capacity decision is SPICE versus direct query per dataset.
+    \item Governed datasets plus RLS rules let one semantic layer serve every audience safely.
+    \item ML Insights puts anomaly tripwires on business metrics---complementing, not replacing, infrastructure alarms.
+    \item Reverse ETL turns the warehouse into an action system; identity resolution and sync budgets make it safe.
+    \item Treat CRM pushes as production integrations: idempotency, dry runs, reconciliation.
+    \item The BI layer's access controls derive from the identity provider, not from dashboard-side lists.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Explain why SPICE both reduces warehouse load and creates a freshness contract with the business.
+    \item \textbf{(Conceptual)} Why is fail-closed the correct default for RLS rule misses, and how do you detect them?
+    \item \textbf{(Hands-on)} Complete the Thursday project; add an RLS rules dataset restricting a test user to one region and verify exports.
+    \item \textbf{(Hands-on)} Build the reverse-ETL loop: \cref{lst:ch16-unload} plus a Lambda pushing to a mock CRM endpoint, with a reconciliation count.
+    \item \textbf{(Hands-on)} Inject an anomaly into daily revenue and capture the ML Insights alert end to end.
+    \item \textbf{(Design)} Design the identity-resolution strategy for customers who exist in web, app, and store systems with different keys.
+    \item \textbf{(Design)} Budget a reverse-ETL sync: 200{,}000 members, API limit 100 calls/s, 100 records/call, business wants 30-minute freshness. Is it feasible? Show the math.
+    \item \textbf{(Architecture)} Design the BI layer for a holding company where each subsidiary's data must remain in its own account.
+\end{enumerate}
+
+\section{Milestone 4 Capstone: Real-Time Fraud Detection}\label{sec:ch16-capstone}
+\index{capstone project}\index{Milestone 4 capstone}\index{fraud detection}
+
+\begin{capstonebox}
+\textbf{Mission.} Build an end-to-end real-time fraud-detection platform: simulated card swipes stream into Kinesis, a Managed Flink application flags any card used in two cities within ten minutes (sliding windows, event time), alerts flow through Firehose into Redshift, and a QuickSight dashboard displays live fraud alerts.
+
+\textbf{Estimated time.} 8--10 hours in a sandbox AWS account.
+
+\textbf{What you\textquotesingle{}ll practice.}
+\begin{itemize}
+    \item Producer design with per-card partition keys (Chapter~13).
+    \item Event-time sliding-window detection in Flink SQL (Chapter~15).
+    \item Governed delivery with Firehose, raw backup, and idempotent writes (Chapter~14).
+    \item A live QuickSight dashboard over the alert stream (this week).
+\end{itemize}
+\end{capstonebox}
+
+\subsection*{Scenario}
+A card network wants same-minute detection of an impossible-travel pattern: one physical card used in two different cities within ten minutes. Swipes arrive as a stream; flagged alerts must reach a fraud-operations dashboard within a minute, with raw events durably archived. The card PAN must never be persisted in plain text anywhere in the analytical estate.
+
+\subsection*{Requirements}
+\textbf{Functional requirements.}
+\begin{itemize}
+    \item A Python producer simulating swipes---including scripted impossible-travel scenarios---with \texttt{card\_id} as the partition key and PANs tokenized at the edge.
+    \item A Flink application on event time using a sliding window to detect cross-city use within ten minutes.
+    \item Firehose delivery of alerts to Redshift with raw backup to S3; deduplication on \texttt{txn\_id}.
+    \item A QuickSight dashboard over the alerts table, refreshing at least every minute.
+\end{itemize}
+
+\textbf{Non-functional requirements.}
+\begin{itemize}
+    \item At least three automated tests: window-logic unit test, late-event handling test, DLQ routing test with a failing case.
+    \item Alarms on \texttt{IteratorAgeMilliseconds} and Flink restarts, wired to SNS.
+    \item A monthly cost estimate (shard-hours versus MSK, Flink KPUs, Firehose volume) with two documented optimizations.
+    \item Security review: KMS-encrypted streams, least-privilege consumers, PAN never persisted in plain text.
+\end{itemize}
+
+\subsection*{Reference Architecture}
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[
+        node distance=0.55cm and 1.0cm,
+        box/.style={rectangle, rounded corners, draw=violet!70!black, thick, fill=violet!10, align=center, font=\small, minimum height=0.9cm, inner sep=4pt},
+        side/.style={rectangle, rounded corners, draw=brown!70!black, thick, fill=brown!10, align=center, font=\footnotesize, inner sep=3pt},
+        arr/.style={-{Stealth}, thick}
+    ]
+    \node[box] (prod) {Producers\\(swipe simulators)};
+    \node[box, right=of prod] (kds) {Kinesis Data\\Streams};
+    \node[box, right=of kds] (flink) {Managed Flink\\(sliding window)};
+    \node[box, right=of flink, yshift=1.0cm] (fh) {Firehose $\rightarrow$ S3\\(raw backup)};
+    \node[box, right=of flink, yshift=-1.0cm] (rs) {Redshift\\(fraud alerts)};
+    \node[box, right=of rs, yshift=1.0cm] (qs) {QuickSight\\live dashboard};
+    \node[side, below=0.6cm of kds] (dlq) {DLQ + idempotent consumers};
+    \draw[arr] (prod) -- (kds);
+    \draw[arr] (kds) -- (flink);
+    \draw[arr] (flink) -- (fh);
+    \draw[arr] (flink) -- (rs);
+    \draw[arr] (rs) -- (qs);
+    \draw[arr, dashed] (dlq) -- (kds);
+    \end{tikzpicture}%
+    }
+    \caption{Milestone 4 reference architecture: real-time fraud detection from swipe simulation to live dashboard.}
+    \label{fig:ch16-capstone-arch}
+\end{figure}
+
+\subsection*{Implementation Steps}
+\begin{enumerate}
+    \item Create the stream (on-demand capacity) and the tokenizing producer with scripted fraud scenarios.
+    \item Build the Flink SQL application: watermarks on \texttt{event\_ts}, the sliding-window detection query below, alert output to a results stream.
+    \item Connect Firehose from the results stream to Redshift with S3 raw backup; dedupe alerts on \texttt{txn\_id}.
+    \item Build the QuickSight dashboard on the alerts table with a one-minute refresh and an anomaly insight on alert rate.
+    \item Write the three tests, wire the two alarms, run the security review, and build the cost model.
+\end{enumerate}
+
+The detection query is the heart of the capstone:
+
+\begin{lstlisting}[language=SQL,caption={Two-cities-in-ten-minutes detection with a hopping window.},label={lst:ch16-fraud-sql}]
+SELECT card_id, window_start, window_end,
+       COUNT(DISTINCT city) AS city_count
+FROM TABLE(HOP(TABLE swipes, DESCRIPTOR(event_ts),
+               INTERVAL '10' MINUTES, INTERVAL '1' MINUTES))
+GROUP BY card_id, window_start, window_end
+HAVING COUNT(DISTINCT city) > 1;
+\end{lstlisting}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item Producer, Flink application, Firehose configuration, and dashboard definition, all in version control.
+    \item The three automated tests with the failing-case demonstration.
+    \item Alarm evidence and a screen recording or screenshots of a scripted fraud event reaching the dashboard.
+    \item The cost model with two optimizations and the security review (tokenization verified).
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item A scripted cross-city pair flags within the freshness budget; a scripted same-city pair does not.
+    \item Late events within the watermark bound attribute correctly; events beyond it route to the side output.
+    \item No plain-text PAN exists in any S3 prefix, stream record, or Redshift table---verified by scan.
+    \item Alarms fire on injected consumer lag and on a forced Flink restart.
+    \item Alert rows in Redshift show no duplicates under producer retries.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Add a second detection rule (amount spike versus per-card baseline) as a keyed-process function with per-card state.
+    \item Replatform detection on MSK with Kafka consumers and compare operational burden and cost.
+    \item Add QuickSight RLS so regional fraud teams see only their region's alerts.
+    \item Build the batch reconciliation job that refines streaming alerts with next-day settled data.
+\end{itemize}

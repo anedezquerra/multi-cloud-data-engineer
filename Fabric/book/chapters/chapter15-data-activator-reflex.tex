@@ -1,0 +1,281 @@
+\chapter{Data Activator (Reflex)}
+\index{Data Activator}\index{Reflex}\index{triggers}\index{conditions}\index{actions}\index{alerting!Reflex}\index{alert noise}\index{Teams notifications}%
+
+\begin{objectives}
+\begin{itemize}
+    \item Explain the Data Activator object model: triggers (now ``rules''), conditions, and actions.
+    \item Create Reflex items from Power BI visuals and from Eventstream data.
+    \item Configure automated actions: Teams messages, emails, and custom workflows.
+    \item Build a sustained-threshold trigger that alerts only after three consecutive minutes of breach.
+    \item Suppress alert noise with hysteresis, aggregation, and re-alert policy.
+    \item Design a proactive alerting system notifying drivers via custom webhooks when trucks go off route.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+Event-driven alerting over analytics---conditions evaluated continuously against live data---exists across clouds, though Fabric's no-code Reflex is unusually approachable.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{2.8cm}p{3.2cm}p{3.2cm}p{3.2cm}p{3.2cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{Fabric} & \textbf{AWS} & \textbf{GCP} & \textbf{Snowflake} \\
+\midrule
+Data-driven alerts & Data Activator (Reflex) & CloudWatch Alarms + SNS & Cloud Monitoring alerts & Snowflake Alerts \\
+Stream-native trigger & Reflex over Eventstream/KQL & Kinesis Analytics + Lambda & Dataflow + Eventarc & Streams + tasks + notifications \\
+BI-visual trigger & Reflex from Power BI visuals & QuickSight threshold alerts & Looker alerts/schedules & Via BI tool \\
+Actions & Teams, email, Power Automate & SNS targets, Lambda & Pub/Sub, Cloud Functions, webhooks & Email, webhook, stored proc \\
+Custom workflows & Power Automate flows & Step Functions & Workflows & External functions \\
+Evaluation latency & Seconds to minutes & Alarm period granularity & Policy-based & Scheduled evaluation \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+Databricks alerts evaluate SQL on schedules; MongoDB Atlas triggers fire on change streams. The portable disciplines are this chapter's heart: \emph{sustained conditions over spikes, actions with owners, and alert noise treated as a reliability bug}.
+\end{crosscloud}
+
+\begin{keyterms}
+\textbf{Reflex item}: the Fabric item that watches data and acts on conditions. \quad
+\textbf{Trigger/rule}: the watched data and the identity of what is being monitored. \quad
+\textbf{Condition}: the predicate evaluated as data arrives---thresholds, changes, sustained states. \quad
+\textbf{Action}: what fires when the condition holds---Teams, email, Power Automate workflow. \quad
+\textbf{Hysteresis}: requiring a condition to hold (or clear) for a sustained period, damping flapping alerts. \quad
+\textbf{Alert noise}: the volume of low-value notifications that trains humans to ignore alerts.
+\end{keyterms}
+
+\section{Week 15 Roadmap}
+Week~15 closes the loop that Chapters~13 and 14 opened: streams are ingested and analyzed; now the platform must \emph{react}. Monday covers the Data Activator object model. Tuesday creates Reflex items from Power BI visuals and Eventstreams. Wednesday covers actions, from Teams messages to custom workflows. Thursday is the hands-on project: an email alert when IoT temperature exceeds a threshold for three consecutive minutes. Friday designs the logistics alerting system with custom app webhooks for off-route trucks.
+
+The week's engineering theme is restraint. Any system can fire an alert; a well-designed system fires the right alert, once, to the right owner, with context---and stays silent otherwise \cite{microsoftDataActivator}.
+
+\begin{notebox}
+Alert latency expectation: Reflex evaluates on the order of seconds to minutes depending on source and condition. It is an operational-reaction layer, not a safety-critical control loop. Do not put it between a furnace and a meltdown; do put it between a KPI and the human who can fix it.
+\end{notebox}
+
+\section{Monday: Triggers, Conditions, and Actions}
+\index{Data Activator!object model}
+Data Activator's model has three parts, and every sound design names them explicitly \cite{microsoftDataActivator}:
+
+\begin{definitionbox}
+A \textbf{Reflex rule} binds \emph{data} (a stream column or a Power BI measure), a \emph{condition} (a predicate over that data, possibly sustained or aggregated), and an \emph{action} (a notification or workflow fired when the condition holds).
+\end{definitionbox}
+
+\begin{itemize}
+    \item \textbf{Data and identity}: what is watched (temperature, order count, fraud score) and per-what (per device, per card, per region). The identity granularity defines who can be paged and how many parallel alert streams exist.
+    \item \textbf{Conditions}: instant thresholds (temperature $>$ 80), sustained conditions (temperature $>$ 80 for 3 consecutive minutes), and change conditions (value enters/exits a state). Sustained conditions are the primary noise weapon.
+    \item \textbf{Actions}: Teams messages to a channel, email to a list, or a Power Automate flow for arbitrary custom workflows---tickets, webhooks, escalations.
+\end{itemize}
+
+\begin{pitfall}
+Single-spike conditions on noisy telemetry produce alert storms, and alert storms produce ignored alerts, and ignored alerts are worse than no alerts. The ``3 consecutive minutes'' pattern in Thursday's lab is not a detail; it is the difference between a signal and a siren.
+\end{pitfall}
+
+\section{Tuesday: Reflex from Power BI and Eventstreams}
+\index{Reflex!from Power BI}\index{Reflex!from Eventstream}
+Reflex items originate where the data already lives \cite{microsoftDataActivator}:
+
+\subsection{From Power BI Visuals}
+A visual on a report---a card showing today's revenue, a gauge showing capacity---can carry a Reflex alert: \emph{set alert} on the visual, define the measure, condition, and cadence, and the rule evaluates as the model refreshes or frames. This path suits KPI-grade reactions: business metrics with business owners.
+
+\subsection{From Eventstreams and KQL}
+Over streaming data, Reflex evaluates per event or per aggregation window directly on the stream or the KQL table. This path suits telemetry-grade reactions: device temperatures, error rates, the fraud patterns of the Milestone~4 capstone. The Chapter~14 discipline applies upstream: dedupe before the rule query, because duplicates double-fire alerts.
+
+\begin{tipbox}
+Choose the source closest to the truth with the least latency that still reads deduplicated data. For KPIs, that is usually the semantic model; for telemetry, the deduped KQL view---never the raw stream with its replay duplicates.
+\end{tipbox}
+
+\section{Wednesday: Actions and Custom Workflows}
+\index{Reflex!actions}\index{Power Automate}\index{Teams notifications}
+Native actions cover the common cases: Teams channel messages, individual Teams messages, and email. The escape hatch is Power Automate: a Reflex action can trigger a flow, and a flow can do essentially anything---create a ticket in an ITSM tool, call a webhook, post to a third-party chat, open an incident.
+
+Action design is contract design. A good action payload includes: what fired (rule name), on what identity (device, region), the observed values, when, the severity, and the runbook link (Chapter~12's discipline arriving in real time). A payload of ``threshold exceeded'' is a dead end delivered at speed.
+
+Re-alert policy completes the model: after firing, a rule should cool down---suppress repeats while the condition continues to hold, and optionally fire a distinct ``resolved'' notification when it clears. Without cooldown, one sustained breach is fifty identical messages.
+
+\begin{pitfall}
+Automating an action that mutates production (restart a service, scale a capacity) from a Reflex rule without a human gate is auto-remediation roulette. Start with notify-only, measure false-positive rate for a month, then graduate specific, reversible actions to automation.
+\end{pitfall}
+
+\section{Thursday: Hands-on Project}
+\index{hands-on lab}\index{Reflex!hands-on}
+The Week~15 lab sets up a Data Activator trigger on the streaming IoT data from Weeks~13--14: an email fires when a device's temperature exceeds a threshold for three consecutive minutes.
+
+\subsection{Goal and Architecture}
+Reuse \texttt{es\_iot\_telemetry} and \texttt{kqldb\_iot}. Create a Reflex item \texttt{reflex\_iot\_temp} over the deduplicated KQL view (or the eventstream with a dedup-aware aggregation), with per-device identity, a sustained condition, and an email action.
+
+\subsection{Step-by-Step Actions}
+\begin{enumerate}
+    \item Create the Reflex item from the eventstream or the KQL table; set the identity to \texttt{DeviceId}.
+    \item Define the condition: \texttt{Temperature > 26} sustained for 3 consecutive minutes (per device).
+    \item Configure the email action with a complete payload: device, observed values, window, runbook link.
+    \item Configure cooldown: suppress repeats for 15 minutes while the condition holds; add a resolved notification.
+    \item Inject a synthetic hot streak from the producer (Chapter~14's validation method) for two minutes---no alert should fire.
+    \item Extend the streak past three minutes---the alert fires exactly once.
+    \item Let the streak end---the resolved notification fires.
+\end{enumerate}
+
+\subsection{Validation Checklist}
+\begin{itemize}
+    \item The rule evaluates per device, not on the fleet aggregate.
+    \item A two-minute breach fires nothing; a sustained breach fires once.
+    \item The payload contains identity, values, window, severity, and runbook link.
+    \item Cooldown suppresses repeats during a continuing breach.
+    \item The resolved notification fires on recovery.
+    \item The rule reads deduplicated data---a replay drill does not double-fire.
+\end{itemize}
+
+\section{Friday: Use Case and Architecture}
+\index{alerting!logistics}\index{webhooks!driver notifications}
+A logistics company runs 800 delivery trucks with GPS telemetry flowing into Fabric through the Chapter~13 pipeline. Requirement: when a truck deviates from its planned route, notify the driver instantly via the company's custom mobile app---which exposes a webhook---and log the event for the operations team.
+
+\subsection{The Design}
+Route deviation is computed in KQL: truck position versus planned route corridor (a stream-to-dimension join against the route table, per Chapter~14). A Reflex rule watches the deduplicated deviation signal per \texttt{TruckId}, with a sustained condition---off-corridor for 60 seconds---to absorb GPS jitter and tunnel dropouts. The action is a Power Automate flow calling the driver-app webhook with a signed payload, plus a Teams message to the regional operations channel. Cooldown prevents nagging; the resolved notification tells the driver they are back on route; every firing writes an audit row to a KQL table for the weekly operations review.
+
+\begin{figure}[H]
+    \centering
+    \begin{tikzpicture}[node distance=8mm and 9mm]
+        \node[doc, minimum width=2.4cm, minimum height=1.0cm] (gps) at (0,0) {Truck GPS\\telemetry};
+        \node[stage] (es) at (3.8,0) {Eventstream};
+        \node[stage] (kql) at (7.6,0) {KQL: deviation\\(route join)};
+        \node[stage, fill=orange!10] (reflex) at (11.6,0) {Reflex rule\\(sustained 60s)};
+        \node[doc, minimum width=2.6cm, minimum height=1.0cm] (flow) at (15.4,0) {Power Automate\\$\rightarrow$ app webhook};
+
+        \draw[arrow] (gps) -- (es);
+        \draw[arrow] (es) -- (kql);
+        \draw[arrow] (kql) -- (reflex);
+        \draw[arrow] (reflex) -- (flow);
+
+        \node[note, text width=12.5cm, align=center] at (7.8,-1.9) {Per-truck identity, sustained condition, signed webhook payload, audit row per firing.};
+    \end{tikzpicture}
+    \caption{Logistics alerting: telemetry to driver notification in seconds.}
+    \label{fig:chapter15-logistics}
+\end{figure}
+
+\begin{pitfall}
+GPS telemetry lies constantly in small ways---jitter, tunnels, urban canyons. A threshold on raw position error alerts on every overpass. Sustained conditions plus a corridor width tuned to measured GPS accuracy are what separate ``driver notified when truly lost'' from ``driver learned to ignore the app.''
+\end{pitfall}
+
+\section{Operational Guidance for Week 15}
+An alerting estate is a product with users. Measure it: firings per week, false-positive rate, time-to-acknowledge, and the count of alerts nobody acted on. The last metric is the one that predicts disaster.
+
+\subsection{Performance and Reliability}
+Keep rule evaluation on deduplicated, materialized data. Bound evaluation windows. Monitor Reflex item health like any production item. Test actions end-to-end monthly---an alert path that silently broke last release is discovered at the worst moment.
+
+\subsection{Security and Governance Checklist}
+\begin{itemize}
+    \item Webhook payloads signed or token-authenticated; secrets vaulted, never in flow definitions.
+    \item Alert destinations (channels, lists) reviewed for information sensitivity---telemetry can leak operational detail.
+    \item Every rule has a named owner; ownerless rules are deleted, not orphaned.
+    \item Automated mutating actions require documented approval and a rollback path.
+    \item Audit rows for every firing kept per the retention policy.
+    \item Rules read deduplicated data; a replay must never re-page a human.
+\end{itemize}
+
+\section{Interview Q\&A}
+\begin{enumerate}
+    \item \textbf{Q: Which three parts define a Data Activator trigger?}\\
+    A: The data being watched (with its identity granularity), the condition evaluated over it (threshold, sustained, or change), and the action fired when the condition holds.
+    \item \textbf{Q: Why require ``3 consecutive minutes'' instead of a single spike?}\\
+    A: Sustained conditions filter the transient noise that dominates real telemetry; they convert a flapping siren into a trustworthy signal, which is the only kind humans keep answering.
+    \item \textbf{Q: Which actions can Reflex fire natively?}\\
+    A: Teams messages and email, plus Power Automate flows as the escape hatch to arbitrary workflows---tickets, webhooks, custom apps.
+    \item \textbf{Q: How do you create an alert from a Power BI visual?}\\
+    A: Set alert on the visual, binding the rule to the visual's measure; the rule evaluates as the semantic model refreshes or frames, which suits KPI-grade business reactions.
+    \item \textbf{Q: What alert latency should you expect from a Reflex item?}\\
+    A: Seconds to minutes depending on source and condition cadence---operational reaction time, not hard-real-time control.
+    \item \textbf{Q: Why must Reflex rules read deduplicated data?}\\
+    A: Because at-least-once delivery and replay produce duplicate events upstream, and a rule over raw duplicates double-fires---paging humans twice for one event.
+\end{enumerate}
+
+\section{Further Reading}
+Review the Data Activator documentation \cite{microsoftDataActivator}. The upstream disciplines are Chapter~13's eventstream semantics \cite{microsoftFabricEventstreams} and Chapter~14's KQL dedup and windowing \cite{microsoftKQL,microsoftKQLMV}. Alert-as-work-order design inherits Chapter~12's runbook discipline \cite{microsoftFabricMonitoringHub}.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item Data Activator binds data, condition, and action; every sound rule names all three plus an owner.
+    \item Sustained conditions are the primary defense against alert storms.
+    \item Reflex evaluates in seconds to minutes: operational reaction, not control loops.
+    \item Actions carry context---identity, values, severity, runbook---or they are noise delivered at speed.
+    \item Cooldown and resolved-notifications complete the alert lifecycle.
+    \item Rules read deduplicated data; replay must never re-page a human.
+    \item Alert estates are products: measure firings, false positives, and ignored alerts, and delete what nobody acts on.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Define hysteresis and explain why alerting systems need it, using the truck-corridor example.
+    \item \textbf{(Conceptual)} When is a Power-BI-visual rule preferable to a stream-native rule, and vice versa?
+    \item \textbf{(Hands-on)} Add a second severity tier to the lab rule (warning at 25, critical at 26) with different actions and cooldowns.
+    \item \textbf{(Hands-on)} Build the Power Automate flow posting a signed payload to a test webhook; verify signature validation.
+    \item \textbf{(Design)} Design the escalation ladder for the logistics system: driver, regional ops, national ops---with timing and conditions.
+    \item \textbf{(Design)} Specify the alert-metrics dashboard: which four metrics, over what window, reviewed how often?
+    \item \textbf{(Interview)} In five sentences, explain why ignored alerts are worse than no alerts, and how sustained conditions plus cooldown prevent the slide.
+    \item \textbf{(Operational)} Write the monthly alert-path test procedure for the lab's rule chain.
+\end{enumerate}
+
+\section{Capstone Project: Fleet Alerting with Noise Discipline}\label{sec:ch15-capstone}
+\index{capstone project}\index{Reflex!capstone}\index{alert noise!capstone}
+
+\begin{capstonebox}
+\textbf{Mission.} Build the two-tier fleet alerting system: per-device Reflex rules with sustained conditions and cooldowns, a warning/critical severity split, a signed webhook action through Power Automate, a resolved-notification lifecycle, an audit table of every firing, and a one-month noise report proving the estate is worth answering.
+
+\textbf{Estimated time.} 4--6 hours on top of the Weeks 13--14 estate.
+
+\textbf{What you'll practice.}
+\begin{itemize}
+    \item Sustained-threshold rule design with per-identity granularity.
+    \item Severity tiers with differentiated actions.
+    \item Signed custom-webhook delivery via Power Automate.
+    \item Cooldown, resolution, and audit as first-class lifecycle features.
+    \item Measuring alert quality instead of assuming it.
+\end{itemize}
+\end{capstonebox}
+
+\subsection*{Scenario}
+Contoso Devices' support team needs fleet temperature alerting they can trust. The previous system (a cron job emailing on every spike) trained everyone to ignore it within a month. The replacement must fire rarely, fire correctly, carry context, and prove its own quality with data.
+
+\subsection*{Requirements}
+\begin{itemize}
+    \item Warning and critical rules per device with sustained conditions and distinct actions.
+    \item Cooldown and resolved notifications configured and demonstrated.
+    \item The Power Automate webhook action with a validated signature.
+    \item Audit table capturing every firing: rule, device, values, timestamps, resolution.
+    \item Evidence: injected noise produces zero alerts; injected sustained breach produces exactly one per tier.
+    \item The noise report template: firings, false positives, acknowledgments, ignored alerts.
+\end{itemize}
+
+\subsection*{Implementation Steps}
+\begin{enumerate}
+    \item Build the warning and critical rules over the deduplicated view.
+    \item Configure actions, cooldowns, and resolution notifications.
+    \item Build and secure the Power Automate webhook flow.
+    \item Implement the audit table write.
+    \item Run the noise and breach evidence scenarios; capture the audit rows.
+    \item Draft the noise report from the audit table.
+\end{enumerate}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item Rule configurations exported or documented with screenshots.
+    \item The secured flow definition and a captured signed payload.
+    \item Audit table contents across the evidence scenarios.
+    \item The noise report template with one populated week (real or simulated).
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item[\(\square\)] Injected sub-threshold noise fires nothing.
+    \item[\(\square\)] A sustained breach fires exactly once per tier, with full context payloads.
+    \item[\(\square\)] Cooldown suppresses repeats; resolution notifies once.
+    \item[\(\square\)] Every firing and resolution appears in the audit table.
+    \item[\(\square\)] The webhook rejects unsigned payloads in testing.
+    \item[\(\square\)] The noise report computes firings, false-positive rate, and ignored-alert count from audit data.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Add fleet-level aggregate rules (site temperature, not device) with separate owners.
+    \item Add a weekly auto-generated noise report delivered to the rules' owners.
+    \item Implement adaptive thresholds from Chapter~14's anomaly detection instead of static values.
+    \item Add a suppression window for known maintenance periods, with audit visibility.
+\end{itemize}

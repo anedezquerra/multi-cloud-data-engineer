@@ -1,0 +1,269 @@
+\chapter{Dataflow and Apache Beam Fundamentals}
+\index{Dataflow}\index{Apache Beam}\index{PCollection}\index{PTransform}\index{ParDo}\index{Flex Templates}
+
+\begin{objectives}
+\begin{itemize}
+    \item Apply the Beam programming model: pipelines, PCollections, PTransforms, ParDo, and runners.
+    \item Explain Dataflow's managed architecture: worker autoscaling, Shuffle and Streaming Engine.
+    \item Unit-test pipelines with TestPipeline, PAssert, and isolated DoFn tests before deploying.
+    \item Package pipelines as Classic or Flex Templates for repeatable, parameterized launches.
+    \item Build the WordCount pipeline and run it on the Dataflow runner with autoscaling.
+    \item Design a real-time pipeline that anonymizes healthcare HL7 messages before warehousing.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+Managed runners for portable pipelines exist on every cloud, but Beam's model---one API, many runners---is the most explicit separation of pipeline logic from execution engine.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{2.8cm}p{3.0cm}p{3.0cm}p{3.0cm}@{}} \\
+\toprule
+\textbf{Capability} & \textbf{GCP Dataflow} & \textbf{AWS} & \textbf{Azure} \\
+\midrule
+Managed runner & Dataflow (Beam native) & Kinesis Data Analytics (Flink), EMR Flink/Spark & HDInsight/Synapse Spark, Fabric \\
+Programming model & Beam (Java/Python/Go) & Flink API, Spark API, Kinesis SQL & Spark API, KQL \\
+Portability & Beam runners (Flink, Spark, Samza) & Moderate & Moderate \\
+Autoscaling & Native, per-stage & Application scaling & Pool-level scaling \\
+Batch + streaming & One model, both modes & Separate services traditionally & Separate engines traditionally \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+The Beam model's contribution is conceptual as much as practical: its unified treatment of bounded and unbounded data, event time, and windowing \cite{akidau2015dataflow} is now the vocabulary in which streaming is discussed on every platform, including \textbf{Snowflake}'s streaming features and \textbf{MongoDB}'s change-stream processors.
+\end{crosscloud}
+
+\begin{keyterms}
+\textbf{PCollection}: an immutable, distributed dataset---bounded or unbounded---flowing through a pipeline.
+\textbf{PTransform}: a data-processing operation consuming and producing PCollections.
+\textbf{ParDo}: the general parallel ``do'' transform executing a user DoFn per element.
+\textbf{Runner}: the engine executing a Beam pipeline---Direct (local), Dataflow, Flink, Spark.
+\textbf{Streaming Engine}: Dataflow's mode that moves streaming shuffle and state off worker VMs into the service backend.
+\textbf{Flex Template}: a containerized pipeline image plus a template spec, launched with parameters without rebuilding code.
+\end{keyterms}
+
+\section{Week 14 Roadmap}
+Week~14 teaches the model and the managed runner together. Monday is the Beam model: PCollections, PTransforms, ParDo, and the runner abstraction. Tuesday is Dataflow's service architecture: autoscaling, Shuffle, Streaming Engine. Wednesday covers templates. Thursday runs WordCount on the Dataflow runner. Friday anonymizes healthcare HL7 streams before they reach BigQuery.
+
+\begin{definitionbox}
+\textbf{Apache Beam} is a unified programming model for batch and streaming data processing. A Beam pipeline is a graph of PTransforms over PCollections, compiled to a \textbf{runner}; \textbf{Dataflow} is Google Cloud's fully managed Beam runner with autoscaling, exactly-once shuffle, and streaming state management \cite{apachebeamdocs,googleclouddataflowdocs}.
+\end{definitionbox}
+
+\section{Monday: The Beam Model---PCollections, PTransforms, ParDo, Runners}
+\index{Beam model}\index{DoFn}\index{runners}
+
+\subsection{Pipelines as Graphs}
+A Beam program builds a directed graph: sources produce PCollections; transforms map, filter, key, window, group, and join them; sinks write results. The same graph runs bounded (a batch of files) or unbounded (a Pub/Sub subscription)---the model unifies both, which is the thesis of the Dataflow paper \cite{akidau2015dataflow}: ask \emph{what} results, \emph{where} in event time, \emph{when} in processing time to emit, and \emph{how} refinements accumulate, and the model handles the rest.
+
+\subsection{ParDo and DoFn}
+\texttt{ParDo} is the workhorse: your \texttt{DoFn.process} runs per element, emitting zero or more outputs, with access to side inputs, state, and timers (Chapter~15). Higher-level transforms---\texttt{Map}, \texttt{Filter}, \texttt{GroupByKey}, \texttt{CombinePerKey}---are convenience wrappers over the same machinery. Fusions and combiner lifting are why idiomatic Beam (combine before group, filter early) runs dramatically cheaper than naive graphs.
+
+\begin{lstlisting}[language=Python,caption={The canonical WordCount expressed in Beam.}]
+import re
+import apache_beam as beam
+
+with beam.Pipeline() as p:
+    (p
+     | "Read" >> beam.io.ReadFromText("gs://dataflow-samples/shakespeare/kinglear.txt")
+     | "Words" >> beam.FlatMap(lambda line: re.findall(r"[A-Za-z']+", line))
+     | "Pair" >> beam.Map(lambda w: (w.lower(), 1))
+     | "Count" >> beam.CombinePerKey(sum)
+     | "Format" >> beam.Map(lambda kv: f"{kv[0]}: {kv[1]}")
+     | "Write" >> beam.io.WriteToText("gs://my-bucket/out/wordcount"))
+\end{lstlisting}
+
+\subsection{Runners and Portability}
+Develop on the Direct runner locally, test with TestPipeline, deploy to Dataflow. Because the model is portable, the same pipeline can run on Flink or Spark---a hedge some organizations value---but portability is at the API level: runner-specific features (Streaming Engine, exactly-once modes) are where managed value concentrates.
+
+\begin{notebox}
+Beam pipelines are lazily constructed: transforms build the graph, and \texttt{pipeline.run()} (or context exit) submits it. Code before submission runs on the launching machine; DoFn bodies run on workers. Confusing the two is the most common beginner bug---a database connection opened at graph-construction time does not exist on workers.
+\end{notebox}
+
+\section{Tuesday: Dataflow Architecture---Autoscaling, Shuffle, Streaming Engine}
+\index{Dataflow!autoscaling}\index{Streaming Engine}\index{shuffle}
+
+\subsection{The Managed Service}
+You submit a graph; Dataflow provisions worker VMs, distributes fused stages, and scales workers between configured bounds as backlog and utilization demand. The service monitors per-stage progress, drains stragglers with dynamic work rebalancing (stealing unprocessed ranges from slow workers), and reports per-stage metrics---system lag, watermark, throughput---that become your alerting surface in Chapter~15.
+
+\subsection{Shuffle and Streaming Engine}
+Batch jobs use the service-based \textbf{Shuffle}: intermediate data moves through a managed shuffle tier instead of worker disks, so workers stay stateless and autoscale freely. \textbf{Streaming Engine} does the same for streaming pipelines---plus moving per-key state into the backend---reducing worker count, improving autoscaling latency, and enabling features like exactly-once shuffle. Unless you have a specific reason (custom network placement, specialized disks), both should be on.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{4.4cm}p{4.4cm}p{4.4cm}@{}} \\
+\toprule
+\textbf{Signal} & \textbf{Meaning} & \textbf{Response} \\
+\midrule
+Workers at max, backlog growing & Under-provisioned or hot stage & Raise \texttt{max\_num\_workers}; inspect stage \\
+Workers idle, low throughput & Input-bound or over-provisioned & Check source parallelism; lower bounds \\
+High system lag, stable watermark & Processing capacity short & Scale up; enable Streaming Engine \\
+Watermark stuck, lag stable & Late/stranded data upstream & Inspect upstream; check event timestamps \\
+\bottomrule
+\end{tabular}
+\caption{Reading Dataflow job metrics during tuning.}
+\label{tab:ch14-dataflow-metrics}
+\end{table}
+
+\begin{tipbox}
+Autoscaling reacts to backlog; it does not predict it. For known daily peaks, either accept the scale-up lag (minutes) or pin a higher \texttt{num\_workers} floor during the peak window via scheduled job updates.
+\end{tipbox}
+
+\section{Wednesday: Templates---Classic versus Flex}
+\index{templates!classic}\index{templates!flex}
+
+Templates separate pipeline \emph{definition} from pipeline \emph{launch}: operators launch parameterized jobs without a development environment. \textbf{Classic templates} stage the serialized graph at build time---parameters must be \texttt{ValueProvider}s resolved at launch, and graph shape cannot depend on them. \textbf{Flex Templates} package the pipeline as a container image; at launch the container runs, builds the graph with full access to parameters, and submits it---conditional graph construction, custom dependencies, and non-ValueProvider parameters all work. Google ships both as Google-provided templates (GCS to BigQuery, Pub/Sub to BigQuery, and dozens more); prefer them over writing your own when they fit.
+
+\begin{pitfall}
+A Classic template whose graph depends on a launch parameter silently bakes the build-time value. If a parameter must change the DAG shape---choose a source, toggle a transform---you need a Flex Template. This constraint has bitten every team that ignored it exactly once.
+\end{pitfall}
+
+\section{Thursday Hands-On Project: WordCount on the Dataflow Runner}
+\index{hands-on project}\index{WordCount}\index{unit testing!Beam}
+This lab runs WordCount locally, unit-tests a transform, then submits to Dataflow with autoscaling---the full develop-test-deploy loop in miniature.
+
+\subsection{Local Run and Unit Test}
+\begin{lstlisting}[language=Python,caption={Unit-testing a Beam transform with TestPipeline and PAssert.}]
+import apache_beam as beam
+from apache_beam.testing.test_pipeline import TestPipeline
+from apache_beam.testing.util import assert_that, equal_to
+
+
+def count_words(lines):
+    return (lines
+            | "Words" >> beam.FlatMap(str.split)
+            | "Pair" >> beam.Map(lambda w: (w, 1))
+            | "Count" >> beam.CombinePerKey(sum))
+
+
+def test_count_words():
+    with TestPipeline() as p:
+        out = p | beam.Create(["a b a", "b"])
+        assert_that(count_words(out), equal_to([("a", 2), ("b", 2)]))
+\end{lstlisting}
+
+\subsection{Submit to Dataflow}
+\begin{lstlisting}[language=bash,caption={Running WordCount on Dataflow with autoscaling from PowerShell.}]
+$env:PROJECT_ID = "my-gcp-dataflow-lab"
+$env:REGION = "us-central1"
+$env:BUCKET = "my-gcp-dataflow-lab-bucket"
+
+python .\wordcount.py `
+  --runner=DataflowRunner `
+  --project=$env:PROJECT_ID `
+  --region=$env:REGION `
+  --temp_location=gs://$env:BUCKET/tmp `
+  --staging_location=gs://$env:BUCKET/staging `
+  --output=gs://$env:BUCKET/out/wordcount `
+  --autoscaling_algorithm=THROUGHPUT_BASED `
+  --max_num_workers=4
+\end{lstlisting}
+
+Open the Dataflow job graph in the console: identify the fused stages, worker count over time, and per-stage throughput. Then rerun with \texttt{--runner=DirectRunner} on a small input and compare---the graph is identical; only the runner changed.
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item The pipeline, the passing unit test, and the submission command transcript.
+    \item A screenshot of the Dataflow job graph with stages and autoscaling behavior annotated.
+    \item A paragraph comparing the local and managed runs: what the runner changed and what it did not.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item The transform logic is covered by a PAssert unit test that fails when logic changes.
+    \item The Dataflow job succeeds with autoscaling enabled and bounded workers.
+    \item Outputs are written to a deterministic Cloud Storage path, overwritable on rerun.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Package the pipeline as a Flex Template with a Docker image and launch it with \texttt{gcloud dataflow flex-template run}.
+    \item Add a Google-provided template run (Text Files on Cloud Storage to BigQuery) and compare with hand-rolled code.
+    \item Benchmark the job with and without service-based shuffle on a large input.
+\end{itemize}
+
+\section{Friday Use Case and Architecture: Real-Time HL7 Anonymization}
+\index{HL7}\index{healthcare anonymization}\index{de-identification!pipeline}
+
+\subsection{Scenario}
+A hospital network streams HL7 admission and lab messages from facilities to a central analytics platform. Before any message lands in BigQuery, direct identifiers (patient names, MRNs, addresses) must be pseudonymized; the mapping from real to pseudonymous identity lives in a restricted system; analysts query only the safe projection.
+
+\subsection{Architecture}
+Facilities publish to a schema-validated Pub/Sub topic (Chapter~13). A streaming Dataflow pipeline parses HL7 segments, calls the tokenization service (or Sensitive Data Protection's de-identification, Chapter~23) through a bounded-batch \texttt{ParDo} with backoff, and writes two outputs: the pseudonymized stream to BigQuery for analytics, and the raw stream to a VPC-SC-protected, CMEK-encrypted Cloud Storage bucket reachable only by the compliance service account. Side inputs carry the day's code mappings; dead-lettered parse failures go to a triage topic with alerts.
+
+\begin{figure}[H]
+    \centering
+    \resizebox{0.95\textwidth}{!}{%
+    \begin{tikzpicture}[
+        src/.style={rectangle, rounded corners, draw=codegray, thick, fill=white, text width=2.7cm, minimum height=1.0cm, align=center, font=\small\bfseries},
+        svc/.style={rectangle, rounded corners, draw=primary, thick, fill=primary!6, text width=3.0cm, minimum height=1.0cm, align=center, font=\small\bfseries},
+        dst/.style={rectangle, rounded corners, draw=codegreen!60!black, thick, fill=green!7, text width=2.9cm, minimum height=1.0cm, align=center, font=\small\bfseries},
+        warn/.style={rectangle, rounded corners, draw=red!60!black, thick, fill=red!6, text width=2.9cm, minimum height=0.9cm, align=center, font=\footnotesize\bfseries},
+        arrow/.style={-{Stealth[length=2.5mm]}, draw=primary, thick},
+        dasharrow/.style={-{Stealth[length=2.5mm]}, draw=codegray, thick, dashed}
+    ]
+        \node[src] (hl7) at (0,0) {Facilities\\HL7 feeds};
+        \node[svc] (ps) at (3.6,0) {Pub/Sub\\schema topic};
+        \node[svc] (df) at (7.4,0) {Dataflow\\parse + tokenize\\(batch API calls)};
+        \node[dst] (bq) at (11.6,1.2) {BigQuery\\pseudonymous\\analytics};
+        \node[warn] (raw) at (11.6,-1.2) {GCS raw vault\\VPC-SC + CMEK};
+
+        \draw[arrow] (hl7) -- (ps);
+        \draw[arrow] (ps) -- (df);
+        \draw[arrow] (df) -- (bq);
+        \draw[dasharrow] (df) -- (raw);
+    \end{tikzpicture}%
+    }
+    \caption{HL7 anonymization: parse and tokenize in flight; analysts see only the pseudonymous projection.}
+    \label{fig:ch14-hl7-anonymization}
+\end{figure}
+
+\begin{tipbox}
+Batch external API calls inside the DoFn (accumulate a bundle, call once) and bound concurrency with backoff---per-message calls to a tokenization endpoint are the classic way to turn a cheap pipeline into an expensive, rate-limited one. Chapter~20 develops this pattern fully.
+\end{tipbox}
+
+\begin{pitfall}
+``Anonymized'' pipelines leak through timestamps, free-text notes, and rare-diagnosis combinations. Pseudonymization of direct identifiers is step one; quasi-identifier risk analysis (Chapter~23) decides whether the analytics projection is actually safe to expose.
+\end{pitfall}
+
+\section{Interview Q\&A}
+\subsection{Concepts and Trade-offs}
+\begin{enumerate}
+    \item \textbf{Q: What is the difference between a PTransform and a ParDo?}\\
+    A: A PTransform is any graph node transforming PCollections; ParDo is the specific general-purpose transform applying your DoFn element-wise.
+
+    \item \textbf{Q: Why unit-test Beam with TestPipeline before deploying to Dataflow?}\\
+    A: Logic errors cost minutes locally and money plus data-correction effort in production; PAssert proves transform semantics, and TestStream (Chapter~15) proves windowing behavior, all in CI.
+
+    \item \textbf{Q: What does Streaming Engine move off the worker VMs?}\\
+    A: Streaming shuffle and per-key state into the service backend, leaving workers stateless, smaller, and faster to autoscale.
+
+    \item \textbf{Q: When should you package a pipeline as a Flex Template?}\\
+    A: When operators must launch parameterized jobs without a dev environment, or when graph shape depends on launch parameters---which Classic templates cannot express.
+
+    \item \textbf{Q: How does Dataflow autoscaling react to a growing backlog?}\\
+    A: It adds workers up to \texttt{max\_num\_workers} based on backlog and utilization, then removes them as the backlog drains---reactive, with minutes of ramp time.
+\end{enumerate}
+
+\section{Further Reading}
+Read the Beam programming guide for the model, transforms, and testing utilities \cite{apachebeamdocs}, and the Dataflow documentation for runner options, Streaming Engine, and templates \cite{googleclouddataflowdocs}. The Dataflow Model paper grounds the unified batch/streaming semantics \cite{akidau2015dataflow}. Chapter~13's Pub/Sub documentation covers the ingestion contracts feeding these pipelines \cite{googlecloudpubsubdocs}.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item Beam unifies batch and streaming: one graph, bounded or unbounded inputs, many runners.
+    \item ParDo/DoFn is where user logic lives; prefer combinable transforms and early filters for cheap graphs.
+    \item Streaming Engine and service shuffle make workers stateless---enable both by default.
+    \item Autoscaling reacts to backlog within worker bounds; plan peaks deliberately.
+    \item Test with TestPipeline and PAssert before any managed run; templates industrialize launches.
+    \item Regulated pipelines separate raw vaults from pseudonymous analytics at the architecture level, not by convention.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Explain graph-construction time versus worker execution time, with one bug that arises from confusing them.
+    \item \textbf{(Conceptual)} Why does moving state into Streaming Engine improve autoscaling for streaming pipelines?
+    \item \textbf{(Hands-on)} Reproduce the Thursday lab; then modify the tokenizer to strip stopwords, update the PAssert, and redeploy.
+    \item \textbf{(Hands-on)} Package WordCount as a Flex Template and launch two runs with different parameters.
+    \item \textbf{(Analysis)} A streaming job shows rising system lag with a stable watermark. Diagnose using Table~\ref{tab:ch14-dataflow-metrics} and propose the fix.
+    \item \textbf{(Design)} Extend the HL7 design with a Bigtable latest-state store per patient pseudonym, including row-key sketch and TTL policy.
+\end{enumerate}

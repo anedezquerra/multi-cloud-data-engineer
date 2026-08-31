@@ -1,0 +1,318 @@
+\chapter{KQL Databases and Eventhouses}
+\index{Eventhouse}\index{KQL}\index{Kusto Query Language}\index{materialized views}\index{arg\_max}\index{time series}\index{anomaly detection}\index{make-series}\index{late-arriving data}\index{stream joins}%
+
+\begin{objectives}
+\begin{itemize}
+    \item Explain the Eventhouse architecture and how KQL databases store and index streaming data.
+    \item Write core KQL: \texttt{search}, \texttt{where}, \texttt{project}, \texttt{summarize}, and time-bounded filters.
+    \item Maintain incremental state with materialized views and deduplicate replayed events with \texttt{arg\_max}.
+    \item Build time series with \texttt{make-series}, rolling windows, and \texttt{series\_decompose\_anomalies}.
+    \item Express stream-to-stream and stream-to-dimension joins with time-windowed keys, and reason about late arrivals.
+    \item Troubleshoot a dashboard whose daily aggregates are wrong because offline devices uploaded data late.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+Purpose-built time-series/log analytics engines---columnar, append-optimized, query-language-native---exist across the ecosystem. Fabric's Eventhouse is the Azure Data Explorer (Kusto) lineage delivered inside the SaaS workspace.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{2.8cm}p{3.2cm}p{3.2cm}p{3.2cm}p{3.2cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{Fabric} & \textbf{AWS} & \textbf{GCP} & \textbf{Snowflake} \\
+\midrule
+Telemetry/log engine & Eventhouse (KQL database) & CloudWatch Logs Insights / OpenSearch / Timestream & Cloud Logging / BigQuery streaming analytics & Snowflake tables + time-series functions \\
+Query language & KQL & Logs Insights QL / SQL & SQL / Logging query language & SQL \\
+Time-series functions & \texttt{make-series}, \texttt{series\_*} family & Timestream SQL functions & BigQuery window/ML functions & Window functions, ASOF joins \\
+Incremental state & Materialized views & Scheduled queries / rollups & BigQuery materialized views & Materialized views, dynamic tables \\
+Dedup idiom & \texttt{arg\_max} by id & Window dedup & \texttt{ROW\_NUMBER} dedup & \texttt{ROW\_NUMBER} / \texttt{MERGE} \\
+Retention control & Retention policies per table & Log group retention / TTL & Log bucket retention / table TTL & Time Travel + data retention \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+Databricks approaches telemetry with Structured Streaming plus Delta; MongoDB with time-series collections. The portable skills: think in \emph{append-only streams plus incremental state}, bound your lookback windows, and treat late arrivals as a policy decision, not a surprise.
+\end{crosscloud}
+
+\begin{keyterms}
+\textbf{Eventhouse}: the Fabric item that hosts one or more KQL databases for real-time analytics. \quad
+\textbf{KQL (Kusto Query Language)}: a pipe-composed, read-optimized query language for telemetry and time-series data. \quad
+\textbf{Materialized view}: a continuously maintained query result---incremental state over an append-only stream. \quad
+\textbf{\texttt{arg\_max}}: the KQL aggregate that returns the row with the maximum value of an expression---the dedup idiom. \quad
+\textbf{\texttt{make-series}}: the operator that converts event streams into ordered time-series arrays for analysis. \quad
+\textbf{Late arrival}: an event whose event time precedes its arrival by more than the processing window allows.
+\end{keyterms}
+
+\section{Week 14 Roadmap}
+Week~14 teaches the query heart of real-time intelligence. Monday covers Eventhouses and KQL databases. Tuesday builds KQL fluency---\texttt{search}, \texttt{where}, \texttt{project}, \texttt{summarize}---plus materialized views and the \texttt{arg\_max} dedup idiom. Wednesday goes advanced: time-series analysis, stream joins with time-windowed keys, late-arrival implications, and why unbounded lookback windows degrade performance. Thursday is the hands-on project: a five-minute rolling average and anomaly detection over the Week~13 IoT stream. Friday runs the troubleshooting scenario---a dashboard wrong because devices went offline and uploaded late---and closes the loop on end-to-end exactly-once reasoning.
+
+KQL is the highest-leverage new language in this program. It reads like a pipeline---data flows through \texttt{|} stages---and it is optimized for exactly the questions streaming systems ask: filter by time, aggregate by window, detect the anomaly, find the latest state \cite{microsoftKQL,microsoftFabricEventhouse}.
+
+\begin{notebox}
+The unifying idea of the week: an append-only event stream plus maintained incremental state (materialized views) reproduces most of what mutable tables give you---without giving up the replay-safety of never updating in place.
+\end{notebox}
+
+\section{Monday: Eventhouses and KQL Databases}
+\index{Eventhouse!architecture}\index{KQL database}
+An Eventhouse is the Fabric container for KQL databases: the compute and storage fabric that ingests streams, indexes columns, compresses extents, and serves queries within seconds of ingestion \cite{microsoftFabricEventhouse}. A KQL database inside it holds tables, materialized views, functions, and policies---retention, caching, row-level security.
+
+\begin{definitionbox}
+An \textbf{Eventhouse} is Fabric's real-time analytics engine host: it provides the compute and storage under which KQL databases ingest, index, and serve high-volume append-only telemetry with sub-second-to-second query latency.
+\end{definitionbox}
+
+Three properties shape engineering practice. \emph{Append-first}: tables are optimized for relentless inserts; updates and deletes exist but are exceptions, which is why dedup happens at query/materialization time. \emph{Time-native}: every table has an ingestion timestamp, most have an event timestamp, and the engine indexes time aggressively. \emph{Policy-driven}: retention and caching are table policies, so hot recent data serves from cache while history ages out deliberately.
+
+\begin{pitfall}
+Eventhouse compute meters against your Fabric capacity. An unbounded dashboard query (``all events, all time, every refresh'') is a capacity incident disguised as a visualization. Bound every query with a time filter as a habit, not an optimization.
+\end{pitfall}
+
+\section{Tuesday: KQL Basics, Materialized Views, and Dedup}
+\index{KQL!basics}\index{materialized views}\index{arg\_max!dedup}
+\subsection{The Core Verbs}
+KQL composes operators left to right through the pipe \cite{microsoftKQL}:
+
+\begin{lstlisting}[language=SQL,caption={Core KQL verbs over the IoT stream.},label={lst:chapter14-core}]
+-- search: raw text/expression hunt across columns
+IoTTelemetry
+| search "device-07";
+
+-- where + project: filter and shape
+IoTTelemetry
+| where Timestamp > ago(1h) and Temperature > 25
+| project DeviceId, Timestamp, Temperature;
+
+-- summarize: aggregate by groups and time bins
+IoTTelemetry
+| where Timestamp > ago(24h)
+| summarize AvgTemp = avg(Temperature), Readings = count()
+    by DeviceId, bin(Timestamp, 5m)
+| order by DeviceId, bin_Timestamp asc;
+\end{lstlisting}
+
+\subsection{Materialized Views as Incremental State}
+A materialized view maintains an aggregate or projection continuously as data arrives---the streaming answer to ``recompute the summary every night.'' Over an append-only stream, the view is the state: dashboards and rules read the view, never the raw firehose \cite{microsoftKQLMV}.
+
+\subsection{Dedup with \texttt{arg\_max}}
+Chapter~13's at-least-once reality lands here. The dedup idiom keeps the latest arrival per logical event:
+
+\begin{lstlisting}[language=SQL,caption={Deduplication idiom: latest arrival per event id.},label={lst:chapter14-dedup}]
+IoTTelemetry
+| summarize arg_max(ingestion_time(), *) by EventId
+\end{lstlisting}
+
+Enforced inside a materialized view (or as the first stage of every consumer query), this makes replay harmless: re-delivered events collapse back to one logical row. The dedup key---\texttt{EventId} stamped at the producer---is the contract from Chapter~13 made executable.
+
+\section{Wednesday: Time Series, Joins, and Late Arrivals}
+\index{time series}\index{make-series}\index{series\_decompose\_anomalies}\index{stream joins}\index{late-arriving data}
+\subsection{Time-Series Analysis}
+\texttt{make-series} converts events into ordered arrays per entity; the \texttt{series\_*} function family then operates on the arrays---filters, decomposition, forecasting, anomaly detection \cite{microsoftKQL}.
+
+\subsection{Stream Joins with Time-Windowed Keys}
+Stream-to-stream joins correlate two unbounded flows; the join key alone is insufficient---a time window bounds which events can match. Stream-to-dimension joins enrich events with the current (or as-of) dimension state. Both patterns appear in Friday's listing.
+
+\subsection{Late Arrivals and Window Policy}
+When a device goes offline and backhauls hours of events, every windowed aggregate over the affected period was computed on incomplete data. The engineering responses, in order of preference: \emph{size windows and materialization lookback to the realistic lateness distribution}; \emph{re-aggregate on arrival} where the materialized view semantics allow; and \emph{document the lateness policy} so ``wrong'' numbers are understood as a stated contract, not a defect. Unbounded lookback---``just re-scan everything always''---degrades both query and materialization performance precisely because it abandons the incremental-state design.
+
+\begin{pitfall}
+A dashboard that silently recomputes with late data shows one number at 09:00 and a different number at 17:00 for the same day, and someone will present both in the same meeting. Decide and publish the lateness policy: how late counts, when numbers stabilize, and how revisions are marked.
+\end{pitfall}
+
+\section{Thursday: Hands-on Project}
+\index{hands-on lab}\index{anomaly detection!hands-on}
+The Week~14 lab queries the Week~13 IoT data: a five-minute rolling average temperature per device and anomaly detection using built-in series functions.
+
+\subsection{Goal and Architecture}
+Reuse \texttt{kqldb\_iot.IoTTelemetry} from Week~13 (or regenerate with its producer). Deliverables: the rolling-average query, the anomaly-flagged result set, and a materialized view maintaining the per-device five-minute means.
+
+\subsection{Step-by-Step Actions}
+\begin{enumerate}
+    \item Verify data is flowing (or restart the producer) and bound every query with \texttt{ago()}.
+    \item Build the \texttt{make-series} base: average temperature per device per five-minute step.
+    \item Apply \texttt{series\_fir} for the rolling average.
+    \item Apply \texttt{series\_decompose\_anomalies} with a 1.5 threshold and expand back to rows.
+    \item Validate: inject a synthetic hot streak from the producer and watch it flag.
+    \item Create the materialized view for the per-device means and compare its latency against the raw query.
+\end{enumerate}
+
+\begin{lstlisting}[language=SQL,caption={Week 14 lab: rolling average and anomaly detection per device.},label={lst:chapter14-lab}]
+// 5-minute rolling average + anomaly detection per device
+IoTTelemetry
+| where Timestamp > ago(6h)
+| make-series AvgTemp = avg(Temperature) default=0
+              on Timestamp step 5m by DeviceId
+| extend RollingAvg = series_fir(AvgTemp, repeat(1, 5))
+| extend Anomalies = series_decompose_anomalies(RollingAvg, 1.5)
+| mv-expand Timestamp, RollingAvg, Anomalies
+| project DeviceId,
+          Timestamp = todatetime(Timestamp),
+          RollingAvg = todouble(RollingAvg),
+          IsAnomaly = toint(Anomalies) == 1
+| order by DeviceId, Timestamp
+\end{lstlisting}
+
+\subsection{Validation Checklist}
+\begin{itemize}
+    \item Every query carries a bounded time filter.
+    \item The rolling average smooths a noisy device without hiding the injected hot streak.
+    \item Anomaly flags fire on the synthetic spike and stay quiet on normal noise.
+    \item The materialized view returns per-device means faster than the raw aggregation.
+    \item You can explain what \texttt{default=0} does to sparse series---and when that default lies.
+\end{itemize}
+
+\section{Friday: Use Case and Architecture}
+\index{late-arriving data!troubleshooting}\index{exactly-once}
+A streaming dashboard shows daily aggregations that keep changing: mobile devices went offline overnight and uploaded their buffered events at dawn. Daily totals for ``yesterday'' grew between the morning standup and the afternoon review. Diagnose and fix.
+
+\subsection{Diagnosis}
+The aggregates are computed over arrival-time windows, not event-time windows with a lateness policy. Yesterday's numbers were computed from whatever had \emph{arrived} by midnight, then silently revised as the backhaul landed. Three compounding issues: no event-time windowing, no stated lateness policy, and---discovered during the fix---duplicates from at-least-once redelivery inflating the revised totals.
+
+\subsection{The Fix: End-to-End Exactly-Once as a Discipline}
+Assemble the week's concepts into the full pattern: Eventstream's at-least-once delivery; idempotent ingestion into KQL and the lakehouse; the dedup key stamped at the producer and enforced at the first queryable boundary; and consumer checkpointing so restarts resume rather than replay. The query layer implements it:
+
+\begin{lstlisting}[language=SQL,caption={Dedup, windowed stream join, and dimension enrichment in one pattern.},label={lst:chapter14-friday}]
+// Dedup (keep latest arrival per id), windowed stream join, dimension lookup
+let Telemetry =
+    IoTTelemetry
+    | where Timestamp > ago(1h)              // bounded lookback window
+    | summarize arg_max(ingestion_time(), *) by EventId;
+let Alerts =
+    DeviceAlerts
+    | where AlertTime > ago(1h)
+    | summarize arg_max(ingestion_time(), *) by AlertId;
+Telemetry
+| join kind=inner Alerts on DeviceId
+| where abs(datetime_diff('second', Timestamp, AlertTime)) <= 300
+| join kind=inner (                          // stream-to-dimension
+    Devices | project DeviceId, Site, Model
+) on DeviceId
+| summarize Readings = count() by Site, Model, bin(Timestamp, 1m)
+\end{lstlisting}
+
+For the dashboard itself: aggregate on event time, set the materialization lookback to the measured lateness distribution (for example 24 hours for this fleet), mark values inside the lateness window as \emph{provisional} in the report, and let the materialized view absorb revisions instead of the executives.
+
+\begin{pitfall}
+Eventstream replay is the top source of silent duplicates downstream: after a consumer failure or reconfiguration, the source's retention window redelivers, and every at-least-once hop can double-land rows. Stamp the dedup key at the producer, propagate it untouched, and enforce dedup at the first queryable boundary so every downstream consumer---dashboards, Reflex rules, reverse ETL---reads already-clean data.
+\end{pitfall}
+
+\section{Operational Guidance for Week 14}
+KQL estates stay healthy through policy: retention, caching, bounded queries, and materialized views doing the heavy lifting dashboards would otherwise do badly.
+
+\subsection{Performance and Reliability}
+Bound every query with time. Push repeated aggregations into materialized views. Keep lookback windows honest about lateness. Use \texttt{ingestion\_time()} deliberately: it measures the pipeline, not the world. Review extent sizes and caching policies monthly against query patterns.
+
+\subsection{Security and Governance Checklist}
+\begin{itemize}
+    \item Apply row-level security policies on KQL tables where telemetry carries tenant or personal scoping.
+    \item Retention policies reflect both cost and compliance---telemetry is not free to keep forever.
+    \item Restrict who can alter materialized views; they are production state.
+    \item Classify telemetry tables; device identifiers joined to customers are personal data.
+    \item Record the lateness policy per dashboard as a published contract.
+    \item Audit \texttt{arg\_max} dedup usage: consumers bypassing the dedup view read dirty data.
+\end{itemize}
+
+\section{Interview Q\&A}
+\begin{enumerate}
+    \item \textbf{Q: How does a KQL materialized view maintain incremental state over an append-only stream?}\\
+    A: It continuously applies its aggregation or projection to newly arrived extents, so consumers read maintained state instead of re-scanning history---the streaming replacement for nightly recompute.
+    \item \textbf{Q: What does \texttt{arg\_max(ingestion\_time(), *) by EventId} deduplicate?}\\
+    A: At-least-once redeliveries: all physical copies of one logical event collapse to the latest-arrived row, keyed by the producer-stamped \texttt{EventId}.
+    \item \textbf{Q: Why do unbounded lookback windows degrade query and materialization performance?}\\
+    A: They abandon incremental state: every query and every view update re-scans ever-growing history instead of the recent slice, so cost grows with data age rather than with workload.
+    \item \textbf{Q: How do late arrivals affect a time-windowed stream join?}\\
+    A: Events arriving after the window closes never match, so joins undercount; the window must reflect the measured lateness distribution, and the policy must state how unmatched events are handled.
+    \item \textbf{Q: Where must the dedup key be generated and enforced for end-to-end exactly-once under replay?}\\
+    A: Generated at the producer before the first send, propagated untouched through Eventstream, and enforced at the first queryable boundary---KQL materialized view or Delta \texttt{MERGE}---so every downstream consumer reads clean data.
+    \item \textbf{Q: What does consumer checkpointing protect against?}\\
+    A: Restart-induced replay: recording the last processed offset or timestamp lets a resumed consumer continue rather than reprocess, which keeps both cost and duplicates bounded.
+\end{enumerate}
+
+\section{Further Reading}
+Review the KQL documentation \cite{microsoftKQL}, materialized views \cite{microsoftKQLMV}, and the Eventhouse overview \cite{microsoftFabricEventhouse}. The ingestion path feeding these tables is Chapter~13's Eventstreams \cite{microsoftFabricEventstreams}; the reaction layer above them is Chapter~15's Data Activator \cite{microsoftDataActivator}.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item Eventhouses host KQL databases: append-first, time-native, policy-driven stores for telemetry.
+    \item KQL composes through pipes: \texttt{where}, \texttt{project}, \texttt{summarize}, \texttt{bin()}---readable and time-obsessed.
+    \item Materialized views are incremental state; dashboards should read views, not firehoses.
+    \item \texttt{arg\_max(ingestion\_time(), *) by EventId} is the dedup contract made executable.
+    \item \texttt{make-series} plus the \texttt{series\_*} family turns event streams into analyzable time series, including anomaly detection.
+    \item Stream joins need time-windowed keys; late arrivals need a published policy, not silent revision.
+    \item Unbounded lookback abandons incremental design---bound every query by time, always.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Explain append-first design and why dedup happens at query time rather than ingestion time in a KQL database.
+    \item \textbf{(Conceptual)} Contrast event time, ingestion time, and processing time; give one question each answers correctly.
+    \item \textbf{(Hands-on)} Rewrite the lab's anomaly detection with \texttt{series\_decompose} and compare baseline/residual behavior to \texttt{series\_decompose\_anomalies}.
+    \item \textbf{(Hands-on)} Build the materialized view version of the dedup pattern and measure the latency difference against query-time dedup at one day of volume.
+    \item \textbf{(Design)} Write the lateness policy for the mobile-fleet dashboard: window sizes, provisional marking, and revision communication.
+    \item \textbf{(Design)} Design the stream-to-dimension ``as-of'' enrichment when device metadata itself changes over time.
+    \item \textbf{(Interview)} In five sentences, explain how materialized views, \texttt{arg\_max} dedup, and bounded lookback together deliver exactly-once \emph{effects} over at-least-once delivery.
+    \item \textbf{(Operational)} Write the runbook for ``materialized view lagging behind ingestion''---detection, cause analysis, catch-up verification.
+\end{enumerate}
+
+\section{Capstone Project: Windowed Analytics over a Replay-Safe Stream}\label{sec:ch14-capstone}
+\index{capstone project}\index{KQL!capstone}\index{materialized views!capstone}
+
+\begin{capstonebox}
+\textbf{Mission.} Deliver the analytical layer over Chapter~13's replay-safe stream: deduplicated base views, materialized per-device aggregates, a rolling-average anomaly detector, a time-windowed alert-correlation join, and a written lateness policy---with evidence that late and duplicated data cannot corrupt the published numbers.
+
+\textbf{Estimated time.} 5--7 hours on top of the Chapter~13 estate.
+
+\textbf{What you'll practice.}
+\begin{itemize}
+    \item Materialized view design for incremental aggregation.
+    \item Anomaly detection with the \texttt{series\_*} family.
+    \item Time-windowed stream joins and stream-to-dimension enrichment.
+    \item Lateness policy as a published, tested contract.
+\end{itemize}
+\end{capstonebox}
+
+\subsection*{Scenario}
+Contoso Devices' support organization needs a live fleet-health view: per-site rolling temperatures, anomaly flags, and correlation between telemetry spikes and device alerts. The data platform team's requirement: yesterday's numbers must be stable by 09:00, with a documented policy covering the fleet's nine-hour offline backhauls.
+
+\subsection*{Requirements}
+\begin{itemize}
+    \item Deduped base consumption (view or materialized view) enforcing \texttt{arg\_max} on \texttt{EventId}.
+    \item Materialized view of per-device, per-site five-minute means.
+    \item The rolling-average anomaly query parameterized by threshold.
+    \item The alert-correlation join with a justified time window.
+    \item The lateness policy document: lookback, provisional marking, stabilization time.
+    \item Evidence runs: injected duplicates and a simulated nine-hour backhaul, both absorbed correctly.
+\end{itemize}
+
+\subsection*{Implementation Steps}
+\begin{enumerate}
+    \item Build the deduped base and the materialized aggregates.
+    \item Implement and tune the anomaly query against injected spikes.
+    \item Implement the correlation join; justify the 300-second window or revise it with data.
+    \item Write the lateness policy; implement provisional marking in the consumption queries.
+    \item Run both evidence scenarios and capture query outputs.
+\end{enumerate}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item All KQL artifacts (views, materialized views, functions) as versioned scripts.
+    \item Anomaly and correlation query results on the evidence data.
+    \item The lateness policy document.
+    \item Evidence outputs proving duplicate and backhaul absorption.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item[\(\square\)] Injected duplicates never appear in any published aggregate.
+    \item[\(\square\)] The simulated backhaul revises only provisional windows, never stabilized ones.
+    \item[\(\square\)] Every consumption query is time-bounded; none scans full history.
+    \item[\(\square\)] The anomaly detector fires on the synthetic spike and stays quiet on noise.
+    \item[\(\square\)] The correlation join's window is justified with measured latency data.
+    \item[\(\square\)] The lateness policy is written, reviewed, and referenced by the dashboard contract.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Add a forecast (\texttt{series\_decompose\_forecast}) for next-hour site temperature and track its error.
+    \item Implement as-of dimension joins for device firmware version at event time.
+    \item Compare materialized-view cost versus on-demand aggregation at seven days of volume; publish the break-even.
+    \item Feed the anomaly flags to a Reflex item (previews Chapter~15) and measure detection-to-alert latency.
+\end{itemize}

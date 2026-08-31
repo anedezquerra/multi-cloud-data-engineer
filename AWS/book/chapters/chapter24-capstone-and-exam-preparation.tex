@@ -1,0 +1,388 @@
+\chapter{Production DataOps and Certification Preparation}
+\index{DataOps}\index{Terraform}\index{dbt}\index{CI/CD}\index{GitHub Actions}\index{expand and contract}\index{infrastructure as code}\index{certification}%
+\begin{objectives}
+\begin{itemize}
+    \item Provision data infrastructure as code with Terraform: S3, Redshift Serverless, Glue jobs, and IAM roles, against a remote locked state backend.
+    \item Build tested, documented dbt models on Redshift with sources, \texttt{ref()} dependencies, and environment targets.
+    \item Implement CI/CD for data workloads: GitHub Actions PR checks, OIDC federation, and Dev$\rightarrow$Prod promotion.
+    \item Execute zero-downtime schema evolution with the expand $\rightarrow$ migrate $\rightarrow$ contract pattern.
+    \item Review the AWS Certified Data Engineer -- Associate domains, identify weak areas, and plan the final assessment.
+    \item Deliver the Milestone~6 capstone: a secure, governed, multi-account data mesh.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+DataOps---IaC, transformation-as-code, CI/CD---is the most portable week in the book: the tools are deliberately cloud-agnostic.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{2.8cm}p{3.0cm}p{3.0cm}p{3.0cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{AWS} & \textbf{Azure} & \textbf{GCP} \\
+\midrule
+IaC (multi-cloud) & Terraform AWS provider & Terraform azurerm & Terraform google \\
+IaC (native) & CloudFormation / CDK & Bicep / ARM & Deployment Manager \\
+Transformation as code & dbt-redshift & dbt-fabric / dbt-synapse & dbt-bigquery \\
+CI/CD & GitHub Actions / CodePipeline & GitHub Actions / Azure DevOps & GitHub Actions / Cloud Build \\
+Remote state locking & S3 + DynamoDB & Azure Blob leases & GCS + state locking \\
+\addlinespace
+CI authentication & OIDC to IAM role & OIDC to Entra workload identity & OIDC to Workload Identity \\
+Zero-downtime DDL & Expand-contract + view shims & Same pattern & Same pattern \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+\textbf{Snowflake} (dbt-snowflake, Terraform provider) and \textbf{MongoDB} (atlas provider, schema-versioned migrations) plug into the same toolchain---this week's skills transfer without translation.
+\end{crosscloud}
+
+\section{Week 24 Roadmap and Mental Model}
+The final week turns everything into an operation. Twenty-three weeks of architecture earn their keep only if the platform is \emph{reproducible} (infrastructure as code), \emph{reviewable} (transformations as tested code), and \emph{changeable without downtime} (CI/CD with expand-contract migrations). That is DataOps \cite{terraformAWSProvider,dbtCore,githubActionsDocs}.
+
+Then the week pivots to you: the certification review compresses the whole program into the AWS Certified Data Engineer -- Associate exam domains, so you can see the platform you built the way the exam will ask about it \cite{awsCertDataEngineer}. The Milestone~6 capstone---a multi-account, governed, privacy-protected data mesh---is the program's final integration and your portfolio's centerpiece.
+
+\begin{definitionbox}
+\textbf{DataOps} applies DevOps discipline to data platforms: infrastructure as code, transformations as tested and versioned code, continuous integration with automated quality gates, staged environment promotion, and zero-downtime change management.
+\end{definitionbox}
+
+\begin{keyterms}
+\textbf{IaC}: infrastructure defined in declarative code and applied by tooling (Terraform, CloudFormation, CDK). \textbf{Remote state}: Terraform's shared state store (S3 backend) with locking (DynamoDB). \textbf{dbt model}: a versioned SQL transformation; \textbf{source} and \texttt{ref()} declare the dependency graph. \textbf{dbt test}: an executable assertion on model output. \textbf{OIDC federation}: CI authenticating to AWS via short-lived tokens, no stored keys. \textbf{Expand-contract}: zero-downtime migration pattern---add new, dual-write/migrate, then remove old only after consumers verify.
+\end{keyterms}
+
+\section{Monday: Terraform for Data Infrastructure}
+\subsection{Everything You Clicked, as Code}
+Every resource from this book---buckets and their lifecycle rules, the Serverless workgroup, Glue jobs, IAM roles, endpoints---exists as Terraform resources \cite{terraformAWSProvider}. The discipline that makes IaC an asset rather than a liability: \emph{remote state in S3 with DynamoDB locking} (so two engineers cannot apply divergent states and state survives a laptop), \emph{modules} for repeated patterns (a governed bucket module bundling encryption, lifecycle, and logging), and \emph{CI-only applies}: engineers run \texttt{plan} in pull requests; only the pipeline runs \texttt{apply}.
+\index{Terraform}\index{remote state}\index{modules}
+
+\begin{lstlisting}[caption={A governed data-lake bucket as Terraform.},label={lst:ch24-terraform}]
+resource "aws_s3_bucket" "data_lake" {
+  bucket = "acme-data-lake-prod"
+  tags   = { Environment = "prod", Owner = "data-platform" }
+}
+
+resource "aws_s3_bucket_versioning" "data_lake" {
+  bucket = aws_s3_bucket.data_lake.id
+  versioning_configuration { status = "Enabled" }
+}
+
+resource "aws_s3_bucket_lifecycle_configuration" "data_lake" {
+  bucket = aws_s3_bucket.data_lake.id
+
+  rule {
+    id     = "tier-raw-to-glacier"
+    status = "Enabled"
+    filter { prefix = "raw/" }
+
+    transition {
+      days          = 30
+      storage_class = "GLACIER"
+    }
+    noncurrent_version_expiration { noncurrent_days = 90 }
+  }
+}
+\end{lstlisting}
+
+\begin{pitfall}
+\textbf{Local state and laptop applies.} Local \texttt{terraform.tfstate} is a single point of divergence, loss, and secret leakage (state contains attribute values). Remote state with locking, plus apply restricted to CI, is the difference between infrastructure as code and infrastructure as folklore.
+\end{pitfall}
+
+\section{Tuesday: dbt on Redshift}
+\subsection{Transformations as a Tested DAG}
+dbt turns the warehouse's transformation layer into software: \emph{models} are SQL files materialized as tables/views, \emph{sources} declare raw inputs with freshness checks, \texttt{ref()} builds the dependency graph, and \emph{tests}---generic (unique, not-null, accepted values, relationships) or custom SQL---assert the output's contract \cite{dbtCore}. Documentation and lineage are generated from the same code, so the DAG visualization your reviewers read is the DAG that runs.
+
+The operating pattern on Redshift: staging models over the raw schema (renames, type casts, nothing clever), intermediate models for reusable logic, marts for consumption---with tests at every boundary. \texttt{dbt build} runs models and tests in dependency order; a failing test stops downstream models, which is exactly the behavior Chapter~22's gates taught you to want.
+
+\begin{lstlisting}[caption={A dbt model with tests, in the house style.},label={lst:ch24-dbt}]
+-- models/marts/fct_orders.sql
+SELECT
+    order_id,
+    customer_id,
+    order_date,
+    amount
+FROM {{ ref('stg_orders') }}
+WHERE amount >= 0
+\end{lstlisting}
+
+\begin{lstlisting}[caption={Schema tests beside the model.},label={lst:ch24-dbt-tests}]
+# models/marts/schema.yml
+models:
+  - name: fct_orders
+    columns:
+      - name: order_id
+        tests: [unique, not_null]
+      - name: customer_id
+        tests:
+          - not_null
+          - relationships:
+              to: ref('dim_customers')
+              field: customer_id
+      - name: amount
+        tests:
+          - dbt_utils.accepted_range:
+              min_value: 0
+\end{lstlisting}
+
+\begin{tipbox}
+dbt tests validate what schemas cannot: uniqueness, referential integrity, value ranges, and freshness of sources. A table can be perfectly typed and completely wrong; the test layer is where ``the pipeline ran green'' becomes ``the data is right.''
+\end{tipbox}
+
+\section{Wednesday: CI/CD and Zero-Downtime Schema Evolution}
+\subsection{The Pipeline for Pipelines}
+The reference workflow: a pull request triggers GitHub Actions to run \texttt{terraform plan}, \texttt{dbt build} against a CI schema, and policy/lint checks; merge to \texttt{main} promotes through Dev to Prod with an approval environment \cite{githubActionsDocs}. Two controls deserve emphasis. \textbf{OIDC federation}: the workflow assumes an IAM role via GitHub's OIDC token---no long-lived AWS keys in repository secrets. \textbf{Environment promotion}: dbt targets and Terraform workspaces separate Dev from Prod, so every change is rehearsed against a real environment before production \cite{awsIAMDocs}.
+\index{GitHub Actions}\index{OIDC federation}\index{environment promotion}
+
+\subsection{Expand $\rightarrow$ Migrate $\rightarrow$ Contract}
+Renaming \texttt{order\_amount} to \texttt{total\_amount} in one release breaks every dashboard mid-deploy. The zero-downtime pattern phases it: \textbf{expand} (add the new nullable column; old column untouched), \textbf{migrate} (dual-write new writes, backfill history; reads still on the old column; a backward-compatible view shim for consumers), \textbf{contract} (switch reads to the new column, verify all consumers, and only then drop the old column in a later release). Each phase is its own dbt model change and its own deployment.
+\index{expand-contract}\index{zero-downtime migration}
+
+\begin{pitfall}
+\textbf{Shipping the contract phase with the migration.} One team shipped the rename and the QuickSight dataset change in a single release: the migration applied minutes before the dashboard refresh, and executive dashboards errored for an hour because nothing pointed at the old column during the gap. Contract-phase drops go in a separate pull request, merged no sooner than one full deploy cycle after all consumers verify---with the compatibility view shim kept until then.
+\end{pitfall}
+
+\section{Thursday Hands-on Project: The Repository Is the Platform}
+\index{hands-on project!Terraform, dbt, and GitHub Actions}
+Create a GitHub repository containing a Terraform module that provisions an S3 data-lake bucket and a Glue job, plus a dbt project with three models and five tests against Redshift, and a GitHub Actions workflow that runs dbt tests on every pull request and deploys on merge to \texttt{main}.
+
+\subsection*{Lab Objectives}
+\begin{itemize}
+    \item Structure the repo: \texttt{terraform/} (modules + environments), \texttt{dbt/}, \texttt{.github/workflows/}.
+    \item Configure the S3+DynamoDB remote backend and OIDC-to-IAM federation.
+    \item Author three dbt models (staging, intermediate, mart) and five tests.
+    \item Prove the gates: a failing test blocks merge; merge deploys to Dev; Prod needs approval.
+\end{itemize}
+
+\subsection*{Procedure}
+The workflow is the deliverable's heart:
+
+\begin{lstlisting}[caption={.github/workflows/data-platform.yml (abridged).},label={lst:ch24-actions}]
+name: data-platform
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  id-token: write   # OIDC federation
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::123456789012:role/GitHubActionsDataRole
+          aws-region: us-east-1
+      - name: Terraform plan
+        run: terraform -chdir=terraform/environments/dev plan -input=false
+      - name: dbt build (CI schema)
+        run: |
+          cd dbt
+          dbt deps
+          dbt build --target ci
+  deploy-dev:
+    needs: test
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - run: terraform -chdir=terraform/environments/dev apply -auto-approve
+      - run: cd dbt && dbt build --target dev
+  deploy-prod:
+    needs: deploy-dev
+    runs-on: ubuntu-latest
+    environment: production   # required reviewers gate this job
+    steps:
+      - run: terraform -chdir=terraform/environments/prod apply -auto-approve
+      - run: cd dbt && dbt build --target prod
+\end{lstlisting}
+
+\subsection*{Verification}
+\begin{itemize}
+    \item A PR with a deliberately failing dbt test is red and unmergeable.
+    \item No AWS keys exist in repository secrets; the OIDC role's trust policy restricts to this repo and branch set.
+    \item Merge deploys to Dev automatically; the Prod job waits for named approval.
+    \item \texttt{terraform plan} on a second engineer's machine against the remote backend shows no drift.
+\end{itemize}
+
+\section{Friday: Certification Preparation---Data Engineer Associate}
+\index{certification!AWS Data Engineer Associate}
+The AWS Certified Data Engineer -- Associate exam is organized into domains that map almost one-to-one onto this book \cite{awsCertDataEngineer}:
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{4.6cm}p{2.2cm}p{5.8cm}@{}}
+\toprule
+\textbf{Exam domain} & \textbf{Weight} & \textbf{This book's chapters} \\
+\midrule
+Data Ingestion and Transformation & $\sim$34\% & Ch.\ 1, 9--15 (S3, EMR, Glue, DMS, Kinesis, Firehose, Flink) \\
+Data Store Management & $\sim$26\% & Ch.\ 1--8 (S3, RDS/Aurora, DynamoDB, Redshift, lakehouse) \\
+Data Operations and Support & $\sim$22\% & Ch.\ 12, 16, 22, 24 (orchestration, quality, DataOps) \\
+Data Security and Governance & $\sim$18\% & Ch.\ 8, 21--23 (Lake Formation, IAM, Macie) \\
+\bottomrule
+\end{tabular}
+\caption{Exam domains mapped to the book. Weights are indicative of the published guide.}
+\label{tab:ch24-exam-domains}
+\end{table}
+
+\subsection{The Review Protocol}
+\begin{enumerate}
+    \item \textbf{Self-assess per domain.} For each domain, re-read the chapter's Key Takeaways and attempt the exercises cold. Mark each objective \emph{confident}, \emph{shaky}, or \emph{blank}.
+    \item \textbf{Repair the blanks first.} A shaky area you have used (Kinesis shard math) recovers by re-reading; a blank area you never built (configure one Lake Formation grant by hand) recovers only by doing the lab.
+    \item \textbf{Practice scenario questions.} The exam's character is ``which service/design for this constraint set''---the Friday use cases in this book are exactly that shape. Re-derive five of them from the constraint lists alone.
+    \item \textbf{Schedule two full-length mock exams} for the weekend after the program, spaced two days apart, reviewing every wrong answer to a root cause.
+\end{enumerate}
+
+\begin{tipbox}
+Exam heuristics that recur across domains: prefer managed/serverless when the stem emphasizes operational simplicity; prefer per-byte cost answers (Parquet, partitioning) when it emphasizes cost; choose the answer with least-privilege IAM and KMS when it emphasizes security; and when two answers both ``work,'' the differentiator is usually operational overhead or cost model, not features.
+\end{tipbox}
+
+\section{Interview Q\&A}
+\subsection{Concepts and Trade-offs}
+\begin{enumerate}
+    \item \textbf{Q: Why store Terraform state remotely with locking?}\\
+    A: Shared state is the source of truth for what exists; locking prevents two applies from diverging it. Local state diverges, gets lost with laptops, and leaks attribute values.
+    \item \textbf{Q: What do dbt tests validate that table schemas alone cannot?}\\
+    A: Semantics: uniqueness, referential integrity, accepted ranges, source freshness. A schema guarantees shape; tests guarantee the data is right.
+    \item \textbf{Q: Why promote dbt runs Dev$\rightarrow$Prod instead of sharing one workspace?}\\
+    A: Every change is rehearsed against a real environment with real data shapes before production. One shared workspace means production is the rehearsal.
+    \item \textbf{Q: Why prefer OIDC federation over long-lived AWS keys in CI?}\\
+    A: OIDC issues short-lived, audience-scoped credentials per workflow run---nothing stored to leak, nothing to rotate. Stored keys in CI secrets are a standing breach waiting for a log line.
+    \item \textbf{Q: What must the PR-check workflow prove before merge to main?}\\
+    A: That the plan is reviewable (\texttt{terraform plan}), the transformations build and pass tests against CI data (\texttt{dbt build}), and policy checks pass---so \texttt{main} is always deployable.
+    \item \textbf{Q: Summarize expand-contract in one breath.}\\
+    A: Add the new schema alongside the old, dual-write and backfill while reads stay old, switch reads behind a compatibility shim, verify all consumers, and drop the old column in a later release.
+\end{enumerate}
+
+\section{Further Reading}
+The Terraform AWS provider registry documents every resource used in this book \cite{terraformAWSProvider}; dbt's documentation covers models, tests, sources, and targets \cite{dbtCore}; GitHub Actions documentation covers OIDC and environments \cite{githubActionsDocs}. The exam guide lists the official domains and sample questions \cite{awsCertDataEngineer}. Revisit the Well-Architected Analytics Lens as a final review scaffold \cite{awsWellArchitectedAnalytics}.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item The platform is the repository: IaC for infrastructure, dbt for transformations, CI for gates, CD for promotion.
+    \item Remote locked state and CI-only applies turn Terraform from folklore into infrastructure.
+    \item dbt tests are the warehouse's contract layer; a green build means correct data, not just completed SQL.
+    \item OIDC federation eliminates stored cloud credentials from CI entirely.
+    \item Expand-contract makes schema change a non-event; the contract phase is a separate, later release.
+    \item Certification review is gap analysis against domains---repair blanks by doing, not reading.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Explain why \texttt{terraform plan} output belongs in the PR while \texttt{apply} belongs in the pipeline.
+    \item \textbf{(Conceptual)} A teammate proposes running Dev and Prod dbt in one schema ``to save time.'' Enumerate the failure modes.
+    \item \textbf{(Hands-on)} Complete the Thursday project; then add a sixth custom test (a SQL assertion on daily row counts) and watch it gate a PR.
+    \item \textbf{(Hands-on)} Implement the expand-contract rename of one column across three releases; document each phase's consumer evidence.
+    \item \textbf{(Hands-on)} Convert the OIDC role's trust to require a specific branch and environment; show a fork failing to assume it.
+    \item \textbf{(Design)} Design the dbt project structure (staging/intermediate/marts) for the Chapter~5 star schema with the Chapter~22 tests.
+    \item \textbf{(Design)} Write the exam-prep plan for a teammate whose blank domains are streaming and security: which chapters, which labs, in what order.
+    \item \textbf{(Architecture)} The platform must now support two teams deploying independently. Adapt the repo, state, and promotion design for monorepo versus polyrepo, and choose.
+\end{enumerate}
+
+\section{Milestone 6 Capstone: A Secure, Governed, Multi-Account Data Mesh}\label{sec:ch24-capstone}
+\index{capstone project}\index{Milestone 6 capstone}\index{data mesh!capstone}\index{multi-account architecture}
+
+\begin{capstonebox}
+\textbf{Mission.} Deliver the program's final integration: a three-account architecture under AWS Organizations---Account A ingests streaming PII and tokenizes it with Macie/Lambda, Account B hosts Redshift Serverless analytics, Account C governs via Lake Formation LF-Tags---with VPC endpoints locking all traffic off the public internet, all provisioned with Terraform and deployed by CI/CD.
+
+\textbf{Estimated time.} 10--14 hours across sandbox accounts, plus review.
+
+\textbf{What you\textquotesingle{}ll practice.}
+\begin{itemize}
+    \item Everything: ingestion (Part~4), warehousing (Part~2), governance (Weeks 8, 22), privacy (Week~23), perimeter (Week~21), and DataOps (this week).
+\end{itemize}
+\end{capstonebox}
+
+\subsection*{Scenario}
+The conglomerate from Week~22's mesh commissions its first production slice. Streaming customer events arrive continuously; PII must be tokenized before any analytical persistence; analytics runs in its own account; governance is centralized; and the whole estate must redeploy from the repository after an imagined account loss.
+
+\subsection*{Requirements}
+\textbf{Functional requirements.}
+\begin{itemize}
+    \item AWS Organizations with the three accounts, OU structure, and the anti-exfiltration SCP attached.
+    \item Account A: Kinesis ingestion, Macie classification, Lambda tokenization into a sanitized S3 zone.
+    \item Account B: Redshift Serverless consuming the governed catalog; dashboards for analysts.
+    \item Account C: Lake Formation LF-Tags, cross-account catalog sharing, CloudTrail aggregation.
+    \item VPC endpoints (gateway + interface) in every data subnet; no internet path.
+\end{itemize}
+
+\textbf{Non-functional requirements.}
+\begin{itemize}
+    \item Entire estate deploys from Terraform via the CI/CD pipeline (OIDC, Dev$\rightarrow$Prod promotion).
+    \item At least three automated policy/quality tests with failing-case demonstrations: PII column inaccessible cross-account, Macie quarantine trigger fires, DQ ruleset halts a bad feed.
+    \item Alarms: CloudTrail data-event alarms and Macie findings to SNS.
+    \item Monthly cost estimate (Macie volume, Redshift Serverless RPUs, endpoint-hours) with two optimizations documented.
+    \item Security review: SCPs attached, tag-based least privilege, no hardcoded secrets, tokenization verified by re-scan.
+\end{itemize}
+
+\subsection*{Reference Architecture}
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[
+        node distance=0.5cm and 0.8cm,
+        acct/.style={draw=codegray, rounded corners, dashed, inner sep=6pt},
+        box/.style={rectangle, rounded corners, draw=teal!60!black, thick, fill=teal!10, align=center, font=\footnotesize, minimum height=0.8cm, inner sep=3pt},
+        side/.style={rectangle, rounded corners, draw=brown!70!black, thick, fill=brown!10, align=center, font=\footnotesize, inner sep=3pt},
+        arr/.style={-{Stealth}, thick}
+    ]
+    \node[box] (ing) {Kinesis\\ingestion};
+    \node[box, right=of ing] (macie) {Macie + Lambda\\tokenize};
+    \node[box, right=of macie] (s3a) {S3 (sanitized)};
+    \node[box, right=of s3a] (rs) {Redshift\\analytics};
+    \node[side, below=0.7cm of rs] (lf) {Lake Formation\\tag-based grants};
+    \begin{scope}[on background layer]
+    \node[acct, fit=(ing)(macie)(s3a), label={[font=\footnotesize\bfseries]above:Account A: Ingestion}] (a) {};
+    \node[acct, fit=(rs), label={[font=\footnotesize\bfseries]above:Account B: Analytics}] (b) {};
+    \node[acct, fit=(lf), label={[font=\footnotesize\bfseries]below:Account C: Governance}] (c) {};
+    \end{scope}
+    \node[side, left=0.6cm of a.north west, anchor=east] (vpce) {VPC endpoints\\(no public path)};
+    \draw[arr] (ing) -- (macie);
+    \draw[arr] (macie) -- (s3a);
+    \draw[arr] (s3a) -- (rs);
+    \draw[arr, dashed] (lf) -- (s3a.south east);
+    \draw[arr, dashed] (lf) -- (rs);
+    \draw[arr, dashed] (vpce.south) |- (ing.west);
+    \end{tikzpicture}%
+    }
+    \caption{Milestone 6 reference architecture: the multi-account governed data mesh.}
+    \label{fig:ch24-capstone-arch}
+\end{figure}
+
+\subsection*{Implementation Steps}
+\begin{enumerate}
+    \item Terraform the organization: OUs, accounts, SCPs, and the per-account baselines.
+    \item Build Account A's ingestion and tokenization path with the Macie classification stage.
+    \item Share the catalog via Lake Formation/RAM; define LF-Tags and expression grants in Account C.
+    \item Stand up Redshift Serverless in Account B against the shared catalog; build the analyst datasets.
+    \item Privatize networking end to end; verify no public path remains.
+    \item Implement the three tests, the alarms, the cost model, and the security review; run the account-loss redeploy drill.
+\end{enumerate}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item The repository: Terraform modules, environments, dbt models, CI workflows, README that rebuilds everything.
+    \item The three policy/quality tests with failing-case evidence.
+    \item Alarm evidence and the redeploy-drill record (time-to-restore measured).
+    \item The cost model with two optimizations and the security review with the re-scan evidence.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item A clean-environment deploy reproduces the estate with no console-only step.
+    \item PII is tokenized before analytical persistence; a cross-account PII read is denied and the denial is evidenced.
+    \item The Macie quarantine trigger and the DQ gate both fire on injected faults.
+    \item All data-plane traffic routes through endpoints; flow-log evidence included.
+    \item The estate's monthly cost is modeled and the two optimizations are measurable.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Add a fourth consumer account onboarded with zero tickets via tag-expression grants.
+    \item Implement crypto-shredding for the ingested subjects end to end.
+    \item Add the QuickSight layer with RLS from Week~16 in Account B.
+    \item Publish the estate's lineage (OpenLineage) and scorecard (Week~22) to the governance account.
+\end{itemize}
+
+\section*{Closing Note}
+Twenty-four weeks ago the deliverable was a bucket with a lifecycle rule. Today it is a governed, private, self-testing, multi-account platform that deploys from a repository. That arc---storage, warehousing, batch, streaming, ML, governance, operations---is the AWS data engineering profession, and it is now yours to practice.

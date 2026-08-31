@@ -1,0 +1,268 @@
+\chapter{Compliance and Data Loss Prevention}
+\index{Sensitive Data Protection}\index{Cloud DLP}\index{InfoTypes}\index{de-identification}\index{tokenization}\index{crypto-shredding}\index{GDPR}
+
+\begin{objectives}
+\begin{itemize}
+    \item Detect PII with InfoTypes, inspection jobs, and scheduled discovery scans over BigQuery and Cloud Storage.
+    \item Apply masking, tokenization, and crypto-based transformations with KMS-wrapped keys.
+    \item Propagate GDPR erasure across lakes, warehouses, streams, and backups via crypto-shredding.
+    \item Reconcile retention policies with legal holds and erasure obligations.
+    \item Build a DLP inspection and de-identification pipeline over sensitive files.
+    \item Architect third-party data ingestion that tokenizes PII with an end-to-end erasure map.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+Sensitive-data discovery and de-identification exist on every platform, though GCP's DLP (Sensitive Data Protection) is unusually deep as a standalone service.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{2.8cm}p{3.0cm}p{3.0cm}p{3.0cm}@{}} \\
+\toprule
+\textbf{Capability} & \textbf{GCP} & \textbf{AWS} & \textbf{Azure / Fabric} \\
+\midrule
+PII discovery & Sensitive Data Protection (DLP) & Macie & Purview Information Protection \\
+De-identification & DLP transforms (mask, tokenize, FPE) & (partner/Lambda transforms) & Purview / ADF masking \\
+Warehouse masking & BigQuery policy tags + routines & (via Lake Formation + UDFs) & Dynamic data masking \\
+Format-preserving & DLP FFX/FPE & (partner) & (partner) \\
+Risk analysis & DLP k-anonymity / l-diversity & (partner) & (partner) \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+\textbf{Snowflake} provides masking policies and tag-based protection; \textbf{MongoDB} provides field-level encryption. The portable compliance lesson: deletion is not erasure---time travel, backups, and replicas retain copies, and only cryptographic erasure or exhaustive replay satisfies a strict right-to-erasure obligation.
+\end{crosscloud}
+
+\begin{keyterms}
+\textbf{InfoType}: a category of sensitive data (email, credit card, national ID) that DLP detectors recognize---built-in, custom, or dictionary-based.
+\textbf{De-identification}: transforming data to remove or obscure identifying content: masking, redaction, tokenization, generalization, bucketing.
+\textbf{Format-preserving encryption (FPE)}: deterministic encryption producing ciphertext in the input's format (a token still looks like an email), enabling joins on protected values.
+\textbf{Crypto-shredding}: rendering data unrecoverable by destroying the key that encrypts it---erasing all copies, including backups, at once.
+\textbf{k-anonymity}: a risk metric---each combination of quasi-identifiers appears at least $k$ times, limiting re-identification.
+\textbf{Legal hold}: a suspension of deletion/erasure obligations for data under litigation or investigation.
+\end{keyterms}
+
+\section{Week 23 Roadmap}
+Week~23 carries the platform through the compliance layer. Monday covers DLP concepts: InfoTypes, inspection, de-identification. Tuesday covers the transformation menu: masking, tokenization, cryptographic hashing. Wednesday covers automated scanning and the GDPR erasure problem done properly. Thursday builds the inspection-and-de-identify pipeline. Friday architects third-party PII ingestion with a complete erasure-propagation map.
+
+\begin{definitionbox}
+\textbf{Sensitive Data Protection} (Cloud DLP) is Google Cloud's discovery and de-identification service: it inspects storage and text for InfoTypes, profiles tables and buckets for sensitive content, transforms data with masking and tokenization primitives, and quantifies re-identification risk \cite{googleclouddlpdocs}.
+\end{definitionbox}
+
+\section{Monday: DLP Concepts---InfoTypes, Inspection, De-identification}
+\index{InfoTypes!built-in}\index{inspection jobs}\index{likelihood}
+
+\subsection{Detection}
+An InfoType names a sensitive category: \texttt{EMAIL\_ADDRESS}, \texttt{CREDIT\_CARD\_NUMBER}, \texttt{US\_SOCIAL\_SECURITY\_NUMBER}, plus hundreds more, extensible with custom regex detectors, dictionaries, and hotword rules. Inspection scans return \emph{findings}---InfoType, location, likelihood, quote---with likelihood tuned by context (a number near the word ``card'' scores higher). The tuning knob that matters in pipelines: minimum likelihood and detector selection, because scanning a data lake with every detector at LOW drowns you in false positives.
+
+\subsection{Discovery and Inspection Modes}
+DLP operates in three modes with different economics: \textbf{content inspection} (API calls over text/images you send---used inside pipelines), \textbf{storage inspection jobs} (scheduled scans of BigQuery tables, buckets, and databases---used for estate-wide discovery), and \textbf{data profiles} (continuous per-table sensitivity scoring feeding the catalog). A governed platform runs discovery continuously and content inspection at ingestion boundaries.
+
+\begin{pitfall}
+Inspection results are themselves sensitive: a finding's quote field contains the PII it found. Restrict who can read findings, prefer quote-free configurations where possible, and route findings into a monitored, access-controlled project---not a shared bucket.
+\end{pitfall}
+
+\section{Tuesday: Masking, Tokenization, and Crypto-Based Hashing}
+\index{masking}\index{tokenization!FFX}\index{deterministic encryption}
+
+\subsection{The Transformation Menu}
+DLP's de-identification primitives serve different consumers. \textbf{Redaction} removes content outright. \textbf{Masking} replaces characters (\texttt{jo***@example.com})---readable to humans, useless for joins. \textbf{Crypto-based tokenization} (deterministic AES or FFX format-preserving encryption keyed by a KMS-wrapped key) produces stable tokens: the same input always yields the same token, so analytics can still join on \texttt{user\_token} without ever seeing the identifier. \textbf{Generalization and bucketing} (age to ranges, timestamps to dates) reduce precision for quasi-identifiers.
+
+\subsection{Who Can Reverse It}
+Masking is irreversible by anyone; tokenization is reversible by whoever holds KMS decrypt permission---which is precisely the control: detokenization becomes an auditable, least-privilege API call rather than a property of the data. Deterministic tokenization's weakness is dictionary attackability on low-entropy values (emails follow patterns); where the threat model includes offline guessing, use keyed hashing with salt management or non-deterministic surrogate replacement plus a protected mapping table.
+
+\begin{definitionbox}
+\textbf{Deterministic tokenization} maps each plaintext to one token under a key: join-compatible and reversible only with the key. \textbf{Non-deterministic replacement} assigns random surrogates with an explicit mapping table: stronger against guessing, but the mapping table becomes a crown-jewel asset requiring its own perimeter.
+\end{definitionbox}
+
+\begin{tipbox}
+Wrap the tokenization key with Cloud KMS (\texttt{kms\_wrapped} crypto keys) so the DLP call presents an encrypted key that KMS unwraps under IAM and audit logging. Keys in configuration files---even in a secret manager without an audit trail per use---undermine the entire reversibility control.
+\end{tipbox}
+
+\section{Wednesday: Automated Scanning and GDPR Erasure Propagation}
+\index{scheduled scanning}\index{right to erasure}\index{time travel}\index{fail-safe}
+
+\subsection{Scheduled Discovery}
+Storage inspection jobs scan BigQuery datasets and bucket prefixes on a schedule with configured InfoTypes and sampling, writing findings to BigQuery for dashboarding: sensitive data discovered in unexpected tables, new columns introducing PII into previously clean datasets, scan coverage versus the asset inventory. Sampling controls cost---a 10\% random sample finds systemic PII presence at a fraction of full-scan price, while regulated tables get 100\% coverage.
+
+\subsection{Why DELETE Is Not Erasure}
+A naive \texttt{DELETE FROM customers WHERE id = :subject} leaves the subject recoverable almost everywhere: BigQuery time travel serves the row via \texttt{FOR SYSTEM\_TIME AS OF} during its window; fail-safe retains it seven more days; backups persist it until they expire; Pub/Sub snapshots replay it; Cloud Storage versioning retains pre-delete generations; derived tables copied it onward. Each layer's retention was designed for durability---and durability is exactly what an erasure request fights.
+
+\subsection{Crypto-Shredding as the Architecture}
+Encrypt each subject's data under a per-subject (or per-subject-group) key in Cloud KMS at ingestion. Erasure then schedules destruction of that key: after the mandatory 24-hour destruction delay, every copy---raw lake objects, warehouse rows, backups, snapshots---becomes permanently unrecoverable ciphertext, in one auditable KMS operation \cite{googlecloudkmsdocs}. The alternative---row-level deletion with replay across every layer---must enumerate and verify each copy path, and fails the audit when a new layer forgets to join the runbook. Legal holds suspend erasure for identified subjects and must be recorded as documented exceptions with owners and review dates.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.4cm}p{4.6cm}p{4.6cm}@{}} \\
+\toprule
+\textbf{Layer} & \textbf{Why DELETE survives} & \textbf{Erasure strategy} \\
+\midrule
+GCS raw zone & Object versions, retention policies & Per-subject keys; crypto-shred \\
+BigQuery curated & Time travel, fail-safe, backups & Crypto-shred; or delete + window expiry + backup aging \\
+Pub/Sub & Message retention, snapshots & Short retention; crypto-shredded payloads \\
+Derived tables & Copies copied onward & Lineage-driven replay (Ch. 22) or crypto-shred \\
+Backups & Immutable by design & Crypto-shred; or wait for rotation \\
+\bottomrule
+\end{tabular}
+\caption{Erasure propagation across platform layers.}
+\label{tab:ch23-erasure-layers}
+\end{table}
+
+\begin{pitfall}
+Crypto-shredding requires key-per-subject granularity decided \emph{at ingestion}. Retrofitting per-subject encryption onto a petabyte lake means re-writing the lake. If erasure obligations apply, the ingestion pipeline's key management is the compliance architecture---decide it on day one.
+\end{pitfall}
+
+\section{Thursday Hands-On Project: Inspect and De-identify Sensitive Files}
+\index{hands-on project}\index{inspection job!lab}\index{de-identification!lab}
+This lab inspects Cloud Storage files for PII with DLP, then de-identifies the content---masking emails and tokenizing customer IDs with a KMS-wrapped key---writing the safe output to a BigQuery table.
+
+\subsection{Stage Sensitive Samples and Create a Key}
+\begin{lstlisting}[language=bash,caption={Staging sample PII and creating the KMS-wrapped tokenization key.}]
+$env:PROJECT_ID = "my-gcp-dlp-lab"
+$env:BUCKET = "my-gcp-dlp-lab-data"
+gcloud config set project $env:PROJECT_ID
+gcloud services enable dlp.googleapis.com cloudkms.googleapis.com
+
+@'
+customer_id,email,note
+C001,ada@example.com,Called about invoice 4412; card on file
+C002,grace@example.com,Email follow-up scheduled for Tuesday
+'@ | Set-Content -Path .\support-notes.csv
+
+gcloud storage cp .\support-notes.csv gs://$env:BUCKET/pii/support-notes.csv
+
+gcloud kms keyrings create dlp-ring --location=global
+gcloud kms keys create dlp-token-key --location=global `
+  --keyring=dlp-ring --purpose=encryption
+\end{lstlisting}
+
+\subsection{Inspect and De-identify}
+\begin{lstlisting}[language=Python,caption={Deterministic, KMS-wrapped tokenization with DLP.}]
+from google.cloud import dlp_v2
+
+dlp = dlp_v2.DlpServiceClient()
+crypto = {"crypto_key": {"kms_wrapped": {
+            "wrapped_key": wrapped_key_bytes,
+            "crypto_key_name": kms_key_resource}},
+          "surrogate_info_type": {"name": "USER_TOKEN"}}
+# deterministic FFX: same input -> same token, joins still work,
+# but detokenization requires an auditable Cloud KMS permission
+\end{lstlisting}
+
+\begin{enumerate}
+    \item Create an inspection job over \texttt{gs://\$BUCKET/pii/} with InfoTypes \texttt{EMAIL\_ADDRESS}, \texttt{CREDIT\_CARD\_NUMBER}, minimum likelihood \texttt{POSSIBLE}, findings to BigQuery.
+    \item De-identify the CSV content via the DLP API: mask \texttt{EMAIL\_ADDRESS} findings, tokenize \texttt{customer\_id} with the FFX configuration above.
+    \item Load the de-identified rows to \texttt{safe.support\_notes} and compare against the source: emails masked, IDs tokenized, notes preserved.
+    \item Verify reversibility control: call \texttt{ReidentifyContent} once as the key-holding identity (success, audit-logged), then as an identity without KMS decrypt (denied).
+\end{enumerate}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item The inspection-job configuration and its findings table excerpt.
+    \item The de-identification configuration (mask + FFX token) and before/after row samples.
+    \item Audit-log evidence of the permitted detokenization and the denied one.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item Inspection finds the planted PII with likelihood at or above the configured minimum.
+    \item Tokenization is deterministic: the same customer ID tokenizes identically across runs.
+    \item Detokenization succeeds only for the KMS-authorized identity, with both attempts in audit logs.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Add k-anonymity risk analysis over the ``safe'' table using ZIP and birth-date quasi-identifiers.
+    \item Wrap the flow in a Dataflow pipeline using DLP's streaming-friendly transforms.
+    \item Simulate an erasure: destroy a per-subject key version (24-hour delay) and document the recovery window.
+\end{itemize}
+
+\section{Friday Use Case and Architecture: Third-Party PII Ingestion with an Erasure Map}
+\index{third-party data}\index{erasure map}\index{compliance architecture}
+
+\subsection{Scenario}
+A marketing platform ingests customer files from third-party partners nightly. Files contain emails, names, and phone numbers. Requirements: PII never persists in the clear beyond a quarantined landing zone; analytics runs on tokens; GDPR erasure requests complete provably within thirty days; legal holds suspend erasure for flagged subjects.
+
+\subsection{Architecture}
+Partner files land in a quarantine bucket inside the VPC-SC perimeter (Chapter~21), CMEK-encrypted, access-limited to the ingestion service account. A Dataflow job validates the file contract, then per record: encrypts the raw payload under the subject's KMS key (created on first sight), tokenizes identifiers with FFX, and writes tokenized rows to the analytics dataset and encrypted raw records to the vault bucket. The erasure service---triggered by request tickets---schedules destruction of the subject's key and records the request, the key destruction ID, and the 24-hour completion in an audit table. Legal holds are a flag on the subject that blocks key destruction and is itself permission-gated and review-dated. The erasure-propagation map---which layer, which mechanism, which SLA---is a maintained document reviewed quarterly and tested in an annual game day.
+
+\begin{figure}[H]
+    \centering
+    \resizebox{0.95\textwidth}{!}{%
+    \begin{tikzpicture}[
+        src/.style={rectangle, rounded corners, draw=codegray, thick, fill=white, text width=2.7cm, minimum height=1.0cm, align=center, font=\small\bfseries},
+        svc/.style={rectangle, rounded corners, draw=primary, thick, fill=primary!6, text width=2.9cm, minimum height=1.0cm, align=center, font=\small\bfseries},
+        sec/.style={rectangle, rounded corners, draw=magenta, thick, fill=magenta!8, text width=2.9cm, minimum height=0.9cm, align=center, font=\footnotesize\bfseries},
+        dst/.style={rectangle, rounded corners, draw=codegreen!60!black, thick, fill=green!7, text width=2.9cm, minimum height=1.0cm, align=center, font=\small\bfseries},
+        arrow/.style={-{Stealth[length=2.5mm]}, draw=primary, thick},
+        dasharrow/.style={-{Stealth[length=2.5mm]}, draw=codegray, thick, dashed}
+    ]
+        \node[src] (partner) at (0,0) {Partner files\\nightly};
+        \node[svc] (quar) at (3.6,0) {Quarantine\\bucket\\VPC-SC + CMEK};
+        \node[svc] (df) at (7.2,0) {Dataflow\\validate + tokenize\\+ per-subject encrypt};
+        \node[dst] (bq) at (11.4,1.2) {BigQuery\\tokenized\\analytics};
+        \node[dst] (vault) at (11.4,-1.2) {Vault bucket\\encrypted raw};
+        \node[sec] (kms) at (7.2,-2.2) {Cloud KMS\\per-subject keys\\+ legal holds};
+
+        \draw[arrow] (partner) -- (quar);
+        \draw[arrow] (quar) -- (df);
+        \draw[arrow] (df) -- (bq);
+        \draw[arrow] (df) -- (vault);
+        \draw[dasharrow] (kms) -- (df);
+        \draw[dasharrow] (kms) -- (vault);
+    \end{tikzpicture}%
+    }
+    \caption{Third-party PII ingestion: quarantine, tokenize for analytics, encrypt per subject for provable erasure.}
+    \label{fig:ch23-pii-ingestion}
+\end{figure}
+
+\begin{tipbox}
+Prove erasure with a canary subject: a synthetic person whose data flows through every layer. The annual game day requests erasure of the canary and verifies unrecoverability per layer---an audit artifact more persuasive than any architecture diagram.
+\end{tipbox}
+
+\begin{pitfall}
+Tokenized PII can be re-identified through quasi-identifiers (ZIP plus birthdate plus gender uniquely identifies most populations). Run DLP risk analysis (k-anonymity, l-diversity) on the ``safe'' tables before declaring them shareable---the token removes the direct identifier, not the person-shaped pattern.
+\end{pitfall}
+
+\section{Interview Q\&A}
+\subsection{Concepts and Trade-offs}
+\begin{enumerate}
+    \item \textbf{Q: What is an InfoType, and name two built-in examples.}\\
+    A: A category of sensitive data DLP recognizes---for example \texttt{EMAIL\_ADDRESS} and \texttt{CREDIT\_CARD\_NUMBER}---with built-in, custom-regex, and dictionary detectors.
+
+    \item \textbf{Q: Masking versus tokenization: which is reversible, and by whom?}\\
+    A: Tokenization is reversible---only by identities holding KMS decrypt permission, under audit. Masking is irreversible by design.
+
+    \item \textbf{Q: Why use a KMS-wrapped key for tokenization?}\\
+    A: The key material is only ever handled encrypted; KMS unwraps it under IAM control with per-use audit logging, making reversibility a governed API call.
+
+    \item \textbf{Q: What does scheduled DLP scanning of BigQuery tables detect?}\\
+    A: PII presence, new sensitive columns, and coverage gaps across the estate---findings land in BigQuery for dashboards and alerting.
+
+    \item \textbf{Q: How do you verify de-identified data is actually unreadable?}\\
+    A: Negative tests (detokenize as an unauthorized identity), risk analysis on quasi-identifiers, and---for erasure---canary-subject game days proving per-layer unrecoverability.
+\end{enumerate}
+
+\section{Further Reading}
+Read the Sensitive Data Protection documentation for InfoTypes, inspection, de-identification templates, and risk analysis \cite{googleclouddlpdocs}. Cloud KMS documentation covers key destruction semantics and the 24-hour delay that crypto-shredding relies on \cite{googlecloudkmsdocs}. BigQuery documentation details time travel and fail-safe behavior that erasure designs must account for \cite{googlecloudbigquerydocs}, and Chapter~21's perimeter controls bound the whole design \cite{googlecloudvpcscdocs}.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item DLP discovers (scheduled scans, profiles) and transforms (mask, tokenize, generalize)---different modes, different economics.
+    \item Tokenization moves reversibility into KMS permissions and audit logs; masking removes it entirely.
+    \item Deletion is not erasure: time travel, fail-safe, backups, snapshots, and versions all retain copies.
+    \item Crypto-shredding erases every layer at once---but only if per-subject keys were designed in at ingestion.
+    \item Legal holds suspend erasure as documented, permission-gated, review-dated exceptions.
+    \item Prove compliance with canary subjects and game days, not with policy documents alone.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} A PM proposes ``just delete the rows within thirty days.'' Write the technical reply enumerating the layers where the data survives.
+    \item \textbf{(Conceptual)} Compare deterministic FFX tokenization with a salted keyed hash for email joining, including the dictionary-attack consideration.
+    \item \textbf{(Hands-on)} Reproduce the Thursday lab, then add a custom dictionary detector for partner-specific loyalty IDs.
+    \item \textbf{(Hands-on)} Run k-anonymity analysis on a public dataset's quasi-identifier columns and interpret the result.
+    \item \textbf{(Design)} Write the erasure-propagation map for the Friday architecture: per layer, mechanism, owner, SLA, and verification method.
+    \item \textbf{(Architecture)} Add the legal-hold workflow: flag storage, permissioning, review cadence, and the audit evidence it produces.
+\end{enumerate}

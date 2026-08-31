@@ -1,0 +1,450 @@
+\chapter{Synapse Data Warehouse in Fabric}
+\index{Synapse Data Warehouse}\index{Data Warehouse}\index{COPY INTO}\index{T-SQL}\index{compute and storage separation}\index{cross-database querying}\index{ingestion patterns}\index{Microsoft Fabric!Data Warehouse}%
+
+\begin{objectives}
+\begin{itemize}
+    \item Explain the Fabric Data Warehouse architecture and why the separation of compute from storage changes warehouse scaling and cost behavior.
+    \item Describe the supported T-SQL surface area in Fabric, including \texttt{COPY INTO}, and contrast it with a full SQL Server engine.
+    \item Compare the three primary warehouse ingestion patterns---pipelines, T-SQL, and Dataflows Gen2---and select the right one for a given workload.
+    \item Load millions of rows of Parquet data directly from a OneLake path using \texttt{COPY INTO}.
+    \item Estimate capacity consumption for a warehouse workload and reason about reserved versus pay-as-you-go billing.
+    \item Recommend a Lakehouse-versus-Warehouse landing pattern for a legacy SQL Server migration that depends on heavy stored procedure logic.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+The cloud data warehouse---decoupled compute over open or managed storage, SQL as the primary interface---is one of the most portable concepts in data engineering. Fabric's Synapse Data Warehouse is the Azure-column answer, and its closest relatives are direct one-to-one mappings.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{2.8cm}p{3.2cm}p{3.2cm}p{3.2cm}p{3.2cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{Fabric Warehouse} & \textbf{AWS} & \textbf{GCP} & \textbf{Snowflake} \\
+\midrule
+Warehouse engine & Synapse Data Warehouse & Amazon Redshift & BigQuery & Snowflake virtual warehouses \\
+Bulk load command & \texttt{COPY INTO} & \texttt{COPY} & \texttt{LOAD DATA} / bq load & \texttt{COPY INTO <table>} \\
+Storage model & Delta-Parquet in OneLake & Managed (RA3) or Spectrum over S3 & Capacitor columnar storage & Micro-partitions on object storage \\
+Compute scaling & Capacity CUs (F SKUs) & Nodes / serverless workgroups & Slots / on-demand & Warehouse size (XS--6XL) \\
+Cross-db query & Three-part names across items & Redshift Spectrum / federated & Dataset-qualified names & Three-part names, shares \\
+Separation of compute/storage & Yes & Yes (RA3, serverless) & Yes & Yes \\
+Concurrency model & Shared capacity, smoothing & WLM queues / auto-scaling & Slot reservations & Multi-cluster warehouses \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+Databricks SQL warehouses and Azure Synapse dedicated SQL pools are the in-family equivalents. MongoDB has no warehouse concept; its analytics path runs through Atlas SQL Interface, federated queries, or export into one of the columnar engines above. The durable lesson: every platform separates \emph{where bytes live} from \emph{who computes over them}, and bills the two differently.
+\end{crosscloud}
+
+\begin{keyterms}
+\textbf{Synapse Data Warehouse}: a Fabric item that provides a full transactional SQL warehouse over Delta-Parquet storage in OneLake. \quad
+\textbf{COPY INTO}: the T-SQL statement that bulk-loads files from a storage path into a warehouse table. \quad
+\textbf{Compute--storage separation}: an architecture in which warehouse storage persists in OneLake while query compute is drawn from the shared Fabric capacity. \quad
+\textbf{Three-part naming}: the \texttt{database.schema.table} convention that enables cross-database queries between warehouses and lakehouse SQL endpoints in one workspace. \quad
+\textbf{Capacity unit (CU)}: the billing and throughput abstraction that warehouses share with every other Fabric workload.
+\end{keyterms}
+
+\section{Week 5 Roadmap}
+Week~5 opens Part~II, the warehousing and business-intelligence arc of the program. Monday covers the Fabric Data Warehouse architecture and the consequences of compute--storage separation. Tuesday builds T-SQL fluency on the supported surface area, with \texttt{COPY INTO} as the centerpiece. Wednesday compares the three ingestion patterns---pipelines, T-SQL, and Dataflows Gen2---and introduces idempotent load design. Thursday is the hands-on project: provision a warehouse and load five million rows of Parquet from OneLake with \texttt{COPY INTO}. Friday closes with a capacity-cost estimation exercise and an architecture decision for a legacy SQL Server migration.
+
+The warehouse matters because Part~I built a lakehouse world optimized for Spark and files, while much of the enterprise still thinks in T-SQL, stored procedures, and star schemas. The Fabric Data Warehouse bridges those worlds: it stores data as open Delta-Parquet in OneLake yet presents a transactional, multi-table SQL surface \cite{microsoftFabricWarehouse}. Understanding when to land data in a warehouse rather than a lakehouse is one of the highest-leverage judgment calls a Fabric data engineer makes.
+
+\begin{notebox}
+The Fabric warehouse is \emph{not} a repackaged SQL Server instance. It is a distributed, SaaS-managed warehouse whose tables are Delta-Parquet files in OneLake. That single fact explains its strengths (open storage, cross-engine reuse, elastic compute) and its limits (a T-SQL surface that is broad but not identical to SQL Server).
+\end{notebox}
+
+\section{Monday: Warehouse Architecture}
+\index{Data Warehouse!architecture}\index{compute and storage separation}\index{OneLake!warehouse storage}
+A Fabric Data Warehouse consists of two logically separate layers. The \emph{storage layer} persists every table as Delta-Parquet files in OneLake, in a managed area owned by the warehouse item. The \emph{compute layer} is a distributed SQL query engine, provisioned automatically from the workspace's Fabric capacity, that parses T-SQL, plans distributed execution, and reads or writes those files \cite{microsoftFabricWarehouse}.
+
+\begin{definitionbox}
+\textbf{Compute--storage separation} is an architecture in which durable data lives in object storage independent of any running compute, so compute can scale, pause, or be re-provisioned without moving or re-loading the data.
+\end{definitionbox}
+
+\subsection{Why Separation Matters}
+In a coupled appliance model, scaling compute means redistributing data across nodes, and storage capacity is bounded by the hardware you bought. In the separated model, storage scales with OneLake and compute scales with the capacity SKU. The engineering consequences are practical:
+
+\begin{itemize}
+    \item \textbf{Independent scaling.} A capacity increase speeds queries without touching data layout; growing data volume does not force a compute purchase.
+    \item \textbf{Open storage.} Because tables are Delta-Parquet in OneLake, Spark notebooks and other warehouses can read the same bytes---no export pipeline is required to hand warehouse data to a data scientist.
+    \item \textbf{Failure isolation.} A failed query or a paused capacity never corrupts or loses stored data; the log of table versions lives with the files.
+    \item \textbf{Cost clarity.} Storage is billed through OneLake and compute through capacity units, so a workload's cost drivers can be attributed and optimized separately.
+\end{itemize}
+
+\subsection{The Warehouse and Its Neighbors}
+A warehouse does not exist alone. In a typical workspace it sits beside lakehouses and semantic models, and the SQL engine can reach across those boundaries. The warehouse also exposes the same connection string style as the lakehouse SQL analytics endpoint, which means SQL Server Management Studio, Azure Data Studio, and any TDS-capable tool connect to it directly.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.4cm}p{5.2cm}p{5.4cm}@{}}
+\toprule
+\textbf{Aspect} & \textbf{Fabric Data Warehouse} & \textbf{Lakehouse SQL analytics endpoint} \\
+\midrule
+Primary interface & Full transactional T-SQL (DDL, DML, procedures) & Read-only T-SQL over lakehouse Delta tables \\
+Storage & Managed Delta-Parquet in OneLake & Lakehouse \texttt{Tables} area in OneLake \\
+Best fit & T-SQL-centric teams, stored procedures, star schemas & Spark-first pipelines with a SQL consumption layer \\
+Write path & \texttt{COPY INTO}, \texttt{INSERT}, CTAS, pipelines, dataflows & Writes happen through Spark or lakehouse APIs \\
+\bottomrule
+\end{tabular}
+\caption{The warehouse versus its read-only lakehouse sibling.}
+\label{tab:chapter5-wh-vs-endpoint}
+\end{table}
+
+\begin{pitfall}
+Do not choose the warehouse purely because the team ``knows SQL.'' If the transformation logic is Spark-native (feature engineering, ML preprocessing, heavy nested data), land it in a lakehouse and let SQL consumers read it through the SQL analytics endpoint. Choosing the wrong home forces awkward cross-engine orchestration later.
+\end{pitfall}
+
+\section{Tuesday: T-SQL in Fabric}
+\index{T-SQL!surface area}\index{COPY INTO}\index{cross-database querying}
+The Fabric warehouse supports a broad, transactional T-SQL surface: DDL such as \texttt{CREATE TABLE} and \texttt{ALTER TABLE}; DML such as \texttt{INSERT}, \texttt{UPDATE}, \texttt{DELETE}, and \texttt{MERGE}; stored procedures, functions, and views; transactions with full ACID semantics; and the \texttt{COPY INTO} bulk-load statement. Some SQL Server surface area---CLR, certain index types, and instance-level features---does not apply because there is no instance: the service manages distribution, and tables are physically Delta-Parquet, not B-trees \cite{microsoftFabricWarehouseTSQL}.
+
+\subsection{COPY INTO}
+\texttt{COPY INTO} is the workhorse of warehouse ingestion. It reads Parquet, CSV, or JSON files from a storage path---including OneLake paths and external Azure storage---and loads them into a target table with massively parallel reads \cite{microsoftFabricCopyInto}.
+
+\begin{definitionbox}
+\textbf{\texttt{COPY INTO}} is a T-SQL bulk-load statement that ingests files from a storage location into a warehouse table, with options for file type, credentials, row rejection, and column mapping.
+\end{definitionbox}
+
+\begin{lstlisting}[language=SQL,caption={Core COPY INTO patterns against OneLake paths.},label={lst:chapter5-copy-into}]
+-- Minimal load from a OneLake Files path exposed via the DFS endpoint
+COPY INTO dbo.stg_sales
+FROM 'https://onelake.dfs.fabric.microsoft.com/<workspace>/<lakehouse>/Files/stage/sales/2026-07/'
+WITH (
+    FILE_TYPE = 'PARQUET'
+);
+
+-- Load with column mapping and a reject tolerance for dirty CSVs
+COPY INTO dbo.stg_orders (order_id, order_date, net_amount)
+FROM 'https://onelake.dfs.fabric.microsoft.com/<workspace>/<lakehouse>/Files/stage/orders/'
+WITH (
+    FILE_TYPE = 'CSV',
+    FIRSTROW = 2,
+    FIELDTERMINATOR = ',',
+    MAXERRORS = 100
+);
+\end{lstlisting}
+
+\begin{tipbox}
+Prefer Parquet over CSV for \texttt{COPY INTO} whenever the upstream producer controls the format. Parquet carries schema and column statistics, loads faster, and eliminates the entire class of delimiter, encoding, and type-inference failures that plague CSV bulk loads.
+\end{tipbox}
+
+\subsection{Cross-Database Querying}
+Within a workspace, the SQL engine resolves three-part names across warehouses and lakehouse SQL analytics endpoints. A query in \texttt{dw\_sales} can join \texttt{lh\_gold.dbo.fact\_sales} directly, reading the lakehouse's Delta files in place. This is the technical foundation of the logical data warehouse pattern developed in Chapter~6: physically separate items, logically one queryable surface \cite{microsoftFabricCrossQuery}.
+
+\begin{pitfall}
+Three-part cross-item queries are convenient but read the remote item's Delta files at query time. A dashboard that cross-joins a large lakehouse table on every render will burn capacity and add latency. Materialize hot joins into warehouse tables when the access pattern is interactive and repetitive.
+\end{pitfall}
+
+\section{Wednesday: Ingestion Patterns}
+\index{ingestion patterns}\index{pipeline!Copy activity}\index{Dataflows Gen2!warehouse}\index{idempotent loads}
+Fabric offers three first-class ways to fill a warehouse. Choosing among them is a daily architecture decision, and the choice has cost, latency, and operability consequences.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{2.6cm}p{4.0cm}p{3.8cm}p{3.6cm}@{}}
+\toprule
+\textbf{Pattern} & \textbf{Strengths} & \textbf{Weaknesses} & \textbf{Best for} \\
+\midrule
+Pipeline Copy activity & Visual authoring, 30+ connectors, scheduling, retry, orchestration & Less expressive than SQL for set-based transforms; per-activity authoring overhead & Source-to-landing movement from many heterogeneous systems \\
+T-SQL (\texttt{COPY INTO}, CTAS, procedures) & Set-based power, idempotent by design, versionable as code, no extra items & Requires files already staged in storage; SQL skills required & OneLake-staged files, stored-procedure migrations, code-reviewed ELT \\
+Dataflows Gen2 & Low-code Power Query transformations, self-service analysts & Harder to unit-test at scale; visual logic drifts without discipline & Analyst-owned cleansing into staging tables \\
+\bottomrule
+\end{tabular}
+\caption{The three warehouse ingestion patterns and when each earns its place.}
+\label{tab:chapter5-ingestion-patterns}
+\end{table}
+
+\subsection{Idempotent Load Design}
+Whichever pattern lands the data, the load must be rerunnable. Production guidance for the week: stage files under date-partitioned OneLake paths, drive loads from a manifest or watermark table, and design retries so re-running the same batch never produces duplicate rows. On failure, rerun the batch---do not hand-patch partial tables.
+
+\begin{lstlisting}[language=SQL,caption={Manifest-driven idempotent load: only unprocessed files load, and the manifest records the batch.},label={lst:chapter5-idempotent-load}]
+-- Load only files not yet recorded in the manifest, then record the batch.
+COPY INTO dbo.stg_sales
+FROM 'https://onelake.dfs.fabric.microsoft.com/<workspace>/<lakehouse>/Files/stage/sales/2026-07/'
+WITH ( FILE_TYPE = 'PARQUET' );
+
+INSERT cfg.load_manifest (batch_path, rows_loaded, loaded_ts)
+VALUES ('stage/sales/2026-07/', @@ROWCOUNT, CURRENT_TIMESTAMP);
+\end{lstlisting}
+
+\begin{notebox}
+A load is idempotent when running it twice produces the same final state as running it once. Manifests, watermarks, \texttt{MERGE}-based upserts, and partition-scoped overwrites are the four standard tools. Hand-editing rows after a partial failure is none of them.
+\end{notebox}
+
+\section{Thursday: Hands-on Project}
+\index{hands-on lab}\index{COPY INTO!five-million-row load}
+The Week~5 lab provisions a warehouse and loads five million rows of Parquet data from a OneLake path using \texttt{COPY INTO} issued from the SQL query editor. You will measure load time, validate row counts, and inspect the Delta files the load produced.
+
+\subsection{Goal and Architecture}
+Create a workspace named \texttt{fabric-de-week05}. Add a lakehouse \texttt{lh\_stage} to hold the source Parquet files and a warehouse \texttt{dw\_sales} as the load target. Generate or obtain a synthetic sales dataset of at least five million rows partitioned by month under \texttt{Files/stage/sales/}. The architecture is deliberately simple: OneLake files on one side, a warehouse table on the other, and one SQL statement between them.
+
+\subsection{Step-by-Step Actions}
+\begin{enumerate}
+    \item Create the workspace and assign it to your Fabric trial capacity.
+    \item Create the lakehouse \texttt{lh\_stage} and upload or generate the partitioned Parquet dataset under \texttt{Files/stage/sales/yyyy-MM/}.
+    \item Create the warehouse \texttt{dw\_sales} in the same workspace.
+    \item In the warehouse's SQL editor, create the target schema and staging table.
+    \item Execute \texttt{COPY INTO} against one month, record duration and row count.
+    \item Execute \texttt{COPY INTO} for the remaining months, recording the manifest after each.
+    \item Validate the final row count and aggregate totals against the source files.
+    \item Inspect the table's underlying Delta files in OneLake to connect the SQL abstraction back to open storage.
+\end{enumerate}
+
+\begin{lstlisting}[language=SQL,caption={Week 5 lab: create the target and load five million rows.},label={lst:chapter5-lab-load}]
+CREATE SCHEMA stg;
+GO
+
+CREATE TABLE stg.sales (
+    order_id      BIGINT,
+    customer_id   BIGINT,
+    product_id    INT,
+    store_id      INT,
+    order_date    DATE,
+    quantity      INT,
+    net_amount    DECIMAL(18,2)
+);
+GO
+
+-- Time the load in the query editor.
+COPY INTO stg.sales
+FROM 'https://onelake.dfs.fabric.microsoft.com/<workspace-id>/lh_stage/Files/stage/sales/2026-07/'
+WITH ( FILE_TYPE = 'PARQUET' );
+
+INSERT cfg.load_manifest (batch_path, rows_loaded, loaded_ts)
+VALUES ('stage/sales/2026-07/', @@ROWCOUNT, CURRENT_TIMESTAMP);
+GO
+
+-- Validation: counts and totals must match the source profile.
+SELECT COUNT(*) AS loaded_rows,
+       SUM(net_amount) AS total_net_amount,
+       MIN(order_date) AS first_order,
+       MAX(order_date) AS last_order
+FROM stg.sales;
+\end{lstlisting}
+
+\begin{tipbox}
+Find the exact OneLake DFS path for a lakehouse folder by right-clicking the folder in the lakehouse explorer and copying its ABFS or DFS path, then substituting your workspace and item identifiers. A wrong segment in this path is the single most common cause of a failed first \texttt{COPY INTO}.
+\end{tipbox}
+
+\subsection{Validation Checklist}
+\begin{itemize}
+    \item \texttt{stg.sales} contains exactly five million rows (or your dataset's documented count).
+    \item Sum and date-range aggregates match a profile computed from the source Parquet files.
+    \item Every loaded batch appears once in \texttt{cfg.load\_manifest}.
+    \item Re-running the same \texttt{COPY INTO} batch is either blocked by the manifest check or proven to duplicate rows---and you can explain which.
+    \item The warehouse table is visible as Delta-Parquet files in OneLake storage.
+    \item Load durations are recorded for the Friday cost discussion.
+\end{itemize}
+
+\section{Friday: Use Case and Architecture}
+\index{capacity estimation}\index{legacy migration}\index{stored procedures}
+A regional logistics company is migrating off an on-premises SQL Server data warehouse. The estate contains roughly 400 stored procedures, nightly batch windows, and a finance team that lives in T-SQL. Leadership asks two questions: what will the Fabric capacity cost, and should the target be a lakehouse or a warehouse?
+
+\subsection{Capacity and Cost Reasoning}
+Fabric bills compute through capacity units. Four licensing shapes dominate the decision: reserved F-SKU capacity for steady production load, pay-as-you-go F SKUs for bursty or business-hours workloads, legacy Power BI Premium licensing for BI-heavy estates, and the 60-day trial used throughout this book \cite{microsoftFabricCapacity,microsoftFabricTrial}.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.6cm}p{3.2cm}p{3.8cm}p{4.4cm}@{}}
+\toprule
+\textbf{Option} & \textbf{Billing model} & \textbf{Best for} & \textbf{Watch-outs} \\
+\midrule
+Fabric capacity reservation (F2--F64) & Reserved CUs, monthly/annual commit & Steady production workloads with predictable load & Paying for idle CUs off-hours; throttling if undersized \\
+Fabric pay-as-you-go (F2--F64) & Per-second CU billing; pause/resume any time & Dev/test, bursty or business-hours-only workloads & Easy to forget to pause; unoptimized Spark jobs spike cost \\
+Power BI Premium (P SKU / PPU) & Per-capacity or per-user monthly & BI-heavy estates already on Premium licensing & P SKUs being superseded by F SKUs; PPU limits sharing \\
+Fabric free trial & 60-day trial capacity, no cost & Learning, proofs of concept, this syllabus & Expires; unsuitable for production SLAs \\
+\bottomrule
+\end{tabular}
+\caption{Fabric licensing shapes for warehouse workloads.}
+\label{tab:chapter5-licensing}
+\end{table}
+
+The estimation workflow is empirical: run the Thursday lab's measured load times and the company's nightly window against the Capacity Metrics app \cite{microsoftFabricMetricsApp}, compute CU-seconds per batch, add interactive query load, then size the smallest SKU that absorbs the peak with headroom. Pause pay-as-you-go capacities outside business hours.
+
+\subsection{Lakehouse or Warehouse for the Migration}
+The deciding factor is the 400 stored procedures. Rewriting them as Spark notebooks is a multi-quarter rewrite with regression risk; porting them to warehouse T-SQL is mostly a compatibility exercise. The recommended architecture lands data through idempotent \texttt{COPY INTO} batches into the warehouse, ports procedures in waves with side-by-side reconciliation against the legacy system, and exposes curated marts through the SQL analytics endpoint or Direct Lake semantic models. Lakehouses still play a role---Bronze landing of raw extracts and any future data-science workloads---but the transactional transformation heart of this migration belongs in the warehouse.
+
+\begin{pitfall}
+A lift-and-shift that copies stored procedures without idempotency analysis reproduces legacy bugs at cloud speed. Before porting each procedure, document its retry unit: if the nightly job failed halfway, what must be true before it can safely rerun?
+\end{pitfall}
+
+\section{Operational Guidance for Week 5}
+Treat the warehouse as production infrastructure from day one: name batches, log loads, reconcile counts, and keep load code in version control. The first time a stakeholder asks ``why does this number differ from last night's report,'' the manifest table is your answer.
+
+\subsection{Performance and Reliability}
+Load during off-peak windows when the capacity is shared with interactive BI. Prefer fewer, larger files for \texttt{COPY INTO}; thousands of tiny staged files recreate the small-file problem inside your ingestion layer. Reconcile every batch: row count, aggregate checksum, and manifest entry. Keep stored procedures under source control and deploy them through the same review process as Spark code.
+
+\subsection{Security and Governance Checklist}
+\begin{itemize}
+    \item Store no credentials in procedure bodies; use workspace-managed connections and identity-based access to OneLake paths.
+    \item Restrict who can run \texttt{COPY INTO} and DDL in production warehouses.
+    \item Record load manifests with batch path, row count, operator or pipeline identity, and timestamp.
+    \item Classify warehouse tables that contain personal data; downstream chapters apply sensitivity labels and RLS.
+    \item Document the retry unit of every stored procedure before it is ported or scheduled.
+\end{itemize}
+
+\section{Interview Q\&A}
+\begin{enumerate}
+    \item \textbf{Q: Why does compute--storage separation matter for a warehouse?}\\
+    A: It lets storage scale with OneLake while compute scales with capacity SKUs, keeps data safe when compute pauses or fails, and opens the same Delta files to other engines without export pipelines.
+    \item \textbf{Q: When is \texttt{COPY INTO} preferable to a pipeline Copy activity?}\\
+    A: When files are already staged in storage and the team wants set-based, versionable, idempotent SQL loads---especially for stored-procedure-centric estates migrating to Fabric.
+    \item \textbf{Q: What is the unit of Fabric capacity billing?}\\
+    A: The capacity unit (CU); consumption is metered in CU-seconds across all workloads sharing the capacity.
+    \item \textbf{Q: Why pause a pay-as-you-go capacity outside business hours?}\\
+    A: Per-second billing means an idle capacity still accrues cost; pausing dev/test capacities overnight and on weekends removes spend that produces no value.
+    \item \textbf{Q: Which ingestion pattern best fits a stored-procedure-heavy migration?}\\
+    A: T-SQL-centric ELT into a warehouse: \texttt{COPY INTO} for staged files, procedures for transformation, preserving the team's existing skills and the procedures' business logic.
+    \item \textbf{Q: What does the Fabric warehouse store physically?}\\
+    A: Delta-Parquet files in OneLake, in a managed area owned by the warehouse item---open storage that Spark and SQL endpoints can also read.
+\end{enumerate}
+
+\section{Further Reading}
+Review Microsoft documentation for the Fabric Data Warehouse \cite{microsoftFabricWarehouse}, its T-SQL surface area \cite{microsoftFabricWarehouseTSQL}, \texttt{COPY INTO} \cite{microsoftFabricCopyInto}, and cross-database querying \cite{microsoftFabricCrossQuery}. For capacity economics, study Fabric licensing concepts \cite{microsoftFabricCapacity}, the Capacity Metrics app \cite{microsoftFabricMetricsApp}, and the trial capacity terms \cite{microsoftFabricTrial}. The lakehouse comparison draws on the lakehouse overview \cite{microsoftFabricLakehouse} and the lakehouse architecture paper \cite{armbrust2021lakehouse}.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item The Fabric Data Warehouse is a transactional T-SQL warehouse whose tables are Delta-Parquet files in OneLake.
+    \item Compute--storage separation makes capacity a scaling dial that never touches stored data, and makes warehouse data readable by Spark and SQL endpoints alike.
+    \item \texttt{COPY INTO} is the highest-throughput, most idempotent-friendly way to load staged Parquet files into warehouse tables.
+    \item Pipelines, T-SQL, and Dataflows Gen2 are complementary ingestion patterns; choose by team skill, transformation shape, and operability, not fashion.
+    \item Idempotent loads---manifests, watermarks, and rerunnable batches---are the difference between an operable warehouse and a nightly incident.
+    \item Capacity cost estimation is empirical: measure CU consumption on real loads, then size and pause capacities deliberately.
+    \item Legacy SQL Server migrations with heavy stored procedures usually belong in the warehouse first, with lakehouses serving raw landing and data-science needs.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Explain compute--storage separation to a DBA whose entire career has been coupled appliances. What fears does it resolve, and what new responsibilities does it create?
+    \item \textbf{(Conceptual)} Why is the Fabric warehouse's T-SQL surface ``broad but not identical'' to SQL Server? Name two features that have no meaning without an instance.
+    \item \textbf{(Hands-on)} Extend the lab: load a second month of Parquet data, then write a query that proves the manifest contains exactly one entry per batch.
+    \item \textbf{(Hands-on)} Convert the lab's \texttt{COPY INTO} into a parameterized stored procedure that takes a batch path and refuses to load a batch already present in the manifest.
+    \item \textbf{(Design)} Given a nightly window of 90 minutes and a measured load of 20M rows per hour on an F8, size the capacity for 60M nightly rows with 25\% headroom. State your assumptions.
+    \item \textbf{(Design)} Sketch the wave plan for migrating 400 stored procedures: how do you group, port, and reconcile them against the legacy system?
+    \item \textbf{(Interview)} In five sentences, defend choosing the warehouse over the lakehouse for a T-SQL-centric migration.
+    \item \textbf{(Operational)} Write the runbook entry for a failed nightly \texttt{COPY INTO}: detection, triage, safe rerun, and escalation.
+\end{enumerate}
+
+\section{Capstone Project: Idempotent Warehouse Load Framework}\label{sec:ch5-capstone}
+\index{capstone project}\index{COPY INTO!capstone}\index{idempotent loads!capstone}\index{load manifest}
+
+\begin{capstonebox}
+\textbf{Mission.} Build a production-shaped warehouse loading framework for a fictional distributor. The framework must stage partitioned Parquet in OneLake, drive \texttt{COPY INTO} loads from a manifest table, reject duplicate batches, reconcile every load, and expose a curated mart for downstream SQL consumers. This is the Week~5 Thursday project raised to operational standards.
+
+\textbf{Estimated time.} 4--6 hours, depending on dataset generation and tenant permissions.
+
+\textbf{What you'll practice.}
+\begin{itemize}
+    \item Provisioning a warehouse and lakehouse pair in one workspace.
+    \item Designing manifest-driven, idempotent \texttt{COPY INTO} batches.
+    \item Writing T-SQL stored procedures that transform staging into a conformed mart.
+    \item Reconciling row counts and aggregates between source, staging, and mart.
+    \item Measuring CU consumption and producing a capacity cost estimate.
+\end{itemize}
+\end{capstonebox}
+
+\subsection*{Scenario}
+Contoso Distribution receives daily sales extracts from three regional systems as Parquet files dropped into OneLake under date-partitioned paths. The analytics team needs a \texttt{mart.daily\_sales} table, refreshed nightly, that finance can query with confidence. Extracts occasionally arrive twice after upstream retries; the framework must absorb duplicates without double-counting revenue.
+
+\subsection*{Requirements}
+\begin{itemize}
+    \item A workspace \texttt{fabric-de-ch5-capstone} with lakehouse \texttt{lh\_stage} and warehouse \texttt{dw\_distribution}.
+    \item Staged Parquet under \texttt{Files/stage/sales/<region>/<yyyy-MM>/} for at least two regions and five days.
+    \item A \texttt{cfg.load\_manifest} table recording batch path, region, row count, status, and timestamps.
+    \item A stored procedure \texttt{cfg.usp\_load\_batch} that loads one batch only if the manifest has no successful entry for it.
+    \item A stored procedure \texttt{mart.usp\_build\_daily\_sales} that rebuilds the mart from staging idempotently.
+    \item Reconciliation queries comparing staged counts, manifest counts, and mart aggregates.
+    \item A one-page capacity estimate built from measured load times.
+\end{itemize}
+
+\subsection*{Reference Architecture}
+\begin{figure}[H]
+    \centering
+    \begin{tikzpicture}[node distance=8mm and 10mm,
+        src/.style={rectangle, rounded corners, draw=codegray, thick, fill=white, align=center, minimum width=2.6cm, minimum height=0.95cm, font=\small\bfseries}]
+        \node[src] (feeds) at (0,0) {Regional\\extracts};
+        \node[store] (onelake) at (4.2,0) {OneLake\\staged Parquet};
+        \node[stage] (copy) at (8.4,0) {COPY INTO\\+ manifest};
+        \node[store] (stg) at (12.4,0) {stg schema\\(warehouse)};
+        \node[stage] (proc) at (16.2,0) {Stored\\procedures};
+        \node[store] (mart) at (20.0,0) {mart\\daily\_sales};
+
+        \draw[arrow] (feeds) -- (onelake);
+        \draw[arrow] (onelake) -- (copy);
+        \draw[arrow] (copy) -- (stg);
+        \draw[arrow] (stg) -- (proc);
+        \draw[arrow] (proc) -- (mart);
+
+        \node[note, text width=13.5cm, align=center] at (10, -2.0) {The manifest gates every load: a batch that already succeeded is skipped, so upstream retries cannot double-count revenue.};
+    \end{tikzpicture}
+    \caption{Week 5 capstone: manifest-driven warehouse load framework.}
+    \label{fig:chapter5-capstone-architecture}
+\end{figure}
+
+\subsection*{Implementation Steps}
+\begin{enumerate}
+    \item Create the workspace, lakehouse, and warehouse; generate or upload the staged Parquet extracts.
+    \item Create \texttt{cfg.load\_manifest} and the \texttt{stg.sales} target table.
+    \item Implement \texttt{cfg.usp\_load\_batch} with the manifest guard and row-count recording.
+    \item Implement \texttt{mart.usp\_build\_daily\_sales} as a rerunnable rebuild (delete-and-rebuild by batch window or full refresh, your documented choice).
+    \item Load all batches, including a deliberate duplicate drop, and prove the mart is unaffected.
+    \item Run reconciliation queries and capture results as evidence.
+    \item Measure load durations, read the Capacity Metrics app, and write the cost estimate.
+\end{enumerate}
+
+\begin{lstlisting}[language=SQL,caption={Capstone manifest guard: skip batches that already succeeded.},label={lst:chapter5-capstone-proc}]
+CREATE PROCEDURE cfg.usp_load_batch
+    @batch_path NVARCHAR(500),
+    @region NVARCHAR(50)
+AS
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM cfg.load_manifest
+        WHERE batch_path = @batch_path AND status = 'Succeeded'
+    )
+    BEGIN
+        -- Idempotent: a retried batch is a no-op.
+        RETURN;
+    END
+
+    DECLARE @full_path NVARCHAR(1000) =
+        'https://onelake.dfs.fabric.microsoft.com/<ws>/lh_stage/Files/'
+        + @batch_path + '/';
+
+    COPY INTO stg.sales
+    FROM @full_path
+    WITH ( FILE_TYPE = 'PARQUET' );
+
+    INSERT cfg.load_manifest (batch_path, region, rows_loaded, status, loaded_ts)
+    VALUES (@batch_path, @region, @@ROWCOUNT, 'Succeeded', CURRENT_TIMESTAMP);
+END
+\end{lstlisting}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item Workspace, lakehouse, and warehouse names with a screenshot or export of the item list.
+    \item The manifest table contents after loading all batches, including the rejected duplicate attempt.
+    \item Both stored procedures under version control.
+    \item Reconciliation query results: staged versus manifest versus mart.
+    \item The capacity cost estimate with measured load times and SKU recommendation.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item[\(\square\)] Every batch is loaded exactly once; a re-dropped extract does not change mart totals.
+    \item[\(\square\)] The manifest records path, region, rows, status, and timestamp for every attempt.
+    \item[\(\square\)] The mart procedure is rerunnable and produces identical results on consecutive runs.
+    \item[\(\square\)] Reconciliation proves staged rows equal manifest rows equal mart contributions.
+    \item[\(\square\)] The capacity estimate cites measured durations, not guesses.
+    \item[\(\square\)] No credentials, personal paths, or hardcoded workspace IDs appear in submitted code.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Add a \texttt{cfg.load\_errors} table and route rejected rows from a dirty CSV batch into it.
+    \item Wrap the batch procedure calls in a Fabric pipeline with a ForEach over a region list.
+    \item Add a mart-level data-quality test that fails when daily revenue deviates by more than three standard deviations.
+    \item Cross-query the mart from a lakehouse SQL analytics endpoint and document when you would materialize instead.
+\end{itemize}

@@ -1,0 +1,266 @@
+\chapter{Advanced Dataflow: Windowing, State, and Exactly-Once Semantics}
+\index{event time}\index{watermarks}\index{windowing}\index{allowed lateness}\index{triggers}\index{state and timers}\index{exactly-once}
+
+\begin{objectives}
+\begin{itemize}
+    \item Distinguish event time from processing time and explain what a watermark estimates.
+    \item Choose fixed, sliding, and session windows for concrete workloads.
+    \item Configure triggers, accumulation modes, and allowed lateness for late-arriving data.
+    \item Manage per-key state with the Beam State and Timers API, bounding state with TTL via watermark garbage collection.
+    \item Join streams over windows with CoGroupByKey and reason about join state retention.
+    \item Compare end-to-end exactly-once with at-least-once plus downstream dedup, and troubleshoot a late-data dashboard inaccuracy.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+Stream-processing semantics are platform-neutral: every serious engine answers the Dataflow Model's four questions, with different defaults and vocabulary.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{2.8cm}p{3.0cm}p{3.0cm}p{3.0cm}@{}} \\
+\toprule
+\textbf{Concept} & \textbf{Beam/Dataflow} & \textbf{Apache Flink} & \textbf{Spark Structured Streaming} \\
+\midrule
+Event-time windows & Fixed/sliding/session & Tumbling/hopping/session & Tumbling/sliding/session \\
+Completeness estimate & Watermark & Watermark & Watermark (threshold) \\
+Late data & Allowed lateness + triggers & Allowed lateness + side outputs & Watermark delay \\
+Per-key state & State \& Timers API & Keyed state + timers & mapGroupsWithState \\
+Exactly-once & Exactly-once shuffle + sinks & Checkpointing + two-phase sinks & Checkpoint + idempotent sinks \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+On the warehousing side, \textbf{Snowflake} streams and \textbf{Microsoft Fabric} eventstreams land micro-batches with simpler semantics; \textbf{MongoDB} change streams feed processors that must implement these semantics themselves. Beam's vocabulary---watermark, trigger, allowed lateness---is the common reference even when the runtime differs \cite{akidau2015dataflow}.
+\end{crosscloud}
+
+\begin{keyterms}
+\textbf{Event time}: the timestamp at which an event occurred at its source; \textbf{processing time}: when the pipeline observes it.
+\textbf{Watermark}: the engine's estimate of event-time completeness---``we have probably seen all data before time $t$.''
+\textbf{Trigger}: the rule deciding when a window emits a pane (early, on-time, late).
+\textbf{Allowed lateness}: how long a window stays open for late events before being garbage-collected.
+\textbf{State and Timers API}: Beam's per-key state bags/values and event-time/processing-time timers for custom stateful logic.
+\textbf{CoGroupByKey}: the windowed join primitive grouping two keyed PCollections by key and window.
+\end{keyterms}
+
+\section{Week 15 Roadmap}
+Week~15 is the conceptual summit of Part~IV. Monday separates event time from processing time and defines watermarks. Tuesday covers the three window strategies. Wednesday handles late data, triggers, and the State and Timers API. Thursday builds the session-window clickstream pipeline with two minutes of allowed lateness. Friday joins streams with CoGroupByKey, assembles end-to-end exactly-once, and debugs a dashboard corrupted by offline mobile uploads.
+
+\begin{definitionbox}
+A \textbf{watermark} is a monotonic estimate of event-time progress: the engine's declaration that it expects no more data older than a given event time. Data arriving behind the watermark is \textbf{late}; windows stay open for it only as long as \textbf{allowed lateness} permits \cite{akidau2015dataflow,apachebeamdocs}.
+\end{definitionbox}
+
+\section{Monday: Event Time, Processing Time, and Watermarks}
+\index{event time vs processing time}\index{watermark!estimate}
+
+\subsection{Two Clocks}
+Every event lives in two time domains. Event time is when the user clicked, the sensor read, the trade executed. Processing time is when your worker saw it. Under perfect conditions they coincide; under mobile offline periods, cross-region queueing, or source outages they diverge arbitrarily. Computing ``clicks per 5-minute window'' against processing time counts events by when the network felt like delivering them; event time counts them by when they happened. For anything humans interpret as behavior, event time is the only defensible axis.
+
+\subsection{Watermark Mechanics}
+The watermark advances as the pipeline observes event timestamps---typically tracking near the maximum seen event time minus a heuristic skew estimate. Windowing, timers, and state garbage collection all key off it. A watermark stuck behind reality stalls window output (dashboards freeze); a watermark racing ahead discards legitimately late data (dashboards lie). Both failure modes are visible in Dataflow's per-stage watermark and system-lag metrics, which is why the monitoring story in this chapter's production notes starts there \cite{googleclouddataflowdocs}.
+
+\begin{pitfall}
+A single pathological upstream---one mobile device that buffered a week of events, one partition of a source lagging---holds the watermark hostage for every downstream window. Cap the damage: bound event-time skew at the source, drop or side-channel events older than a sanity horizon, and monitor oldest-event-age alongside watermark lag.
+\end{pitfall}
+
+\section{Tuesday: Windowing Strategies---Fixed, Sliding, Session}
+\index{fixed windows}\index{sliding windows}\index{session windows}
+
+\subsection{Fixed and Sliding}
+\textbf{Fixed (tumbling) windows} partition time into disjoint buckets---hourly revenue, daily aggregates. \textbf{Sliding (hopping) windows} are defined by size and period: a ten-minute window emitted every minute is a rolling detector---the fraud rule ``same card in two cities within ten minutes'' in the Milestone~4 capstone is exactly a sliding window over per-card events. Note the cost asymmetry: each event belongs to \(size / period\) sliding windows, multiplying downstream state and computation.
+
+\subsection{Session Windows}
+\textbf{Session windows} group events by activity bursts: a window opens at a key's first event, extends while gaps stay under a threshold, and closes after the gap elapses. User analytics (visits, app sessions, support interactions) are the canonical fit. Sessions are per-key and dynamically merged, which makes them more expensive than fixed windows and makes their state retention directly proportional to allowed lateness.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{2.6cm}p{4.2cm}p{5.6cm}@{}} \\
+\toprule
+\textbf{Window} & \textbf{Definition} & \textbf{Canonical use} \\
+\midrule
+Fixed & Disjoint buckets of size $s$ & Periodic aggregates: hourly revenue, daily KPIs \\
+Sliding & Size $s$, period $p$ (overlapping) & Rolling detectors: fraud rules, moving averages \\
+Session & Gap-based, per key, dynamically merged & User activity sessions, device connectivity bursts \\
+\bottomrule
+\end{tabular}
+\caption{Beam windowing strategies and their canonical workloads \cite{apachebeamdocs}.}
+\label{tab:ch15-windows}
+\end{table}
+
+\begin{tipbox}
+Choose the window from the \emph{question}, not the data shape. ``Daily totals'' is fixed; ``any 10-minute span with two cities'' is sliding; ``how long do users engage per visit'' is session. The wrong choice is not a style error---it changes the answer.
+\end{tipbox}
+
+\section{Wednesday: Late Data, Triggers, and the State and Timers API}
+\index{allowed lateness!configuration}\index{triggers!early-on-time-late}\index{BagStateSpec}\index{state TTL}
+
+\subsection{Triggers and Accumulation}
+A window fires panes according to its trigger: the default fires once when the watermark passes the window end. \texttt{AfterWatermark(early=..., late=...)} adds speculative early panes (freshness) and per-late-event refinement (correctness). The \textbf{accumulation mode} decides whether a new pane \emph{accumulates} with prior panes or \emph{discards} them---discarding fits counters and per-pane detectors; accumulating fits running totals. \textbf{Allowed lateness} keeps window state alive past the watermark for late refinement, at direct state-storage cost; when it expires, the window and its state are garbage-collected and stragglers are dropped (or side-output if you coded for it).
+
+\subsection{Per-Key State and Timers}
+Windowing is declarative state; the State and Timers API is the imperative layer underneath: \texttt{BagStateSpec} to accumulate, \texttt{ValueStateSpec} to remember, \texttt{TimerSpec} to fire callbacks in event or processing time. The canonical use is custom deduplication and pattern detection with explicit expiry.
+
+\begin{lstlisting}[language=Python,caption={Stateful deduplication with a 10-minute event-time TTL.}]
+import apache_beam as beam
+from apache_beam.coders import coders
+from apache_beam.transforms.userstate import BagStateSpec, TimerSpec, on_timer
+
+class DedupWithTimer(beam.DoFn):
+    SEEN = BagStateSpec("seen", coders.StrUtf8Coder())
+    EXPIRY = TimerSpec("expiry")
+
+    def process(self, element, seen=beam.DoFn.StateParam(SEEN),
+                expiry=beam.DoFn.TimerParam(EXPIRY)):
+        key, event = element
+        expiry.set(event["event_ts"] + 600)  # state TTL: 10 min
+        if event["event_id"] in set(seen.read()):
+            return  # duplicate: discard
+        seen.add(event["event_id"])
+        yield event
+
+    @on_timer(EXPIRY)
+    def on_expiry(self, seen=beam.DoFn.StateParam(SEEN)):
+        seen.clear()  # free per-key state at timer fire
+\end{lstlisting}
+
+\begin{pitfall}
+Unbounded per-key state kills streaming jobs---slowly, then at 03:00 on a Saturday. Every \texttt{BagStateSpec} needs a removal story: watermark garbage collection via allowed lateness, an explicit expiry timer, or a bounded data structure. If you cannot state when state is freed, the job owns a memory leak with a billing address.
+\end{pitfall}
+
+\section{Thursday Hands-On Project: Sessionized Clicks with Late Data}
+\index{hands-on project}\index{session windows!lab}\index{TestStream}
+This lab builds a streaming pipeline reading clicks from Pub/Sub, grouping them into session windows (with a fixed-window variant for 5-minute counts), allowing two minutes of late data, and writing results to BigQuery---then proves the windowing logic with a TestStream unit test.
+
+\subsection{The Streaming Pipeline}
+\begin{lstlisting}[language=Python,caption={Pub/Sub clicks windowed with late-data tolerance into BigQuery.}]
+import json
+import apache_beam as beam
+from apache_beam.options.pipeline_options import PipelineOptions, StandardOptions
+from apache_beam.transforms.window import TimestampedValue, FixedWindows
+import apache_beam.transforms.trigger as trigger
+
+options = PipelineOptions(project="my-project", region="us-central1",
+                          temp_location="gs://my-bucket/tmp")
+options.view_as(StandardOptions).streaming = True
+
+with beam.Pipeline(options=options) as p:
+    (p | "Read" >> beam.io.ReadFromPubSub(
+             subscription="projects/my-project/subscriptions/clicks-sub")
+       | "Parse" >> beam.Map(lambda b: json.loads(b.decode("utf-8")))
+       | "Stamp" >> beam.Map(lambda e: TimestampedValue(e, e["event_ts"]))
+       | "Window" >> beam.WindowInto(
+             FixedWindows(300),  # 5-minute windows
+             trigger=trigger.AfterWatermark(late=trigger.AfterCount(1)),
+             allowed_lateness=120,  # 2 minutes of late data
+             accumulation_mode=trigger.AccumulationMode.DISCARDING)
+       | "KeyByUser" >> beam.Map(lambda e: (e["user_id"], 1))
+       | "Count" >> beam.CombinePerKey(sum)
+       | "Write" >> beam.io.WriteToBigQuery(
+             "my-project:analytics.clicks_5min",
+             create_disposition=beam.io.BigQueryDisposition.CREATE_IF_NEEDED))
+\end{lstlisting}
+
+\subsection{Session Variant and Unit Test}
+Replace the \texttt{Window} step with \texttt{beam.WindowInto(Sessions(gap\_size=300), allowed\_lateness=120)} for true sessionization, keying by \texttt{user\_id} first. Then prove behavior locally:
+
+\begin{lstlisting}[language=Python,caption={TestStream proving on-time and late panes.}]
+from apache_beam.testing.test_stream import TestStream
+from apache_beam.testing.test_pipeline import TestPipeline
+from apache_beam.testing.util import assert_that, equal_to_windowed
+from apache_beam.transforms.window import TimestampedValue
+
+def test_late_click_counted_once():
+    with TestPipeline() as p:
+        stream = (TestStream()
+                  .add_elements([TimestampedValue({"user_id": "u1", "event_ts": 0}, 0)])
+                  .advance_watermark_to(310)          # first window closes
+                  .add_elements([TimestampedValue({"user_id": "u1", "event_ts": 100}, 310)])  # late
+                  .advance_watermark_to_infinity())
+        # apply Parse/Stamp/Window/KeyByUser/Count, then:
+        # assert two panes: on-time pane and one late refinement
+        _ = p | stream
+        # (assertions omitted for brevity; use assert_that with pane matchers)
+\end{lstlisting}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item The fixed-window and session-window pipelines, with a note on when each is correct.
+    \item The TestStream test output proving late events refine the window exactly once.
+    \item Console screenshots of per-stage watermark lag while replaying a late-data scenario.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item Events are stamped from their source event time, not arrival time.
+    \item The windowing declares trigger, accumulation mode, and allowed lateness explicitly.
+    \item The unit test demonstrates an on-time pane and a late refinement without double counting.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Emit dropped-because-too-late events to a side output and a monitoring metric.
+    \item Replace \texttt{CombinePerKey} with the stateful \texttt{DedupWithTimer} DoFn keyed on \texttt{event\_id}.
+    \item Run the pipeline against a simulated Pub/Sub replay and chart watermark behavior.
+\end{itemize}
+
+\section{Friday: Stream-Stream Joins, Exactly-Once, and the Late-Mobile Dashboard}
+\index{CoGroupByKey}\index{stream-stream join}\index{exactly-once!end-to-end}\index{watermark lag}
+
+\subsection{Joining Streams over Windows}
+Stream-stream joins in Beam are windowed \texttt{CoGroupByKey}s: key both inputs identically, apply a shared windowing, and the join emits when matching keys co-occur in a window. Two disciplines follow. First, \textbf{watermark alignment}: the joined output's completeness is bounded by the slower input's watermark---a lagging dimension stream stalls the fact stream's joins. Second, \textbf{state retention}: join state lives until window closing plus allowed lateness; wide windows times high cardinality times long lateness is a state-size multiplication you must compute, not discover.
+
+\subsection{End-to-End Exactly-Once}
+The assembly from Chapter~13 completed: Streaming Engine provides exactly-once shuffle between stages; the BigQuery Storage Write API provides exactly-once sink semantics within its stream commit model; deterministic keys make reruns idempotent. The alternative---at-least-once delivery plus downstream dedup by event ID (a \texttt{MERGE} or a dedup query over a raw table)---is cheaper in pipeline complexity and often the right choice when a deduplication key is natural and consumers tolerate a dedup step. Choose deliberately: exactly-once infrastructure where duplicates are dangerous (billing, fraud), at-least-once plus dedup where they are merely untidy.
+
+\subsection{Use Case: The Dashboard That Lies}
+A streaming dashboard shows daily aggregations that do not match finance's numbers. Investigation finds mobile devices that go offline for hours, then upload event batches---arriving after windows closed, silently dropped by default watermarks. The fix is layered: extend \texttt{allowed\_lateness} to the business's true tolerance (hours, not minutes); add a late trigger so refinements republish; make the BigQuery sink upsert by window key so refined panes replace rather than duplicate; and add a Cloud Monitoring alert on watermark lag and on a ``very late'' side-output metric so the next incident pages instead of being discovered in a board meeting.
+
+\begin{tipbox}
+Alert on \textbf{per-stage data watermark lag} and system lag, and page on sustained growth. Watermark lag growing while input rate is normal is the streaming equivalent of a disk filling: everything still works, right up until it very much does not \cite{googlecloudmonitoringdocs}.
+\end{tipbox}
+
+\begin{pitfall}
+Changing stateful logic---state specs, timers, windowing---usually breaks in-place job updates because existing state cannot map to the new schema. Prefer drain-and-replace for stateful changes: drain the old job, start the new one from a snapshot or fresh subscription, and plan the cutover to avoid reprocessing or gaps.
+\end{pitfall}
+
+\section{Interview Q\&A}
+\subsection{Concepts and Trade-offs}
+\begin{enumerate}
+    \item \textbf{Q: What does a watermark estimate, and what lies behind it?}\\
+    A: Event-time completeness: the engine believes it has seen all events up to time $t$. Late data---offline devices, delayed sources---arrives behind it.
+
+    \item \textbf{Q: Why does unbounded per-key state kill a streaming job, and how do timers plus watermark garbage collection bound it?}\\
+    A: State accumulates in worker or backend storage until memory/disk exhausts; expiry timers free state explicitly and watermark progress garbage-collects closed windows, bounding lifetime.
+
+    \item \textbf{Q: In the dedup DoFn, what do the SEEN bag state and EXPIRY timer each do?}\\
+    A: SEEN remembers event IDs already emitted for the key; EXPIRY fires after ten minutes of event time to clear them, bounding the dedup horizon.
+
+    \item \textbf{Q: What must align for a CoGroupByKey stream-stream join to emit, and what state does it retain?}\\
+    A: Matching keys within the same window on both inputs; it buffers each side's elements per key per window until closing plus allowed lateness.
+
+    \item \textbf{Q: How do Streaming Engine shuffle and the Storage Write API deliver end-to-end exactly-once, and when is at-least-once plus dedup cheaper?}\\
+    A: Exactly-once shuffle removes intra-pipeline duplicates and the sink commits records idempotently; dedup-based designs skip that infrastructure and are cheaper when a natural dedup key exists and consumers tolerate a merge step.
+\end{enumerate}
+
+\section{Further Reading}
+Read the Beam programming guide's windowing, triggers, and state-and-timers chapters \cite{apachebeamdocs}, and the Dataflow Model paper for the foundational semantics \cite{akidau2015dataflow}. Dataflow documentation covers watermark and system-lag metrics, exactly-once modes, and job update constraints \cite{googleclouddataflowdocs}; Cloud Monitoring documentation covers the alert policies \cite{googlecloudmonitoringdocs}. The BigQuery documentation details the Storage Write API's exactly-once behavior \cite{googlecloudbigquerydocs}.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item Event time is the defensible axis for behavior analytics; processing time is an operational detail.
+    \item Watermarks trade completeness for latency; monitor them like disk usage.
+    \item Fixed, sliding, and session windows answer different questions---choose from the question.
+    \item Triggers plus allowed lateness define the freshness-correctness contract of every window.
+    \item All state needs an eviction story: expiry timers, watermark GC, or bounded structures.
+    \item Exactly-once end-to-end is assembled hop by hop; at-least-once plus dedup is a legitimate, often cheaper alternative.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Explain why a processing-time daily report disagrees with finance after a mobile network outage, even with zero bugs.
+    \item \textbf{(Conceptual)} A fraud rule uses 10-minute sliding windows with 1-minute period. Compute the per-event window multiplicity and its effect on state.
+    \item \textbf{(Hands-on)} Reproduce the Thursday lab; then set \texttt{allowed\_lateness=0}, replay late events, and document where they go.
+    \item \textbf{(Hands-on)} Add the dedup DoFn upstream of the window and verify via TestStream that a duplicated event ID emits once.
+    \item \textbf{(Analysis)} Given watermark lag growing at one stage only, list three causes and the metric or log that distinguishes each.
+    \item \textbf{(Design)} Specify the drain-and-replace cutover plan for a stateful pipeline whose windowing must change from 5-minute fixed to session windows.
+\end{enumerate}

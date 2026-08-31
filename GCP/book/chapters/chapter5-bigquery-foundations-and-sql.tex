@@ -1,0 +1,298 @@
+\chapter{BigQuery Foundations and Core SQL}
+\index{BigQuery}\index{data warehouse}\index{Dremel}\index{Colossus}\index{Jupiter network}\index{star schema}\index{slowly changing dimensions}
+
+\begin{objectives}
+\begin{itemize}
+    \item Explain BigQuery's decoupled architecture built on Colossus storage, the Jupiter network, and the Dremel execution engine.
+    \item Compare on-demand pricing with capacity-based Editions and slot reservations, and select a model for a given workload shape.
+    \item Apply window functions, arrays, and structs in GoogleSQL to analytical problems that are painful in flat relational SQL.
+    \item Model a star schema with declared grain, fact table types, conformed dimensions, and SCD Type~2 change tracking.
+    \item Query the GitHub public dataset, unnest nested fields, and compute a seven-day rolling average with window functions.
+    \item Estimate the monthly cost of a workload scanning fifty terabytes per day and recommend an Edition tier with justification.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+Serverless analytical warehouses differ in pricing mechanics and tuning surface, but the core ideas---decoupled storage and compute, columnar execution, and pay-for-what-you-scan or pay-for-capacity---are portable across platforms.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{2.8cm}p{3.0cm}p{3.0cm}p{3.0cm}@{}} \\
+\toprule
+\textbf{Capability} & \textbf{GCP BigQuery} & \textbf{AWS Redshift} & \textbf{Azure} \\
+\midrule
+Warehouse engine & Dremel over Colossus & RA3 managed storage & Synapse / Fabric warehouse \\
+Unit of compute & Slots & RPUs / node hours & DWU / capacity units \\
+On-demand pricing & Per TiB scanned & Redshift Serverless RPUs & Serverless SQL per TB \\
+Capacity pricing & Editions (Standard, Enterprise, Enterprise Plus) & Provisioned clusters & Provisioned pools / Fabric capacities \\
+Result acceleration & BI Engine & Materialized views, AQUA & Fabric caching / result-set cache \\
+Nested data & ARRAY and STRUCT first-class & SUPER (semi-structured) & OPENJSON over nvarchar \\
+Cross-cloud analytics & BigQuery Omni & Redshift data sharing & Fabric OneLake shortcuts \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+\textbf{Snowflake} is the closest philosophical cousin: fully managed, storage and compute separated, and priced by credit consumption on virtual warehouses. \textbf{MongoDB Atlas} is an operational document store with an aggregation framework, not a columnar warehouse; it pairs with analytical stores rather than replacing them. \textbf{Microsoft Fabric} lands its warehouse and lakehouse workloads on OneLake, making the storage layer the unifying concept rather than the engine.
+\end{crosscloud}
+
+\begin{keyterms}
+\textbf{Slot}: BigQuery's unit of computational capacity; queries consume slots for the duration of their execution stages.
+\textbf{On-demand pricing}: per-TiB-scanned billing where each query pays for the bytes it reads.
+\textbf{Editions}: capacity pricing tiers (Standard, Enterprise, Enterprise Plus) billed in slot-hours with autoscaling.
+\textbf{Colossus}: Google's distributed file system that durably stores BigQuery's columnar data.
+\textbf{Star schema}: a dimensional model with fact tables surrounded by conformed dimension tables.
+\textbf{SCD Type 2}: a slowly changing dimension strategy that keeps full history by versioning rows with validity intervals.
+\end{keyterms}
+
+\section{Week 5 Roadmap}
+Week~5 opens Part~II by moving from storage primitives to the analytical engine at the center of most GCP data platforms. BigQuery is where raw files from Chapter~1's buckets, relational extracts from Chapter~2, and streams from later chapters converge into governed, queryable assets. Understanding its architecture is not academic trivia: the separation of storage and compute explains why BigQuery scales without cluster management, why it charges per byte scanned or per slot, and why table design decisions echo directly in the monthly bill.
+
+Monday dissects the decoupled architecture: Colossus, Jupiter, and Dremel. Tuesday covers pricing models, slots, and Editions. Wednesday develops advanced GoogleSQL---window functions, arrays, structs---and Kimball dimensional modeling with SCD Type~2. Thursday is a hands-on lab against the GitHub public dataset. Friday estimates and governs the cost of a fifty-terabyte-per-day marketing analytics workload.
+
+\begin{definitionbox}
+\textbf{BigQuery} is Google Cloud's serverless, petabyte-scale data warehouse. Storage and compute are fully decoupled: data lives in columnar format on Colossus, and queries are executed by Dremel workers that shuffle intermediate results over the Jupiter network \cite{googlecloudbigquerydocs,melnik2010dremel}.
+\end{definitionbox}
+
+\section{Monday: Decoupled Architecture---Colossus, Jupiter, and Dremel}
+\index{BigQuery!architecture}\index{Colossus}\index{Jupiter network}\index{Dremel}
+
+\subsection{Separation of Storage and Compute}
+Traditional data warehouses couple storage and compute: a node owns disks, holds a slice of the data, and executes the part of the query touching that slice. Scaling storage means adding compute, and scaling compute means redistributing data. BigQuery breaks this coupling. Data resides in Colossus, the same planet-scale distributed file system lineage as the Google File System \cite{ghemawat2003gfs}, encoded in a columnar format with rich metadata. Compute is stateless: Dremel workers read from Colossus over the network, process query stages, and terminate. Because workers hold no durable state, BigQuery can allocate thousands of slots to one query and zero to the same project a second later.
+
+\begin{notebox}
+The decoupled design is why BigQuery has no indexes to build, no vacuum to schedule, and no cluster to size. The engineering levers move to table layout (partitioning, clustering, Chapter~6), query shape, and pricing-model choice.
+\end{notebox}
+
+\subsection{Dremel Execution and the Shuffle Tier}
+Dremel executes a query as a directed acyclic graph of stages. Leaf stages scan columnar blocks from Colossus; intermediate stages aggregate, join, or repartition rows through an in-memory shuffle service; a final stage assembles results. The Jupiter petabit-scale network makes reading remote storage cheap enough that locality is not the bottleneck it was for classic Hadoop clusters \cite{melnik2010dremel}. Each stage consumes \textbf{slots}, and the query's slot-milliseconds and bytes-billed are visible after execution---two numbers you will use constantly in cost governance.
+
+\begin{figure}[H]
+    \centering
+    \resizebox{0.95\textwidth}{!}{%
+    \begin{tikzpicture}[
+        layer/.style={rectangle, rounded corners, draw=primary, thick, fill=primary!6, text width=3.2cm, minimum height=1.0cm, align=center, font=\small\bfseries},
+        eng/.style={rectangle, rounded corners, draw=codegreen!60!black, thick, fill=green!7, text width=3.0cm, minimum height=1.0cm, align=center, font=\small\bfseries},
+        net/.style={rectangle, rounded corners, draw=magenta, thick, fill=magenta!8, text width=6.6cm, minimum height=0.8cm, align=center, font=\small\bfseries},
+        arrow/.style={-{Stealth[length=2.5mm]}, draw=primary, thick}
+    ]
+        \node[layer] (client) at (0,0) {Clients\\SQL, bq, APIs, notebooks};
+        \node[eng] (dremel) at (0,-2.0) {Dremel\\stateless slots + shuffle};
+        \node[net] (jupiter) at (0,-3.6) {Jupiter petabit network};
+        \node[layer] (colossus) at (0,-5.2) {Colossus\\columnar storage + metadata};
+
+        \draw[arrow] (client) -- (dremel);
+        \draw[arrow] (dremel) -- (jupiter);
+        \draw[arrow] (jupiter) -- (colossus);
+    \end{tikzpicture}%
+    }
+    \caption{BigQuery's decoupled stack: stateless Dremel compute reads columnar data from Colossus over Jupiter.}
+    \label{fig:ch5-decoupled-architecture}
+\end{figure}
+
+\begin{pitfall}
+``Serverless'' does not mean ``unbounded.'' A badly written query---an unfiltered scan of a petabyte table, a cross join, a skewed key---will happily consume enormous slot capacity and budget. Serverless removes cluster administration, not engineering discipline.
+\end{pitfall}
+
+\section{Tuesday: Pricing Models, Slots, and Editions}
+\index{BigQuery!pricing}\index{slots}\index{Editions}\index{on-demand pricing}\index{reservations}
+
+\subsection{On-Demand versus Capacity Pricing}
+On-demand pricing charges per TiB of data scanned by each query, with the first tier free monthly. It is the right default for spiky, experimental, or low-volume workloads: no commitments, no idle cost. Its weakness is variance---one analyst's missing \texttt{WHERE} clause can scan petabytes.
+
+Capacity pricing buys \textbf{slots} in an Edition (Standard, Enterprise, or Enterprise Plus) and bills slot-hours. Editions add autoscaling: a baseline of slots is always available, and additional slots spin up under load and spin down afterward. Enterprise and Enterprise Plus unlock features such as longer time-travel windows, advanced security, and higher concurrent-query limits \cite{googlecloudbigquerypricing}.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{2.6cm}p{3.2cm}p{3.8cm}p{4.0cm}@{}} \\
+\toprule
+\textbf{Option} & \textbf{Billing model} & \textbf{Best for} & \textbf{Watch-outs} \\
+\midrule
+On-demand & Per TiB scanned & Spiky, unpredictable, low-volume workloads & One bad query can scan petabytes; set custom query cost quotas \\
+Editions (slots) & Slot-hours per tier & Steady production workloads needing predictable spend & Commitments are per region; idle baseline slots still bill \\
+Flat-rate (legacy) & Fixed monthly slots & Legacy contracts migrating to Editions & Being phased out; no new features \\
+BigQuery Omni & Per TiB (or slots) on cross-cloud data & Analytics over data that stays in AWS or Azure & Source-cloud egress plus cross-region latency \\
+\bottomrule
+\end{tabular}
+\caption{BigQuery pricing models and their trade-offs \cite{googlecloudbigquerypricing}.}
+\label{tab:ch5-pricing-models}
+\end{table}
+
+\subsection{Reservations and Workload Isolation}
+Capacity purchased in an Edition is assigned to \textbf{reservations}, which map slot pools to projects, folders, or jobs. A common pattern separates \texttt{etl}, \texttt{bi}, and \texttt{ad-hoc} reservations so a dashboard refresh storm cannot starve a critical nightly load. Idle-slot sharing lets one reservation borrow unused capacity from another, which keeps utilization high without manual rebalancing.
+
+\begin{tipbox}
+Start on-demand, measure four weeks of real usage (bytes scanned per day, concurrency, peak slot demand from \texttt{INFORMATION\_SCHEMA.JOBS}), then model Editions. Buying a commitment before you know your slot-hours profile usually wastes money.
+\end{tipbox}
+
+\section{Wednesday: Advanced SQL and Dimensional Modeling}
+\index{window functions}\index{arrays}\index{structs}\index{Kimball dimensional modeling}\index{SCD Type 2}
+
+\subsection{Window Functions, Arrays, and Structs}
+GoogleSQL treats nested and repeated data as first-class. A \texttt{STRUCT} groups related fields into one column; an \texttt{ARRAY} holds repeated values. Public datasets such as the GitHub archive use them heavily: one row per commit, with an array of touched files. \texttt{UNNEST} flattens arrays into rows for aggregation, and window functions compute running and rolling measures without self-joins.
+
+\begin{lstlisting}[language=SQL,caption={Seven-day rolling average of daily commits per repository with window functions.}]
+WITH daily AS (
+  SELECT repo_name,
+         DATE(committer.date) AS commit_date,
+         COUNT(*) AS commits
+  FROM `bigquery-public-data.github_repos.sample_commits`,
+       UNNEST(repo_name) AS repo_name
+  GROUP BY repo_name, commit_date
+)
+SELECT repo_name,
+       commit_date,
+       commits,
+       AVG(commits) OVER (
+         PARTITION BY repo_name
+         ORDER BY commit_date
+         ROWS BETWEEN 6 PRECEDING AND CURRENT ROW
+       ) AS rolling_7d_avg
+FROM daily
+ORDER BY repo_name, commit_date;
+\end{lstlisting}
+
+Window frames (\texttt{ROWS BETWEEN ...}), ranking (\texttt{ROW\_NUMBER}, \texttt{RANK}), and navigation (\texttt{LAG}, \texttt{LEAD}) replace correlated subqueries and self-joins, and they execute in a single pass per partition. When you catch yourself writing a self-join on a date range, reach for a window frame first.
+
+\subsection{Kimball Dimensional Modeling}
+\index{fact table}\index{conformed dimensions}\index{grain}
+Dimensional modeling organizes analytical data into \textbf{fact tables} (measurable events) and \textbf{dimension tables} (descriptive context) \cite{kimball2013toolkit}. The discipline starts with \textbf{declaring the grain}: a fact table row means exactly one thing---one order line, one daily account snapshot, one shipment leg. The grain commits you to what the table can answer and protects every downstream aggregation from double counting.
+
+Fact tables come in three classic types. \textbf{Transaction facts} record discrete events at their natural grain. \textbf{Periodic snapshot facts} summarize state at regular intervals, such as daily inventory levels. \textbf{Accumulating snapshot facts} track a workflow through milestones---order placed, paid, shipped, delivered---updating one row as the process advances. \textbf{Conformed dimensions} (a shared \texttt{dim\_date}, \texttt{dim\_customer}, \texttt{dim\_product}) allow facts from different processes to be combined in one report.
+
+\subsection{Slowly Changing Dimensions}
+A Type~1 dimension overwrites changed attributes; a Type~2 dimension preserves history by closing the current row and inserting a new version. Type~2 is required when reports must reconstruct ``what did we believe then,'' such as the customer's segment at the moment of each purchase.
+
+\begin{lstlisting}[language=SQL,caption={SCD Type 2 upsert into a customer dimension using MERGE.}]
+-- SCD Type 2 upsert into a customer dimension on BigQuery
+MERGE analytics.dim_customer T
+USING staging.customers_daily S
+ON T.customer_id = S.customer_id AND T.is_current = TRUE
+WHEN MATCHED AND (T.email <> S.email OR T.segment <> S.segment) THEN
+  UPDATE SET valid_to = CURRENT_DATE(), is_current = FALSE
+WHEN NOT MATCHED THEN
+  INSERT (customer_id, email, segment, valid_from, valid_to, is_current)
+  VALUES (S.customer_id, S.email, S.segment, CURRENT_DATE(), DATE '9999-12-31', TRUE);
+-- Follow with a second INSERT for the new versions of the matched rows.
+\end{lstlisting}
+
+\begin{pitfall}
+The \texttt{MERGE} must match on both the natural key and \texttt{is\_current = TRUE}. Matching on the key alone updates every historical version of the customer, silently corrupting the timeline. The second pass---inserting the new current version of each closed row---is equally easy to forget.
+\end{pitfall}
+
+\section{Thursday Hands-On Project: GitHub Public Dataset Analytics}
+\index{hands-on project}\index{public datasets}\index{UNNEST}\index{rolling average}
+This lab queries the GitHub public dataset, unnests nested commit fields, and computes a seven-day rolling average of commits per repository. Work in the BigQuery console or with the \texttt{bq} CLI; public datasets cost nothing to store, and queries draw from the free monthly on-demand tier.
+
+\subsection{Explore the Dataset}
+\begin{lstlisting}[language=bash,caption={Inspecting the GitHub public dataset schema from the bq CLI.}]
+bq show bigquery-public-data:github_repos.sample_commits
+
+bq query --nouse_legacy_sql `
+  "SELECT repo_name, commit, author.date.sec AS authored_sec
+   FROM ``bigquery-public-data.github_repos.sample_commits``
+   LIMIT 5"
+\end{lstlisting}
+
+\subsection{Unnest and Aggregate}
+\begin{lstlisting}[language=SQL,caption={Unnesting repository arrays and counting daily commits.}]
+SELECT repo_name,
+       DATE(committer.date) AS commit_date,
+       COUNT(*) AS commits
+FROM `bigquery-public-data.github_repos.sample_commits`,
+     UNNEST(repo_name) AS repo_name
+WHERE DATE(committer.date) >= DATE_SUB(CURRENT_DATE(), INTERVAL 90 DAY)
+GROUP BY repo_name, commit_date
+ORDER BY commits DESC
+LIMIT 100;
+\end{lstlisting}
+
+\subsection{Rolling Average with a Window Function}
+Reuse the rolling-average query from Wednesday. Verify the frame by hand for one repository: pick eight consecutive days, average the first seven, and compare with the \texttt{rolling\_7d\_avg} value on the seventh day. Manual verification of one window catches frame-boundary errors that aggregates hide.
+
+\begin{notebox}
+Before every query in the console, glance at the bytes-processed estimate in the top-right corner. Make this a reflex: estimate first, run second.
+\end{notebox}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item The rolling-average query saved in a repository file with a one-paragraph explanation of the frame choice.
+    \item A screenshot or CLI output of the bytes-processed estimate for each query run.
+    \item A short table of the top ten repositories by commits in the window, with their rolling averages.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item The query uses \texttt{UNNEST} on a repeated field and a window function with an explicit frame.
+    \item The rolling average is computed per repository with \texttt{PARTITION BY} and a seven-row frame.
+    \item Results are reproducible: a teammate can paste the SQL and get identical output.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Rewrite the aggregation using \texttt{STRUCT}s to keep per-repo daily counts nested in one row per repository.
+    \item Compare bytes billed for the sample table versus the full \texttt{commits} table and explain the difference.
+    \item Add a \texttt{RANK()} window to flag each repository's single busiest day in the period.
+\end{itemize}
+
+\section{Friday Use Case and Architecture: Costing a 50 TB/Day Marketing Workload}
+\index{cost estimation}\index{Editions!recommendation}\index{FinOps}
+
+\subsection{Scenario}
+A marketing analytics team scans roughly fifty terabytes of event data daily across attribution, campaign, and audience queries. Leadership asks two questions: what will BigQuery cost per month, and should the workload move to an Edition?
+
+\subsection{On-Demand Estimate}
+On-demand analysis pricing is per TiB scanned; using a representative list price of \$6.25 per TiB, fifty terabytes per day is \(50 \times 30 = 1{,}500\)~TiB per month, or roughly \$9{,}375 monthly---before storage, streaming inserts, and any queries that blow past the fifty-terabyte norm \cite{googlecloudbigquerypricing}. The number itself is less important than the method: volume times frequency times price, plus a sensitivity range for query-growth scenarios.
+
+\subsection{Edition Recommendation}
+Steady daily volume with predictable working hours argues for capacity pricing. The recommendation pattern is: measure slot demand from \texttt{INFORMATION\_SCHEMA.JOBS\_BY\_PROJECT} for two to four weeks, choose the smallest Edition whose autoscaling ceiling covers the p95 peak, isolate the workload in its own reservation, and keep on-demand for genuinely spiky experimentation. If measured sustained usage is, for example, 200--400 slots during business hours, an Enterprise baseline with autoscaling is typically cheaper and far more predictable than 1{,}500~TiB of on-demand scanning---and it unlocks longer time travel and advanced governance features.
+
+\begin{tipbox}
+Whichever model you choose, set guardrails: custom query cost quotas per user and per project, dry-run checks in CI for expensive SQL, and a weekly bytes-billed report grouped by user, table, and query pattern \cite{googlecloudmonitoringdocs}.
+\end{tipbox}
+
+\begin{pitfall}
+Do not compare ``on-demand cost of current queries'' with ``cost of a commitment'' without checking waste first. Partition filters and clustering (Chapter~6) routinely cut bytes scanned by ten to one hundred times; the cheapest slot is the one a well-designed table never needs.
+\end{pitfall}
+
+\section{Interview Q\&A}
+\subsection{Concepts and Trade-offs}
+\begin{enumerate}
+    \item \textbf{Q: Which BigQuery components make storage and compute independently scalable?}\\
+    A: Colossus stores columnar data durably; stateless Dremel workers compute over it; Jupiter connects them with enough bandwidth that workers need not be co-located with data.
+
+    \item \textbf{Q: When do Editions beat on-demand pricing?}\\
+    A: When sustained slot usage is steady enough that slot-hours cost less than per-TiB scanning---typically continuous production ELT and BI workloads with measurable daily volume.
+
+    \item \textbf{Q: What does ``declaring the grain'' of a fact table commit you to?}\\
+    A: Every row means exactly one thing at one level of detail; all measures, keys, and aggregations must respect that declaration or results double-count.
+
+    \item \textbf{Q: When is SCD Type 2 required over Type 1?}\\
+    A: When history must be reconstructed---regulatory reporting, point-in-time joins, or any analysis of ``what we knew when.''
+
+    \item \textbf{Q: Why must an SCD2 MERGE match on both key and is\_current?}\\
+    A: Matching on the key alone would update every historical version row, destroying the timeline the Type 2 design exists to preserve.
+\end{enumerate}
+
+\section{Further Reading}
+Read the BigQuery documentation for architecture, datasets, and query reference \cite{googlecloudbigquerydocs}, and the pricing page for current per-TiB and Edition rates \cite{googlecloudbigquerypricing}. Study the Dremel paper for the execution model's origins \cite{melnik2010dremel} and the GFS paper for the storage lineage \cite{ghemawat2003gfs}. Kimball and Ross remain the definitive dimensional-modeling reference \cite{kimball2013toolkit}. Review Cloud Monitoring documentation for the slot-utilization and bytes-billed dashboards used in the Friday use case \cite{googlecloudmonitoringdocs}.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item BigQuery's decoupled architecture---Colossus storage, Jupiter network, Dremel compute---eliminates cluster management but not design responsibility.
+    \item Choose on-demand for spiky work and Editions for steady workloads; measure slot demand before committing.
+    \item Window functions, arrays, and structs replace self-joins and staging tables for most rolling and nested analytics.
+    \item Declaring the grain is the foundational dimensional-modeling act; conformed dimensions make facts composable.
+    \item SCD Type 2 preserves history with validity intervals and demands a disciplined two-step MERGE.
+    \item Cost governance is a design input: bytes-processed estimates, quotas, and reservation isolation belong in the platform, not in a quarterly surprise.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Explain to a skeptical DBA why BigQuery needs no indexes, vacuum, or cluster sizing---and what disciplines replace them.
+    \item \textbf{(Conceptual)} A query scans the same 2~TB table fifty times per day. Compare on-demand and Edition costs qualitatively and state what you would measure to decide.
+    \item \textbf{(Hands-on)} Run the rolling-average query on the GitHub dataset, then rewrite it with \texttt{ROWS BETWEEN 6 PRECEDING AND 3 PRECEDING} and explain what the new frame means.
+    \item \textbf{(Hands-on)} Create a \texttt{dim\_customer} table, load three versions of one customer with the SCD2 MERGE pattern, and write a point-in-time query returning the customer's segment on a past date.
+    \item \textbf{(Design)} Model an order-management star schema: declare the grain of each fact table, classify each as transaction, periodic snapshot, or accumulating snapshot, and list the conformed dimensions.
+    \item \textbf{(Architecture)} Extend the Friday cost estimate with three scenarios---flat volume, 20\% monthly growth, and a Black-Friday spike---and recommend a pricing strategy for each.
+\end{enumerate}

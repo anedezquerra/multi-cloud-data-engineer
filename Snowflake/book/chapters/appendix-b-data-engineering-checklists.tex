@@ -1,0 +1,108 @@
+\chapter{Data Engineering Checklists}
+\index{checklists}\index{runbooks}%
+This appendix distills the book's operational discipline into checklists used at design reviews, go-lives, incidents, and audits. Each item cites the chapter that teaches the reasoning. A checklist item you cannot verify is a finding, not a formality.
+
+\section{New Ingestion Pipeline Review}
+Before any new feed goes to production:
+\begin{itemize}
+    \item[$\square$] Stage URL ends at a folder boundary with trailing slash; bucket scoped by prefix (Ch.~5).
+    \item[$\square$] Authentication via storage integration; zero hardcoded credentials in DDL or code (Ch.~5).
+    \item[$\square$] \texttt{STORAGE\_ALLOWED\_LOCATIONS} mirrors the IAM/bucket scoping (Ch.~5).
+    \item[$\square$] \texttt{VALIDATION\_MODE} dry-run executed against real sample files (Ch.~5).
+    \item[$\square$] \texttt{ON\_ERROR} mode chosen per dataset criticality, with a dead-letter or retry path (Ch.~5).
+    \item[$\square$] Loaded rows carry \texttt{METADATA\$FILENAME} and load timestamp lineage (Ch.~5).
+    \item[$\square$] Reconciliation query exists: files arrived vs.\ files loaded (Ch.~5).
+    \item[$\square$] Mechanism matches the latency SLA: bulk COPY, Snowpipe, or streaming---with the decision recorded (Ch.~6).
+    \item[$\square$] Backlog alert defined (\texttt{pendingFileCount} or consumer lag), not just error alerts (Ch.~6).
+    \item[$\square$] Pipe error notifications wired to an \texttt{ERROR\_INTEGRATION} (Ch.~6).
+\end{itemize}
+
+\section{CDC and Continuous Pipeline Review}
+\begin{itemize}
+    \item[$\square$] Stream type is the narrowest sufficient (append-only where possible) (Ch.~7).
+    \item[$\square$] Consumers are gated with \texttt{SYSTEM\$STREAM\_HAS\_DATA} (Ch.~7).
+    \item[$\square$] Every consumer is idempotent: keyed \texttt{MERGE} or dedup-key pattern, proven by a repeated-run test (Ch.~7).
+    \item[$\square$] Stream staleness monitored (\texttt{STALE} flag) with a documented re-bootstrap runbook and RTO (Ch.~7).
+    \item[$\square$] Late-arriving dimension members absorbed by lag tuning and re-runs, never dropped (Ch.~7).
+    \item[$\square$] Task steps have \texttt{USER\_TASK\_TIMEOUT\_MS} and \texttt{SUSPEND\_TASK\_AFTER\_NUM\_FAILURES} set (Ch.~8).
+    \item[$\square$] Dynamic-table lag budget validated: each downstream lag $\geq$ upstream lag + measured refresh time (Ch.~11).
+    \item[$\square$] Refresh history monitored for silent incremental $\rightarrow$ full refresh fallbacks (Ch.~11).
+    \item[$\square$] Backfill/replay path exists and has been rehearsed (Ch.~8).
+\end{itemize}
+
+\section{Data Contract and Schema Change Review}
+\begin{itemize}
+    \item[$\square$] Raw payloads land whole; validation lives one layer downstream (Ch.~9).
+    \item[$\square$] Contracts enforced (CHECK constraints or dbt contracts) with quarantine routing for rejects (Ch.~9).
+    \item[$\square$] Contract ownership documented: producer defines, consumers approve breaking changes (Ch.~9).
+    \item[$\square$] Schema changes follow expand $\rightarrow$ migrate $\rightarrow$ contract across separate releases (Ch.~23).
+    \item[$\square$] Compatibility shim view maintained until a CI gate proves zero old-column references (Ch.~23).
+    \item[$\square$] schemachange ledger updated by CI; no manual DDL in production (Ch.~23).
+    \item[$\square$] dbt models carry \texttt{unique}, \texttt{not\_null}, \texttt{accepted\_values}, \texttt{relationships} where applicable; incremental models declare \texttt{unique\_key} (Ch.~23).
+\end{itemize}
+
+\section{Security and Governance Go-Live}
+\begin{itemize}
+    \item[$\square$] No grants to \texttt{PUBLIC}; no direct user grants; access flows user $\rightarrow$ functional role $\rightarrow$ access role (Ch.~17).
+    \item[$\square$] \texttt{ACCOUNTADMIN} usage is break-glass only, MFA-enforced, and alerted (Ch.~17).
+    \item[$\square$] Service accounts use key-pair auth with keys in a secrets manager; network policies restrict origins (Ch.~17).
+    \item[$\square$] Future grants cover new objects so least privilege is the low-toil path (Ch.~17).
+    \item[$\square$] PII columns classified with tags; tag-based masking verified as \emph{each} consuming role, including negative tests (Ch.~18).
+    \item[$\square$] Row access policies tested against joins and aggregates, not just base queries (Ch.~18).
+    \item[$\square$] Aggregate-inference exposure assessed; cohort floors applied to shared products (Ch.~18, 20).
+    \item[$\square$] Erasure design chosen and tested: retention-bounded deletion or crypto-shredding; legal-hold override present (Ch.~18).
+    \item[$\square$] Shares contain secure views only; revocation tested (Ch.~19).
+    \item[$\square$] Reader accounts carry per-client warehouses with resource monitors (Ch.~19).
+\end{itemize}
+
+\section{Cost and Performance Review (Monthly)}
+\begin{itemize}
+    \item[$\square$] Credits attributed by warehouse/team/product via query tags and \texttt{QUERY\_HISTORY} (Ch.~10).
+    \item[$\square$] Top-10 most expensive queries reviewed; each classified (pruning, spill, schedule, idle) (Ch.~10).
+    \item[$\square$] Every warehouse has auto-suspend set and a resource monitor attached (Ch.~2, 23).
+    \item[$\square$] Multi-cluster scaling policy matches workload criticality (Standard vs.\ Economy) (Ch.~2).
+    \item[$\square$] Automatic Clustering and Search Optimization carry per-table cost justifications (Ch.~1, 3).
+    \item[$\square$] Dynamic-table refresh history checked for full-refresh credit spikes (Ch.~11).
+    \item[$\square$] Cortex token usage reconciled against forecast; pre-filtering in place (Ch.~22).
+    \item[$\square$] Cost-anomaly alert fired at least once in test this quarter (Ch.~23).
+\end{itemize}
+
+\section{Production Go-Live Checklist}
+\begin{itemize}
+    \item[$\square$] Infrastructure applied via Terraform; \texttt{terraform plan} reviewed in the PR (Ch.~23).
+    \item[$\square$] dbt build green including tests in QA; DMFs scheduled on critical tables (Ch.~23).
+    \item[$\square$] Resource monitors configured per environment posture (dev suspends, prod pages) (Ch.~23).
+    \item[$\square$] Alerts route to a notification integration that pages a human (Ch.~8, 23).
+    \item[$\square$] Data-quality checks (row-count reconciliation, duplicate detection, freshness) demonstrated failing safely (Ch.~8).
+    \item[$\square$] Runbooks written: stale stream, failed pipe, broken deploy, key rotation (Ch.~6--8, 17).
+    \item[$\square$] Recovery boundaries documented: Time Travel retention per object class, Fail-safe expectations, clone strategy (Ch.~4).
+    \item[$\square$] Monthly cost estimate documented with two explicit optimization decisions (all capstones).
+\end{itemize}
+
+\section{Incident Quick Reference}
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}p{4.4cm}p{4.8cm}p{4.8cm}@{}}
+\toprule
+\textbf{Symptom} & \textbf{First query / check} & \textbf{Runbook} \\
+\midrule
+Data stopped flowing & \texttt{SYSTEM\$PIPE\_STATUS}; S3 event prefix & Ch.~6: starved pipe checklist \\
+Stream stale & \texttt{SHOW STREAMS} (\texttt{STALE=true}) & Ch.~7: recreate stream, reload target, anti-join audit \\
+Task graph silent & \texttt{TASK\_HISTORY} skip reasons & Ch.~8: \texttt{WHEN} gate false; resume order \\
+Dashboard wrong after deploy & schemachange ledger + dbt run results & Ch.~23: roll back to shim view; contract-gate postmortem \\
+Credit spike & \texttt{WAREHOUSE\_METERING\_HISTORY} hourly & Ch.~10/23: anomaly alert triage; top queries by bytes \\
+PII exposure report & \texttt{ACCESS\_HISTORY} + \texttt{TAG\_REFERENCES} & Ch.~18: masking test matrix rerun; erasure if required \\
+Credential leak & \texttt{LOGIN\_HISTORY} anomalies & Ch.~17: revoke, rotate, re-scope trust policy \\
+Consumer can't see share & \texttt{SHOW GRANTS TO SHARE} & Ch.~19: secure-view grant and account identifier check \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{Certification Readiness (Chapter 24)}
+\begin{itemize}
+    \item[$\square$] Two consecutive timed practice exams above threshold in \emph{every} domain.
+    \item[$\square$] Error log emptied through hands-on remediation, not memorization.
+    \item[$\square$] Can whiteboard: three-layer architecture, ingestion options, stream/task/dynamic-table trade-offs, RBAC hierarchy, sharing topology---without notes.
+    \item[$\square$] Can compute clustering-depth implications and Economy-vs-Standard scaling behavior from a scenario stem.
+    \item[$\square$] Portfolio repository reproducible from READMEs; five-minute walkthrough rehearsed per project.
+\end{itemize}

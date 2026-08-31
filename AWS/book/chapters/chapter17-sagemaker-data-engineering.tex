@@ -1,0 +1,269 @@
+% NOTE: Filename is fixed by the book outline; content teaches Week 17
+% (In-Database Machine Learning with Redshift ML) of the syllabus.
+\chapter{In-Database Machine Learning with Redshift ML}
+\index{Redshift ML}\index{in-database machine learning}\index{CREATE MODEL}\index{churn prediction}\index{SageMaker Autopilot}%
+\begin{objectives}
+\begin{itemize}
+    \item Explain Redshift ML architecture: SQL in front, SageMaker training behind, model functions in the warehouse.
+    \item Create models for regression, binary and multi-class classification, and K-Means clustering with \texttt{CREATE MODEL}.
+    \item Select problem types and objectives, and justify metric choice (e.g., F1 over accuracy) for imbalanced data.
+    \item Score live data with model functions directly in SQL and reason about data movement avoided.
+    \item Judge when a problem has outgrown Redshift ML and should graduate to full SageMaker.
+    \item Architect SQL-only daily inventory forecasting for 1{,}000 retail stores.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+Bringing the model to the data---rather than shipping data to a modeling platform---is a pattern every warehouse now offers.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{2.8cm}p{3.0cm}p{3.0cm}p{3.0cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{AWS} & \textbf{Azure} & \textbf{GCP} \\
+\midrule
+SQL-based ML & Redshift ML (CREATE MODEL) & Fabric SynapseML / T-SQL PREDICT & BigQuery ML (CREATE MODEL) \\
+AutoML behind the scenes & SageMaker Autopilot & Azure ML AutoML & Vertex AI AutoML \\
+In-warehouse scoring & SQL function per model & T-SQL PREDICT & ML.PREDICT \\
+Custom code path & BYO model via SageMaker & Synapse Spark MLlib & BigQuery remote models / Vertex \\
+Clustering & K-Means problem type & MLlib KMeans & ML.KMEANS \\
+\addlinespace
+Training data leaves warehouse? & Yes (to SageMaker, in-account) & Varies & No (BigQuery-native) \\
+Cost driver & SageMaker training + S3 staging & Capacity units & Bytes processed + training \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+\textbf{Snowflake} ML offers \texttt{CREATE MODEL} and Snowpark ML with warehouse-side scoring---the closest analog. \textbf{MongoDB} has no in-database ML; Atlas Vector Search addresses the adjacent similarity problem instead.
+\end{crosscloud}
+
+\section{Week 17 Roadmap and Mental Model}
+The next four weeks build machine learning into the data platform. Week~17 starts where the leverage is highest for a data engineer: \emph{inside the warehouse you already run}. Redshift ML lets you train a model with a SQL statement and call it like a function in a query---no notebook, no endpoint, no feature pipeline \cite{awsRedshiftMLDocs}.
+
+The mental model: \texttt{CREATE MODEL} is a compiler directive, not magic. Redshift exports the training data to S3, delegates training to Amazon SageMaker (Autopilot for automatic mode, or a specified algorithm), and compiles the winning model into a scalar function available in SQL. Knowing that architecture explains everything else in the week: the IAM role, the S3 staging bucket, the billing (SageMaker training time plus Redshift inference), and the limits---you get a good model with zero infrastructure, not arbitrary control over the modeling process.
+
+\begin{definitionbox}
+\textbf{Redshift ML} is a warehouse feature that trains machine-learning models via \texttt{CREATE MODEL} SQL statements---delegating training to SageMaker---and exposes the resulting model as a SQL function for in-database inference.
+\end{definitionbox}
+
+\begin{keyterms}
+\textbf{CREATE MODEL}: the DDL statement defining training data, target, problem type, and objective. \textbf{FUNCTION clause}: names the SQL function that scores rows. \textbf{Problem type}: regression, binary/multiclass classification, or K-Means. \textbf{Objective}: the metric Autopilot optimizes (F1, AUC, MSE, accuracy). \textbf{BYO model}: importing an existing SageMaker model for in-warehouse scoring. \textbf{Training/export bucket}: the S3 staging area where training data and artifacts land.
+\end{keyterms}
+
+\section{Monday: Redshift ML Architecture}
+\subsection{SQL in Front, SageMaker Behind}
+When \texttt{CREATE MODEL} runs, Redshift unloads the training query's result to the designated S3 bucket, calls SageMaker Autopilot (in automatic mode) to explore candidates, selects the best model against your objective, and deploys it as a function invocable in SQL \cite{awsRedshiftMLDocs}. Inference happens inside the warehouse---no per-row API calls, no endpoint to manage---which is the entire value proposition: \textbf{data never leaves your account's analytical plane for scoring, and the model travels to the data}.
+\index{CREATE MODEL}
+
+The IAM role attached to \texttt{CREATE MODEL} is the security boundary: it needs S3 access to the staging bucket and SageMaker permissions, and it should be scoped to exactly those---the role becomes the delegation point auditors ask about first.
+
+\begin{notebox}
+Redshift ML pricing has two meters: SageMaker training (charged per training resource-hour) and the S3 staging of training data and artifacts. Inference itself runs in the warehouse and consumes cluster compute. For iterative experimentation, cap Autopilot's candidates (\texttt{MAX\_CANDIDATES}) and runtime (\texttt{MAX\_RUNTIME}) in the model settings.
+\end{notebox}
+
+\section{Tuesday: Creating Models---Regression, Classification, K-Means}
+\subsection{The Three Problem Types}
+\textbf{Regression} predicts a continuous number (tomorrow's units sold). \textbf{Binary and multiclass classification} predict a label (churn/not-churn; product category). \textbf{K-Means} clusters unlabeled rows into $k$ groups (customer micro-segments)---unsupervised, so there is no target column. Automatic mode infers the problem type from the target column; production practice is to \emph{declare} \texttt{PROBLEM\_TYPE} and \texttt{OBJECTIVE} explicitly so the model's contract is in the DDL and reviewed like any schema.
+\index{regression}\index{classification}\index{K-Means}
+
+The training query is the feature-engineering surface. Everything conventional wisdom says about ML data applies: dedupe before training, exclude leaky columns (anything only knowable after the outcome), and treat the \texttt{SELECT} as a versioned artifact---the model is exactly as good as that query.
+
+\begin{pitfall}
+\textbf{Target leakage through the training query.} If \texttt{days\_to\_churn} or \texttt{winback\_offer\_sent} sneaks into the feature list, the model ``learns'' the answer and collapses in production. Review training queries for leakage with the same suspicion you review grants for over-permission.
+\end{pitfall}
+
+\section{Wednesday: Evaluation and Scoring in SQL}
+\subsection{Evaluation Where the Data Lives}
+Model metadata and validation metrics are queryable (\texttt{SHOW MODEL}, system views), so evaluation happens beside the data. The metric choice deserves the same care as the modeling: for imbalanced classification---5\% churn---\emph{accuracy} is a trap (predicting ``no churn'' always scores 95\%), while \textbf{F1} balances precision and recall on the minority class, and AUC summarizes ranking quality across thresholds. Setting \texttt{OBJECTIVE 'F1'} in the DDL is not a detail; it is the statement of what the business is optimizing.
+\index{F1 score}\index{class imbalance}
+
+\subsection{Scoring Live Data}
+Once the model state is \texttt{READY}, the function scores any row set in SQL---including live, current tables:
+
+\begin{lstlisting}[language=SQL,caption={Training a churn model and scoring live customers in SQL.},label={lst:ch17-churn}]
+CREATE MODEL customer_churn_model
+FROM (
+    SELECT tenure_months, monthly_spend, support_tickets,
+           avg_session_min, is_churned
+    FROM analytics.customers
+)
+TARGET is_churned
+FUNCTION fn_predict_churn
+IAM_ROLE 'arn:aws:iam::123456789012:role/RedshiftMLRole'
+SETTINGS (
+    S3_BUCKET 'ml-artifacts-bucket',
+    PROBLEM_TYPE 'binary_classification',
+    OBJECTIVE 'F1'
+);
+
+-- score live customers once the model state is READY
+SELECT customer_id, churn_prob
+FROM (
+    SELECT customer_id,
+           fn_predict_churn(tenure_months, monthly_spend,
+                            support_tickets, avg_session_min) AS churn_prob
+    FROM analytics.customers_current
+)
+WHERE churn_prob > 0.7;
+\end{lstlisting}
+
+The pattern to notice: scoring is a \emph{query}, so it composes with everything SQL already does---joins, filters, scheduled inserts into a risk-segment table that Chapter~16's reverse ETL can push to the CRM. That composability is why in-database ML punches above its modeling sophistication.
+\index{in-database scoring}
+
+\section{Thursday Hands-on Project: Churn Prediction in Pure SQL}
+\index{hands-on project!Redshift ML churn}
+Train a logistic-regression-style churn classifier on sample customer data and predict churn on live data---without leaving SQL.
+
+\subsection*{Lab Objectives}
+\begin{itemize}
+    \item Create the IAM role and staging bucket for Redshift ML.
+    \item Build a training dataset with a leaky column deliberately excluded (and documented).
+    \item Train with an explicit problem type and F1 objective; inspect validation metrics.
+    \item Score the current customer base and persist a risk table for downstream use.
+\end{itemize}
+
+\subsection*{Procedure}
+\begin{enumerate}
+    \item Create \texttt{RedshiftMLRole} trusted by \texttt{redshift.amazonaws.com}, with S3 access to \texttt{ml-artifacts-bucket} and the SageMaker permissions Redshift ML requires; attach it to the workgroup/namespace.
+    \item Build \texttt{analytics.customers} with features and the \texttt{is\_churned} label (synthetic is fine---five columns, 100k rows, roughly 10\% positive).
+    \item Run \cref{lst:ch17-churn}'s \texttt{CREATE MODEL}; poll \texttt{SHOW MODEL customer\_churn\_model} until state is \texttt{READY}; record the validation F1.
+    \item Score \texttt{analytics.customers\_current}; persist high-risk rows into \texttt{analytics.churn\_risk\_daily} with the score date---the table Chapter~16's reverse ETL consumes.
+    \item Retrain on a second synthetic batch and compare F1 to feel for data sensitivity.
+\end{enumerate}
+
+\subsection*{Verification}
+\begin{itemize}
+    \item \texttt{SHOW MODEL} reports \texttt{READY} with a validation F1 substantially above the majority-class baseline.
+    \item The risk table's score distribution is plausible (a minority above 0.7), and re-scoring is idempotent by score date.
+    \item The training query is version-controlled with its leakage exclusions noted.
+    \item Cost evidence: the SageMaker training line item for the run is captured and stated.
+\end{itemize}
+
+\section{Friday Use Case: SQL-Only Inventory Forecasting for 1,000 Stores}
+\index{use case!inventory forecasting}
+A retailer needs daily unit-demand forecasts per store per category for 1{,}000 stores, feeding the replenishment system. The data platform team is SQL-strong and ML-tooling-light; leadership wants minimal data movement. Design it on Redshift ML.
+
+\subsection{Architecture Decisions}
+\textbf{Problem shape.} Daily store-category demand is a regression problem with strong seasonality. Features come from the warehouse itself: trailing 7/28-day sales means, day-of-week and holiday flags, promotion indicators, price---all SQL-computable from \texttt{fact\_sales}. No feature leaves the warehouse; the training query is the feature pipeline.
+
+\textbf{Model topology.} One global model with store and category features usually beats 1{,}000 per-store models in both accuracy and operability---one \texttt{CREATE MODEL}, one function, one monitoring surface. Where a category behaves wildly differently (fresh food versus hardware), a handful of per-segment models is the middle path.
+
+\textbf{Scoring and serving.} A nightly scheduled query scores tomorrow's demand for every store-category into \texttt{forecast\_daily(store, category, date, forecast, model\_version)}. The replenishment system reads that table; the warehouse remains the only integration point. Chapter~16's reverse-ETL pattern applies if replenishment lives in a SaaS tool.
+
+\textbf{When to graduate.} The trigger list for moving to full SageMaker (Chapters 18--20): you need custom architectures (deep sequence models), per-model hyperparameter control, explainability reports the business requires, or latency-critical real-time inference. Daily batch forecasting from warehouse features hits none of those---which is precisely why Redshift ML is the right scope here.
+
+\begin{pitfall}
+\textbf{Using in-database ML to avoid building ML discipline.} Redshift ML removes infrastructure, not rigor. You still need train/validation honesty, a champion--challenger retraining cadence, forecast-accuracy monitoring (MAPE by store), and a documented owner for the training query. The SQL is easy; the lifecycle is the job.
+\end{pitfall}
+
+\section{Interview Q\&A}
+\subsection{Concepts and Trade-offs}
+\begin{enumerate}
+    \item \textbf{Q: What part of training does Redshift ML delegate to SageMaker?}\\
+    A: Everything past the export: Redshift unloads the training query to S3, SageMaker Autopilot (or a specified algorithm) trains and selects the model, and the winner is compiled back into a SQL function.
+    \item \textbf{Q: Why is in-database ML attractive for SQL-only forecasting pipelines?}\\
+    A: Features, training, and scoring all live where the data already is. No extraction pipelines, no endpoints, no new operational surface---the training query doubles as the feature pipeline.
+    \item \textbf{Q: What does the \texttt{FUNCTION} clause of \texttt{CREATE MODEL} define?}\\
+    A: The name and signature of the SQL function that scores rows, mapping argument order to the training query's feature columns.
+    \item \textbf{Q: Why choose F1 over accuracy for imbalanced churn data?}\\
+    A: With 5\% positives, always-negative scores 95\% accuracy while detecting nothing. F1 balances precision and recall on the minority class, aligning the objective with the business cost of missed churners.
+    \item \textbf{Q: When should you graduate from Redshift ML to full SageMaker?}\\
+    A: When you need custom architectures, fine hyperparameter control, formal explainability, or real-time low-latency inference---or when the team owns an ML platform practice that wants full lifecycle control.
+    \item \textbf{Q: What is target leakage and how do you catch it?}\\
+    A: A feature unknowable at prediction time contaminating training. Catch it by reviewing the training query column-by-column against the question ``is this knowable before the outcome?''
+\end{enumerate}
+
+\section{Further Reading}
+The Redshift ML documentation covers \texttt{CREATE MODEL} settings, problem types, objectives, BYO models, and cost controls \cite{awsRedshiftMLDocs}. The SageMaker guide provides the delegated-training context \cite{awsSageMakerDocs}. Kimball and Ross discuss the warehouse as the natural home for scored, conformed analytical outputs \cite{kimballDWToolkit}.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item Redshift ML is SQL front-end, SageMaker engine, in-warehouse inference---model comes to the data.
+    \item Declare \texttt{PROBLEM\_TYPE} and \texttt{OBJECTIVE} explicitly; the DDL is the model's contract.
+    \item The training query is the feature pipeline: version it, review it for leakage, own it.
+    \item Metric choice is business policy: F1 for imbalanced classification, never default accuracy.
+    \item Scoring as SQL composes with scheduled tables and reverse ETL---the compounding advantage.
+    \item Graduate to SageMaker for control and lifecycle needs, not for fashion; daily batch forecasting is Redshift ML's home turf.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Explain the two billing meters of Redshift ML and how \texttt{MAX\_CANDIDATES} interacts with them.
+    \item \textbf{(Conceptual)} Why does a global model with store features usually beat 1,000 per-store models?
+    \item \textbf{(Hands-on)} Run the Thursday project; then retrain with \texttt{OBJECTIVE 'Accuracy'} on the imbalanced data and compare confusion matrices.
+    \item \textbf{(Hands-on)} Add a leaky column to the training query, observe the inflated validation metric, and write the review note that catches it.
+    \item \textbf{(Hands-on)} Build \texttt{forecast\_daily} for ten synthetic stores and schedule its nightly refresh.
+    \item \textbf{(Design)} Design the champion--challenger process: how does a retrained model earn its way into the scoring path?
+    \item \textbf{(Design)} Specify the monitoring for the forecasting system: which accuracy metric, which granularity, which alarm thresholds.
+    \item \textbf{(Architecture)} The retailer adds a requirement for per-request pricing inference under 100 ms. Redesign the serving layer and justify leaving Redshift ML for that path.
+\end{enumerate}
+
+\section{Capstone Project: A Warehouse-Native Demand Forecasting Pipeline}\label{sec:ch17-capstone}
+\index{capstone project}\index{Redshift ML!capstone}
+
+\begin{capstonebox}
+\textbf{Mission.} Deliver the Friday scenario as a working system: feature engineering in SQL, a trained demand model, nightly batch forecasts into a served table, accuracy monitoring, and a documented retraining cadence---entirely within the warehouse plane.
+
+\textbf{Estimated time.} 5--7 hours in a sandbox AWS account.
+
+\textbf{What you\textquotesingle{}ll practice.}
+\begin{itemize}
+    \item Feature queries as versioned artifacts with leakage review.
+    \item Model DDL with explicit problem type, objective, and cost caps.
+    \item Nightly scoring into a contract-stable forecast table.
+    \item Forecast-accuracy monitoring as a first-class deliverable.
+\end{itemize}
+\end{capstonebox}
+
+\subsection*{Scenario}
+A 50-store pilot of the Friday scenario: daily forecasts per store-category for the top 20 categories, consumed by a replenishment prototype reading one table. Success means the pilot's forecast accuracy beats the incumbent naive (last-7-days-mean) baseline.
+
+\subsection*{Requirements}
+\textbf{Functional requirements.}
+\begin{itemize}
+    \item A versioned training query producing the feature set from \texttt{fact\_sales} history, with a leakage review note.
+    \item A trained regression model with capped Autopilot runtime, and its validation metrics recorded.
+    \item A nightly scoring job writing \texttt{forecast\_daily} with model version and score date.
+    \item An accuracy report comparing model versus naive baseline by category.
+\end{itemize}
+
+\textbf{Non-functional requirements.}
+\begin{itemize}
+    \item The IAM role is scoped to the staging bucket and required SageMaker actions only.
+    \item Training cost per run is measured and recorded; reruns are idempotent by date.
+    \item The forecast table's schema is a documented contract with the replenishment consumer.
+\end{itemize}
+
+\subsection*{Implementation Steps}
+\begin{enumerate}
+    \item Generate two years of synthetic store-category daily sales with seasonality and promotions.
+    \item Write and review the feature query; build the training view.
+    \item Train with capped settings; record validation metrics and cost.
+    \item Implement nightly scoring and the accuracy report against held-out days.
+    \item Wire the report to a weekly scheduled query; document the retraining trigger.
+    \item Write the consumer contract for \texttt{forecast\_daily}.
+\end{enumerate}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item The feature query, model DDL, and scoring job in version control.
+    \item Validation metrics, training-cost record, and the model-versus-baseline accuracy report.
+    \item The consumer contract and the retraining runbook.
+    \item IAM policy evidence for the scoped role.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item The model beats the naive baseline on held-out data by a stated, measured margin.
+    \item Nightly scoring is idempotent and lands before the replenishment read window.
+    \item The training query has a documented leakage review.
+    \item Every claim in the accuracy report is reproducible from recorded queries.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Add a per-segment model for the worst-forecast category and measure the lift.
+    \item Feed forecast versus actuals into a QuickSight dashboard with an anomaly alert.
+    \item Push stockout-risk segments to a mock replenishment API via the Chapter~16 reverse-ETL pattern.
+    \item Rebuild the same model in SageMaker Autopilot directly (Chapter~18) and compare control, cost, and accuracy.
+\end{itemize}

@@ -1,0 +1,263 @@
+\chapter{Production DataOps and the Enterprise Capstone}
+\index{Terraform}\index{Bicep}\index{dbt}\index{CI/CD}\index{GitHub Actions}\index{expand--contract}\index{infrastructure as code}%
+\begin{objectives}
+\begin{itemize}
+    \item Provision ADLS Gen2, Synapse, and Data Factory with Terraform's \texttt{azurerm} provider, and read Bicep as the Azure-native alternative.
+    \item Manage Terraform state in an Azure Storage backend with locking, and keep state files out of version control.
+    \item Structure a dbt project---models, tests, documentation---against Synapse or Fabric.
+    \item Build a GitHub Actions pipeline that validates Terraform and runs dbt tests on every pull request, with \texttt{apply} gated on review.
+    \item Deploy zero-downtime schema changes with the expand--contract pattern coordinated through dbt and lineage.
+    \item Design environment promotion (dev $\rightarrow$ test $\rightarrow$ prod) for data platform artifacts.
+    \item Complete the program's final capstone: a secure, governed, multi-subscription data mesh deployed entirely from code.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+Infrastructure as code, SQL-based transformation, and CI/CD are the most portable skills in this book---the same Terraform workflow and the same dbt project structure run against every cloud.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{3.0cm}p{2.9cm}p{3.1cm}p{3.2cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{AWS} & \textbf{Azure} & \textbf{GCP} \\
+\midrule
+Multi-cloud IaC & Terraform \texttt{aws} provider & Terraform \texttt{azurerm} provider & Terraform \texttt{google} provider \\
+Native IaC & CloudFormation / CDK & Bicep / ARM templates & Deployment Manager (legacy) / Config Controller \\
+Transform-as-code & dbt on Redshift/Athena & dbt on Synapse/Fabric & dbt on BigQuery \\
+CI/CD & CodePipeline / GitHub Actions & GitHub Actions / Azure DevOps & Cloud Build / GitHub Actions \\
+State backend & S3 + DynamoDB lock & Azure Storage + lease lock & GCS backend \\
+\addlinespace
+\multicolumn{4}{@{}l@{}}{\textbf{Fabric}: Git integration + deployment pipelines; \textbf{Snowflake}: dbt + Terraform provider; \textbf{MongoDB}: Atlas Terraform provider.} \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+Everything in this chapter is vendor-neutral discipline: declarative infrastructure, reviewed plans, tested transformations, and schema changes that never break a consumer mid-flight.
+\end{crosscloud}
+
+\begin{keyterms}
+\textbf{IaC}: infrastructure as code---declarative, versioned, reviewable environment definitions.\quad
+\textbf{Terraform state}: the recorded mapping of configuration to real resources; shared state needs a remote backend with locking.\quad
+\textbf{dbt}: SQL transformation framework with models, tests, and documentation as code.\quad
+\textbf{Expand--contract}: zero-downtime schema evolution: add new shape, migrate, switch reads, then remove the old.\quad
+\textbf{Environment promotion}: the same artifacts progressing dev $\rightarrow$ test $\rightarrow$ prod through gates.
+\end{keyterms}
+
+\section{Week 24 Overview: The Program Becomes a Platform}
+The final week is about \emph{repeatability}. Every resource built by hand in Chapters 1--23 becomes code; every deployment becomes a reviewed, tested pipeline run; every schema change becomes a migration that never breaks a consumer. This is DataOps: the application of software-engineering delivery discipline to data platforms. The chapter ends with the program's final capstone---the multi-subscription, zero-trust, governed data mesh that assembles everything.
+
+\section{Monday: Terraform and Bicep for Data Platforms}
+\index{Terraform}\index{Bicep}\index{state backend}
+
+\subsection{Terraform with the azurerm Provider}
+Terraform declares desired state; the \texttt{azurerm} provider maps it to Azure Resource Manager \cite{hashicorp2025azurerm}. The data-platform skeleton:
+
+\begin{lstlisting}[language={},caption={Terraform for the storage and orchestration foundation.},label={lst:ch24-terraform}]
+terraform {
+  required_providers {
+    azurerm = { source = "hashicorp/azurerm", version = "~> 4.0" }
+  }
+  backend "azurerm" {
+    resource_group_name  = "rg-tfstate"
+    storage_account_name = "sttfstate001"
+    container_name       = "tfstate"
+    key                  = "platform.tfstate"
+  }
+}
+provider "azurerm" { features {} }
+
+resource "azurerm_storage_account" "adls" {
+  name                     = "stadlsdemo001"
+  resource_group_name      = azurerm_resource_group.rg.name
+  location                 = azurerm_resource_group.rg.location
+  account_tier             = "Standard"
+  account_replication_type = "LRS"
+  is_hns_enabled           = true
+  public_network_access_enabled = false
+}
+
+resource "azurerm_data_factory" "adf" {
+  name                = "adf-demo-001"
+  resource_group_name = azurerm_resource_group.rg.name
+  location            = azurerm_resource_group.rg.location
+  identity { type = "SystemAssigned" }
+}
+\end{lstlisting}
+
+Two details carry the production weight. First, the \textbf{remote state backend} on Azure Storage with lease-based locking: state is the source of truth about what exists, so it must be shared, locked against concurrent applies, and never committed to git. Second, explicit security defaults: \texttt{public\_network\_access\_enabled = false} written \emph{in code}, because several resource types default to public.
+
+\subsection{Bicep: The Azure-Native Alternative}
+Bicep transpiles to ARM templates and offers first-day support for every Azure resource property, tight portal integration, and no state file (ARM tracks deployments) \cite{microsoft2025bicep}. Choose Bicep for Azure-only estates with ARM-native teams; choose Terraform for multi-cloud posture, the provider ecosystem (Databricks, dbt Cloud, Snowflake), and the plan/apply workflow maturity. Many organizations standardize on Terraform for data platforms and Bicep for foundational landing zones.
+
+\begin{pitfall}
+\textbf{terraform apply without review.} A destructive apply on a storage account is a data-loss event. The workflow is: \texttt{plan} on every pull request, review the plan like code, \texttt{apply} only from the protected main branch after merge---and state locking makes two applies at once impossible.
+\end{pitfall}
+
+\section{Tuesday: dbt---Transformations as Reviewed Code}
+\index{dbt}\index{incremental models}
+
+\subsection{Models, Tests, Documentation}
+A dbt project is a directory of SQL \textbf{models} (SELECT statements materialized as views/tables/incremental tables), \textbf{tests} (generic---unique, not-null, accepted-values, relationships---plus custom SQL tests), and generated \textbf{documentation} with lineage \cite{dbtlabs2025core}. Against Synapse or Fabric, dbt becomes the transformation layer the warehouse was missing: versioned SQL, reviewed in PRs, tested in CI, documented automatically. The \texttt{ref()} graph is a dependency DAG you did not have to draw---and, as Wednesday shows, the safety net for schema changes.
+
+\subsection{Incremental Models}
+Full refreshes do not scale; dbt \textbf{incremental} models append or merge new rows using a watermark column. The pattern pairs with Chapter 12's idempotency: incremental models with unique keys merge rather than duplicate, and \texttt{--full-refresh} remains the recovery path when logic changes invalidate history.
+
+\section{Wednesday: CI/CD and Zero-Downtime Schema Evolution}
+\index{CI/CD}\index{GitHub Actions}\index{expand--contract}
+
+\subsection{The Pipeline}
+The data platform's CI/CD workflow on GitHub Actions: on pull request---\texttt{terraform fmt/validate/plan}, \texttt{dbt build} against a CI schema, linting; on merge to main---\texttt{terraform apply}, ADF publish (the npm ADFUtilities pattern), dbt deploy to the next environment. Environment promotion is the same artifact set advancing through dev $\rightarrow$ test $\rightarrow$ prod with gates between: plan review, test evidence, and for prod, an approval.
+
+\begin{lstlisting}[language={},caption={Pull-request validation workflow (excerpt).},label={lst:ch24-actions}]
+name: pr-validate
+on: [pull_request]
+jobs:
+  terraform:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+      - run: terraform -chdir=infra init -backend=false
+      - run: terraform -chdir=infra validate
+      - run: terraform -chdir=infra plan -input=false
+  dbt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: pip install dbt-synapse
+      - run: dbt build --target ci        # models + tests against CI schema
+\end{lstlisting}
+
+\subsection{Expand--Contract Migrations}
+A breaking schema change---renaming \texttt{customer\_email}---ships as four ordered releases: (1) \textbf{expand}: add the new nullable column alongside the old; (2) \textbf{migrate}: dual-write new writes and backfill history (dbt incremental or ADF copy); (3) \textbf{switch reads}: a backward-compatible view shim so consumers keep one stable interface; (4) \textbf{contract}: drop the old column only after Purview lineage and the dbt \texttt{ref()} graph prove no consumer reads it. Every intermediate state is valid; no consumer breaks between releases.
+
+\begin{pitfall}
+\textbf{Contracting first.} The failure story is canonical: a release dropped \texttt{customer\_email} while the dbt model and the Power BI dataset still referenced it; dashboards failed at 09:00 and the fix needed a hot rollback and a full dbt re-run. Never drop until the dependency check---lineage plus \texttt{ref()} graph---returns zero readers, and ship the view shim in the same release as the column change.
+\end{pitfall}
+
+\section{Thursday Hands-on Project: Terraform + dbt + GitHub Actions}
+\index{hands-on lab}\index{Terraform!project}
+Create a GitHub repository containing Terraform that provisions an ADLS Gen2 account and an ADF instance, a dbt project with three models and five tests, and a workflow that validates Terraform and runs dbt tests on every pull request.
+
+\subsection{Build the Repository}
+\begin{enumerate}
+    \item \texttt{infra/}: the Terraform from Listing~\ref{lst:ch24-terraform}---resource group, HNS-enabled ADLS account with public access disabled, ADF with a system-assigned identity, and the remote state backend.
+    \item \texttt{transform/}: a dbt project with staging, intermediate, and mart models over the lab orders data; five tests: unique and not-null on the order key, accepted values on status, a relationship test to customers, a freshness test on source arrival.
+    \item \texttt{.github/workflows/}: Listing~\ref{lst:ch24-actions}, extended with the dbt job against a CI schema.
+\end{enumerate}
+
+\subsection{Prove the Gates}
+Open three pull requests: a valid change (both jobs green, plan output posted), a Terraform change that would enable public access (plan review catches it---this is why humans read plans), and a dbt change violating a test (dbt job red, merge blocked by branch protection). The red PRs are the deliverables: gates that have never fired are gates you have not verified.
+
+\section{Friday: Program Review and Certification Scheduling}
+\index{DP-700!revision}
+Close the program deliberately. Re-run Chapter 23's exam-mapping table against yourself; the capstones you shipped are the scenario practice the exam assumes. Identify the two weakest domains by mock-exam evidence, schedule both full-length mocks for the coming weekend and the next, and book the exam for when two consecutive mocks clear 80\%. Then do the more durable thing: keep the capstone repositories green. A platform you can still deploy from code in three months is worth more to your next employer than the badge.
+
+\section{Milestone 6 Capstone: The Secure, Governed, Multi-Subscription Data Mesh}\label{sec:ch24-capstone}
+\index{capstone project}\index{data mesh!capstone}\index{zero trust!capstone}
+
+\begin{capstonebox}
+\textbf{Mission:} Deploy the program's final architecture entirely from code: three subscriptions---ingestion with PII tokenization, analytics with Synapse and ADLS, governance with Purview---peered VNets, private endpoints everywhere, zero public access, dbt-gated loads, and a GitHub Actions pipeline that plans, tests, and applies under review.
+
+\textbf{Estimated time:} 12--16 hours.
+
+\textbf{What you will practice:}
+\begin{itemize}
+    \item Terraform modules per subscription with a locked remote state backend.
+    \item Zero-trust networking: private endpoints, DNS, exfiltration protection (Chapter 21).
+    \item Tokenized PII ingestion with event-driven processing (Chapters 13, 20, 23).
+    \item Governance-as-default: Purview, dbt gates, budgets (Chapter 22).
+\end{itemize}
+\end{capstonebox}
+
+\subsection*{Scenario}
+The conglomerate from Chapter 22 sanctions the mesh pilot: Subscription A ingests streaming PII and tokenizes it with Functions and Key Vault; Subscription B hosts the Synapse and ADLS analytics estate; Subscription C runs Purview governance. All traffic is private; all deployment is code; all loads are quality-gated. You are the platform team.
+
+\subsection*{Requirements}
+\begin{itemize}
+    \item \textbf{IaC:} one Terraform module per subscription; remote state with locking; nothing deployed by hand; \texttt{plan} on PRs, \texttt{apply} post-review.
+    \item \textbf{Network:} VNet peering, private DNS zones, private endpoints on every data service; \texttt{public\_network\_access\_enabled = false} in code, verified from outside.
+    \item \textbf{Ingestion:} Event Hubs $\rightarrow$ tokenization Function (Key Vault keys) $\rightarrow$ analytics estate; PHI never persists unmasked.
+    \item \textbf{Quality:} dbt project with at least three models and five tests gating the tokenized load; poisoned-batch demonstration.
+    \item \textbf{Governance:} sources registered and scanned in Purview; classifications evidenced before serving; cost budget per subscription with alerts.
+    \item \textbf{Review:} the Chapter 22 four-page monthly review produced from this estate's real outputs.
+\end{itemize}
+
+\subsection*{Reference Architecture}
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[node distance=1.2cm]
+        \node[stage] (suba) {Subscription A\\Ingestion\\Event Hubs + Functions\\(tokenize PII)};
+        \node[stage, right=1.6cm of suba] (subb) {Subscription B\\Analytics\\Synapse + ADLS\\dbt-gated loads};
+        \node[stage, below=1.4cm of suba] (subc) {Subscription C\\Governance\\Microsoft Purview};
+        \node[doc, below=1.4cm of subb] (net) {Peered VNets\\private endpoints + DNS\\zero public access};
+        \node[doc, right=1.6cm of subb] (cicd) {GitHub Actions\\plan $\rightarrow$ review $\rightarrow$ apply};
+        \draw[arrow] (suba) -- node[above,font=\scriptsize]{VNet peering} (subb);
+        \draw[arrow, dashed] (subc) -- (suba);
+        \draw[arrow, dashed] (subc) -- (subb);
+        \draw[arrow, dashed] (net) -- (subb);
+        \draw[arrow, dashed] (net) -| (suba);
+        \draw[arrow, dashed] (cicd) -- (subb);
+    \end{tikzpicture}%
+    }
+    \caption{Final capstone: a three-subscription, zero-trust, code-deployed data mesh with governance as the default path.}
+    \label{fig:ch24-capstone-arch}
+\end{figure}
+
+\subsection*{Implementation Steps}
+\begin{enumerate}
+    \item Write the three Terraform modules; configure the locked state backend; deploy Subscription C (governance) first.
+    \item Peer the VNets; create private DNS zones; deploy endpoints with DNS zone groups---the Listing~\ref{lst:ch21-pep} pattern as code.
+    \item Deploy the tokenization Function with Key Vault references; wire Event Hubs ingestion.
+    \item Deploy Synapse with public access disabled; register and scan sources in Purview.
+    \item Add the dbt project and the GitHub Actions gates; run the happy path and the poisoned batch.
+    \item Prove zero public reachability from outside; produce the cost budgets and the monthly review.
+\end{enumerate}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item The repository: Terraform modules, dbt project, workflows, and a README that deploys everything from clean.
+    \item Evidence: plan/apply history, dbt test results (pass and blocked), the outside-fails network proof, Purview classifications.
+    \item The cost report across three subscriptions and the four-page monthly review.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item \texttt{terraform destroy} followed by \texttt{apply} rebuilds the entire estate with no manual step.
+    \item No resource is publicly reachable; all cross-subscription traffic flows over private endpoints.
+    \item A poisoned tokenized batch is blocked by the dbt gate, quarantined, alerted, and audited.
+    \item A destructive plan (e.g., deleting a storage account) is visible in PR review and blocked by process.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Add a fourth domain subscription using only your modules and templates---the mesh handoff test.
+    \item Implement one expand--contract migration on a served table with the lineage-gated contract step.
+    \item Add Defender for Cloud and the Chapter 23 privacy calendar to the governance subscription.
+\end{itemize}
+
+\section{Key Takeaways for the Whole Program}
+\begin{itemize}
+    \item Storage decisions are architecture decisions; identity, networking, and lifecycle are designed, not defaulted.
+    \item Serve logically when you can, provision when you must, and always measure bytes, seconds, and dollars.
+    \item Pipelines are software: parameterized, tested, idempotent, and wired to fail loudly.
+    \item Streams are state: watermarks, checkpoints, and exactly-once are engineering, not configuration.
+    \item Models are data products: versioned features, gated promotion, and monitored drift.
+    \item Governance, privacy, and cost are the operating layer that makes everything else survivable at scale.
+    \item If it is not in code with a reviewed plan and a tested pipeline, it does not exist---that is the DataOps bar this book set out to teach.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Why does Terraform state need locking, and what failure does the lease prevent?
+    \item \textbf{(Conceptual)} Explain each expand--contract step and what breaks if step 4 precedes step 3.
+    \item \textbf{(Conceptual)} Why run \texttt{terraform plan} on PRs but \texttt{apply} only after merge and review?
+    \item \textbf{(Hands-on)} Complete the Thursday project with all three gate-proving pull requests.
+    \item \textbf{(Hands-on)} Convert one hand-built lab environment to Terraform and verify zero drift on plan.
+    \item \textbf{(Hands-on)} Add a dbt exposure documenting a Power BI dependency, then use lineage plus \texttt{ref()} to approve a contract step.
+    \item \textbf{(Design)} Design the environment-promotion gates for the capstone estate: what evidence advances dev $\rightarrow$ test $\rightarrow$ prod.
+    \item \textbf{(Design)} Write the ADR for Terraform versus Bicep for this estate.
+    \item \textbf{(Design)} Build your final two-week certification plan from two mock-exam result sets.
+    \item \textbf{(Interview)} Prepare a two-minute answer to ``walk me through how a column rename reaches production in your platform.''
+\end{enumerate}

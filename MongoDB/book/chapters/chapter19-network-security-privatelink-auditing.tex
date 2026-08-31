@@ -1,0 +1,255 @@
+\chapter{Network Security, PrivateLink, and Auditing}
+\index{network security}\index{PrivateLink}\index{VPC peering}\index{IP access list}\index{TLS}\index{auditing}\index{audit filter}\index{SIEM}\index{zero trust}%
+
+\begin{objectives}
+\begin{itemize}
+    \item Isolate Atlas traffic with IP access lists, VPC peering, and private endpoints (AWS PrivateLink, Azure Private Link, GCP Private Service Connect).
+    \item Enforce TLS 1.3 with custom certificate authorities across client, intra-cluster, and agent paths.
+    \item Write scoped JSON audit filters capturing identity events and sensitive-collection access.
+    \item Ship audit logs off-host to a SIEM with rotation, and treat audit gaps as incidents.
+    \item Enable auditing with a custom filter on a sensitive collection in the Thursday lab.
+    \item Architect a zero-trust perimeter for Atlas with real-time SIEM integration in the Friday engagement.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+Private connectivity and audit streaming are table stakes on every cloud; the vocabulary differs, the architecture does not.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{2.9cm}p{3.0cm}p{3.0cm}p{3.0cm}@{}} 
+\toprule
+\textbf{Capability} & \textbf{AWS} & \textbf{Azure} & \textbf{GCP} \\
+\midrule
+Private endpoint & PrivateLink & Private Link & Private Service Connect \\
+Coarse network gate & Security groups / NACLs & NSGs / firewall rules & VPC firewall rules \\
+Peering & VPC peering / TGW & VNet peering & VPC Network Peering \\
+TLS policy & ACM + TLS policies & Key Vault + TLS policy & Certificate Manager \\
+Audit stream & CloudTrail + engine logs & Diagnostic settings + Entra logs & Cloud Audit Logs \\
+SIEM targets & Security Hub / Splunk & Microsoft Sentinel & Chronicle / Splunk \\
+\addlinespace
+Snowflake / Fabric & \multicolumn{3}{l}{Network policies + private connectivity (AWS PrivateLink etc.); access history views for audit; Fabric routes through Entra and Purview} \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+MongoDB's specifics worth mastering: private endpoints into Atlas remove public exposure by construction, and the Enterprise/Atlas auditing framework emits filterable JSON events---identity, DDL, and scoped DML---that stream to your SIEM \cite{mongodbPrivateLinkDocs,mongodbAuditingDocs}.
+\end{crosscloud}
+
+\section{Week 19 Roadmap: The Perimeter and the Paper Trail}
+Chapter 17 established identity; Chapter 18 made data unreadable without keys. This week closes the two remaining surfaces: the network path (who can even reach the cluster) and the audit trail (the record of everything that happened). Neither is optional in a regulated deployment, and both are measured controls: a perimeter is proven by a connection audit, and an audit pipeline is proven by the events it demonstrably captured \cite{mongodbPrivateLinkDocs,mongodbAuditingDocs,mongodbTLSDocs}.
+
+\begin{definitionbox}
+A \textbf{zero-trust perimeter} for a database means: no public network path exists, every connection is authenticated and encrypted, every consequential action is recorded off-host, and every layer fails closed.
+\end{definitionbox}
+
+\begin{keyterms}
+\textbf{IP access list}: CIDR allowlist at the Atlas boundary. \textbf{Private endpoint}: a unidirectional private link from your network into Atlas. \textbf{Custom CA}: enterprise certificate authority issuing database certificates. \textbf{Audit filter}: the JSON predicate selecting recorded events. \textbf{SIEM}: the security event platform consuming audit streams. \textbf{Audit gap}: an interval where events were not captured or shipped---itself an incident.
+\end{keyterms}
+
+\section{Monday: Network Isolation}
+\subsection{The Perimeter Layers}
+Atlas network exposure is layered deliberately. \textbf{IP access lists}: the coarse outer gate---fine for fixed office egress, weak for cloud workloads with dynamic addresses. \textbf{VPC peering}: private routing between your VPC and Atlas's; mature but CIDR-planning-bound and non-transitive. \textbf{PrivateLink / Private Endpoint / PSC}: a unidirectional private endpoint from your VPC into Atlas---no public exposure at all, no CIDR coupling, and the correct answer for regulated workloads. Combined with cloud security groups on your side, the database becomes unreachable from the public internet by construction, not by policy.
+
+\begin{pitfall}
+\textbf{IP access lists as the production posture.} IP lists are brittle under dynamic cloud addressing, accumulate stale entries, and audit poorly. For anything regulated, they are a development convenience at most; the private endpoint is the perimeter.
+\end{pitfall}
+
+\subsection{Proving the Perimeter}
+A perimeter is a claim until tested. The verification habit: from a host outside the allowed paths, attempt the connection and confirm failure (fail closed, not fail open); enumerate the Atlas project's network configuration as code (Chapter 21) and diff it against policy; and review access-list entries on a schedule---every entry should have an owner and a reason, like firewall rules.
+
+\section{Tuesday: TLS Configuration}
+Enforce TLS 1.3 (or 1.2 minimum) with \texttt{net.tls} settings; in enterprise deployments use custom CAs so certificate issuance follows corporate PKI policy. In transit is easy to declare and easy to silently degrade: the operational checks are that clients fail closed (no \texttt{tlsAllowInvalidCertificates} anywhere outside a sandbox), that certificate expiry is monitored (an expired cert at 3 a.m.\ is an outage, not a security event), and that intra-cluster TLS (\texttt{clusterAuthMode: x509}) encrypts replication and sharding traffic too.
+
+\begin{pitfall}
+\textbf{Encrypting the client path but not the cluster path.} Default concern goes to application connections; replication, sharding, monitoring agents, and backup streams cross networks too. Verify TLS on every link.
+\end{pitfall}
+
+\subsection{Certificate Lifecycle}
+Certificates expire, authorities rotate, and clients pin. The lifecycle checklist: issuance from the corporate CA with documented validity periods, expiry monitoring with alerts at 30/14/7 days, a rotation runbook that has been executed (on Kubernetes the operator rolls it, Chapter 22), and a revocation path (CRL/OCSP) that is actually reachable from clients. Certificate management is where network security meets operations; an unmonitored expiry is a self-inflicted outage with a security flavor.
+
+\section{Wednesday: The Auditing Framework}
+MongoDB Enterprise and Atlas record auditable events---authentication attempts, authorization failures, DDL, and (by filter) DML on selected collections---as JSON lines to a file, syslog, or the console. The production posture is selective: audit everything about \emph{identity} (auth success/failure, role changes, user management) and everything touching \emph{sensitive collections}; auditing every read on every collection generates storage-filling noise that drowns the signal \cite{mongodbAuditingDocs}.
+
+\begin{lstlisting}[language=JavaScript, caption={Scoped audit filter: identity events plus all access to salaries.}]
+// mongod --auditFilter '...' (JSON), Enterprise/Atlas only:
+{
+  $or: [
+    { atype: { $in: ["authenticate", "authCheck", "createUser", "dropUser",
+                     "grantRolesToUser", "revokeRolesFromUser"] } },
+    { "param.ns": "hr.salaries" }       // every action on the sensitive collection
+  ]
+}
+\end{lstlisting}
+
+\subsection{Shipping and Protecting Audit Logs}
+An audit log that lives on the audited host protects nobody: a privileged attacker edits it. Ship audit events off-host in near-real time (Fluent Bit / a SIEM collector), retain them per the compliance schedule, and alert on audit-pipeline gaps---agent restarts and disk-full events are themselves audit incidents. The alerting on authorization-failure spikes from Chapter 17 doubles as a detection control: a spike usually means a misconfigured role or a probing attacker, and the runbook should distinguish the two deliberately.
+
+\begin{notebox}
+Audit verbosity is a cost knob: high-verbosity auditing generates significant I/O and log volume. Scope filters to sensitive collections and DDL, size the log destination for peak write windows, and monitor ingestion lag like any other pipeline (Chapter 16's lag discipline applies to the audit stream too).
+\end{notebox}
+
+\section{Thursday Hands-On Project: Auditing a Sensitive Collection}
+Enable auditing on a MongoDB Enterprise (or Atlas) lab deployment and capture a full access trail for a sensitive collection.
+
+\subsection{Lab Protocol}
+\begin{enumerate}
+    \item Start an Enterprise \texttt{mongod} with \texttt{--auditDestination file --auditFormat JSON} and the Wednesday audit filter, scoped to identity events plus the \texttt{hr.salaries} collection.
+    \item Create users with distinct roles (Chapter 17): one with \texttt{find} on \texttt{hr.salaries}, one without.
+    \item Execute the scripted scenario: permitted read, denied read, a DDL change, a role grant, and a failed login.
+    \item Parse the audit log (it is JSON lines) and produce the evidence table: one row per scenario step with the matching \texttt{atype}, user, and result.
+    \item Ship the log to a second directory via a scripted forwarder and delete one local line---demonstrate that the shipped copy is intact (the off-host property).
+\end{enumerate}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item The audit configuration, filter JSON, and scenario script.
+    \item The parsed evidence table mapping each action to its audit event.
+    \item The off-host shipping demonstration with the tamper comparison.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item Every scenario action---permitted, denied, DDL, grant, failed login---appears in the shipped log with actor and timestamp.
+    \item Benign traffic on non-sensitive collections does \emph{not} flood the log (the filter works).
+    \item The tamper test demonstrates the local log is not the source of truth.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Add the authorization-failure-spike alert using Chapter 23's monitoring stack and trigger it with a scripted probe.
+    \item Rotate the audit log and verify no events are lost across the rotation boundary.
+\end{itemize}
+
+\section{Friday Use Case and Architecture: The Zero-Trust Atlas Perimeter}
+\subsection{Scenario and Requirements}
+A financial-services firm must demonstrate to its regulator that MongoDB Atlas is unreachable from the public internet, that all traffic is encrypted under enterprise PKI policy, and that every access to regulated collections is recorded in the corporate SIEM within one minute.
+
+\subsection{Architecture}
+The perimeter in layers, each independently verified. Network: PrivateLink endpoints from each application VPC; the Atlas project has an empty IP access list---public connectivity is off by construction, not by rule. Transport: TLS 1.3 with certificates from the corporate CA; intra-cluster x.509; expiry monitoring with the 30/14/7-day alerts. Identity: Chapter 17's OIDC federation for humans and x.509 for services. Audit: the scoped filter streams identity events plus regulated-collection DML to the SIEM via a forwarder with its own health alert; the SIEM's detection content includes the authorization-failure-spike rule and impossible-travel on administrative logins. Verification: a monthly connectivity audit (external host must fail to connect), the configuration-as-code diff, and the Thursday-style evidence table regenerated per release.
+
+\begin{figure}[H]
+    \centering
+    \resizebox{0.95\textwidth}{!}{%
+    \begin{tikzpicture}[
+        layer/.style={rectangle, rounded corners, draw=primary, fill=primary!6, minimum width=2.7cm, minimum height=1.05cm, align=center, font=\small\bfseries},
+        sec/.style={rectangle, rounded corners, draw=red!60!black, fill=red!5, minimum width=2.7cm, minimum height=1.05cm, align=center, font=\small\bfseries},
+        arrow/.style={-{Stealth[length=2.5mm]}, draw=primary, thick}
+    ]
+        \node[layer] (app) at (0,0) {Application VPC\\(security groups)};
+        \node[layer] (pl) at (4.1,0) {PrivateLink\\endpoint};
+        \node[layer] (tls) at (8.1,0) {TLS 1.3\\corporate CA};
+        \node[layer] (atlas) at (12.1,0) {Atlas cluster\\(no public path)};
+        \node[sec] (siem) at (12.1,-2.2) {SIEM\\(audit stream,\\detections)};
+        \draw[arrow] (app) -- (pl);
+        \draw[arrow] (pl) -- (tls);
+        \draw[arrow] (tls) -- (atlas);
+        \draw[arrow, dashed] (atlas) -- (siem);
+    \end{tikzpicture}%
+    }
+    \caption{Zero-trust perimeter: private-only connectivity, enforced TLS under enterprise PKI, and the audit stream to the SIEM.}
+    \label{fig:ch19-zerotrust}
+\end{figure}
+
+\subsection{Guardrails}
+Three controls keep the perimeter honest: the empty-public-access posture is asserted by a scheduled configuration check (drift pages the platform team), certificate expiry alerts are tested quarterly with a short-lived cert, and the audit pipeline's own health is monitored---a silent audit gap pages as a security incident, per this week's production discipline.
+
+\section{Interview Q\&A}
+\subsection{Perimeter and Audit}
+\begin{enumerate}
+    \item \textbf{Q: Why is PrivateLink preferred over IP access lists?}\\
+    A: Private endpoints remove public exposure by construction and decouple from CIDR churn; IP lists are brittle under dynamic addressing, accumulate stale entries, and audit poorly.
+
+    \item \textbf{Q: Why enforce TLS 1.3 with custom certificate authorities?}\\
+    A: Custom CAs keep issuance, rotation, and revocation under enterprise PKI policy; TLS 1.3 is the current floor. The operational half---fail-closed clients and expiry monitoring---is where deployments actually break.
+
+    \item \textbf{Q: What do audit filters limit?}\\
+    A: Which events are recorded: identity events plus scoped DML on sensitive collections, instead of a full-fidelity stream that fills disks and drowns detections.
+
+    \item \textbf{Q: Why ship audit logs off-host?}\\
+    A: A host-privileged attacker can edit local logs; the trail is trustworthy only where the compromised host cannot rewrite it. The audit pipeline's own health is monitored as an incident class.
+
+    \item \textbf{Q: Name the layers of a zero-trust Atlas perimeter.}\\
+    A: No public path (PrivateLink), encrypted transport (TLS 1.3, custom CA), authenticated identity (OIDC/x.509), least-privilege authorization (Chapter 17), encryption in use where required (Chapter 18), and the off-host audit stream---each independently verified.
+\end{enumerate}
+
+\section{Further Reading}
+Atlas private-endpoint documentation covers PrivateLink, Private Link, and PSC \cite{mongodbPrivateLinkDocs}; TLS configuration is in the server manual \cite{mongodbTLSDocs}; the auditing framework and filter syntax are in the auditing manual \cite{mongodbAuditingDocs}. Chapter 17 provides the identity layer this perimeter protects \cite{mongodbSecurityChecklistDocs,mongodbRBACDocs}, and Chapter 23's alert runbooks operationalize the gap detections \cite{mongodbAtlasMonitoringDocs}.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item Perimeter by construction beats perimeter by policy: private endpoints, empty public access lists.
+    \item TLS fails silently: fail-closed clients, expiry monitoring, and intra-cluster encryption are the operational half.
+    \item Audit identity events and sensitive collections; verbosity is a cost knob, not a virtue.
+    \item Audit logs are evidence only off-host; the shipping pipeline is monitored like any other.
+    \item Audit gaps are incidents with runbooks, not shrugged-at log lines.
+    \item Every layer is verified: connectivity audits, config-as-code diffs, and regenerated evidence tables.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Order the three network options (IP list, peering, private endpoint) by auditability and justify the ranking.
+    \item \textbf{(Conceptual)} Why must \texttt{tlsAllowInvalidCertificates} never survive outside a sandbox, and how do you detect it in client configs?
+    \item \textbf{(Conceptual)} Which audit events prove ``who granted this privilege,'' and what is their retention requirement?
+    \item \textbf{(Hands-on)} Run the Thursday lab and produce the evidence table.
+    \item \textbf{(Hands-on)} Attempt a connection from an unauthorized network and capture the fail-closed evidence.
+    \item \textbf{(Design)} Design the SIEM detection pack for a MongoDB estate: five detections with their log sources.
+    \item \textbf{(Design)} Write the certificate-expiry runbook: detection thresholds, rotation steps, rollback.
+    \item \textbf{(Interview)} ``The audit shows nothing for the night of the incident.'' Walk the investigation.
+\end{enumerate}
+
+\section{Capstone Project: Zero-Trust Perimeter Evidence Pack}\label{sec:ch19-capstone}
+
+\begin{capstonebox}
+\textbf{Mission:} produce the perimeter-and-audit evidence pack for a regulated Atlas deployment: PrivateLink-only connectivity verified from an unauthorized host, TLS 1.3 under a custom CA with expiry alerting, scoped auditing shipped off-host, and a detection demonstration---all configuration as code.
+
+\textbf{Estimated time:} 5--7 hours.
+
+\textbf{What you will practice:}
+\begin{itemize}
+    \item Building private-only database connectivity and proving it adversarially.
+    \item Operating TLS under enterprise PKI with lifecycle controls.
+    \item Producing audit evidence that survives scrutiny.
+\end{itemize}
+\end{capstonebox}
+
+\subsection*{Scenario}
+The regulator's perimeter review requires demonstration: show that the cluster cannot be reached publicly, that transport meets policy, and that regulated-collection access is provably recorded. You deliver the pack and run the demonstration live.
+
+\subsection*{Requirements}
+\begin{itemize}
+    \item Private-endpoint connectivity with the public path disabled, plus a scripted external-host connection attempt that fails closed.
+    \item TLS 1.3 with a custom CA; expiry alerts at 30/14/7 days demonstrated with a short-lived certificate.
+    \item The scoped audit filter deployed as code; the Thursday evidence table regenerated against it.
+    \item Off-host audit shipping with the tamper demonstration and a monitored pipeline-health check.
+    \item One SIEM detection (authorization-failure spike) demonstrated end to end.
+\end{itemize}
+
+\subsection*{Implementation Steps}
+\begin{enumerate}
+    \item \textbf{Isolate.} Deploy the private endpoint; remove public access; run the adversarial connection test.
+    \item \textbf{Encrypt.} Configure TLS under the custom CA; inject the expiring certificate; capture the alert.
+    \item \textbf{Audit.} Deploy the filter; regenerate the evidence table; ship off-host; run the tamper test.
+    \item \textbf{Detect.} Wire and fire the authorization-failure detection.
+    \item \textbf{Package.} Assemble the pack: configs as code, test outputs, alert evidence, and the runbook links.
+\end{enumerate}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item All network, TLS, and audit configuration as code.
+    \item The adversarial connection evidence, expiry-alert evidence, and audit evidence table.
+    \item The detection demonstration and the pipeline-health monitor.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item The external connection attempt fails closed with captured evidence.
+    \item The audit trail captures the full scenario and only the scoped events.
+    \item Every control is reproducible from the repository without manual steps.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Add impossible-travel detection on administrative logins and test it with simulated logins.
+    \item Extend the pack with Chapter 20's retention policy for the audit archive itself.
+\end{itemize}

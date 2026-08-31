@@ -1,0 +1,348 @@
+\chapter{Real-Time Delivery with Amazon Data Firehose}
+\index{Kinesis Data Firehose}\index{Amazon Data Firehose}\index{inline transformation}\index{format conversion}\index{data delivery}\index{anonymization}%
+\begin{objectives}
+\begin{itemize}
+    \item Explain Firehose delivery-stream architecture: sources, buffering, transformation, and destinations.
+    \item Configure inline Lambda transformations and reason about their latency and cost.
+    \item Convert JSON to Parquet or ORC in flight and explain the downstream cost impact.
+    \item Design delivery reliability: source-record backup, retry behavior, and failure destinations.
+    \item Build an end-to-end pipeline from Kinesis Data Streams through Firehose to Parquet on S3.
+    \item Architect a real-time anonymization pipeline for healthcare HL7 messages destined for Redshift.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+Managed stream-to-sink delivery---buffer, transform, convert, land---exists in every platform, usually as a feature of the streaming service rather than a separate product.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{2.8cm}p{3.0cm}p{3.0cm}p{3.0cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{AWS} & \textbf{Azure} & \textbf{GCP} \\
+\midrule
+Managed stream delivery & Data Firehose & Event Hubs Capture & Pub/Sub export subscriptions / Dataflow templates \\
+Inline transformation & Lambda in Firehose & Capture (no transform) / Functions pattern & Dataflow / Cloud Run functions \\
+In-flight format conversion & JSON $\rightarrow$ Parquet/ORC & Via downstream Synapse/Fabric & Via Dataflow \\
+Warehouse delivery & Firehose $\rightarrow$ Redshift & Event Hubs $\rightarrow$ Synapse & Pub/Sub $\rightarrow$ BigQuery (Storage Write API) \\
+Search delivery & Firehose $\rightarrow$ OpenSearch & Event Hubs $\rightarrow$ Elastic & Pub/Sub $\rightarrow$ Elasticsearch \\
+\addlinespace
+Buffering model & Size + interval hints & Time/size capture windows & Subscription batching \\
+Failure handling & S3 backup + error prefixes & Dead-lettering & Dead-letter topics \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+\textbf{Snowflake} Snowpipe Streaming is the same idea aimed at one destination: the warehouse table. \textbf{Fabric} Eventstreams route to lakehouse tables with optional transformation. \textbf{MongoDB} sits on the receiving end via sink connectors or trigger-based loads.
+\end{crosscloud}
+
+\section{Week 14 Roadmap and Mental Model}
+Week~13 ended at the stream: ordered, durable, replayable---and useless until the data lands somewhere analysts can touch. Amazon Data Firehose (formerly Kinesis Data Firehose) is the managed answer to the most common streaming question: \emph{get these records from the stream into S3/Redshift/OpenSearch/HTTP, batched sensibly, optionally transformed, without me running any consumers} \cite{awsFirehoseDocs}.
+
+Firehose is deliberately not a stream processor. There are no windows, no joins, no state (that is Chapter~15). What it offers is the \emph{delivery} concerns done right: buffering by size and time, inline Lambda transformation, JSON-to-Parquet conversion, compression, encryption, retries, and a backup copy of the raw records. The week's craft is knowing exactly where its ceiling is---and never asking it to do Chapter~15's job.
+
+\begin{definitionbox}
+\textbf{Amazon Data Firehose} is a fully managed delivery service: it consumes records (from Kinesis Data Streams, MSK, or direct puts), buffers them by size and interval, optionally transforms them with Lambda and converts their format, and delivers the batch to a destination with retry and raw-backup handling.
+\end{definitionbox}
+
+\begin{keyterms}
+\textbf{Delivery stream}: the Firehose resource binding a source to a destination with buffering and transform configuration. \textbf{Buffer hints}: size (1--128 MB) and interval (60--900 s for S3) controlling batch formation. \textbf{Inline transformation}: a Lambda invocation per buffer batch that can modify, enrich, or drop records. \textbf{Data format conversion}: schema-driven JSON-to-Parquet/ORC conversion using the Glue catalog. \textbf{Source-record backup}: a raw copy of incoming records to a separate S3 prefix, independent of delivery success.
+\end{keyterms}
+
+\section{Monday: Firehose Architecture and Destinations}
+\subsection{The Delivery Pipeline}
+A delivery stream's lifecycle per batch: read records from the source, invoke the transformation Lambda if configured, convert format if configured, buffer to the size or interval hint, compress and encrypt, write to the destination, and retry per destination-specific policy. Every stage is observable via CloudWatch metrics---\texttt{DeliveryToS3.Success}, \texttt{ExecuteProcessing.Success}, and friends---which is where your alarms live.
+\index{delivery stream}\index{buffer hints}
+
+Destinations include S3 (the lake landing zone), Redshift (via an intermediate S3 COPY---Firehose stages, then issues COPY), OpenSearch, Splunk, and generic HTTP endpoints for third-party services. The Redshift path's S3 staging detail matters operationally: failed or retried deliveries accumulate in the intermediate bucket unless lifecycle rules (Chapter~1) clean them.
+
+\subsection{Buffering Is a Latency--Efficiency Trade}
+Buffer hints trade delivery latency against file economics. A 60-second / 1~MB buffer lands data fast but writes many small files---which Chapter~7 taught us to fear at query time. A 15-minute / 128~MB buffer writes few large, Parquet-friendly files at the cost of freshness. There is no correct setting, only a stated freshness budget per destination: dashboards get tight buffers; the data lake gets fat ones.
+\index{buffering}
+
+\begin{tipbox}
+When freshness and file economics conflict, split the stream: two delivery streams from the same Kinesis source---one with tight buffers to a ``hot'' prefix for near-real-time reads, one with fat buffers to the curated lake. Streams are multi-consumer by design; use it.
+\end{tipbox}
+
+\section{Tuesday: Inline Transformation with Lambda}
+\subsection{Per-Batch Record Surgery}
+Attach a Lambda function and Firehose passes each buffered batch through it; the function returns every record marked \texttt{Ok} (deliver), \texttt{Dropped} (discard), or \texttt{ProcessingFailed} (retry, then route to the error prefix) \cite{awsFirehoseDocs,awsLambdaDocs}. This is the right tool for per-record work: uppercasing fields, enriching from a lookup, masking a column, validating shape, splitting one record into two. It is the wrong tool for anything requiring state across records---dedup windows, joins, aggregations all belong in Flink (Chapter~15).
+\index{inline transformation}
+
+\subsection{Latency and Cost Accounting}
+Each transformation adds the Lambda's execution time to the batch's path and bills Lambda GB-seconds plus Firehose's transformation surcharge per GB. At high volume the discipline is: keep the function small (no network calls per record---batch lookups), keep memory modest, and set the retry duration so a flapping dependency cannot stall delivery indefinitely. Source-record backup (Wednesday) is what makes aggressive transformation safe: the untouched original always exists.
+\index{Lambda cost}
+
+\begin{pitfall}
+\textbf{Per-record external API calls inside the transformation.} A Lambda that calls an enrichment API per record multiplies a 10{,}000-record batch into 10{,}000 sequential or throttled calls, blowing the batch timeout and backing up the stream. Cache lookups in the function's memory, batch the API, or move enrichment to a stateful stream processor.
+\end{pitfall}
+
+\section{Wednesday: In-Flight Format Conversion}
+\subsection{JSON In, Parquet Out}
+Firehose can convert JSON records to Parquet or ORC during delivery, using a table definition in the Glue Data Catalog as the schema of record. The payoff compounds downstream: Chapter~7's scanned-bytes economics apply immediately, no conversion job required. The constraints: incoming records must match the catalog schema (mismatches land in the error prefix), and the schema lives in one place---which is exactly the contract discipline of Chapter~11.
+\index{format conversion}\index{Parquet conversion}
+
+\begin{notebox}
+Conversion failures and transformation failures write to different error prefixes under your S3 error output (\texttt{processing-failed/}, \texttt{format-conversion-failed/}). Alarm on both; a misconfigured schema version can silently divert an entire day's records into the error path while the main prefix stays green on \emph{zero delivered}---a metric worth alarming on too.
+\end{notebox}
+
+\subsection{Source-Record Backup}
+Enabling source-record backup writes every incoming record---pre-transformation---to a separate S3 prefix, regardless of delivery outcome. This is your replay capability and your audit trail: when the transformation has a bug, when Redshift rejects a load, when a regulator asks what \emph{actually} arrived, the raw prefix answers. The cost is one extra S3 write path; the alternative is reconstructing history from a log that rolled past retention.
+\index{source-record backup}
+
+\section{Thursday Hands-on Project: Stream to Parquet via Firehose}
+\index{hands-on project!Firehose transformation}
+Connect a Firehose delivery stream to the Week~13 Kinesis stream, transform records with Lambda, convert to Parquet, and land in S3---with raw backup enabled.
+
+\subsection*{Lab Objectives}
+\begin{itemize}
+    \item Create a delivery stream sourcing from \texttt{iot-temperature-stream}.
+    \item Attach a Lambda that uppercases all incoming string values.
+    \item Enable JSON-to-Parquet conversion against a Glue catalog table.
+    \item Verify curated Parquet output, error prefixes, and the raw backup prefix.
+\end{itemize}
+
+\subsection*{Procedure}
+First the transformation function:
+
+\begin{lstlisting}[language=Python,caption={Firehose transformation Lambda: uppercase every string field.},label={lst:ch14-lambda}]
+import base64
+import json
+
+def lambda_handler(event, context):
+    output = []
+    for record in event["records"]:
+        payload = json.loads(base64.b64decode(record["data"]))
+        transformed = {
+            k: (v.upper() if isinstance(v, str) else v)
+            for k, v in payload.items()
+        }
+        output.append({
+            "recordId": record["recordId"],
+            "result": "Ok",
+            "data": base64.b64encode(
+                (json.dumps(transformed) + "\n").encode("utf-8")
+            ).decode("utf-8"),
+        })
+    return {"records": output}
+\end{lstlisting}
+
+Register the schema the converter will use (matching the transformed record shape), then create the delivery stream:
+
+\begin{lstlisting}[language=bash,caption={Glue table for schema-of-record, then the delivery stream.},label={lst:ch14-firehose}]
+$Bucket = "acme-analytics-raw-123456789012"
+
+# Schema of record for JSON -> Parquet conversion
+aws glue create-table --database-name week7_lake --table-input "{`
+  `"Name`":`"iot_readings`",`
+  `"StorageDescriptor`":{`
+    `"Columns`":[`
+      {`"Name`":`"sensor_id`",`"Type`":`"string`"},`
+      {`"Name`":`"ts`",`"Type`":`"bigint`"},`
+      {`"Name`":`"temp_c`",`"Type`":`"double`"},`
+      {`"Name`":`"battery_pct`",`"Type`":`"int`"}],`
+    `"Location`":`"s3://$Bucket/curated/iot/`",`
+    `"InputFormat`":`"org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat`",`
+    `"OutputFormat`":`"org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat`",`
+    `"SerdeInfo`":{`"SerializationLibrary`":`
+      `"org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe`"}}}"
+
+# Delivery stream: KDS source, Lambda transform, Parquet to S3, raw backup on
+aws firehose create-delivery-stream --cli-input-json "{
+  `"DeliveryStreamName`": `"iot-to-lake`",
+  `"DeliveryStreamType`": `"KinesisStreamAsSource`",
+  `"KinesisStreamSourceConfiguration`": {
+    `"KinesisStreamARN`": `"arn:aws:kinesis:us-east-1:123456789012:stream/iot-temperature-stream`",
+    `"RoleARN`": `"arn:aws:iam::123456789012:role/FirehoseRole`" },
+  `"ExtendedS3DestinationConfiguration`": {
+    `"BucketARN`": `"arn:aws:s3:::$Bucket`",
+    `"Prefix`": `"curated/iot/`",
+    `"ErrorOutputPrefix`": `"errors/iot/`",
+    `"BufferingHints`": { `"SizeInMBs`": 64, `"IntervalInSeconds`": 300 },
+    `"CompressionFormat`": `"UNCOMPRESSED`",
+    `"RoleARN`": `"arn:aws:iam::123456789012:role/FirehoseRole`",
+    `"ProcessingConfiguration`": { `"Enabled`": true, `"Processors`": [{
+      `"Type`": `"Lambda`",
+      `"Parameters`": [{ `"ParameterName`": `"LambdaArn`",
+        `"ParameterValue`": `"arn:aws:lambda:us-east-1:123456789012:function:UppercaseTransform`" }] }]},
+    `"DataFormatConversionConfiguration`": {
+      `"Enabled`": true,
+      `"InputFormatConfiguration`": { `"Deserializer`": {
+        `"OpenXJsonSerDe`": {} } },
+      `"OutputFormatConfiguration`": { `"Serializer`": {
+        `"ParquetSerDe`": {} } },
+      `"SchemaConfiguration`": {
+        `"DatabaseName`": `"week7_lake`", `"TableName`": `"iot_readings`",
+        `"RoleARN`": `"arn:aws:iam::123456789012:role/FirehoseRole`",
+        `"CatalogId`": `"123456789012`" } },
+    `"S3BackupMode`": `"Enabled`",
+    `"S3BackupConfiguration`": {
+      `"BucketARN`": `"arn:aws:s3:::$Bucket`",
+      `"Prefix`": `"raw-backup/iot/`",
+      `"RoleARN`": `"arn:aws:iam::123456789012:role/FirehoseRole`" } } }"
+\end{lstlisting}
+
+(The listing keeps Firehose's snake-case JSON verbatim inside PowerShell strings; in real deployments this configuration belongs in Terraform---Chapter~24.)
+
+\subsection*{Verification}
+\begin{itemize}
+    \item Parquet files appear under \texttt{curated/iot/} within one buffer interval; Athena reads them via the Glue table and shows uppercased \texttt{sensor\_id} values.
+    \item The \texttt{raw-backup/iot/} prefix contains the pre-transformation JSON.
+    \item A record violating the schema (drop a field from the producer) lands under \texttt{errors/iot/format-conversion-failed/} while valid records continue.
+    \item CloudWatch shows \texttt{DeliveryToS3.Success} at 1.0 and non-zero \texttt{DeliveryToS3.DataFreshness} under the buffer interval.
+\end{itemize}
+
+\section{Friday Use Case: Real-Time HL7 Anonymization into Redshift}
+\index{use case!HL7 anonymization}
+A health network streams HL7 admission/discharge/transfer messages from hospital systems. Analysts need near-real-time occupancy and flow dashboards in Redshift, but messages contain patient identifiers that must never reach the warehouse. Design the anonymization pipeline.
+
+\subsection{Architecture}
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[
+        box/.style={rectangle, rounded corners, draw=primary, thick, fill=primary!6, align=center, minimum width=2.9cm, minimum height=1.0cm, font=\small\bfseries},
+        guard/.style={rectangle, rounded corners, draw=red!60!black, thick, fill=red!5, align=center, minimum width=2.7cm, minimum height=0.95cm, font=\footnotesize\bfseries},
+        storebox/.style={cylinder, shape aspect=0.25, draw=primary, thick, fill=blue!6, shape border rotate=90, align=center, text width=2.6cm, minimum height=1.25cm, font=\footnotesize\bfseries},
+        arr/.style={-{Stealth[length=2.5mm]}, draw=primary, thick}
+    ]
+        \node[box] (hl7) at (0,0) {Hospital HL7\\feeds (MLLP)};
+        \node[box] (ing) at (3.3,0) {Ingest layer\\parse + validate};
+        \node[box] (kds) at (6.6,0) {Kinesis Data\\Streams};
+        \node[guard] (anon) at (9.9,1.2) {Firehose + Lambda\\tokenize PHI};
+        \node[storebox] (raw) at (9.9,-1.4) {S3 raw backup\\(restricted)};
+        \node[box] (rs) at (13.0,0) {Redshift\\dashboards};
+        \draw[arr] (hl7) -- (ing);
+        \draw[arr] (ing) -- (kds);
+        \draw[arr] (kds) -- (anon);
+        \draw[arr] (anon) -- (rs);
+        \draw[arr, dashed] (kds) |- (raw);
+    \end{tikzpicture}%
+    }
+    \caption{HL7 anonymization pipeline: tokenization happens in the delivery path; only de-identified records reach Redshift; the restricted raw backup preserves originals under separate controls.}
+    \label{fig:ch14-hl7}
+\end{figure}
+
+\subsection{Design Decisions}
+\textbf{Tokenize, don't mask.} The Lambda transformation replaces the patient identifier with a token from a dedicated tokenization store (deterministic, so the same patient links across messages; mapping table in a separate account with separate keys). Irreversible masking would break longitudinal analysis; raw identifiers would break the compliance boundary. Chapter~23 covers the erasure implications.
+
+\textbf{Two destinations, two trust levels.} The Redshift destination receives only tokenized records via Firehose's COPY path. The raw backup---which contains PHI---lands in a bucket with Object Lock, separate KMS keys, and Lake Formation grants limited to the privacy team. The backup exists for replay and audit, not for analytics.
+
+\textbf{Failure discipline.} \texttt{ProcessingFailed} records route to the error prefix with alarmed depth; a failing tokenizer must never fail-open to delivering raw PHI. The Lambda's retry budget is short and the alarm is loud, because the alternative to latency here is not risk---it is compliance exposure.
+
+\textbf{Freshness.} Occupancy dashboards tolerate five minutes; the buffer is 5 minutes / 16 MB, and the intermediate Redshift staging prefix has a lifecycle rule because failed COPY attempts accumulate there silently.
+
+\begin{pitfall}
+\textbf{Anonymizing after the warehouse.} Any design that lands PHI in Redshift ``temporarily'' has already failed the requirement---Redshift snapshots, logs, and Spectrum exports all inherit the copy. De-identification belongs in the delivery path, before the first analytical write.
+\end{pitfall}
+
+\section{Interview Q\&A}
+\subsection{Concepts and Trade-offs}
+\begin{enumerate}
+    \item \textbf{Q: Name three native Firehose destinations.}\\
+    A: S3, Redshift (via an intermediate S3 COPY), and OpenSearch---plus Splunk and generic HTTP endpoints.
+    \item \textbf{Q: Why enable source-record backup to S3 on a delivery stream?}\\
+    A: It preserves the pre-transformation originals regardless of delivery success: replay after a transformation bug, audit of what actually arrived, and recovery when a destination rejects records.
+    \item \textbf{Q: What do inline Lambda transformations add to latency and cost?}\\
+    A: The function's execution time per batch plus Lambda GB-seconds and Firehose's per-GB transformation surcharge. Small, stateless functions keep both modest; per-record network calls explode them.
+    \item \textbf{Q: Why convert JSON to Parquet during Firehose delivery?}\\
+    A: It eliminates a separate conversion job and makes the lake columnar at landing---the scanned-bytes cost savings (Chapter~7) apply from the first query.
+    \item \textbf{Q: Where does data land when Redshift delivery keeps failing?}\\
+    A: In the intermediate S3 staging prefix Firehose uses for its COPY---which is why that prefix needs lifecycle rules and the \texttt{DeliveryToRedshift.Success} metric needs an alarm.
+    \item \textbf{Q: What can Firehose's Lambda transformation never correctly do?}\\
+    A: Anything requiring state across records: dedup windows, joins, aggregations. Those belong in a stream processor (Chapter~15).
+\end{enumerate}
+
+\section{Further Reading}
+The Firehose Developer Guide covers buffering, transformation, format conversion, backup, and per-destination retry behavior \cite{awsFirehoseDocs}; the Lambda guide covers the batch-response contract and execution model \cite{awsLambdaDocs}. The Glue catalog's schema-of-record role is documented with the Data Catalog \cite{awsGlueCatalogDocs}, and the privacy patterns build on Chapter~1's encryption and Chapter~8's governance \cite{awsKMSDocs,awsLakeFormationDocs}.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item Firehose is managed delivery, not stream processing: buffer, transform per record, convert format, land, retry, back up.
+    \item Buffer hints are a stated freshness--efficiency trade per destination; split streams when one stream needs both ends.
+    \item Inline Lambda is for per-record surgery; state belongs in Flink; per-record API calls are the classic scaling bug.
+    \item In-flight Parquet conversion makes the lake columnar at landing, with the Glue catalog as schema of record.
+    \item Source-record backup is the replay and audit floor---enable it before you need it.
+    \item De-identification belongs in the delivery path; a warehouse that ever held raw PHI inherits that copy everywhere.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Explain why Firehose-to-Redshift is a two-hop delivery and what operational duty the hop creates.
+    \item \textbf{(Conceptual)} A team wants exactly-once delivery into S3 from Firehose. Explain what Firehose actually guarantees and how to get idempotent effects downstream.
+    \item \textbf{(Hands-on)} Complete the Thursday lab; then change the buffer to 1 MB / 60 s and quantify the small-file explosion with an Athena query-time comparison.
+    \item \textbf{(Hands-on)} Break the transformation Lambda (raise an exception) and document where records go and which metrics move.
+    \item \textbf{(Hands-on)} Point a second delivery stream at the same Kinesis stream with different buffer hints and compare the two prefixes.
+    \item \textbf{(Design)} Design the tokenization store for the HL7 case: consistency requirements, latency budget, key management, and the re-identification process for authorized care use.
+    \item \textbf{(Design)} A vendor needs a subset of the stream via HTTPS. Design the HTTP-endpoint delivery with its retry and failure posture.
+    \item \textbf{(Architecture)} Add Macie (Chapter~23) scanning of the raw-backup prefix and describe the finding workflow for PHI discovered where none should persist.
+\end{enumerate}
+
+\section{Capstone Project: A Governed Streaming Delivery Layer}\label{sec:ch14-capstone}
+\index{capstone project}\index{Firehose!capstone}
+
+\begin{capstonebox}
+\textbf{Mission.} Build the delivery layer for a streaming platform: one Kinesis stream feeding governed delivery to a Parquet lake and a Redshift serving tier, with inline transformation, in-flight conversion, raw backup, and full failure-path evidence.
+
+\textbf{Estimated time.} 4--6 hours in a sandbox AWS account.
+
+\textbf{What you\textquotesingle{}ll practice.}
+\begin{itemize}
+    \item Multi-destination delivery design from a single stream.
+    \item Transformation and format-conversion configuration with error-path observability.
+    \item Buffer-hint tuning against a stated freshness budget.
+    \item Backup, lifecycle, and alarm hygiene for every prefix Firehose touches.
+\end{itemize}
+\end{capstonebox}
+
+\subsection*{Scenario}
+An e-commerce company streams order events. Analysts query the curated lake (Parquet, five-minute freshness acceptable); the operations dashboard reads Redshift (one-minute freshness desired); compliance requires a tamper-evident raw archive. One stream, three requirements.
+
+\subsection*{Requirements}
+\textbf{Functional requirements.}
+\begin{itemize}
+    \item One Kinesis stream; two delivery streams (lake and Redshift) plus raw backup on both.
+    \item The lake path converts to Parquet against a catalog schema; the Redshift path stages through a lifecycle-managed prefix.
+    \item An inline transformation normalizes currency codes and drops internal-only fields before any analytical landing.
+    \item Alarms on delivery success, transformation failures, error-prefix depth, and data freshness.
+\end{itemize}
+
+\textbf{Non-functional requirements.}
+\begin{itemize}
+    \item Every prefix Firehose writes has a lifecycle policy and an owner.
+    \item The internal-only fields are demonstrably absent from lake and warehouse, verified by query and by Macie-style scan.
+    \item A destination outage drill shows records preserved and recoverable.
+\end{itemize}
+
+\subsection*{Implementation Steps}
+\begin{enumerate}
+    \item Create the stream and register the catalog schema for conversion.
+    \item Build the two delivery streams with their buffer postures.
+    \item Implement and test the transformation Lambda, including the \texttt{Dropped} path for internal fields.
+    \item Configure backup prefixes with Object Lock on the compliance archive.
+    \item Run the outage drill: disable the Redshift endpoint, observe, restore, recover.
+    \item Write the freshness budget table and the alarm rationale.
+\end{enumerate}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item Delivery-stream configurations as code or exported JSON.
+    \item Query evidence: Parquet lake and Redshift both populated, internal fields absent.
+    \item The outage-drill write-up with metric screenshots and recovery steps.
+    \item Alarm definitions and the freshness budget.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item Curated Parquet is queryable within the stated lake freshness budget.
+    \item Redshift dashboards see data within their budget, with staging-prefix lifecycle hygiene proven.
+    \item Raw backup contains pre-transformation records and is access-separated.
+    \item Transformation failure routes records to error prefixes and pages---never silently drops.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Add an OpenSearch destination for operational search over the same stream.
+    \item Replace direct conversion with an Iceberg-aware landing using a Flink job (Chapter~15) and compare trade-offs.
+    \item Add per-record PII detection in the Lambda using a managed service and measure the latency/cost impact.
+    \item Build the cost model: Firehose GB, Lambda GB-s, conversion surcharge, versus a self-run consumer fleet.
+\end{itemize}

@@ -1,0 +1,254 @@
+\chapter{Vertex AI Foundations: Training, Registry, and Serving}
+\index{Vertex AI}\index{AutoML}\index{Model Registry}\index{endpoints}\index{Explainable AI}\index{custom training}
+
+\begin{objectives}
+\begin{itemize}
+    \item Map the Vertex AI ecosystem and choose between AutoML and custom training.
+    \item Train an AutoML Tabular model on a BigQuery dataset and version it in the Model Registry.
+    \item Deploy models to managed endpoints and choose between online and batch prediction.
+    \item Interpret feature attributions from Explainable AI for model consumers.
+    \item Request an online prediction with a cURL call against a deployed endpoint.
+    \item Design a secure GPU training workflow for data scientists working from governed BigQuery data.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+Managed ML platforms converge on the same lifecycle---train, register, deploy, explain---behind different consoles.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{2.8cm}p{3.0cm}p{3.0cm}p{3.0cm}@{}} \\
+\toprule
+\textbf{Capability} & \textbf{GCP Vertex AI} & \textbf{AWS SageMaker} & \textbf{Azure ML / Fabric} \\
+\midrule
+AutoML (tabular) & AutoML Tabular & Autopilot & Automated ML \\
+Custom training & Training jobs (any framework) & Training jobs & Compute clusters/jobs \\
+Model registry & Vertex Model Registry & Model Registry & MLflow model registry \\
+Online serving & Endpoints & Endpoints & Online endpoints \\
+Batch scoring & Batch prediction & Batch transform & Batch endpoints \\
+Explainability & Explainable AI attributions & Clarify & Responsible AI dashboards \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+\textbf{Snowflake} embeds Snowpark ML and Cortex for in-warehouse inference; \textbf{MongoDB} users typically serve models adjacent to Atlas via app-tier integrations; \textbf{Databricks ML} unifies lakehouse training with MLflow. For the data engineer, the constant is the interface contract: features in, predictions out, lineage and governance around both.
+\end{crosscloud}
+
+\begin{keyterms}
+\textbf{Vertex AI}: Google Cloud's unified ML platform for training, registry, deployment, and monitoring.
+\textbf{AutoML}: managed model search and training over a dataset with minimal code.
+\textbf{Model Registry}: the versioned store of trained models with lineage and aliases.
+\textbf{Endpoint}: a managed serving resource hosting one or more deployed models with traffic splitting.
+\textbf{Batch prediction}: offline scoring of a dataset to files or BigQuery, without a live endpoint.
+\textbf{Feature attribution}: per-feature contribution scores (e.g., sampled Shapley) explaining a prediction.
+\end{keyterms}
+
+\section{Week 18 Roadmap}
+Week~18 moves from SQL-native ML to the full platform. Monday maps the Vertex AI ecosystem and the AutoML-versus-custom decision. Tuesday covers the Model Registry and endpoint deployment. Wednesday covers Explainable AI. Thursday trains and deploys an AutoML Tabular model from BigQuery and calls it with cURL. Friday designs the secure GPU workflow for data scientists.
+
+\begin{definitionbox}
+\textbf{Vertex AI} is Google Cloud's managed machine-learning platform: datasets from BigQuery or Cloud Storage, AutoML and custom training on managed infrastructure, a versioned Model Registry, online endpoints and batch prediction, Explainable AI, pipelines, and model monitoring under one API and permission model \cite{googlecloudvertexaidocs}.
+\end{definitionbox}
+
+\section{Monday: The Ecosystem and AutoML versus Custom Training}
+\index{Vertex AI!ecosystem}\index{AutoML vs custom training}
+
+\subsection{The Platform Map}
+Vertex AI's components compose: \textbf{Datasets} reference BigQuery tables or Cloud Storage files; \textbf{training} runs AutoML or custom jobs (your container, any framework, managed GPUs); the \textbf{Model Registry} versions artifacts with lineage back to dataset and code; \textbf{endpoints} serve online predictions; \textbf{batch prediction} scores datasets offline; \textbf{Feature Store}, \textbf{Pipelines}, and \textbf{Model Monitoring} (Chapter~19) close the loop. For the data engineer, the key property is that data never leaves governed storage: training reads BigQuery in place, and predictions can write back to it.
+
+\subsection{AutoML or Custom}
+AutoML Tabular searches architectures and hyperparameters over your table---strong baselines with zero modeling code, ideal when the problem is standard tabular classification/regression and the team's constraint is time or ML depth. Custom training wins when you need a specific architecture, custom loss, non-tabular data, fine control over the training loop, or a framework the team already knows (TensorFlow, PyTorch, XGBoost). The professional pattern: AutoML establishes the baseline in days; custom training must beat it measurably to justify its operational cost.
+
+\begin{pitfall}
+AutoML's convenience hides a data contract: schema, label semantics, and time-splits are inputs you still own. An AutoML model trained on leaky features (columns unknowable at prediction time) performs beautifully in evaluation and collapses in production. Leakage review is a human responsibility no platform automates.
+\end{pitfall}
+
+\begin{tipbox}
+Always declare the time column for temporal problems so AutoML's split respects chronology. Random splits on temporal data leak the future into training---the same trap as Chapter~17, one platform layer up.
+\end{tipbox}
+
+\section{Tuesday: Model Registry and Endpoint Deployment}
+\index{Model Registry!versioning}\index{endpoints!online vs batch}\index{traffic splitting}
+
+\subsection{Registry as the System of Record}
+Every model version in the Registry carries its artifact, framework, metrics, dataset lineage, and labels; aliases (\texttt{production}, \texttt{challenger}) decouple consumers from version numbers. The registry is where governance lives: approvals are alias changes, rollbacks are alias moves, audits are lineage queries. Data engineers feed it (training pipelines) and consume it (batch-scoring jobs that resolve \texttt{production} rather than hardcoding a version).
+
+\subsection{Online versus Batch Serving}
+\textbf{Online endpoints} serve single predictions with millisecond latency for interactive flows---checkout fraud checks, next-best-action---and bill for provisioned machine time with configurable min/max replicas per deployed model, plus traffic splitting for canary rollouts. \textbf{Batch prediction} scores a BigQuery table or file set into BigQuery or Cloud Storage with no endpoint to run---the right answer for nightly scoring of millions of rows. The decision is latency and traffic shape, not model quality: the same registered model serves both.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.6cm}p{4.4cm}p{4.4cm}@{}} \\
+\toprule
+\textbf{Dimension} & \textbf{Online endpoint} & \textbf{Batch prediction} \\
+\midrule
+Latency & Milliseconds, per request & Minutes to hours, per dataset \\
+Cost shape & Always-on replicas (min nodes) & Per job, scales to zero \\
+Traffic management & Split across model versions & One model per job \\
+Best for & Interactive flows (checkout, API) & Nightly scores, list generation \\
+\bottomrule
+\end{tabular}
+\caption{Online versus batch serving on Vertex AI \cite{googlecloudvertexaidocs}.}
+\label{tab:ch18-online-vs-batch}
+\end{table}
+
+\begin{pitfall}
+\texttt{min\_replica\_count=0} eliminates idle cost but reintroduces cold-start latency on the first request after idle---tens of seconds of spinner on a checkout flow. If an endpoint serves humans, keep at least one warm replica or accept and measure the cold-start tail.
+\end{pitfall}
+
+\section{Wednesday: Explainable AI and Feature Attributions}
+\index{Explainable AI}\index{feature attributions}\index{Shapley}
+
+Explainable AI returns \textbf{feature attributions} with each prediction: per-feature contribution scores (sampled Shapley or integrated gradients, method depending on model type) answering ``why this score for this input.'' For data engineers, attributions serve two operational purposes beyond model trust. First, \textbf{debugging the data pipeline}: when a feature's attribution suddenly dominates or vanishes, the feature computation upstream likely broke---attributions are a distribution-shift canary. Second, \textbf{consumer communication}: a credit-decision or churn-retention system owes its users reasons, and attribution payloads are the raw material of those explanations. Persist attributions alongside predictions in BigQuery so both uses are queryable later.
+
+\begin{notebox}
+Attributions explain the model, not the world: they describe what the model used, which is exactly what you need for debugging and disclosure, and not evidence that the model's reasoning is causally correct.
+\end{notebox}
+
+\section{Thursday Hands-On Project: AutoML Tabular from BigQuery to a Live Endpoint}
+\index{hands-on project}\index{AutoML Tabular}\index{online prediction!cURL}
+This lab trains an AutoML Tabular model on a cleaned BigQuery dataset, registers it, deploys it to an endpoint, and scores it with cURL.
+
+\subsection{Train via the Console or API}
+\begin{enumerate}
+    \item Create a Vertex AI tabular dataset from \texttt{analytics.churn\_features} (the Chapter~17 feature table, cleaned and labeled).
+    \item Launch an AutoML Tabular classification training job: label \texttt{will\_churn}, a declared time column if present, a one-hour training budget, and explainability enabled.
+    \item When training completes, review evaluation metrics in the Registry---the same reading as Chapter~17: AUC, precision/recall at threshold.
+\end{enumerate}
+
+\subsection{Deploy and Predict}
+\begin{lstlisting}[language=bash,caption={Deploying the model to an endpoint and requesting an online prediction.}]
+$env:PROJECT_ID = "my-gcp-vertex-lab"
+$env:REGION = "us-central1"
+$env:MODEL = "churn-automl-lab"
+$env:ENDPOINT = "churn-endpoint-lab"
+
+gcloud ai endpoints create --region=$env:REGION --display-name=$env:ENDPOINT
+
+# Deploy with one warm replica (note the endpoint/model IDs from output):
+gcloud ai endpoints deploy-model <ENDPOINT_ID> `
+  --region=$env:REGION --model=<MODEL_ID> `
+  --display-name=churn-v1 `
+  --machine-type=n1-standard-4 --min-replica-count=1 --max-replica-count=2
+
+@'
+{"instances": [{"visits": 12, "pageviews": 45, "timeonsite": 620,
+                "country": "United States", "deviceCategory": "desktop"}]}
+'@ | Set-Content -Path .\instance.json
+
+$token = (gcloud auth print-access-token)
+Invoke-RestMethod -Method Post `
+  -Uri "https://$env:REGION-aiplatform.googleapis.com/v1/projects/$env:PROJECT_ID/locations/$env:REGION/endpoints/<ENDPOINT_ID>:predict" `
+  -Headers @{ Authorization = "Bearer $token" } `
+  -ContentType "application/json" `
+  -InFile .\instance.json
+\end{lstlisting}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item Training-job configuration and the evaluation report screenshot from the Registry.
+    \item The endpoint ID, deployed-model details, and a successful prediction response with attributions.
+    \item A cost note: training hours, endpoint replica-hours, and the batch alternative for this workload.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item The model trains from a governed BigQuery table with a declared time-based split where applicable.
+    \item The endpoint serves a prediction with feature attributions via a scripted call.
+    \item The Registry shows the model version with lineage to the dataset.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Score the same dataset via batch prediction to BigQuery and compare per-row cost with the endpoint.
+    \item Run a challenger AutoML config behind a 90/10 traffic split and compare live metrics.
+    \item Wire prediction logging into BigQuery and chart attribution drift over a week of synthetic traffic.
+\end{itemize}
+
+\section{Friday Use Case and Architecture: Secure GPU Training over Governed Data}
+\index{GPU training}\index{data scientist workflow}\index{secure ML}
+
+\subsection{Scenario}
+A fintech's data scientists train custom TensorFlow models on GPUs. Training data lives in BigQuery under row access policies and policy tags (Chapter~8); regulatory policy forbids exporting row-level PII to local laptops; the platform team must provide self-service GPU training without weakening the governance perimeter.
+
+\subsection{Architecture}
+Scientists work in Vertex AI Workbench instances inside the project VPC---no public IPs, access via Identity-Aware Proxy, Workload Identity instead of downloaded keys (Chapter~21). Training jobs read BigQuery through the BigQuery Storage API with the scientist's or pipeline's identity, so policy tags and row policies filter what training can even see; derived feature tables carry their own policy tags. Custom training jobs run as managed Vertex jobs on GPU machine types with the training service account scoped to read the feature dataset and write only to a designated model-artifacts bucket under CMEK. Registered models flow to staging endpoints automatically; production alias moves require an approver group.
+
+\begin{figure}[H]
+    \centering
+    \resizebox{0.95\textwidth}{!}{%
+    \begin{tikzpicture}[
+        db/.style={cylinder, shape border rotate=90, aspect=0.25, draw=primary, thick, fill=primary!10, text width=2.9cm, minimum height=1.2cm, align=center, font=\small\bfseries},
+        svc/.style={rectangle, rounded corners, draw=primary, thick, fill=primary!6, text width=3.0cm, minimum height=1.0cm, align=center, font=\small\bfseries},
+        sec/.style={rectangle, rounded corners, draw=magenta, thick, fill=magenta!8, text width=3.0cm, minimum height=0.9cm, align=center, font=\footnotesize\bfseries},
+        arrow/.style={-{Stealth[length=2.5mm]}, draw=primary, thick},
+        dasharrow/.style={-{Stealth[length=2.5mm]}, draw=codegray, thick, dashed}
+    ]
+        \node[db] (bq) at (0,0) {BigQuery\\feature tables\\policy tags};
+        \node[svc] (wb) at (4.4,1.4) {Vertex Workbench\\private VPC, IAP};
+        \node[svc] (train) at (4.4,-1.4) {Vertex Training\\GPU jobs\\scoped SA};
+        \node[svc] (reg) at (9.2,0) {Model Registry\\staging alias};
+        \node[sec] (iam) at (12.8,0) {IAM + VPC-SC\\+ CMEK + audit};
+
+        \draw[arrow] (bq) -- (wb);
+        \draw[arrow] (bq) -- (train);
+        \draw[arrow] (wb) -- (train);
+        \draw[arrow] (train) -- (reg);
+        \draw[dasharrow] (iam) -- (bq);
+        \draw[dasharrow] (iam) -- (reg);
+    \end{tikzpicture}%
+    }
+    \caption{Secure GPU workflow: governed reads, scoped training identities, gated production promotion.}
+    \label{fig:ch18-secure-gpu-training}
+\end{figure}
+
+\begin{tipbox}
+Give scientists their speed through \emph{pre-approved paths}: a golden container image with their frameworks, a feature-store dataset contract, and a one-command job submission. Governance that makes the secure path the easy path gets followed; governance that blocks work gets routed around.
+\end{tipbox}
+
+\begin{pitfall}
+Notebook persistence is a data-exfiltration channel: a Workbench instance with a mounted home directory and egress to the internet can carry training data anywhere. Disable public IPs, route egress through controlled NAT with logging, and include notebook disks in the CMEK and VPC-SC posture.
+\end{pitfall}
+
+\section{Interview Q\&A}
+\subsection{Concepts and Trade-offs}
+\begin{enumerate}
+    \item \textbf{Q: When is AutoML Tabular sufficient versus custom training?}\\
+    A: When the problem is standard tabular classification/regression and time or ML depth is the constraint; custom training earns its cost for specific architectures, custom losses, or non-tabular data---and must beat the AutoML baseline measurably.
+
+    \item \textbf{Q: What does the Model Registry version control?}\\
+    A: Model artifacts with framework, metrics, dataset and code lineage, labels, and aliases---making promotion an alias move and rollback trivial.
+
+    \item \textbf{Q: Online versus batch prediction: which serves a checkout flow?}\\
+    A: Online endpoints---millisecond, per-request latency with warm replicas. Batch prediction serves nightly offline scoring where latency is irrelevant.
+
+    \item \textbf{Q: What do feature attributions tell a model consumer?}\\
+    A: Which features contributed most to this specific prediction---enough for reason codes and debugging, not causal proof.
+
+    \item \textbf{Q: Why deploy through an endpoint rather than calling the model directly?}\\
+    A: Endpoints add the operational layer---scaling, traffic splitting, monitoring, IAM---that raw model artifacts lack; consumers integrate once with the endpoint, not with every model version.
+\end{enumerate}
+
+\section{Further Reading}
+Read the Vertex AI documentation for datasets, AutoML, custom training, endpoints, and Explainable AI \cite{googlecloudvertexaidocs}. The BigQuery Storage API and policy-tag enforcement behind secure training reads are covered in the BigQuery documentation \cite{googlecloudbigquerydocs}. Chapter~19's pipeline and monitoring documentation completes the lifecycle \cite{googlecloudvertexpipelines}, and Chapter~21's VPC Service Controls documentation covers the perimeter referenced here \cite{googlecloudvpcscdocs}.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item AutoML is the baseline generator; custom training must beat it to justify its operational weight.
+    \item The Registry is the system of record: lineage in, aliases out, approvals as alias moves.
+    \item Online endpoints serve interactive flows with warm-replica cost; batch prediction scales to zero for offline scoring.
+    \item Feature attributions double as pipeline debugging canaries and consumer-facing reason codes.
+    \item Secure training means governed reads in place, scoped service accounts, private workbenches, and gated promotion.
+    \item Leakage and time-split discipline are human responsibilities at every level of platform abstraction.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} A team wants custom PyTorch training for a standard tabular churn model before any AutoML baseline exists. Construct the argument you would have with them.
+    \item \textbf{(Conceptual)} Explain how traffic splitting plus the \texttt{production} alias gives you canary deployment with instant rollback.
+    \item \textbf{(Hands-on)} Reproduce the Thursday lab, then batch-score the same dataset to BigQuery and reconcile scores against endpoint predictions.
+    \item \textbf{(Hands-on)} Persist ten attribution payloads to BigQuery and write the query finding the feature with the largest week-over-week attribution shift.
+    \item \textbf{(Design)} Write the IAM and network specification for the Friday fintech: roles per persona, service accounts, egress rules, and the promotion approval flow.
+    \item \textbf{(Architecture)} Add a cost model: endpoint replicas versus batch prediction for three traffic shapes (interactive API, nightly scores, monthly deep analysis).
+\end{enumerate}

@@ -1,0 +1,283 @@
+\chapter{The MongoDB Kubernetes Operator}
+\index{Kubernetes}\index{operator}\index{CRD}\index{MongoDB Community Operator}\index{Enterprise Operator}\index{StatefulSet}\index{rolling upgrade}\index{reconciliation loop}%
+
+\begin{objectives}
+\begin{itemize}
+    \item Explain Custom Resource Definitions and the operator reconciliation loop.
+    \item Deploy replica sets and sharded clusters on Kubernetes via MongoDB custom resources.
+    \item Automate rolling upgrades, TLS certificate rotation, and storage scaling through the operator.
+    \item Contrast the Community and Enterprise Operators and the operator--Ops Manager relationship.
+    \item Deploy the Community Operator on Minikube and run a rolling upgrade in the Thursday lab.
+    \item Architect a private-cloud database-as-a-service on the Enterprise Operator.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+Managed Kubernetes is commoditized across clouds; the database-on-Kubernetes question---operator versus managed service---is asked identically everywhere.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{2.9cm}p{3.0cm}p{3.0cm}p{3.0cm}@{}} 
+\toprule
+\textbf{Capability} & \textbf{AWS} & \textbf{Azure} & \textbf{GCP} \\
+\midrule
+Managed K8s & EKS & AKS & GKE \\
+Operator hosting & EKS + operators & AKS + operators & GKE + operators (Autopilot caveats) \\
+Stateful workload primitive & EBS-backed PVCs & Azure Disk PVCs & PD-backed PVCs \\
+DBaaS alternative & DocumentDB / RDS & Cosmos DB & Atlas on GCP / Firestore \\
+Secrets & Secrets Manager + ESO & Key Vault CSI/ESO & Secret Manager + ESO \\
+\addlinespace
+Snowflake / Fabric & \multicolumn{3}{l}{N/A as SaaS---but Snowpark Container Services runs containerized services next to data, the inverse direction} \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+The operator pattern itself---declare desired state as a custom resource, let a controller reconcile---is now the industry default for stateful software on Kubernetes, from databases to certificate managers \cite{mongodbK8sOperatorDocs,kubernetesDocs}.
+\end{crosscloud}
+
+\section{Week 22 Roadmap: Declarative Databases}
+Chapter 21 made Atlas declarative through Terraform; this week makes self-managed MongoDB declarative through Kubernetes. The operator is the translation layer: you declare a \texttt{MongoDB} custom resource (three members, TLS on, version 8.0), and the operator continuously reconciles cluster reality against it---creating StatefulSets, wiring TLS, orchestrating elections, and rolling upgrades. The engineering questions are what the operator automates, what it cannot decide for you, and when the whole approach loses to Atlas \cite{mongodbK8sOperatorDocs}.
+
+\begin{definitionbox}
+A \textbf{Kubernetes operator} is a controller that watches Custom Resource Definitions (CRDs)---such as \texttt{MongoDB} or \texttt{MongoDBOpsManager}---and reconciles actual cluster state toward the declared spec in a continuous loop.
+\end{definitionbox}
+
+\begin{keyterms}
+\textbf{CRD}: the API extension defining database objects. \textbf{Reconciliation loop}: observe $\to$ diff $\to$ act, forever. \textbf{StatefulSet}: the workload primitive giving pods stable identity and storage. \textbf{PVC}: persistent volume claim, the database's disk. \textbf{Rolling upgrade}: member-at-a-time version advance preserving availability. \textbf{Operator scope}: namespace-scoped versus cluster-scoped watching.
+\end{keyterms}
+
+\section{Monday: Operator Architecture}
+\subsection{CRDs and the Reconciliation Loop}
+Installing the operator registers CRDs and runs a controller pod. When you apply a \texttt{MongoDB} resource, the loop observes the spec, diffs it against live state (StatefulSets, Services, Secrets, the replica-set configuration itself), and acts: create missing members, update the replica-set config, roll pods whose spec changed. The same loop heals drift continuously---delete a pod and the StatefulSet recreates it; the operator re-asserts the replica-set membership. This is Chapter 5's machinery, with Kubernetes as the process supervisor.
+
+\subsection{What the Operator Owns---and What It Cannot Decide}
+The operator automates deployment topology, membership, TLS wiring, version rolls, and (Enterprise) backup/agent configuration. It cannot choose your shard key, size your working set (Chapter 12), design your network policy, or decide whether three availability zones of anti-affinity matter for your SLO. The declarative spec encodes your decisions; the operator executes them reliably. Teams that treat the CRD as the whole design discover the difference during their first zonal outage with all three members in one zone.
+
+\begin{pitfall}
+\textbf{Forgetting cgroup-aware cache sizing.} Inside containers, WiredTiger sizes from visible memory (Chapter 12): set \texttt{cacheSizeGB} explicitly in the spec and align pod requests/limits with it, or the kubelet's OOM killer becomes your cache-eviction policy.
+\end{pitfall}
+
+\section{Tuesday: Deploying Databases as Custom Resources}
+\subsection{A Replica Set as YAML}
+\begin{lstlisting}[language=yaml, caption={A three-member TLS-enabled replica set as a custom resource.}]
+apiVersion: mongodbcommunity.mongodb.com/v1
+kind: MongoDBCommunity
+metadata:
+  name: orders-rs
+spec:
+  members: 3
+  type: ReplicaSet
+  version: "8.0.0"
+  security:
+    authentication:
+      modes: ["SCRAM", "X509"]
+    tls:
+      enabled: true
+      certificateKeySecretRef:
+        name: orders-rs-cert          # cert-manager or corporate PKI
+  users:
+    - name: orders-api
+      db: admin
+      passwordSecretRef: { name: orders-api-pw }   # from ESO/vault, never literal
+      roles: [ { name: readWrite, db: shop } ]
+  statefulSet:
+    spec:
+      template:
+        spec:
+          topologySpreadConstraints:                 # one member per zone
+            - maxSkew: 1
+              topologyKey: topology.kubernetes.io/zone
+              whenUnsatisfiable: DoNotSchedule
+\end{lstlisting}
+
+Sharded clusters follow the same shape with \texttt{type: ShardedCluster}, shard/mongos/CSRS counts, and per-component resource blocks---Chapter 6's topology expressed declaratively. Credentials come from an external secrets operator (ESO) or Vault integration; a literal password in a manifest is the same finding as a password in application config (Chapter 17).
+
+\subsection{Storage as a Decision}
+PVCs bind pods to volumes; the storage class determines the disk. Production checklists: a storage class with provisioned IOPS matched to the Chapter 12 model, \texttt{volumeBindingMode: WaitForFirstConsumer} so volumes land in the pod's zone, expand-only policies (volume expansion is supported; shrink is not), and the admission that local NVMe via a local-volume provisioner beats network storage for latency-critical primaries at the cost of tying members to nodes.
+
+\section{Wednesday: Day-2 Automation}
+\subsection{Rolling Upgrades}
+Changing \texttt{spec.version} triggers the operator's rolling upgrade: it updates one member at a time, waits for health and replication-lag recovery between members, and steps down primaries last (or forces election appropriately). The replica-set guarantee from Chapter 5---availability through member loss---is what makes the roll safe; your SLO is protected by the protocol, and the operator orchestrates it. Failed rolls halt rather than cascade, leaving the cluster healthy at the old version.
+
+\subsection{TLS Rotation and Storage Scaling}
+Certificate rotation is a spec change the operator rolls identically: new certificate secret, rolling restart, zero downtime---automating the manual PKI drill from Chapter 17. Storage scaling edits the PVC size (expansion only); compute scaling edits pod resources, again rolled member-by-member. Every one of these operations is a Git diff (Chapter 21's pipeline applies here unchanged: manifests in Git, applied by CD, drift-detected).
+
+\begin{notebox}
+The Enterprise Operator manages through Ops Manager: the operator reconciles CRDs into Ops Manager automation, which owns the agents on each member---adding monitoring, backup, and fine-grained automation control at the cost of operating Ops Manager itself. Community Operator is self-contained and sufficient for most platform teams.
+\end{notebox}
+
+\section{Thursday Hands-On Project: Minikube Operator Lab}
+Deploy the Community Operator on Minikube, provision a three-member replica set, and execute a rolling version upgrade while a client writes continuously.
+
+\subsection{Lab Protocol}
+\begin{lstlisting}[language=bash, caption={Operator install and replica-set deployment on Minikube.}]
+minikube start --driver=docker --memory=8192 --cpus=4
+kubectl create ns mongodb
+
+helm repo add mongodb https://mongodb.github.io/helm-charts
+helm install community-operator mongodb/community-operator -n mongodb
+
+kubectl apply -f k8s/orders-rs.yaml -n mongodb        # the CRD from Tuesday
+kubectl get mdbc orders-rs -n mongodb -w              # watch phase -> Running
+
+# Continuous writer (mongosh in a loop), then trigger the upgrade:
+kubectl patch mdbc orders-rs -n mongodb --type merge `
+  -p '{"spec":{"version":"8.0.5"}}'
+kubectl get pods -n mongodb -w    # observe member-at-a-time roll
+\end{lstlisting}
+
+Observe: the writer's error log during the roll (retryable errors only, per Chapter 5's failover discipline), the operator's per-member sequencing, and the final state where all members run the new version with zero manual replica-set operations.
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item The manifests, the operator install script, and the writer client.
+    \item The upgrade observation log: pod roll sequence, writer errors, total time.
+    \item A note comparing the roll's behavior against the Chapter 5 manual failover drill.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item The replica set reaches Running with TLS and zone-spread members.
+    \item The rolling upgrade completes with the writer observing only retryable errors.
+    \item All evidence is reproducible from the repo's scripts.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Delete a member pod mid-upgrade and document the operator's recovery behavior.
+    \item Add a sharded-cluster CRD (2 shards, 1 CSRS, 1 mongos) and verify chunk routing through the service.
+\end{itemize}
+
+\section{Friday Use Case and Architecture: Private-Cloud DBaaS}
+\subsection{Scenario and Requirements}
+A regulated enterprise cannot use public Atlas and must offer internal teams self-service MongoDB with enterprise backup, monitoring, and one-click provisioning---a private DBaaS on its own Kubernetes fleet.
+
+\subsection{Architecture}
+The platform: Enterprise Operator + Ops Manager on a dedicated management cluster; tenant databases as \texttt{MongoDB} custom resources on workload clusters, one per tenant for isolation. The self-service layer is a thin API (or GitOps repo with PR-based provisioning per Chapter 21) that renders tenant CRDs from a template encoding the enterprise defaults: TLS from the corporate PKI, zone-spread StatefulSets, sized storage classes, backup enabled through Ops Manager, RBAC bindings to the corporate directory, and NetworkPolicies isolating tenant namespaces. The operator handles lifecycle; Ops Manager provides the backup/monitoring console; the platform team curates the template---which is where all the lessons of this book live as defaults rather than documentation.
+
+\begin{figure}[H]
+    \centering
+    \resizebox{0.95\textwidth}{!}{%
+    \begin{tikzpicture}[
+        box/.style={rectangle, rounded corners, draw=primary, fill=primary!6, minimum width=2.7cm, minimum height=1.1cm, align=center, font=\small\bfseries},
+        op/.style={rectangle, rounded corners, draw=green!45!black, fill=green!8, minimum width=2.7cm, minimum height=1.1cm, align=center, font=\small\bfseries},
+        arrow/.style={-{Stealth[length=2.5mm]}, draw=primary, thick}
+    ]
+        \node[box] (api) at (0,0) {Self-service API\\(tenant request)};
+        \node[box] (git) at (3.9,0) {GitOps repo\\CRD templates};
+        \node[op] (oper) at (7.8,0) {Enterprise\\Operator};
+        \node[op] (om) at (7.8,-2.1) {Ops Manager\\backup + monitoring};
+        \node[box] (t1) at (11.9,1.1) {Tenant A\\replica set};
+        \node[box] (t2) at (11.9,-1.1) {Tenant B\\sharded cluster};
+        \draw[arrow] (api) -- (git);
+        \draw[arrow] (git) -- (oper);
+        \draw[arrow] (oper) -- (t1);
+        \draw[arrow] (oper) -- (t2);
+        \draw[arrow, dashed] (oper) -- (om);
+    \end{tikzpicture}%
+    }
+    \caption{Private DBaaS: tenant requests become curated CRDs; the operator reconciles; Ops Manager backs up and monitors.}
+    \label{fig:ch22-dbaas}
+\end{figure}
+
+\subsection{The Build-Versus-Manage Line}
+The architecture review question is always: why not Atlas? The honest answers are sovereignty (data must not leave the enterprise boundary), existing Kubernetes investment, and unit economics at large fleet scale. The honest costs are that you now own Ops Manager availability, Kubernetes upgrades, storage performance, and every failure mode Parts III--IV taught---the operator automates execution, not judgment.
+
+\section{Interview Q\&A}
+\subsection{Kubernetes Operations}
+\begin{enumerate}
+    \item \textbf{Q: What is a CRD?}\\
+    A: A Kubernetes API extension defining a new object kind (e.g. \texttt{MongoDBCommunity}); the operator watches instances and reconciles cluster reality toward each spec.
+
+    \item \textbf{Q: What does the operator automate versus decide?}\\
+    A: It automates deployment, membership, TLS, rolls, and healing. It cannot decide shard keys, sizing, network topology, or anti-affinity---the spec encodes your design.
+
+    \item \textbf{Q: How does a rolling upgrade stay safe?}\\
+    A: Member-at-a-time with health gates between members; replica-set protocol (Chapter 5) keeps a majority serving throughout, and a failed member halts the roll rather than cascading.
+
+    \item \textbf{Q: Operator versus Ops Manager?}\\
+    A: Community Operator is self-contained reconciliation. Enterprise Operator drives Ops Manager, which owns agents, backup, and monitoring---more capability, one more system to run.
+
+    \item \textbf{Q: Why Minikube for learning?}\\
+    A: It gives a real API server and real reconciliation on one machine; the failure drills (pod deletion, upgrade rollback) are identical to production semantics at laptop cost.
+\end{enumerate}
+
+\section{Further Reading}
+The MongoDB Kubernetes Operator documentation covers both editions and their CRD references \cite{mongodbK8sOperatorDocs}; Kubernetes concepts---StatefulSets, PVCs, controllers---are in the official docs \cite{kubernetesDocs}. Ops Manager's architecture appears in Chapter 23's tooling context \cite{mongodbOpsManagerDocs}, and the GitOps application path is Chapter 21's \cite{terraformDocs}. Airflow or similar orchestrators complement the operator for data-plane jobs \cite{apacheAirflowRepo}.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item Operators turn databases into declared, continuously reconciled custom resources.
+    \item StatefulSets + PVCs give members stable identity and storage; storage class choice is a performance decision.
+    \item Rolling upgrades, TLS rotation, and storage expansion are spec diffs with replica-set safety underneath.
+    \item Set \texttt{cacheSizeGB} explicitly; align pod limits or the OOM killer tunes your cache.
+    \item Zone-spread topology constraints are the difference between HA and three pods on one node.
+    \item Private DBaaS = curated CRD templates + operator + Ops Manager, with sovereignty as the justification.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Trace the reconciliation loop for a \texttt{members: 3 $\to$ 5} spec change.
+    \item \textbf{(Conceptual)} Why is volume shrink unsupported and how does that shape capacity policy?
+    \item \textbf{(Conceptual)} When does a namespace-scoped operator beat a cluster-scoped one in a multi-tenant fleet?
+    \item \textbf{(Hands-on)} Extend the lab with TLS rotation via a new certificate secret and observe the roll.
+    \item \textbf{(Hands-on)} Trigger the OOM scenario with a mismatched cache/limit and capture the evidence, then fix it.
+    \item \textbf{(Design)} Write the tenant CRD template policy for the DBaaS: every default and its chapter justification.
+    \item \textbf{(Design)} Design the operator-upgrade procedure itself: who upgrades the reconciler, and how is it rolled back?
+    \item \textbf{(Interview)} ``Our MongoDB pods keep getting OOM-killed under load.'' Diagnose with the Chapter 12 connection.
+\end{enumerate}
+
+\section{Capstone Project: Kubernetes-Native Staging Platform}\label{sec:ch22-capstone}
+
+\begin{capstonebox}
+\textbf{Mission:} deliver a Kubernetes-native staging platform for the book's order system: operator-managed replica set with TLS, zone-spread members, externalized secrets, a GitOps apply path, a demonstrated rolling upgrade and pod-loss recovery, and a costed comparison against the equivalent Atlas tier.
+
+\textbf{Estimated time:} 5--7 hours.
+
+\textbf{What you will practice:}
+\begin{itemize}
+    \item Production-grade CRD authorship (TLS, anti-affinity, resources, secrets).
+    \item Day-2 operations as Git diffs: upgrades, rotation, scaling.
+    \item The build-versus-managed analysis with real numbers.
+\end{itemize}
+\end{capstonebox}
+
+\subsection*{Scenario}
+Your organization runs staging on Kubernetes and production on Atlas. Staging must mirror production topology faithfully enough that failover, upgrade, and restore drills (Chapter 23) rehearse meaningfully against it.
+
+\subsection*{Requirements}
+\begin{itemize}
+    \item Operator-deployed three-member replica set: TLS, x.509 or SCRAM from externalized secrets, zone-spread constraints, sized requests/limits with explicit \texttt{cacheSizeGB}.
+    \item GitOps apply path for all manifests (Chapter 21 pipeline extended to \texttt{k8s/}).
+    \item Demonstrated rolling upgrade and single-pod loss with client-visible behavior logged.
+    \item A storage-class decision document (IOPS, expansion, zone binding).
+    \item The costed comparison: K8s staging fleet versus Atlas M-tier equivalents, with two optimization decisions.
+\end{itemize}
+
+\subsection*{Implementation Steps}
+\begin{enumerate}
+    \item \textbf{Deploy.} Operator, secrets integration, and the replica-set CRD; verify topology.
+    \item \textbf{Pipeline.} Wire manifests into the GitOps flow with staging gates.
+    \item \textbf{Drill.} Execute the upgrade and the pod-loss drill; capture client-visible evidence.
+    \item \textbf{Decide.} Write the storage-class document and the costed comparison.
+    \item \textbf{Package.} Ensure a clean Minikube rebuild from the repo alone.
+\end{enumerate}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item All manifests, pipeline configuration, drill logs, and the two decision documents.
+    \item A README enabling a clean-environment rebuild.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item The platform rebuilds from the repository on a fresh Minikube without manual steps.
+    \item Both drills show only retryable client errors and automatic recovery.
+    \item The cost document states a clear recommendation with measured inputs.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Add a sharded-cluster staging environment behind mongos and re-run Chapter 7's scatter-gather tests.
+    \item Integrate the operator's metrics with the Chapter 23 monitoring stack.
+\end{itemize}

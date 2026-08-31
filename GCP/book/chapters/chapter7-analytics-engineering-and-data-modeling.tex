@@ -1,0 +1,288 @@
+\chapter{Advanced Data Types and Federated Analytics}
+\index{BigQuery GIS}\index{GEOGRAPHY}\index{external tables}\index{BigQuery Omni}\index{federated queries}\index{BigQuery Search}
+
+\begin{objectives}
+\begin{itemize}
+    \item Query geospatial data with the \texttt{GEOGRAPHY} type, spatial joins, and BigQuery Search indexes.
+    \item Create external tables over Cloud Storage files and explain their performance and governance limits.
+    \item Evaluate BigQuery Omni for cross-cloud analytics, including egress cost and latency trade-offs.
+    \item Decide when federated querying beats ingestion and when data should be loaded natively.
+    \item Build an external table over CSV files and join it with native geospatial taxi-dropoff data.
+    \item Design a multi-cloud analytics architecture for a retailer whose history lives in Amazon S3.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+Every warehouse now answers the same two questions: ``can I query data I have not loaded?'' and ``can I query data in another cloud?'' The mechanics and bills differ.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{2.8cm}p{3.0cm}p{3.0cm}p{3.0cm}@{}} \\
+\toprule
+\textbf{Capability} & \textbf{GCP BigQuery} & \textbf{AWS} & \textbf{Azure / Fabric} \\
+\midrule
+Query files in place & External tables / BigLake & Redshift Spectrum / Athena & Synapse serverless / OneLake shortcuts \\
+Cross-cloud analytics & BigQuery Omni & Athena federated queries & Fabric shortcuts to S3/ADLS \\
+Geospatial type & GEOGRAPHY (S2-based) & GEOMETRY/GEOGRAPHY (Athena, Redshift) & geography (SQL) / KQL geo \\
+Full-text search & SEARCH indexes & OpenSearch integration & Azure AI Search / KQL full-text \\
+Egress consideration & Omni reads billed; source egress applies & Cross-region/egress per GB & Cross-cloud egress per GB \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+\textbf{Snowflake} queries external tables and Iceberg tables in customer storage, and \textbf{MongoDB Atlas Data Federation} reaches into S3 and Atlas clusters. The universal lesson: federation moves compute to data only when the engine supports it; otherwise bytes travel, and the egress bill follows.
+\end{crosscloud}
+
+\begin{keyterms}
+\textbf{GEOGRAPHY}: BigQuery's spherical geospatial type, with functions for distance, containment, and spatial joins.
+\textbf{External table}: a BigQuery table whose data remains in Cloud Storage (or another source) and is read at query time.
+\textbf{BigQuery Omni}: cross-cloud analytics that runs BigQuery compute adjacent to data in AWS or Azure.
+\textbf{Federated query}: a query executed against data outside BigQuery's managed storage.
+\textbf{Search index}: a BigQuery index that accelerates \texttt{SEARCH} and text-filter predicates on large tables.
+\textbf{Data contract}: the agreed schema and semantics a data source guarantees to its consumers.
+\end{keyterms}
+
+\section{Week 7 Roadmap}
+Week~7 widens BigQuery's aperture. Monday adds the \texttt{GEOGRAPHY} type and search indexes for spatial and text analytics. Tuesday creates external tables that query Cloud Storage files in place. Wednesday introduces BigQuery Omni for analytics over data that must remain in AWS or Azure. Thursday joins an external CSV table to native geospatial taxi data in one query. Friday designs a multi-cloud architecture for a retailer with history in S3 and analytics in GCP.
+
+\begin{definitionbox}
+\textbf{Federation} means querying data where it lives instead of loading it first. The trade is constant: federation avoids pipeline build-out and storage duplication, but gives up clustering, predictable latency, and (often) cost predictability that native managed storage provides \cite{googlecloudbigqueryexternal}.
+\end{definitionbox}
+
+\section{Monday: BigQuery GIS and Search}
+\index{GEOGRAPHY!functions}\index{spatial join}\index{ST\_WITHIN}\index{SEARCH index}
+
+\subsection{The GEOGRAPHY Type}
+BigQuery's \texttt{GEOGRAPHY} type models points, lines, and polygons on a spherical Earth, built on the S2 geometry library. The workhorse functions are \texttt{ST\_GEO GPOINT} (construct a point from longitude, latitude), \texttt{ST\_DISTANCE} (meters between geographies), \texttt{ST\_WITHIN} and \texttt{ST\_CONTAINS} (point-in-polygon tests), and \texttt{ST\_INTERSECTS} (any overlap). Spatial joins---``which zone contains each taxi drop-off''---express naturally as \texttt{JOIN ... ON ST\_WITHIN(point, polygon)}.
+
+\begin{lstlisting}[language=SQL,caption={Point-in-polygon spatial join between taxi drop-offs and zones.}]
+SELECT z.zone_name, COUNT(*) AS dropoffs
+FROM `project.analytics.taxi_dropoffs` t
+JOIN `project.reference.city_zones` z
+  ON ST_WITHIN(t.dropoff_point, z.boundary)
+GROUP BY z.zone_name
+ORDER BY dropoffs DESC;
+\end{lstlisting}
+
+\begin{pitfall}
+\texttt{ST\_GEOGPOINT} takes \textbf{longitude first, latitude second}. Swapping them silently relocates your fleet into the ocean. Validate with a known landmark whenever you construct points from raw coordinates.
+\end{pitfall}
+
+\subsection{Search Indexes}
+A BigQuery \textbf{search index} accelerates \texttt{SEARCH} queries and some filter patterns over text-heavy columns---log forensics, error-message hunting, free-text ticket fields \cite{googlecloudbigquerydocs}. Create one with \texttt{CREATE SEARCH INDEX ... ON table(ALL COLUMNS)} or a named column list. Indexes consume storage and take time to build; the payoff appears on selective text predicates over large tables, not on dashboards that scan whole partitions anyway.
+
+\begin{tipbox}
+Geospatial predicates benefit from clustering by a location-derived key (such as an S2 cell or geohash prefix) on very large tables. The index-free spatial join is correct but reads everything; a clustered pre-filter keeps spatial analytics economical.
+\end{tipbox}
+
+\section{Tuesday: External Tables over Cloud Storage}
+\index{external tables!Cloud Storage}\index{federation!limits}
+
+\subsection{Creating and Querying External Tables}
+An external table registers a schema and a set of Cloud Storage URIs (CSV, JSON, Avro, Parquet) without copying data into BigQuery managed storage. Queries read the files at execution time.
+
+\begin{lstlisting}[language=SQL,caption={External table over CSV exports in Cloud Storage.}]
+CREATE OR REPLACE EXTERNAL TABLE ext.partner_returns (
+  return_id   STRING,
+  order_id    STRING,
+  reason_code STRING,
+  returned_at TIMESTAMP
+)
+OPTIONS (
+  format = 'CSV',
+  skip_leading_rows = 1,
+  uris = ['gs://partner-exports/returns/*.csv']);
+\end{lstlisting}
+
+\subsection{What Federation Gives Up}
+External tables cannot be clustered, do not track table statistics for the optimizer the same way, re-read files on every query, and depend on the source bucket's availability and your IAM to it. They shine for exploratory analysis of data you may never load, for low-frequency reference data owned elsewhere, and as a staging step before a curated load. They are wrong for hot dashboards and for anything whose latency or cost must be predictable.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.6cm}p{4.6cm}p{4.6cm}@{}} \\
+\toprule
+\textbf{Property} & \textbf{External table} & \textbf{Native (managed) table} \\
+\midrule
+Storage & Files in Cloud Storage & BigQuery managed columnar \\
+Clustering/pruning stats & None & Partition + cluster pruning \\
+Read pattern & Files re-read each query & Columnar blocks, cached metadata \\
+Best use & Exploration, one-off joins, staging & Repeated analytics, dashboards, SLA-bound \\
+Cost predictability & Low (full file scans) & High (pruned scans) \\
+\bottomrule
+\end{tabular}
+\caption{External versus native BigQuery tables \cite{googlecloudbigqueryexternal}.}
+\label{tab:ch7-external-vs-native}
+\end{table}
+
+\begin{notebox}
+External tables do not enforce your schema on the files; a malformed CSV row fails or corrupts the query at read time. Treat the source prefix as a data contract: version it, validate it, and agree on who may change it.
+\end{notebox}
+
+\section{Wednesday: BigQuery Omni and Cross-Cloud Analytics}
+\index{BigQuery Omni}\index{cross-cloud analytics}\index{egress cost}
+
+\subsection{Architecture}
+BigQuery Omni runs BigQuery compute in an AWS or Azure region, adjacent to data stored in S3 or ADLS. You create a connection to the foreign bucket, define external tables over it, and query with the same GoogleSQL. Compute happens near the data; only query results---not raw data---cross clouds unless you explicitly \texttt{CREATE TABLE AS} or export.
+
+\subsection{When Omni Wins}
+Omni wins when data gravity, sovereignty, or egress cost forbids moving bulk data, and when the analysis is intermittent enough that duplicated pipelines would cost more than federated reads. It loses when analytics are daily and heavy (load the data natively instead), when sub-second latency matters (cross-cloud round trips accumulate), and when the source cloud's egress pricing turns large result exports into a budget event.
+
+\begin{pitfall}
+Omni removes \emph{bulk} data movement, not \emph{all} data movement. Results, cross-cloud joins, and exports still generate source-cloud egress and cross-region latency. Model egress as a first-class line item before committing to the architecture.
+\end{pitfall}
+
+\begin{definitionbox}
+\textbf{Data gravity} is the tendency of applications and analytics to be pulled toward where large datasets already reside, because moving petabytes is slower and more expensive than moving compute.
+\end{definitionbox}
+
+\section{Thursday Hands-On Project: External CSVs Joined with Native GIS Data}
+\index{hands-on project}\index{external table}\index{ST\_WITHIN}
+This lab creates an external table over CSV files in Cloud Storage and joins it to native geospatial taxi-dropoff data, comparing the federated result with a native load.
+
+\subsection{Stage the Files}
+\begin{lstlisting}[language=bash,caption={Creating sample zone CSVs and uploading them to Cloud Storage.}]
+$env:BUCKET = "my-gcp-data-engineering-lab-ext"
+
+@'
+zone_id,zone_name,min_lng,min_lat,max_lng,max_lat
+Z1,Downtown,-73.999,40.700,-73.950,40.760
+Z2,Midtown,-74.010,40.740,-73.960,40.790
+'@ | Set-Content -Path .\zones.csv
+
+gcloud storage cp .\zones.csv gs://$env:BUCKET/ext/zones/zones.csv
+\end{lstlisting}
+
+For the demo, replace the bounding-box CSV with real polygon boundaries (GeoJSON converted to WKT) when available; the query below uses a simplified rectangular polygon built with \texttt{ST\_GEOGFROMTEXT}.
+
+\subsection{Create the External Table and Join}
+\begin{lstlisting}[language=SQL,caption={External zones table joined to native taxi drop-off points.}]
+CREATE OR REPLACE EXTERNAL TABLE ext.city_zones (
+  zone_id STRING, zone_name STRING,
+  min_lng FLOAT64, min_lat FLOAT64,
+  max_lng FLOAT64, max_lat FLOAT64)
+OPTIONS (format = 'CSV', skip_leading_rows = 1,
+         uris = ['gs://my-gcp-data-engineering-lab-ext/ext/zones/*.csv']);
+
+SELECT z.zone_name, COUNT(*) AS dropoffs
+FROM `bigquery-public-data.new_york_taxi_trips.tlc_yellow_trips_2022` t
+JOIN ext.city_zones z
+  ON ST_WITHIN(
+       ST_GEOGPOINT(t.dropoff_longitude, t.dropoff_latitude),
+       ST_GEOGFROMTEXT(CONCAT('POLYGON((',
+         z.min_lng, ' ', z.min_lat, ',', z.max_lng, ' ', z.min_lat, ',',
+         z.max_lng, ' ', z.max_lat, ',', z.min_lng, ' ', z.max_lat, ',',
+         z.min_lng, ' ', z.min_lat, '))')))
+GROUP BY z.zone_name
+ORDER BY dropoffs DESC;
+\end{lstlisting}
+
+\subsection{Compare with a Native Load}
+Load the same CSV into a native table with \texttt{bq load}, rerun the join, and compare bytes billed and elapsed time. The native version should prune and cache better; the external version required zero pipeline work. That comparison---speed of answer versus cost per answer---is the entire federation calculus in miniature.
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item The external table DDL and the spatial join query, committed to the course repository.
+    \item A results table of drop-offs per zone, plus the native-versus-external comparison of bytes billed.
+    \item A short note on what would break if the partner changed the CSV column order.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item The external table reads CSVs directly from Cloud Storage with no intermediate load.
+    \item The join uses \texttt{ST\_WITHIN} with correctly ordered longitude/latitude coordinates.
+    \item The native-versus-external comparison cites measured bytes billed from dry runs or job metadata.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Replace rectangles with real neighborhood polygons in WKT and rerun the join.
+    \item Cluster a native copy of the taxi table by a geohash prefix and measure the spatial-join speedup.
+    \item Add a search index to a text-heavy column in the taxi dataset and benchmark a \texttt{SEARCH} query.
+\end{itemize}
+
+\section{Friday Use Case and Architecture: Retail History in S3, Analytics in GCP}
+\index{multi-cloud architecture}\index{data gravity}\index{migration strategy}
+
+\subsection{Scenario}
+A retailer runs its new platform on GCP, but five years of sales history---two petabytes of Parquet---sit in Amazon S3 under an active AWS workload. Executives want unified analytics in BigQuery without disrupting the AWS systems that still write to that bucket.
+
+\subsection{Options Analysis}
+Three architectures compete. \textbf{Full migration}: transfer history with Storage Transfer Service into Cloud Storage and load natively---best long-term cost and performance, highest up-front effort, and it creates a dual-write or cutover problem while AWS systems keep writing. \textbf{Pure Omni}: query S3 in place---fastest to value, no migration, but every daily dashboard pays federated-scan costs and AWS egress on exports. \textbf{Hybrid}: Omni for the cold historical tail queried rarely, plus a one-time load of the hot recent window into native partitioned tables, plus an incremental feed for new data. Most real programs land on the hybrid.
+
+\begin{figure}[H]
+    \centering
+    \resizebox{0.95\textwidth}{!}{%
+    \begin{tikzpicture}[
+        src/.style={rectangle, rounded corners, draw=codegray, thick, fill=white, text width=3.0cm, minimum height=1.0cm, align=center, font=\small\bfseries},
+        svc/.style={rectangle, rounded corners, draw=primary, thick, fill=primary!6, text width=3.2cm, minimum height=1.0cm, align=center, font=\small\bfseries},
+        dst/.style={cylinder, shape border rotate=90, aspect=0.25, draw=primary, thick, fill=primary!10, text width=3.2cm, minimum height=1.3cm, align=center, font=\small\bfseries},
+        arrow/.style={-{Stealth[length=2.5mm]}, draw=primary, thick},
+        dasharrow/.style={-{Stealth[length=2.5mm]}, draw=magenta, thick, dashed}
+    ]
+        \node[src] (s3) at (0,0) {AWS S3\\5 yrs Parquet};
+        \node[svc] (omni) at (4.6,1.6) {BigQuery Omni\\cold history queries};
+        \node[svc] (sts) at (4.6,-1.6) {Storage Transfer\\Service (hot window)};
+        \node[dst] (bq) at (9.4,-0.2) {BigQuery native\\partitioned sales};
+        \node[svc] (dash) at (13.2,-0.2) {Dashboards\\and analysts};
+
+        \draw[dasharrow] (s3) -- node[above, font=\footnotesize]{federated} (omni);
+        \draw[arrow] (s3) -- node[below, font=\footnotesize]{one-time + incremental} (sts);
+        \draw[arrow] (sts) -- (bq);
+        \draw[dasharrow] (omni.east) -- (dash.north west);
+        \draw[arrow] (bq) -- (dash);
+    \end{tikzpicture}%
+    }
+    \caption{Hybrid multi-cloud retail analytics: Omni for cold federated reads, native load for the hot window.}
+    \label{fig:ch7-multicloud-retail}
+\end{figure}
+
+\begin{tipbox}
+Write the exit criteria into the design on day one: at what monthly federated-scan cost does full migration win? Track Omni bytes and egress in billing export; when the line crosses the migration amortization curve, execute the migration you already designed.
+\end{tipbox}
+
+\begin{pitfall}
+Do not federate a workload and then pretend it is free of pipelines. Someone still owns schema drift in S3, connection credentials, egress budget alerts, and the failure mode where the AWS bucket policy changes and every GCP dashboard breaks at once.
+\end{pitfall}
+
+\section{Interview Q\&A}
+\subsection{Concepts and Trade-offs}
+\begin{enumerate}
+    \item \textbf{Q: What is the difference between an external table and a native BigQuery table?}\\
+    A: External tables read source files at query time with no clustering or managed statistics; native tables use BigQuery's columnar storage with pruning, caching, and predictable performance.
+
+    \item \textbf{Q: Which GEOGRAPHY function tests whether a point falls inside a polygon?}\\
+    A: \texttt{ST\_WITHIN(point, polygon)} (equivalently \texttt{ST\_CONTAINS(polygon, point)}).
+
+    \item \textbf{Q: What extra cost dimension does BigQuery Omni introduce?}\\
+    A: Source-cloud egress and cross-cloud latency whenever results, joins, or exports move bytes out of AWS or Azure.
+
+    \item \textbf{Q: Why can external tables not benefit from clustering?}\\
+    A: BigQuery does not manage the file layout; rows are not rewritten into sorted blocks, so no block-level statistics exist to prune with.
+
+    \item \textbf{Q: When is federated querying preferable to ingestion?}\\
+    A: For exploratory, low-frequency, or short-lived questions over data you do not own or may never need again---when pipeline cost would exceed query cost.
+\end{enumerate}
+
+\section{Further Reading}
+Read the geospatial analytics introduction for the full GEOGRAPHY function set \cite{googlecloudbigquerygis}, the external-data documentation for format support and limits \cite{googlecloudbigqueryexternal}, and the Omni documentation for connection setup and cross-cloud pricing \cite{googlecloudbigqueryomni}. Review Storage Transfer Service documentation for the migration leg of the Friday architecture \cite{googlecloudstoragetransfer}, and Apache Iceberg for the open table format increasingly used to make lake files portable across engines \cite{apacheiceberg}.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item The GEOGRAPHY type makes spatial joins first-class SQL; remember longitude precedes latitude.
+    \item External tables trade pipeline effort for prunable, predictable performance---use them for exploration and staging.
+    \item BigQuery Omni moves compute to foreign data but not the egress bill; model it before committing.
+    \item Federation versus ingestion is an economic decision about query frequency, latency, and data gravity.
+    \item Multi-cloud analytics almost always lands on a hybrid: federate the cold tail, load the hot window.
+    \item Any federated source is a data contract: version it, monitor it, and assign an owner.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Explain why ``we will just query S3 from BigQuery forever'' usually fails economically at daily-dashboard scale.
+    \item \textbf{(Conceptual)} Describe two failure modes unique to external tables that native tables do not have, and a mitigation for each.
+    \item \textbf{(Hands-on)} Reproduce the Thursday lab, then deliberately swap longitude and latitude and describe how you would detect the error systematically.
+    \item \textbf{(Hands-on)} Create a search index on a text column of a public dataset and compare a \texttt{SEARCH} query's bytes billed before and after.
+    \item \textbf{(Design)} Write the decision memo for the Friday retailer: hybrid versus full migration, with numbers, risks, and exit criteria.
+    \item \textbf{(Architecture)} Add a data-contract enforcement layer (schema validation on new files, quarantine prefix) to the external-table design.
+\end{enumerate}

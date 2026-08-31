@@ -1,0 +1,131 @@
+\chapter{Environment Setup and Sample Data}
+\index{setup}\index{Fabric trial}\index{tools!installation}\index{sample data}\index{workspace conventions}%
+This appendix is the standing setup reference for every lab in the book. Complete it once
+before Chapter~0 and return whenever a lab assumes a tool, a connection, or a dataset that
+your machine or tenant does not yet have. Everything here targets Windows with PowerShell,
+matching the environment used throughout the program.
+
+\section{Accounts and Tenant}
+\index{Fabric trial!setup}%
+\begin{itemize}
+    \item \textbf{Fabric trial capacity.} Create a free 60-day trial capacity from the Fabric portal
+    and enable Fabric in your tenant \cite{microsoftFabricTrial}. The trial covers every lab in the
+    book; it expires, so it is unsuitable for anything with an SLA.
+    \item \textbf{Tenant settings.} Where you administer the tenant, review the Fabric admin portal's
+    tenant switches (Git integration, export, sharing) early---several Part~VI labs depend on them
+    \cite{microsoftFabricTenantSettings}.
+    \item \textbf{Azure access.} Some labs (gateways, Key Vault, Azure SQL source, Dataverse) need an
+    Azure subscription or instructor-provided equivalents. A free Azure account suffices for the
+    gateway and SQL labs.
+\end{itemize}
+
+\section{Local Tooling}
+\index{VS Code}\index{Azure CLI}\index{SSMS}\index{Git!installation}%
+Install once, in this order:
+
+\begin{enumerate}
+    \item \textbf{Python 3.x} --- used by the Week~13 producer, the Week~16 simulator, and synthetic
+    data generation. Verify with \texttt{python --version}.
+    \item \textbf{Git} --- required from Chapter~0 onward; Week~23 depends on it. Verify with
+    \texttt{git --version}.
+    \item \textbf{VS Code} --- with the Python extension; the editor for producer scripts and
+    repository work.
+    \item \textbf{Azure CLI (\texttt{az})} --- sign in with \texttt{az login}; used for Key Vault,
+    storage, and Appendix~B's reference commands.
+    \item \textbf{SQL Server Management Studio (SSMS)} --- the T-SQL client for the SQL analytics
+    endpoint and warehouse labs (Chapters~5--6, 21).
+    \item \textbf{Docker Desktop} (optional) --- the cleanest way to run the mock on-premises
+    SQL Server for the Chapter~11 gateway lab.
+    \item \textbf{Python packages} --- \texttt{azure-eventhub} (Week~13), \texttt{faker} (Weeks~16,
+    24), \texttt{mlflow} and \texttt{scikit-learn} (Weeks~18--20).
+\end{enumerate}
+
+\begin{lstlisting}[language=bash,caption={One-time tool verification (PowerShell).},label={lst:appendixa-verify}]
+python --version
+git --version
+az --version
+az login
+pip install azure-eventhub faker mlflow scikit-learn
+\end{lstlisting}
+
+\section{Repository and Credential Conventions}
+\index{credentials!conventions}%
+Clone or create the course repository with the standard layout---\texttt{data/}, \texttt{src/},
+\texttt{tests/}, \texttt{infra/}, \texttt{docs/}---and observe three credential rules from day one:
+
+\begin{itemize}
+    \item Secrets live in environment variables (for example \texttt{AZURE\_CLIENT\_ID},
+    \texttt{EVENTSTREAM\_CONN\_STR}) or Azure Key Vault---never in notebooks, pipeline JSON, or Git.
+    \item Enable secret scanning on the course repository before Week~23's Git integration makes every
+    workspace notebook a committed file.
+    \item Commit generator scripts, never generated data; the datasets below are reproducible by design.
+\end{itemize}
+
+\section{Workspace Naming Conventions}
+\index{workspace!naming}%
+Labs reference workspaces by predictable names: \texttt{fabric-de-weekNN} for weekly labs,
+\texttt{fabric-de-milestoneN} for capstones, and \texttt{fabric-de-w23-dev|test|prod} for the CI/CD
+estate. Lakehouses are \texttt{lh\_<purpose>}, warehouses \texttt{dw\_<domain>}, eventstreams
+\texttt{es\_<stream>}, KQL databases \texttt{kqldb\_<domain>}, pipelines \texttt{PL\_<action>}.
+Consistency matters because runbooks, alerts, and the run ledger all reference these names.
+
+\section{Sample Datasets}
+\index{sample data!NYC Taxi}\index{sample data!Olist}\index{faker}%
+The book's labs and capstones standardize on three data sources:
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.2cm}p{4.6cm}p{5.8cm}@{}}
+\toprule
+\textbf{Dataset} & \textbf{Used in} & \textbf{Notes} \\
+\midrule
+NYC Taxi (TLC trip records) & Parts I--II (Chapters 1--8) & Public Parquet, mirrored on Azure Open Datasets; 1--5M rows suffice for capstones \\
+Olist Brazilian e-commerce & Parts III and V (Chapters 9--12, 17--20) & $\sim$100k orders across 9 related CSVs: orders, items, customers, products, payments, reviews \\
+Synthetic streams (\texttt{faker}) & Parts IV and VI (Chapters 13--16, 21--24) & Credit-card swipes, IoT telemetry, PII-style CRM rows; seed generators for reproducibility \\
+\bottomrule
+\end{tabular}
+\caption{Standard datasets and where they are used.}
+\label{tab:appendixa-datasets}
+\end{table}
+
+Volume guidance: Part~I medallion work at 1--10M CSV rows; the Part~II warehouse star schema at
+$\sim$5M fact rows; Part~III re-ingests the nine Olist tables daily; Part~IV streams at
+5--20k events per minute during demos; Part~V scores $\sim$100k rows per batch.
+
+\begin{lstlisting}[language=Python,caption={Seeded synthetic PII generator (commit the script, not the data).},label={lst:appendixa-faker}]
+from faker import Faker
+import csv
+
+fake = Faker()
+Faker.seed(42)  # reproducible
+
+with open("data/synthetic_customers.csv", "w", newline="") as f:
+    w = csv.writer(f)
+    w.writerow(["customer_id", "name", "email", "phone", "region"])
+    for i in range(100_000):
+        w.writerow([f"C{i:06d}", fake.name(), fake.email(),
+                    fake.phone_number(), fake.random_element(["US", "EU", "APAC"])])
+\end{lstlisting}
+
+\section{Troubleshooting Checklist}
+\index{troubleshooting!setup}%
+\begin{itemize}
+    \item \textbf{Notebook cannot see the lakehouse}: attach a default lakehouse to the notebook; verify
+    the workspace is on a Fabric capacity, not a shared-only assignment.
+    \item \textbf{\texttt{COPY INTO} path errors}: re-copy the OneLake DFS path from the lakehouse
+    explorer; a wrong workspace or item segment is the usual cause (Chapter~5).
+    \item \textbf{SSMS cannot connect}: use the SQL analytics endpoint connection string from lakehouse
+    settings, Microsoft Entra MFA authentication, and confirm the endpoint reflects the table
+    (files under \texttt{Files/} are invisible until registered as Delta tables).
+    \item \textbf{Gateway offline}: check the gateway service on the host, then the cluster view in the
+    portal; the Chapter~11 lab's failure drill covers the recovery pattern.
+    \item \textbf{Throttling during labs}: the trial capacity is shared; pause unused capacities and
+    check the Capacity Metrics app before assuming a lab is broken \cite{microsoftFabricMetricsApp}.
+\end{itemize}
+
+\begin{tipbox}
+When a lab fails, reproduce the failure at the smallest possible scope---one row, one file, one
+minute of telemetry---before investigating the estate. Every chapter's validation checklist is
+written to support exactly that reduction.
+\end{tipbox}

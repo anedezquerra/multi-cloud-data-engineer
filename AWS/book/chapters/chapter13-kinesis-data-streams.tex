@@ -1,0 +1,354 @@
+\chapter{Message Queuing and Streaming Ingestion with Amazon Kinesis}
+\index{Amazon SQS}\index{Amazon SNS}\index{Kinesis Data Streams}\index{shard}\index{partition key}\index{Amazon MSK}\index{Apache Kafka}%
+\begin{objectives}
+\begin{itemize}
+    \item Decouple producers from consumers with Amazon SQS queues and SNS fan-out patterns.
+    \item Size Kinesis Data Streams from shard throughput limits and design partition keys for per-entity ordering.
+    \item Write retrying Boto3 producers and idempotent consumers, and interpret \texttt{IteratorAgeMilliseconds}.
+    \item Compare Kinesis with Amazon MSK (managed Kafka) on operations, pricing, and ecosystem fit.
+    \item Reason honestly about exactly-once processing on top of at-least-once delivery.
+    \item Architect a global telemetry ingestion point for five million mobile-game clients.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+Queues, pub/sub, and append-only logs are the three messaging primitives; every cloud ships all three.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{2.8cm}p{3.0cm}p{3.0cm}p{3.0cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{AWS} & \textbf{Azure} & \textbf{GCP} \\
+\midrule
+Pull queue & Amazon SQS & Azure Queue Storage / Service Bus & Pub/Sub (pull) \\
+Pub/sub fan-out & Amazon SNS & Event Grid / Service Bus topics & Pub/Sub \\
+Durable streaming log & Kinesis Data Streams & Event Hubs & Pub/Sub (ordered) \\
+Managed Kafka & Amazon MSK & Event Hubs for Kafka & Managed Service for Apache Kafka \\
+Serverless stream processor & Managed Flink / Lambda & Stream Analytics & Dataflow \\
+\addlinespace
+Scaling unit & Shard (1 MB/s in, 2 MB/s out) & Throughput units / partitions & Throughput quotas \\
+Ordering scope & Per partition key & Per partition key & Per ordering key \\
+Retention & 24 h--365 days & 1--90 days & Up to 31 days \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+\textbf{Fabric} Real-Time Intelligence wraps KQL databases and Eventstreams around the same log concept. \textbf{Snowflake} consumes streams via Snowpipe Streaming. \textbf{MongoDB} change streams are the database-native analog---a log of changes, replayable and resumable.
+\end{crosscloud}
+
+\section{Week 13 Roadmap and Mental Model}
+Everything so far moved data in files or tables. Week~13 moves it as \emph{events}: small, ordered, continuous, and consumed the moment they exist. The week's core distinction is between a \textbf{queue}---a work-distribution channel where each message is processed once and deleted---and a \textbf{stream}---a durable, replayable log where many consumers read the same events at their own pace \cite{awsKinesisDocs}.
+
+Three services cover the spectrum. \textbf{SQS} is the queue: decoupling, buffering, and per-message deletion. \textbf{SNS} is the fan-out: one publish, many subscribers. \textbf{Kinesis Data Streams (KDS)} is the log: shards, ordering keys, retention, and replay. And \textbf{Amazon MSK} is the ecosystem answer for organizations standardized on Apache Kafka. Choosing among them is Wednesday's work; building correct producers and consumers on the log is Thursday's.
+
+\begin{definitionbox}
+\textbf{A streaming data platform} durably records an ordered, append-only sequence of events (the log), lets multiple independent consumers read it at their own pace, and guarantees per-key ordering and at-least-once delivery. Throughput is provisioned in shards (Kinesis) or partitions (Kafka).
+\end{definitionbox}
+
+\begin{keyterms}
+\textbf{Shard}: Kinesis throughput unit---1 MB/s or 1{,}000 records/s in, 2 MB/s out. \textbf{Partition key}: the hashing input that routes a record to a shard and defines the ordering scope. \textbf{Sequence number}: a record's position in its shard. \textbf{Iterator}: a consumer's cursor into a shard. \textbf{IteratorAgeMilliseconds}: how far behind the newest record a consumer is. \textbf{DLQ}: dead-letter queue for poison messages. \textbf{Fan-out}: one event delivered to many independent consumers (SNS, or enhanced fan-out in KDS).
+\end{keyterms}
+
+\section{Monday: Decoupling with SQS and SNS}
+\subsection{SQS: The Work Queue}
+Amazon SQS is a fully managed queue: producers send messages, consumers poll and delete them, and a visibility timeout hides in-flight messages from other consumers until processing completes or fails \cite{awsSQSDocs}. Standard queues offer at-least-once delivery and best-effort ordering at virtually unlimited throughput; FIFO queues offer exactly-once \emph{delivery} within a deduplication window and strict per-group ordering, capped by throughput quotas per message group. Dead-letter queues capture messages that fail repeatedly, so one poison message cannot block a fleet.
+\index{SQS}\index{visibility timeout}\index{dead-letter queue}
+
+\subsection{SNS: The Fan-Out}
+Amazon SNS is push-based pub/sub: publishers send to a topic, and every subscription---SQS queues, Lambda functions, HTTPS endpoints, email---receives each message \cite{awsSNSDocs}. The canonical pattern is \emph{fan-out to queues}: one SNS topic fronting several SQS queues, each queue owned by an independent consumer team. SNS handles distribution; SQS gives each consumer its own buffering, retry, and DLQ semantics. Message filtering lets subscribers receive only the subset they declare.
+\index{SNS}\index{fan-out pattern}
+
+\begin{tipbox}
+Never subscribe a Lambda directly to a high-volume topic when you may need replay or backpressure control. SNS-to-SQS-to-consumer preserves a durable buffer you can drain, inspect, and replay; a direct subscription drops events your consumer could not keep up with.
+\end{tipbox}
+
+\section{Tuesday: Kinesis Data Streams---Shards, Keys, and Scaling}
+\subsection{The Shard Model}
+A Kinesis stream is a sequence of shards; each shard is an ordered, append-only log with fixed capacity: 1 MB/s or 1{,}000 records per second of ingress, 2 MB/s of egress per consumer (or a dedicated 2 MB/s per consumer with enhanced fan-out) \cite{awsKinesisDocs}. Records carry a \emph{partition key}; Kinesis hashes it to a shard, so all records with the same key land in the same shard in order. Retention runs from 24 hours to 365 days, during which any consumer can re-read---the property that makes streams replayable and queues not.
+\index{shard}\index{partition key}\index{enhanced fan-out}
+
+\subsection{Sizing and Hot Shards}
+Sizing is arithmetic. Ingress: expected events/second $\times$ average record size, divided by 1 MB/s and by 1{,}000 records/s; the shard count is the maximum of the two, plus headroom for growth and skew. The subtle failure is the \emph{hot shard}: if one partition key dominates---a celebrity user, a single tenant---its shard saturates while others idle, and you get \texttt{ProvisionedThroughputExceeded} on a stream that is ``mostly empty.'' Defenses: choose high-cardinality keys, add entropy to hot keys (and handle the ordering consequences), and scale by split/merge or on-demand mode.
+\index{hot shard}\index{ProvisionedThroughputExceeded}
+
+\begin{pitfall}
+\textbf{Partition keys with low cardinality or skew.} Ordering scope and parallelism are the same choice: the partition key. A key with ten values pins your stream to ten hot spots forever. Choose keys that are high-cardinality \emph{and} the unit of ordering you actually need---usually an entity ID like \texttt{sensor-17} or \texttt{user-92341}.
+\end{pitfall}
+
+\subsection{Consumers, Checkpointing, and Iterator Age}
+Consumers read via shard iterators and checkpoint their position---the Kinesis Client Library (KCL) does this in DynamoDB, tracking which sequence numbers each worker has processed. The health metric of the whole arrangement is \texttt{IteratorAgeMilliseconds}: the age of the last record the consumer read. Rising iterator age means consumers are falling behind; because retention is finite (24 hours by default), falling far enough behind is data loss. Alarm on it.
+\index{KCL}\index{checkpointing}\index{IteratorAgeMilliseconds}
+
+\begin{pitfall}
+\textbf{Blocking on poison records.} Kinesis delivers at-least-once and in order per shard: a record your consumer cannot process will be redelivered forever, pinning the shard. Design consumers to be idempotent---deduplicate on a record ID (DynamoDB conditional put, Redis)---and route repeatedly failing records to a dead-letter location (SQS DLQ or S3 error prefix) instead of blocking the iterator.
+\end{pitfall}
+
+\section{Wednesday: Amazon MSK Versus Kinesis}
+\subsection{Same Log, Different Contract}
+Amazon MSK is managed Apache Kafka: real brokers, real ZooKeeper/KRaft, the real Kafka API, in your VPC \cite{awsMSKDocs,apacheKafkaProject}. The comparison with Kinesis is not ``which is better'' but ``which operating model you are buying'':
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.2cm}p{4.5cm}p{4.7cm}@{}}
+\toprule
+\textbf{Dimension} & \textbf{Kinesis Data Streams} & \textbf{Amazon MSK} \\
+\midrule
+API & AWS-native, IAM-integrated & Full Kafka protocol and ecosystem \\
+Operations & Nearly none; shard or on-demand scaling & Broker fleet you size, patch windows, version upgrades \\
+Pricing unit & Shard-hours + payload (or on-demand) & Broker instance-hours + storage \\
+Portability & Low (AWS API) & High (standard Kafka clients move anywhere) \\
+Retention & 24 h--365 days, per stream & Configurable, disk-bounded per broker \\
+Native integrations & Lambda triggers, Firehose, Flink, KCL & Kafka Connect, MirrorMaker, any Kafka client \\
+\bottomrule
+\end{tabular}
+\caption{Kinesis versus MSK: an operating-model decision.}
+\label{tab:ch13-kinesis-msk}
+\end{table}
+
+Choose Kinesis when the estate is AWS-native, the team is small, and IAM-integrated access matters. Choose MSK when Kafka compatibility is a requirement---existing clients, Connect connectors, ksqlDB, multi-cloud posture---or when retention and partitioning semantics must be Kafka's exactly.
+
+\section{Thursday Hands-on Project: An IoT Temperature Stream}
+\index{hands-on project!Kinesis producer and consumer}
+Create a Kinesis data stream, write a Python producer streaming mock IoT temperature readings with per-sensor ordering, and a consumer that prints what it reads.
+
+\subsection*{Lab Objectives}
+\begin{itemize}
+    \item Create a stream and compute the shard count from first principles.
+    \item Produce batches with \texttt{put\_records}, handling partial failures with backoff.
+    \item Consume with shard iterators and checkpoint mentally (KCL in production).
+    \item Watch \texttt{IteratorAgeMilliseconds} move as the consumer lags and catches up.
+\end{itemize}
+
+\subsection*{Procedure}
+Fifty sensors reporting once per second at roughly 150 bytes each is $\sim$7.5 KB/s and 50 records/s---one shard is comfortably sufficient; we use two to make the sharding visible.
+
+\begin{lstlisting}[language=bash,caption={Creating the stream.},label={lst:ch13-create-stream}]
+aws kinesis create-stream --stream-name iot-temperature-stream --shard-count 2
+aws kinesis describe-stream-summary --stream-name iot-temperature-stream
+\end{lstlisting}
+
+\begin{lstlisting}[language=Python,caption={Boto3 producer with per-sensor partition keys and partial-failure retry.},label={lst:ch13-producer}]
+import json, random, time
+import boto3
+
+kinesis = boto3.client("kinesis", region_name="us-east-1")
+STREAM = "iot-temperature-stream"
+
+def make_reading(sensor_id: int) -> dict:
+    return {
+        "sensor_id": f"sensor-{sensor_id}",
+        "ts": int(time.time()),
+        "temp_c": round(random.uniform(15.0, 35.0), 2),
+        "battery_pct": random.randint(20, 100),
+    }
+
+while True:
+    records = []
+    for sensor_id in range(1, 51):
+        records.append({
+            "Data": json.dumps(make_reading(sensor_id)).encode("utf-8"),
+            "PartitionKey": f"sensor-{sensor_id}",  # per-sensor ordering
+        })
+    resp = kinesis.put_records(StreamName=STREAM, Records=records)
+    if resp["FailedRecordCount"]:
+        # retry only failed records with backoff (ProvisionedThroughputExceeded)
+        failed = [r for r, o in zip(records, resp["Records"]) if "ErrorCode" in o]
+        time.sleep(0.5)
+        kinesis.put_records(StreamName=STREAM, Records=failed)
+    time.sleep(1)
+\end{lstlisting}
+
+\begin{lstlisting}[language=Python,caption={Minimal shard-iterator consumer (KCL handles this machinery in production).},label={lst:ch13-consumer}]
+import json
+import boto3
+
+kinesis = boto3.client("kinesis", region_name="us-east-1")
+STREAM = "iot-temperature-stream"
+
+shards = kinesis.list_shards(StreamName=STREAM)["Shards"]
+iterators = [
+    kinesis.get_shard_iterator(
+        StreamName=STREAM,
+        ShardId=s["ShardId"],
+        ShardIteratorType="LATEST",
+    )["ShardIterator"]
+    for s in shards
+]
+
+while True:
+    for i, it in enumerate(iterators):
+        resp = kinesis.get_records(ShardIterator=it, Limit=100)
+        iterators[i] = resp["NextShardIterator"]
+        for rec in resp["Records"]:
+            reading = json.loads(rec["Data"])
+            print(f"shard {i}: {reading['sensor_id']} "
+                  f"{reading['temp_c']}C seq={rec['SequenceNumber']}")
+\end{lstlisting}
+
+\subsection*{Verification}
+\begin{itemize}
+    \item Records from one sensor arrive in timestamp order within their shard---the partition-key guarantee made visible.
+    \item Halting the consumer and restarting from \texttt{TRIM\_HORIZON} replays retained records---the stream-is-a-log property.
+    \item Forcing throughput past the shard limit (raise the sensor count) produces \texttt{ProvisionedThroughputExceeded} and exercises the retry path.
+    \item CloudWatch shows \texttt{IteratorAgeMilliseconds} climbing while the consumer sleeps and falling when it resumes.
+\end{itemize}
+
+\section{Friday Use Case: Global Telemetry for Five Million Mobile Games}
+\index{use case!mobile game telemetry}
+A games publisher must ingest telemetry from five million concurrent mobile clients: session events, purchases, and crash reports, feeding live dashboards, anti-cheat analytics, and a data lake. The requirements state ``exactly-once processing and strict message ordering.'' Your job includes negotiating those requirements into something buildable.
+
+\subsection{Unpacking the Requirements}
+\textbf{Ordering} is only definable per entity: events for player \texttt{p-123} must be ordered; player A's events against player B's need no order. That is exactly the partition-key guarantee---so ordering costs nothing if scoped per player, and is impossible (or ruinously serializing) if scoped globally.
+
+\textbf{Exactly-once} splits into delivery and effect. Kinesis delivers at-least-once; exactly-once \emph{effects} come from idempotent consumers: deduplicate on a unique event ID (the client generates a UUID per event; the consumer does a DynamoDB conditional put before writing), or make downstream writes naturally idempotent (upsert by event ID). Where the sink supports transactions (Chapter~15's two-phase commit), end-to-end exactly-once is real; everywhere else, ``exactly-once'' is a contract about effects, not wires.
+
+\subsection{Architecture}
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[
+        box/.style={rectangle, rounded corners, draw=primary, thick, fill=primary!6, align=center, minimum width=2.9cm, minimum height=1.0cm, font=\small\bfseries},
+        guard/.style={rectangle, rounded corners, draw=red!60!black, thick, fill=red!5, align=center, minimum width=2.6cm, minimum height=0.9cm, font=\footnotesize\bfseries},
+        arr/.style={-{Stealth[length=2.5mm]}, draw=primary, thick}
+    ]
+        \node[box] (clients) at (0,0) {5M clients\\(SDK batching)};
+        \node[box] (edge) at (3.3,0) {API edge\\(validate, auth)};
+        \node[box] (kds) at (6.6,0) {Kinesis Data Streams\\on-demand mode};
+        \node[box] (flink) at (9.9,1.0) {Flink analytics\\(Ch.~15)};
+        \node[box] (fh) at (9.9,-1.0) {Firehose $\rightarrow$ S3\\(Ch.~14)};
+        \node[guard] (dedup) at (6.6,2.0) {Idempotent consumers\\event-ID dedup + DLQ};
+        \node[guard] (lag) at (9.9,-2.3) {Alarms: IteratorAge,\\WriteThroughputExceeded};
+        \draw[arr] (clients) -- (edge);
+        \draw[arr] (edge) -- (kds);
+        \draw[arr] (kds) -- (flink);
+        \draw[arr] (kds) -- (fh);
+        \draw[arr, dashed] (dedup) -- (kds);
+    \end{tikzpicture}%
+    }
+    \caption{Global telemetry: edge validation, per-player partition keys, on-demand shards, independent consumers, idempotent writes.}
+    \label{fig:ch13-telemetry}
+\end{figure}
+
+\subsection{Design Decisions}
+\textbf{Client discipline.} Clients batch events (10--50 per request) and tag each with a UUID and monotonically increasing per-session sequence. Batching converts 5M $\times$ 1 event/s into a manageable record rate; UUIDs make dedup possible.
+
+\textbf{Capacity.} Peak estimate: 200{,}000 records/second $\times$ 300 bytes $\approx$ 60 MB/s ingress $\Rightarrow$ roughly 200 shards with headroom (records/s bound). On-demand capacity mode absorbs the daily player-count swings; alarms on write-throughput rejections catch the edge cases.
+
+\textbf{Regional strategy.} Streams are regional; clients write to their nearest region's stream, and cross-region replication into the analytics region consolidates. Global ordering is neither needed nor attempted; per-player ordering survives because a player is pinned to a region per session.
+
+\begin{pitfall}
+\textbf{Accepting ``exactly-once, globally ordered'' as a literal requirement.} Global order destroys parallelism; exactly-once delivery does not exist on unreliable networks---only exactly-once effects do. The professional move is to negotiate to per-entity ordering plus idempotent consumers, and write the dedup contract into the API.
+\end{pitfall}
+
+\section{Interview Q\&A}
+\subsection{Concepts and Trade-offs}
+\begin{enumerate}
+    \item \textbf{Q: Which two throughput limits determine how many shards a stream needs?}\\
+    A: Per-shard ingress of 1 MB/s \emph{and} 1{,}000 records/s---the shard count is the max of the byte-based and record-based computations, plus headroom.
+    \item \textbf{Q: Why does partition-key choice control per-entity ordering?}\\
+    A: Kinesis hashes the key to a shard; a shard is the ordered unit. Equal keys share a shard, so per-key order is guaranteed---and a skewed key concentrates load on one shard.
+    \item \textbf{Q: What does a rising \texttt{IteratorAgeMilliseconds} warn about?}\\
+    A: Consumers falling behind. Since retention is finite (default 24 h), a consumer that stays behind long enough loses data; alarm before the retention horizon.
+    \item \textbf{Q: How do you build exactly-once effects on at-least-once delivery?}\\
+    A: Idempotent consumers: deduplicate on a unique event ID (conditional put in DynamoDB) or write idempotently (upsert by key), and route poison records to a DLQ.
+    \item \textbf{Q: Kinesis versus MSK: which is billed per shard-hour and record volume?}\\
+    A: Kinesis. MSK bills broker instance-hours and storage---you pay for a fleet; Kinesis bills for log capacity.
+    \item \textbf{Q: When does SQS FIFO suffice and Kinesis is overkill?}\\
+    A: When each message has exactly one consumer, no replay is needed, and throughput fits FIFO quotas. Streams earn their cost when multiple consumers read the same events or replay matters.
+\end{enumerate}
+
+\section{Further Reading}
+The Kinesis Data Streams Developer Guide covers shards, partition keys, iterators, KCL checkpointing, and on-demand mode \cite{awsKinesisDocs}. The SQS and SNS guides cover visibility timeouts, DLQs, FIFO, and fan-out \cite{awsSQSDocs,awsSNSDocs}. The MSK Developer Guide and the Kafka documentation cover the broker-side model \cite{awsMSKDocs,apacheKafkaProject}. Streaming Systems provides the delivery-semantics and ordering theory behind Friday's negotiation \cite{akidauStreamingSystems}.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item Queues distribute work (consumed once); streams record a replayable log (read by many). Pick per consumer topology, not habit.
+    \item Shard sizing is byte-and-record arithmetic; hot shards are a key-design failure, not a capacity failure.
+    \item Partition keys simultaneously define ordering scope and parallelism---choose them as high-cardinality entity IDs.
+    \item \texttt{IteratorAgeMilliseconds} against the retention window is the stream's existential alarm.
+    \item At-least-once delivery plus idempotent consumers plus DLQs is how exactly-once \emph{effects} are actually built.
+    \item Kinesis buys AWS-native simplicity; MSK buys Kafka compatibility and portability.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Explain the difference between message deletion in SQS and retention in Kinesis, and what each implies for adding a new consumer next month.
+    \item \textbf{(Conceptual)} Why does enhanced fan-out exist, given shards already have 2 MB/s of egress?
+    \item \textbf{(Hands-on)} Run the Thursday lab; then set the consumer's iterator to \texttt{TRIM\_HORIZON} after ten minutes and document what replays.
+    \item \textbf{(Hands-on)} Force a hot shard: send 80\% of records with one partition key and observe which metrics move.
+    \item \textbf{(Hands-on)} Build the SNS-to-SQS fan-out: one topic, two queues, message filtering per queue, and a DLQ with a redrive policy.
+    \item \textbf{(Design)} Size the shard count for 50{,}000 events/second at 2 KB average, with 3$\times$ burst headroom. Show the arithmetic both ways.
+    \item \textbf{(Design)} Design the dedup contract for the Friday telemetry case: where the UUID is generated, where dedup state lives, and what the eviction window must cover.
+    \item \textbf{(Architecture)} The publisher must now serve European players from EU-resident infrastructure. Sketch the regional design and the consolidation path.
+\end{enumerate}
+
+\section{Capstone Project: A Resilient Telemetry Ingestion Tier}\label{sec:ch13-capstone}
+\index{capstone project}\index{Kinesis!capstone}
+
+\begin{capstonebox}
+\textbf{Mission.} Build a production-shaped telemetry ingestion tier: a sized and alarmed Kinesis stream, a retrying producer, an idempotent consumer with checkpointing and a DLQ, and the evidence that ordering, replay, and failure semantics all behave as designed.
+
+\textbf{Estimated time.} 4--6 hours in a sandbox AWS account.
+
+\textbf{What you\textquotesingle{}ll practice.}
+\begin{itemize}
+    \item Shard sizing arithmetic and on-demand versus provisioned mode selection.
+    \item Producer partial-failure handling and partition-key design.
+    \item Idempotent consumption with dedup state and poison-record routing.
+    \item Stream observability: iterator age, throughput rejections, DLQ depth.
+\end{itemize}
+\end{capstonebox}
+
+\subsection*{Scenario}
+The publisher from the Friday use case is piloting with 50{,}000 concurrent clients. Build the ingestion tier they will scale from, and prove its failure semantics before the pilot---not during the launch spike.
+
+\subsection*{Requirements}
+\textbf{Functional requirements.}
+\begin{itemize}
+    \item A stream sized from a documented workload estimate, with the arithmetic committed.
+    \item A producer handling partial \texttt{put\_records} failures with bounded backoff.
+    \item A consumer that deduplicates on event ID, checkpoints progress, and routes three-time failures to a DLQ.
+    \item Alarms on iterator age, write-throughput rejections, and DLQ depth, wired to SNS.
+\end{itemize}
+
+\textbf{Non-functional requirements.}
+\begin{itemize}
+    \item A killed consumer resumes from its checkpoint with no duplicates downstream.
+    \item A hot-key fault injection is detectable from metrics alone.
+    \item The DLQ is inspectable and a redrive procedure is documented.
+\end{itemize}
+
+\subsection*{Implementation Steps}
+\begin{enumerate}
+    \item Write the sizing memo and create the stream accordingly.
+    \item Implement the producer (extend \cref{lst:ch13-producer} with event UUIDs).
+    \item Implement the idempotent consumer with DynamoDB conditional-put dedup and checkpointing.
+    \item Inject faults: consumer kill, poison record, hot key; capture metric and DLQ evidence for each.
+    \item Configure the three alarms and demonstrate one firing.
+    \item Write the redrive runbook and the pilot go/no-go checklist.
+\end{enumerate}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item The sizing memo, stream configuration, and alarm definitions.
+    \item Producer and consumer code with the dedup and DLQ paths.
+    \item Fault-injection evidence: kill/resume without duplicates, poison record in the DLQ, hot-key metrics.
+    \item The redrive runbook and go/no-go checklist.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item Per-player ordering holds under the full test load, verified programmatically.
+    \item Replay from \texttt{TRIM\_HORIZON} produces zero duplicate downstream effects.
+    \item Poison records never block a shard longer than the retry policy allows.
+    \item All three alarms have fired at least once during testing and are documented.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Add a Lambda consumer triggered by the stream with a bisect-batch-on-error policy and compare its failure behavior.
+    \item Attach a Firehose delivery stream as a second consumer (preview of Chapter~14).
+    \item Replatform the consumer onto KCL with multi-instance rebalancing and document the lease table.
+    \item Repeat the pilot sizing for MSK with the same workload and compare monthly cost.
+\end{itemize}

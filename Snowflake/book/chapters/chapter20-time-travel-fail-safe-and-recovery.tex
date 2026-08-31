@@ -1,0 +1,255 @@
+\chapter{Data Clean Rooms and the Native App Framework}
+\index{data clean room}\index{differential privacy}\index{Native Apps}\index{Week 20}%
+\begin{objectives}
+\begin{itemize}
+    \item Explain data clean rooms: multi-party, privacy-preserving analytics without raw data exposure.
+    \item Apply cryptographic hashing and differential privacy to overlap analyses.
+    \item Enforce minimum cohort sizes so aggregates cannot re-identify individuals.
+    \item Describe the Snowflake Native App Framework: what providers ship and how consumers install it.
+    \item Build a hands-on two-party clean room computing advertiser--publisher overlap without exposing emails.
+    \item Design a healthcare research clean room for joint ML studies across hospital networks and pharmaceutical companies.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+Privacy-preserving collaboration is a cross-industry pattern; each hyperscaler productized a clean room, and Snowflake additionally lets you ship entire applications to consumers.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{2.8cm}p{3.0cm}p{3.0cm}p{3.0cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{AWS} & \textbf{Azure} & \textbf{GCP} \\
+\midrule
+Clean room service & AWS Clean Rooms & Azure confidential computing + partner tools & BigQuery data clean rooms \\
+Identifier protection & Hashed/normalized join keys & Confidential enclaves & Confidential space + policy \\
+Aggregate thresholds & Minimum cohort rules & Policy-based & Analysis rules \\
+Differential privacy & AWS Clean Rooms DP & SmartNoise ecosystem & DP libraries + BigQuery DP \\
+App distribution & AWS Marketplace AMIs/SaaS & Azure Marketplace & GCP Marketplace \\
+\addlinespace
+Snowflake equivalent & \multicolumn{3}{l}{Snowflake Data Clean Rooms; Native App Framework for shipping code + data} \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+\textbf{MongoDB} and \textbf{Fabric} rely on partner architectures rather than native clean-room products. Snowflake's compounding advantage: clean rooms build on Chapter 19's zero-copy sharing, so multi-party analysis never moves anyone's data, and Native Apps ship not just data but the code that consumes it.
+\end{crosscloud}
+
+\section{Week 20 Roadmap}
+Chapter 19 shared data bilaterally. The harder business problem is \emph{multi-party analysis where nobody may see anyone else's rows}: advertisers and publishers measuring overlap, hospitals and pharma companies running joint studies. Data clean rooms solve it; the Native App Framework generalizes it into shipping governed applications \cite{snowflakeCleanRoomsDocs,snowflakeNativeAppsDocs}.
+
+Monday frames clean-room concepts. Tuesday covers the cryptographic and statistical machinery. Wednesday introduces Native Apps. Thursday builds the advertiser--publisher overlap lab. Friday designs the healthcare research clean room---closing Milestone 5's governance arc.
+
+\begin{keyterms}
+\textbf{Data clean room}: a governed environment where parties run approved analyses on combined data without accessing each other's raw rows.\quad
+\textbf{Overlap analysis}: computing the intersection size (or aggregates over it) of two parties' audiences.\quad
+\textbf{Differential privacy}: adding calibrated noise so results provably bound what any individual's data could change.\quad
+\textbf{Minimum cohort threshold}: refusing results over groups smaller than $k$, blocking re-identification via small cells.\quad
+\textbf{Native App}: a versioned Snowflake application---code, data, and UI---installed into a consumer's account.
+\end{keyterms}
+
+\section{Monday: Clean Room Concepts}
+\index{data clean room}
+The business question is always some variant of: ``what do our datasets tell us \emph{together}, given that neither of us may read the other's?'' Classic approaches---ship CSVs to a neutral third party, sign an NDA, hope---fail on exposure, freshness, and auditability simultaneously. A clean room replaces trust-by-contract with trust-by-architecture:
+
+\begin{definitionbox}
+A \textbf{data clean room} is a governed computation environment in which (a) each party's raw data stays in its own account, (b) only approved query templates may run against the combined data, and (c) results pass privacy controls---hashing of identifiers, aggregate-only outputs, minimum cohort sizes---before either party sees them.
+\end{definitionbox}
+
+In Snowflake, the mechanics reuse Part IV's toolkit: each party exposes governed secure views (Chapter 19) into a shared analysis context; approved analyses are versioned SQL templates; and the controls of Chapter 18 (masking, row policies, cohort floors) enforce output safety. The engineering content is not a new object type---it is the \emph{discipline} of template approval, identifier normalization, and output gating.
+
+\begin{notebox}
+Clean rooms govern \emph{questions}, not just data. ``Which of my customers are also your viewers?'' is approvable; ``list your viewers'' is not, even though both run against the same tables. Template allow-lists are where policy becomes code.
+\end{notebox}
+
+\section{Tuesday: Hashing, Differential Privacy, and Cohort Floors}
+\index{hashing}\index{differential privacy}\index{cohort threshold}
+\subsection{Identifier Hashing}
+Overlap analysis needs join keys neither party can reverse. The standard: normalize identifiers (lowercase, trimmed emails), hash with a keyed function (\texttt{SHA2(email, 256)} or HMAC with a shared salt), and join on the hash. Hashing is \emph{pseudonymization}, not anonymization---a dictionary attack over common emails can reverse unsalted hashes---so it combines with aggregate-only output rules.
+
+\subsection{Differential Privacy}
+\index{differential privacy}
+Hashing protects identifiers; aggregates still leak. If a result set contains ``customers in segment A,'' a party who knows one member can probe membership by differencing queries. \textbf{Differential privacy} (DP) adds calibrated random noise to outputs so that any single individual's inclusion provably changes the result distribution by at most a bounded factor---the privacy budget $\varepsilon$ \cite{dwork2006dp}. Smaller $\varepsilon$ means stronger privacy and noisier answers; the budget is a policy dial set per study.
+
+\subsection{Minimum Cohort Floors}
+The simplest, most universally deployed control: refuse any result computed over fewer than $k$ individuals. A ``segment'' of three people is a re-identification vector; a floor of $k=100$ makes small-cell probing statistically useless. In Snowflake clean-room templates the floor is enforced in the template itself---\texttt{HAVING COUNT(DISTINCT subject) >= 100}---so no approved query can violate it.
+
+\begin{pitfall}
+\textbf{Controls must compose.} Hashing without cohort floors leaks through small groups; cohort floors without DP leak through differencing across adjacent queries; DP without template allow-lists leaks through unrestricted query volume. A clean room is the conjunction, not the menu.
+\end{pitfall}
+
+\section{Wednesday: The Native App Framework}
+\index{Native App Framework}
+Chapter 19 shipped \emph{data}. A \textbf{Native App} ships \emph{the whole product}: tables, views, stored procedures, Streamlit UI, and setup logic, packaged as a versioned application the consumer installs into their own account. The app's code runs on the consumer's compute against consumer-side and provider-shared data; upgrades arrive as versions; the provider never operates the consumer's account.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{4.0cm}p{4.6cm}p{4.6cm}@{}}
+\toprule
+ & \textbf{Secure share / listing} & \textbf{Native App} \\
+\midrule
+Payload & Governed data access & Code + data + UI, versioned \\
+Consumer runs & Their SQL against shared data & The provider's application logic \\
+Upgrade path & Schema changes, contract risk & Versioned releases with upgrade scripts \\
+Fit & Data products & Analytical applications, clean-room apps, connectors \\
+\bottomrule
+\end{tabular}
+\caption{Shares distribute data; Native Apps distribute applications.}
+\label{tab:chapter20-share-vs-app}
+\end{table}
+
+For clean rooms, Native Apps close the last gap: the \emph{analysis itself}---the approved templates, the DP noise, the cohort floors---ships as the app, so every participant runs identical, provider-versioned logic instead of hand-copied SQL.
+
+\section{Thursday Hands-On Project: Two-Party Overlap Analysis}
+\index{hands-on project!clean room}
+This lab builds the advertiser--publisher overlap clean room with hashing, aggregate-only outputs, and a cohort floor.
+
+\subsection*{Scenario}
+An advertiser and a publisher want to know how many of the advertiser's customers saw a campaign---and the reach rate by broad region---without either party learning \emph{which} individuals overlap.
+
+\subsection*{Procedure}
+\begin{enumerate}
+    \item In two accounts (or two schemas simulating them), create customer tables with normalized emails.
+    \item Each party publishes a secure view exposing only \texttt{SHA2(LOWER(TRIM(email)), 256)} and coarse region.
+    \item Write the approved overlap template: inner join on hash, aggregate by region, \texttt{HAVING COUNT(DISTINCT h) >= 25}.
+    \item Run the template; verify neither party can list the other's rows and that small regions are suppressed.
+    \item Attempt the attacks: dictionary-probe a hash of a known email; difference two adjacent queries to isolate an individual. Document what each attack yields under the controls.
+    \item Add DP-style noise (a deterministic-seeded jitter per region) and document the accuracy/privacy trade-off.
+\end{enumerate}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item \textbf{Both parties' DDL:} secure views, shares, and the approved template library.
+    \item \textbf{Overlap results} with suppression evidence for small cohorts.
+    \item \textbf{Attack log:} the two probing attacks and what the architecture returned to each.
+    \item \textbf{Policy memo:} the cohort floor, the $\varepsilon$ rationale, and the template-approval workflow.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item No query path returns another party's row-level data.
+    \item Outputs below the cohort floor are suppressed by the template, not by convention.
+    \item Identifier fields are normalized and keyed-hashed; raw emails never leave either account.
+    \item The DP noise level and its accuracy cost are quantified in the memo.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Repackage the template library as a Native App and install it in the ``consumer'' account.
+    \item Implement query-volume auditing to bound repeated-query differencing attacks.
+    \item Add a third party and analyze how the approval workflow scales.
+\end{itemize}
+
+\section{Friday Real-World Architecture: The Healthcare Research Clean Room}
+\index{Real-World Architecture!healthcare clean room}
+Three hospital networks and a pharmaceutical company want joint studies---treatment outcome correlations across populations---under strict patient-privacy law. No party may see another's patient records; the pharma company may see only cohort-level results.
+
+\subsection{Architecture}
+Each hospital publishes secure views with keyed-hashed patient identifiers and clinical attributes, masked per Chapter 18. A clean-room Native App---versioned by the consortium's data governance board---ships the approved study templates: cohort construction, outcome correlation with DP noise, minimum cohort $k=50$, and automatic suppression of rare-condition cells. Compute runs in a neutral analysis account; every executed template is logged with its hash so the audit trail proves \emph{which approved questions were asked}, not just that data was touched.
+
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[
+        hosp/.style={rectangle, rounded corners, draw=codegreen!60!black, thick, fill=green!8, align=center, minimum width=2.6cm, minimum height=1.0cm, font=\small\bfseries},
+        room/.style={rectangle, rounded corners, draw=primary, thick, fill=primary!6, align=center, minimum width=3.6cm, minimum height=1.3cm, font=\small\bfseries},
+        gatebox/.style={rectangle, rounded corners, draw=red!60!black, thick, fill=red!8, align=center, minimum width=3.0cm, minimum height=1.0cm, font=\small\bfseries},
+        arrow/.style={-{Stealth[length=2.5mm]}, draw=primary, thick},
+        lbl/.style={font=\scriptsize\itshape, text=codegray}
+    ]
+        \node[hosp] (h1) at (0, 1.6) {Hospital A\\hashed view};
+        \node[hosp] (h2) at (0, 0) {Hospital B\\hashed view};
+        \node[hosp] (h3) at (0, -1.6) {Hospital C\\hashed view};
+        \node[room] (cr) at (5.4, 0) {Clean-room account\\approved templates\\(Native App, versioned)};
+        \node[gatebox] (gate) at (10.4, 0) {Output gate\\DP noise +\\cohort floor $k{=}50$};
+        \node[hosp] (pharma) at (14.0, 0) {Pharma\\cohort results};
+        \draw[arrow] (h1) -- (cr);
+        \draw[arrow] (h2) -- (cr);
+        \draw[arrow] (h3) -- (cr);
+        \draw[arrow] (cr) -- node[lbl, above]{aggregates only} (gate);
+        \draw[arrow] (gate) -- (pharma);
+    \end{tikzpicture}%
+    }
+    \caption{Healthcare clean room: hashed secure views feed a versioned template app; an output gate enforces DP noise and cohort floors before results leave.}
+    \label{fig:chapter20-healthcare-cleanroom}
+\end{figure}
+
+\subsection{Governance Operating Model}
+The technology is half the design. The other half: a template-approval board with clinical and legal sign-off, a privacy-budget ledger per study (total $\varepsilon$ spend tracked and capped), query-volume auditing to detect probing patterns, and incident procedures for when a template itself is found leaky. The clean room's deliverable is not data---it is \emph{provable process}.
+
+\begin{pitfall}
+\textbf{Rare diseases break cohort floors in the right direction---respect it.} Clinical pressure to see small-cell results is exactly the re-identification scenario. The answer is study redesign (pooled periods, broader geographies), not a lower $k$.
+\end{pitfall}
+
+\section{Interview Q\&A}
+\begin{enumerate}
+    \item \textbf{Q: What problem does a data clean room solve?}\\
+    A: Multi-party analytics where no participant may access another's raw data---approved computations run on combined data with privacy controls on outputs.
+    \item \textbf{Q: Why hash emails before an overlap analysis?}\\
+    A: Hashing pseudonymizes identifiers so neither party sees the other's raw keys; keyed hashing resists dictionary reversal, and it composes with aggregate-only outputs.
+    \item \textbf{Q: What does differential privacy add to query results?}\\
+    A: Calibrated noise that provably bounds how much any individual's data can change the output---protecting against differencing and membership-probe attacks.
+    \item \textbf{Q: What can a Snowflake Native App ship to consumers?}\\
+    A: A versioned application: tables, views, stored procedures, and Streamlit UI, installed into the consumer's account and run on their compute.
+    \item \textbf{Q: Why must clean-room analyses enforce minimum group sizes?}\\
+    A: Small cells re-identify individuals---a cohort floor suppresses results over fewer than $k$ subjects so aggregates cannot become lookups.
+\end{enumerate}
+
+\section{Further Reading}
+Snowflake's clean-room and Native App documentation define the platform mechanics \cite{snowflakeCleanRoomsDocs,snowflakeNativeAppsDocs}. Dwork's foundational work formalizes differential privacy \cite{dwork2006dp}. The governance substrate is Part IV: RBAC (Chapter 17), masking and erasure (Chapter 18), and sharing (Chapter 19).
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item Clean rooms govern questions: template allow-lists turn privacy policy into code.
+    \item Keyed hashing, aggregate-only outputs, cohort floors, and DP noise compose---none is sufficient alone.
+    \item Hashing is pseudonymization; the output gate is what makes it privacy.
+    \item Native Apps ship versioned application logic into consumer accounts---clean-room analyses included.
+    \item Rare populations stress cohort floors; redesign studies, never the floor.
+    \item The deliverable of a regulated clean room is provable process: template versions, privacy budgets, query logs.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Explain why unsalted email hashes are reversible in practice.
+    \item \textbf{(Conceptual)} Describe a differencing attack and the two controls that jointly defeat it.
+    \item \textbf{(Hands-on)} Build the overlap template with a configurable cohort floor and test its suppression boundary.
+    \item \textbf{(Hands-on)} Implement seeded DP noise and measure accuracy loss at three $\varepsilon$ values.
+    \item \textbf{(Hands-on)} Package a two-template analysis as a Native App and walk through a version upgrade.
+    \item \textbf{(Design)} Write the privacy-budget ledger schema and the per-study $\varepsilon$ accounting rule.
+    \item \textbf{(Design)} Design the template-approval workflow: roles, sign-offs, and emergency revocation.
+    \item \textbf{(Operations)} Build the query-volume monitor that flags probing patterns across executions.
+    \item \textbf{(Governance)} Draft the data-use agreement clauses that map to each technical control.
+    \item \textbf{(Interview)} Explain to a hospital CISO why their data never leaves their account in this design.
+\end{enumerate}
+
+\section{Capstone Project: Governed Multi-Tenant Platform and Secure Share}\label{sec:ch20-capstone}
+\index{capstone project!Milestone 5}
+\begin{capstonebox}
+\textbf{Mission.} Integrate Weeks 17--20 into a production security perimeter: an access/functional RBAC hierarchy, tag-based dynamic masking for PII, row access policies for regional multi-tenancy, and a secure share exposing anonymized Gold aggregates to external reader accounts---with crypto-shredding for erasure.
+
+\textbf{Estimated time.} 8--10 hours across the four weeks' labs.
+
+\textbf{Deliverable checklist.}
+\begin{itemize}
+    \item The full governance stack deploys from a clean environment per a committed README.
+    \item Architecture diagram: role hierarchy, policies, and share topology.
+    \item At least three automated policy tests (masking as unauthorized role, row-policy bypass attempt, share content validation) with failing-case demonstrations.
+    \item Monitoring evidence: an exported access-audit query against \texttt{ACCOUNT\_USAGE}.
+    \item Monthly cost estimate (reader accounts, governance features) with two optimization decisions.
+    \item Security review: MFA enforced, separation of duties documented, PII classification report attached.
+\end{itemize}
+\end{capstonebox}
+
+The capstone's hardest element---tag-based masking---follows the Chapter 18 pattern:
+
+\begin{lstlisting}[language=SQL, caption={Tag-based dynamic masking policy}]
+CREATE OR REPLACE MASKING POLICY pii_mask AS
+  (val STRING) RETURNS STRING ->
+  CASE WHEN IS_ROLE_IN_SESSION('HR_ROLE') THEN val
+       ELSE '***MASKED***' END;
+
+ALTER TAG pii_email SET MASKING POLICY pii_mask;
+-- every column tagged pii_email is now masked by role
+\end{lstlisting}
+
+Field pitfalls: sharing base tables instead of secure views leaks unmasked columns; testing masking only as an admin role hides policy gaps---test as each consumer role; and deleting rows while leaving clones, Time Travel, and Fail-safe readable does not satisfy erasure.

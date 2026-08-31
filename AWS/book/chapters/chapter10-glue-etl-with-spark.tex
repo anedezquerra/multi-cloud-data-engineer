@@ -1,0 +1,327 @@
+\chapter{Serverless ETL with AWS Glue}
+\index{AWS Glue}\index{DynamicFrame}\index{Glue Studio}\index{Glue DataBrew}\index{job bookmarks}\index{DPU}\index{serverless ETL}%
+\begin{objectives}
+\begin{itemize}
+    \item Explain Glue's serverless ETL model and the difference between DynamicFrames and Spark DataFrames.
+    \item Build visual ETL pipelines in Glue Studio and profile data with Glue DataBrew.
+    \item Make re-runs safe with job bookmarks and idempotent write patterns.
+    \item Tune jobs with worker types, DPU sizing, and Flex execution, and reason about DPU billing.
+    \item Evaluate Glue versus EMR for analyst-built daily reporting pipelines.
+    \item Build a pipeline that joins two tables, drops nulls, transforms timestamps, and loads clean data into Redshift.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+Serverless, catalog-integrated ETL is a universal pattern; only the branding differs.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{2.8cm}p{3.0cm}p{3.0cm}p{3.0cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{AWS} & \textbf{Azure} & \textbf{GCP} \\
+\midrule
+Serverless ETL engine & AWS Glue (Spark) & Fabric Dataflow Gen2 / pipelines & Dataflow / Cloud Data Fusion \\
+Visual ETL designer & Glue Studio & Data Factory designer & Data Fusion studio \\
+Interactive data prep & Glue DataBrew & Power Query (Fabric) & Dataprep (Trifacta) \\
+Shared catalog & Glue Data Catalog & OneLake catalog / Purview & Dataplex \\
+Re-run state & Job bookmarks & Pipeline state / watermark columns & Job state / watermarking \\
+\addlinespace
+Capacity unit & DPU-hour & Capacity units & vCPU-hr (Dataflow) \\
+Batch spot discount & Flex execution & Low-priority pools & Preemptible/Spot workers \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+\textbf{Snowflake} approaches the same problems from inside the warehouse: streams, tasks, and Snowpark replace external ETL for in-warehouse transforms. \textbf{MongoDB} users meet this layer as the Atlas Data API or Spark connector feeding the lake. The Glue skill set---schema-aware transforms, idempotent re-runs, capacity tuning---transfers to all of them.
+\end{crosscloud}
+
+\section{Week 10 Roadmap and Mental Model}
+Chapter~9 gave you full control of a big-data cluster; Week~10 asks when you should decline that control. AWS Glue is serverless Spark (and Python shell) with the Data Catalog built in: you write the transformation, Glue provisions the workers, runs the job, and tears everything down \cite{awsGlueDocs}. For the large middle class of ETL work---daily joins, type fixes, format conversion, Redshift loads---Glue removes cluster operations entirely.
+
+The week's three engineering disciplines: understand the \emph{abstraction} (DynamicFrames and when to drop to DataFrames), make every job \emph{idempotent} (bookmarks plus overwrite-style writes), and manage \emph{capacity economics} (DPUs, worker types, Flex).
+
+\begin{definitionbox}
+\textbf{AWS Glue} is a serverless data integration service comprising an ETL engine (Spark and Python shell), a visual designer (Glue Studio), an interactive preparation tool (DataBrew), a scheduler and workflow engine, crawlers, and the Data Catalog shared with Athena, Spectrum, and EMR.
+\end{definitionbox}
+
+\begin{keyterms}
+\textbf{DynamicFrame}: Glue's schema-flexible distributed collection with resolve-choice semantics. \textbf{DPU}: data processing unit---4 vCPU + 16 GB; the billing and capacity unit. \textbf{Job bookmark}: persisted per-job state tracking processed inputs so re-runs process only new data. \textbf{Glue Studio}: the visual job designer that generates PySpark. \textbf{DataBrew}: the interactive, no-code profiling and cleaning tool. \textbf{Flex}: discounted spare-capacity execution for non-urgent jobs.
+\end{keyterms}
+
+\section{Monday: Glue ETL---DynamicFrames Versus Spark DataFrames}
+\subsection{The DynamicFrame Abstraction}
+Glue jobs are Spark jobs with an extra abstraction. A Spark \emph{DataFrame} has one rigid schema; a \emph{DynamicFrame} is a collection of self-describing records designed for data whose schema is messy or evolving \cite{awsGlueDocs}. Its signature operations---\texttt{resolveChoice}, \texttt{relationalize}, \texttt{applyMapping}---handle the real-world cases: a field that is sometimes a string and sometimes a struct, nested JSON that must become relational tables.
+\index{DynamicFrame}\index{resolveChoice}
+
+\begin{lstlisting}[language=Python,caption={Glue job skeleton: catalog in, DynamicFrame transforms, Redshift out.},label={lst:ch10-glue-job}]
+import sys
+from awsglue.context import GlueContext
+from awsglue.dynamicframe import DynamicFrame
+from awsglue.job import Job
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from pyspark.sql.functions import col, to_timestamp
+
+args = getResolvedOptions(sys.argv, ["JOB_NAME"])
+sc = SparkContext()
+glueContext = GlueContext(sc)
+job = Job(glueContext)
+job.init(args["JOB_NAME"], args)
+
+orders = glueContext.create_dynamic_frame.from_catalog(
+    database="week7_lake", table_name="sales_parquet",
+    transformation_ctx="orders",
+)
+customers = glueContext.create_dynamic_frame.from_catalog(
+    database="week7_lake", table_name="customers",
+    transformation_ctx="customers",
+)
+
+# Drop to DataFrames for the join/filter/timestamp logic...
+joined = (
+    orders.toDF()
+          .join(customers.toDF(), "customer_id")
+          .filter(col("customer_id").isNotNull() & col("amount").isNotNull())
+          .withColumn("order_ts", to_timestamp(col("order_date")))
+)
+
+# ...and back to a DynamicFrame for Glue's Redshift sink options.
+out = DynamicFrame.fromDF(joined, glueContext, "out")
+
+glueContext.write_dynamic_frame.from_options(
+    frame=out,
+    connection_type="redshift",
+    connection_options={
+        "url": "jdbc:redshift://week5-wg.123456789012.us-east-1.redshift-serverless.amazonaws.com:5439/dev",
+        "dbtable": "analytics.sales_clean",
+        "redshiftTmpDir": "s3://acme-analytics-raw-123456789012/tmp/glue/",
+        "aws_iam_role": "arn:aws:iam::123456789012:role/RedshiftS3ReadRole",
+    },
+    transformation_ctx="redshift_sink",
+)
+job.commit()
+\end{lstlisting}
+
+\textbf{When to use which:} start from the catalog with DynamicFrames, convert to DataFrame (\texttt{.toDF()}) the moment you need the full Spark API---window functions, complex expressions, ML---and convert back for Glue-specific sinks. Most production jobs live mostly in DataFrame land; the DynamicFrame earns its keep at schema boundaries.
+\index{DataFrame conversion}
+
+\section{Tuesday: Glue Studio and DataBrew}
+\subsection{Visual ETL for Working Teams}
+Glue Studio lets you compose sources, transforms, and targets on a canvas and generates the PySpark job underneath. Its honest role in a professional estate: fast prototyping, and a legible starting point for analysts. The generated code should graduate into version control, where engineers harden it---parameterize paths, add error handling, attach bookmarks.
+\index{Glue Studio}
+
+\subsection{DataBrew: Profiling Before Pipelines}
+Glue DataBrew is the interactive counterpart: point it at a dataset and it profiles columns (null rates, distributions, outliers) and offers 250+ no-code transformations as a visual ``recipe'' that can run on a schedule \cite{awsGlueDataBrewDocs}. DataBrew's highest-leverage use is \emph{before} you write a Glue job---its profile tells you the null rates and type inconsistencies your job must handle. Chapter~12's capstone uses DataBrew again as a data-quality gate.
+\index{Glue DataBrew}\index{data profiling}
+
+\begin{tipbox}
+DataBrew profile jobs scan the full dataset and bill accordingly. Profile a sampled S3 path during development; reserve full-dataset profiles for the pre-production validation run.
+\end{tipbox}
+
+\section{Wednesday: Bookmarks, DPUs, and Flex}
+\subsection{Job Bookmarks and Idempotency}
+A job bookmark records what a job already processed---which S3 objects, which partition values---so a re-run processes only what is new \cite{awsGlueDocs}. Bookmarks solve the ``what's new'' half of idempotency; the other half is the \emph{write} side. A job that appends rows to the target will duplicate them on any re-run that reprocesses input. Production discipline: write with overwrite semantics scoped to the partition being rebuilt (or MERGE into Redshift), parameterize the run date, and keep bookmarks enabled so retries reprocess only new partitions.
+\index{job bookmark}\index{idempotency}
+
+\begin{pitfall}
+\textbf{Bookmark on, append write.} Bookmarks prevent re-reading; they do nothing about re-writing. A mid-job failure retried with an append sink duplicates everything the first attempt wrote. Pair bookmarks with partition-overwrite or merge sinks, and make the pair a code-review checklist item.
+\end{pitfall}
+
+\subsection{Capacity and Cost: DPUs, Worker Types, Flex}
+A DPU is 4 vCPU and 16 GB of memory; jobs bill per DPU-second with a one-minute minimum \cite{awsGlueDocs}. Tuning levers: worker type (G.1X, G.2X and larger for memory-heavy shuffles), worker count (parallelism versus diminishing returns), and \emph{Flex execution}, which runs the job on spare capacity at a discount in exchange for variable start times---ideal for non-urgent backfills and nightly jobs with slack in their window.
+\index{DPU}\index{worker type}\index{Flex execution}
+
+\section{Thursday Hands-on Project: A Glue Studio Pipeline into Redshift}
+\index{hands-on project!Glue Studio pipeline}
+Build a visual ETL pipeline in Glue Studio that joins two tables, drops null values, transforms a timestamp, and loads the clean data into Redshift---then harden the generated script.
+
+\subsection*{Lab Objectives}
+\begin{itemize}
+    \item Compose the pipeline visually: two catalog sources, a join, a null filter, a timestamp transform, a Redshift target.
+    \item Inspect and parameterize the generated PySpark script.
+    \item Enable bookmarks, run the job twice, and prove the second run loads nothing new.
+    \item Introduce a bad record and observe the pipeline's behavior.
+\end{itemize}
+
+\subsection*{Procedure}
+\begin{enumerate}
+    \item In Glue Studio, create a job from the visual canvas. Add two \emph{AWS Glue Data Catalog} sources: \texttt{week7\_lake.sales\_parquet} and \texttt{week7\_lake.customers}.
+    \item Add a \emph{Join} transform on \texttt{customer\_id}; a \emph{Filter} transform dropping rows where \texttt{customer\_id IS NULL} or \texttt{amount IS NULL}; a \emph{Custom Transform} (or SQL) converting \texttt{order\_date} to a true timestamp column \texttt{order\_ts}.
+    \item Add an \emph{Amazon Redshift} target writing \texttt{analytics.sales\_clean} with the S3 temporary directory set to a dedicated \texttt{tmp/glue/} prefix.
+    \item Open the generated script tab. Replace hardcoded bucket and table literals with job parameters; save.
+    \item On the \emph{Job details} tab: worker type G.1X, 4 workers, job bookmarks \emph{Enabled}, Flex \emph{off} for the timed first run.
+    \item Run the job; verify row counts in Redshift. Load one new day's files to S3, rerun, and verify only the new partition's rows arrive.
+\end{enumerate}
+
+\begin{lstlisting}[language=SQL,caption={Verification queries against the Redshift target.},label={lst:ch10-verify}]
+-- Row count and freshness
+SELECT COUNT(*) AS rows_loaded,
+       MAX(order_ts) AS latest_order
+FROM analytics.sales_clean;
+
+-- After the second (bookmark) run, this delta must equal only new rows:
+SELECT order_date::DATE, COUNT(*)
+FROM analytics.sales_clean
+GROUP BY 1
+ORDER BY 1 DESC
+LIMIT 5;
+
+-- Null hygiene: both must return zero
+SELECT COUNT(*) FROM analytics.sales_clean
+WHERE customer_id IS NULL OR amount IS NULL;
+\end{lstlisting}
+
+\subsection*{Verification}
+\begin{itemize}
+    \item The Redshift table contains exactly the joined, filtered rows---no nulls in the enforced columns.
+    \item The second run's Redshift delta equals the new data only, demonstrating bookmark behavior plus idempotent writes.
+    \item The generated script is under version control with parameters externalized.
+    \item A deliberately malformed record produces a documented, non-silent outcome (dropped by filter, or job failure---your stated choice).
+\end{itemize}
+
+\section{Friday Use Case: Glue or EMR for the Analyst Team?}
+\index{use case!Glue versus EMR}
+A team of eight business analysts must build and run daily reporting pipelines: join the day's extracts, clean types, load Redshift. None manage infrastructure; two know Python well. Their director asks whether to standardize on Glue or EMR.
+
+\subsection{The Evaluation}
+\textbf{Skill fit.} Glue Studio's visual canvas and generated code match analysts who think in transforms, not clusters. EMR's value---framework choice, instance tuning, long-running jobs---is precisely what this team does not want to operate.
+
+\textbf{Workload fit.} The pipelines are daily, minutes-to-an-hour, schema-evolving, and catalog-centric: the Glue sweet spot. None are multi-framework, none run 24/7, none need exotic libraries beyond what custom Python wheel uploads provide.
+
+\textbf{Cost fit.} Intermittent daily jobs bill only DPU-seconds used; there is no idle cluster. Flex execution discounts the overnight schedule further.
+
+\textbf{Where the answer would flip.} Heavy continuous streaming, sub-second latency, framework requirements Glue lacks, or a platform team that already runs EKS---those point back to Chapter~9. State them in the recommendation so the decision is revisitable.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.4cm}p{4.4cm}p{4.4cm}@{}}
+\toprule
+\textbf{Criterion} & \textbf{AWS Glue} & \textbf{Amazon EMR} \\
+\midrule
+Operations burden & None (serverless) & Cluster lifecycle, even if transient \\
+Skill required & SQL/Python, visual design & Spark/Hadoop operations \\
+Workload shape & Batch, intermittent, catalog-centric & Continuous, multi-framework, exotic \\
+Cost shape & DPU-seconds per run & Node-hours per cluster \\
+Escape hatches & Drop to DataFrame; custom wheels & Anything the ecosystem offers \\
+\bottomrule
+\end{tabular}
+\caption{Glue versus EMR for the analyst reporting estate.}
+\label{tab:ch10-glue-vs-emr}
+\end{table}
+
+\begin{pitfall}
+\textbf{Choosing the tool the builders cannot operate.} The correct comparison is not feature lists; it is who owns a 2~a.m.\ failure. A serverless pipeline an analyst can rerun beats an elegant cluster only an absent engineer can restart.
+\end{pitfall}
+
+\section{Interview Q\&A}
+\subsection{Concepts and Trade-offs}
+\begin{enumerate}
+    \item \textbf{Q: What does a DynamicFrame offer that a Spark DataFrame does not?}\\
+    A: Self-describing records with schema-resolution operators---\texttt{resolveChoice}, \texttt{applyMapping}, \texttt{relationalize}---built for messy or evolving schemas and catalog-aware sinks. Convert to DataFrame when you need the full Spark API.
+    \item \textbf{Q: What do job bookmarks guarantee on a re-run?}\\
+    A: That inputs already processed are not reprocessed---new objects or partitions only. They do not make the sink idempotent; overwrite or merge writes must cover the output side.
+    \item \textbf{Q: When is Flex execution the cheaper choice?}\\
+    A: For non-urgent jobs---backfills, overnight batch with slack---that tolerate delayed starts. Flex runs on spare capacity at a discount; latency-sensitive or SLA-bound jobs stay on standard execution.
+    \item \textbf{Q: Why is Glue usually a better fit than EMR for analyst-built pipelines?}\\
+    A: No clusters to operate, a visual designer that generates real code, catalog integration, and per-second billing that matches intermittent daily runs.
+    \item \textbf{Q: What compute does one DPU represent for billing?}\\
+    A: 4 vCPU and 16 GB of memory, billed per second with a one-minute minimum. Worker type and count multiply from there.
+    \item \textbf{Q: What is DataBrew's best use in a Glue estate?}\\
+    A: Interactive profiling and recipe prototyping before pipeline development---and, as Chapter~12 shows, a schedulable data-quality gate inside an orchestrated pipeline.
+\end{enumerate}
+
+\section{Further Reading}
+The Glue Developer Guide covers jobs, DynamicFrames, bookmarks, worker types, and Flex \cite{awsGlueDocs}; the DataBrew guide covers profiling and recipes \cite{awsGlueDataBrewDocs}. Spark's own documentation underpins everything the DataFrame half of a Glue job does \cite{apacheSparkProject,zaharia2016apache}. The Well-Architected Analytics Lens frames the Glue-versus-EMR operational trade \cite{awsWellArchitectedAnalytics}.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item Glue is serverless Spark plus the catalog: the right default for intermittent, schema-evolving batch ETL.
+    \item DynamicFrames handle messy schemas at the boundary; DataFrames carry the serious transform logic.
+    \item Idempotency is a pair: bookmarks for the read side, overwrite-or-merge sinks for the write side, plus a run-date parameter.
+    \item DPU sizing, worker types, and Flex execution are the cost levers; per-second billing rewards right-sizing.
+    \item Glue Studio accelerates building; DataBrew accelerates understanding the data first.
+    \item Tool selection is an operations decision: match the tool to the team that must run it at 2~a.m.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Explain why bookmarks alone do not prevent duplicate rows in Redshift, and name the two write-side patterns that complete idempotency.
+    \item \textbf{(Conceptual)} When would a Flex job be the wrong choice even if it is cheaper?
+    \item \textbf{(Hands-on)} Complete the Thursday lab; then modify the script to MERGE into Redshift by business key instead of inserting, and demonstrate a safe full rerun.
+    \item \textbf{(Hands-on)} Rerun the job on Flex three times and record start latency versus the standard runs.
+    \item \textbf{(Hands-on)} Profile the source dataset in DataBrew; list three findings that change the job's transform logic.
+    \item \textbf{(Design)} A job's runtime doubled after the source added ten columns. Walk through the DPU, worker-type, and layout checks you would run.
+    \item \textbf{(Design)} Design the parameter contract (run date, source prefix, target table, mode) for a reusable nightly Glue job template.
+    \item \textbf{(Architecture)} The analyst team now needs a five-minute micro-batch. Evaluate Glue streaming, EMR, and Kinesis/Flink (Chapters 13--15) for this requirement.
+\end{enumerate}
+
+\section{Capstone Project: An Idempotent Nightly ETL Fleet on Glue}\label{sec:ch10-capstone}
+\index{capstone project}\index{AWS Glue!capstone}
+
+\begin{capstonebox}
+\textbf{Mission.} Convert three manual analyst workflows into a governed, idempotent nightly Glue fleet: catalog-driven sources, bookmarked incremental loads, Flex scheduling, and Redshift targets---with proof that failures rerun safely.
+
+\textbf{Estimated time.} 4--6 hours in a sandbox AWS account.
+
+\textbf{What you\textquotesingle{}ll practice.}
+\begin{itemize}
+    \item Graduating Glue Studio prototypes into version-controlled, parameterized jobs.
+    \item Bookmark plus overwrite-sink idempotency, demonstrated under forced failure.
+    \item Capacity tuning: worker types, DPU counts, Flex versus standard execution.
+    \item Redshift sink hygiene: temporary directories, IAM roles, and merge semantics.
+\end{itemize}
+\end{capstonebox}
+
+\subsection*{Scenario}
+Three analyst-built nightly pipelines currently run as manual notebook executions. They overlap in sources, drift in logic, and once a month someone reloads a full table by accident. Standardize them as Glue jobs with a shared template, and prove the failure story before finance relies on the numbers.
+
+\subsection*{Requirements}
+\textbf{Functional requirements.}
+\begin{itemize}
+    \item Three jobs from one parameterized template: run date, source, target, and mode as parameters.
+    \item Bookmarks enabled; sinks use partition-overwrite or merge, never blind append.
+    \item Nightly schedule on Flex where the window allows; alerting on failure to SNS.
+    \item A forced mid-job failure followed by a rerun that produces zero duplicates.
+\end{itemize}
+
+\textbf{Non-functional requirements.}
+\begin{itemize}
+    \item All job code in version control; no console-only configuration.
+    \item DPU sizing justified with a before/after measurement for at least one job.
+    \item A runbook entry per job: what it does, how to rerun safely, what the alarm means.
+\end{itemize}
+
+\subsection*{Implementation Steps}
+\begin{enumerate}
+    \item Extract the common template from the three workflows; externalize parameters.
+    \item Implement the sinks with overwrite/merge semantics; enable bookmarks.
+    \item Schedule on Flex; wire failures to SNS.
+    \item Kill one job mid-run (stop the run) and rerun; capture the zero-duplicate evidence.
+    \item Measure one job across two worker types and document the sizing decision.
+    \item Write the runbook entries and the template README.
+\end{enumerate}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item The template and three job configurations in version control.
+    \item The forced-failure/rerun evidence with row-count comparisons.
+    \item The sizing measurement and Flex-versus-standard latency notes.
+    \item SNS alarm configuration evidence and the three runbook entries.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item Any job can be rerun for any date with no duplicates and no manual cleanup.
+    \item Failure notifications arrive in SNS with job name and run ID.
+    \item No pipeline step exists only in the console.
+    \item Cost per nightly run is known and recorded per job.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Add a Glue workflow chaining the three jobs with a shared failure path.
+    \item Introduce a DataBrew profile job as a pre-load quality gate (preview of Chapter~12).
+    \item Add Glue Data Quality rules to one job (deep coverage in Chapter~22).
+    \item Parameterize the template enough to onboard a fourth pipeline in under an hour; demonstrate it.
+\end{itemize}

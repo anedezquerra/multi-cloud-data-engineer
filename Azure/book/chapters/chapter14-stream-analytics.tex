@@ -1,0 +1,295 @@
+\chapter{Real-Time Processing with Azure Stream Analytics}
+\index{Azure Stream Analytics}\index{windowing}\index{tumbling window}\index{late arrival}\index{watermark}\index{TIMESTAMP BY}%
+\begin{objectives}
+\begin{itemize}
+    \item Explain the Azure Stream Analytics (ASA) architecture: inputs, the SQL-like query, streaming units, and outputs.
+    \item Write ASA queries using tumbling, hopping, sliding, and session windows, and choose the right window for a business question.
+    \item Distinguish event time from arrival time and control it with TIMESTAMP BY.
+    \item Configure late-arrival and out-of-order tolerance windows with explicit adjust-versus-drop policies.
+    \item Sink windowed aggregates to Azure SQL Database and Power BI with correct delivery semantics.
+    \item Monitor watermark delay and input-event metrics so silent input stalls are distinguishable from zero traffic.
+    \item Diagnose a dashboard whose daily aggregates are skewed by offline mobile devices uploading late.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+Managed SQL-over-streams exists on every cloud, and the windowing vocabulary---tumbling, hopping, sliding, session---is identical everywhere; only the engine and billing unit differ.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{3.0cm}p{2.9cm}p{3.1cm}p{3.2cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{AWS} & \textbf{Azure} & \textbf{GCP} \\
+\midrule
+Managed stream SQL & Managed Flink (Kinesis Data Analytics) & Azure Stream Analytics & Dataflow (Beam SQL) \\
+Billing unit & Kinesis Processing Units & Streaming Units (SUs) & Dataflow worker resources \\
+Event source & Kinesis / MSK & Event Hubs / IoT Hub & Pub/Sub \\
+Late-data control & Watermarks in Flink & Late/out-of-order policies & Watermarks + allowed lateness \\
+Stream to warehouse & Kinesis Firehose $\rightarrow$ Redshift & ASA output $\rightarrow$ Synapse/SQL & Dataflow $\rightarrow$ BigQuery \\
+\addlinespace
+\multicolumn{4}{@{}l@{}}{\textbf{Fabric}: eventstreams + Activator; \textbf{Snowflake}: Snowpipe Streaming + dynamic tables; \textbf{MongoDB}: Atlas Stream Processing.} \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+When a use case outgrows ASA---complex state, stream-stream joins at scale, custom code---Chapter 15's Spark Structured Streaming is the escalation path, with the same windowing concepts at a lower level of abstraction.
+\end{crosscloud}
+
+\begin{keyterms}
+\textbf{Streaming Unit (SU)}: ASA's blended CPU/memory capacity slice; jobs are sized in SUs and monitored by SU utilization.\quad
+\textbf{Event time}: when the event happened (producer timestamp); \textbf{arrival time}: when it reached the hub.\quad
+\textbf{Tumbling window}: fixed-size, non-overlapping, back-to-back time buckets.\quad
+\textbf{Watermark}: the engine's estimate of event-time progress; the mechanism that decides when a window can close.\quad
+\textbf{Late arrival}: an event whose event time is older than the configured tolerance when it arrives.
+\end{keyterms}
+
+\section{Week 14 Overview: SQL Against the Firehose}
+Chapter 13 landed unbounded data in Event Hubs. This chapter processes it in motion. Azure Stream Analytics is the serverless option: you write a SQL-like query over streaming inputs, ASA runs it continuously on managed capacity, and results flow to outputs---SQL Database, Synapse, ADLS, Cosmos DB, Power BI---with at-least-once delivery \cite{microsoft2025asa}. No cluster, no code deployment, no state management on your side. The price of that simplicity is the boundary of the model: when the logic needs custom state, ML libraries, or multi-stream joins with complex timing, you graduate to Chapter 15.
+
+The conceptual core of the week is time. Streaming correctness is the management of the gap between \emph{when things happened} and \emph{when they were observed}---windows, watermarks, and tolerance policies are the tools.
+
+\section{Monday: ASA Architecture and Query Language}
+\index{Azure Stream Analytics!architecture}\index{streaming units}
+
+\subsection{Inputs, Query, Outputs}
+An ASA job is three declarations: \textbf{inputs} (streaming---Event Hubs, IoT Hub---or \emph{reference data}, slowly changing blobs/tables joined to enrich the stream), the \textbf{query} (a SELECT statement executed continuously), and \textbf{outputs} (sinks with their own delivery semantics). The query language looks like T-SQL with streaming extensions: windowing functions, \texttt{TIMESTAMP BY}, and temporal joins. Because the engine is shared and serverless, capacity is expressed in \textbf{Streaming Units}; the operational skill is reading SU utilization---sustained values above 80\% mean add SUs or reduce per-event work.
+
+\subsection{A First Query}
+\begin{lstlisting}[language=SQL,caption={Continuous aggregation from Event Hubs to Azure SQL, in event time.},label={lst:ch14-basic}]
+SELECT deviceId,
+       System.Timestamp() AS window_end,
+       AVG(tempC) AS avg_temp,
+       COUNT(*)   AS readings
+INTO   sql_telemetry_agg
+FROM   iot_hub_input TIMESTAMP BY ts
+GROUP BY deviceId, TumblingWindow(minute, 5);
+\end{lstlisting}
+
+\texttt{TIMESTAMP BY ts} promotes the producer's timestamp to the event-time axis; without it, the engine uses arrival time, and every late or replayed event lands in the wrong window.
+
+\begin{pitfall}
+\textbf{Forgetting TIMESTAMP BY.} Arrival-time windows make dashboards that look correct in testing (where data arrives instantly) and silently wrong in production (where it does not). Declare event time explicitly, always.
+\end{pitfall}
+
+\section{Tuesday: The Four Windows}
+\index{windowing!types}
+
+\subsection{Tumbling and Hopping}
+\textbf{Tumbling} windows partition time into equal non-overlapping buckets: \emph{count clicks per 5 minutes}. Every event belongs to exactly one window. \textbf{Hopping} windows overlap: \emph{a 10-minute window computed every 2 minutes}---a moving average that updates smoothly. Same size, smaller hop, more overlapping windows per event.
+
+\subsection{Sliding and Session}
+\textbf{Sliding} windows emit on \emph{content change}, not on a schedule: \texttt{SlidingWindow(minute, 10)} produces output whenever the set of events in the trailing 10 minutes changes---the right tool for detectors (``any card used in two cities within 10 minutes,'' Chapter 16's capstone). \textbf{Session} windows group events separated by less than a timeout gap---user sessions from clickstreams---with a maximum duration cap.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{2.6cm}p{4.4cm}p{6.2cm}@{}}
+\toprule
+\textbf{Window} & \textbf{Emits} & \textbf{Canonical question} \\
+\midrule
+Tumbling & On a fixed cadence, disjoint buckets & ``KPIs per 5 minutes'' \\
+Hopping & Overlapping buckets on a cadence & ``Moving 10-minute average every 2 minutes'' \\
+Sliding & When window content changes & ``Alert when X happens within Y minutes'' \\
+Session & When activity gaps exceed a timeout & ``Group this user's activity into sessions'' \\
+\bottomrule
+\end{tabular}
+\caption{Window selection is a statement about the business question, not the data.}
+\label{tab:ch14-windows}
+\end{table}
+
+\begin{tipbox}
+If the requirement says ``every N minutes,'' reach for tumbling or hopping. If it says ``whenever the condition becomes true,'' reach for sliding. If it says ``a burst of user activity,'' reach for session.
+\end{tipbox}
+
+\section{Wednesday: Late and Out-of-Order Events}
+\index{late arrival}\index{out-of-order}\index{watermark}
+
+\subsection{The Two Disorder Knobs}
+ASA exposes two policies \cite{microsoft2025asaWindowing}:
+\begin{itemize}
+    \item \textbf{Out-of-order tolerance}: how far apart event times may be within the arriving stream. Events outside it are \emph{adjusted} (clamped to the tolerance edge) or \emph{dropped}, per policy.
+    \item \textbf{Late-arrival tolerance}: how much older than the current watermark an event may be when it arrives. Same adjust-or-drop choice.
+\end{itemize}
+Adjusted events are re-timestamped and counted in a tolerable window; dropped events vanish---counted in metrics, invisible in results. Defaults (seconds) suit connected services; mobile telemetry, where devices buffer offline for hours, needs tolerances measured in the business's reporting cadence and a deliberate decision about what ``the daily total'' means for data that arrives tomorrow.
+
+\subsection{The Silent-Stall Problem}
+A stalled input---no events arriving---advances no watermark, closes no windows, and emits no rows. On the dashboard, a dead producer is indistinguishable from zero traffic. The fix is operational: alert on \texttt{Watermark Delay} and \texttt{Input Events} metrics so that ``no rows'' and ``no input'' are different alerts with different runbooks.
+
+\begin{pitfall}
+\textbf{Default tolerances on mobile data.} The default late-arrival window silently drops offline-device uploads. Daily aggregates then undercount precisely the least-connected users---and the bias is invisible until someone reconciles against the source system.
+\end{pitfall}
+
+\section{Thursday Hands-on Project: Five-Minute Click Aggregates to Azure SQL}
+\index{hands-on lab}\index{tumbling window!project}
+Build an ASA job that reads click events from the Chapter 13 hub, counts clicks in five-minute tumbling windows, and writes aggregates to Azure SQL Database.
+
+\subsection{Create the Job}
+\begin{lstlisting}[language=bash,caption={Streaming job shell; input/output/query wiring via CLI JSON or the portal.},label={lst:ch14-asa}]
+$rg = "rg-de-azure-book-week13"
+az stream-analytics job create --name asa-clicks --resource-group $rg `
+  --location eastus --streaming-units 3 `
+  --transformation name=clicks query="@transformation.sql"
+\end{lstlisting}
+
+\subsection{The Query}
+\begin{lstlisting}[language=SQL,caption={Tumbling-window click counts, event time from the producer payload.},label={lst:ch14-clicks}]
+SELECT page,
+       System.Timestamp() AS window_end,
+       COUNT(*) AS clicks,
+       COUNT(DISTINCT userId) AS unique_users
+INTO   sql_click_agg
+FROM   eh_clicks TIMESTAMP BY event_ts
+GROUP BY page, TumblingWindow(minute, 5);
+\end{lstlisting}
+
+\subsection{Test the Time Policies}
+Send three event classes with the Chapter 13 producer pattern: in-order events (expect clean windows), an event 30 minutes late with a 5-minute tolerance (expect a drop or adjust per your configured policy), and an out-of-order burst. Capture the job's \texttt{LateInputEvents} and \texttt{OutOfOrderEvents} metrics as evidence. Then verify the Azure SQL table receives one row per page per window with matching totals.
+
+\section{Friday Use Case: The Offline-Mobile Dashboard}
+\index{use case}\index{late arrival!case study}
+A media app's daily-engagement dashboard is wrong by 8--12\% every morning and ``heals'' by afternoon. Root cause: mobile clients buffer events while offline and upload on reconnect; the ASA job's default 5-second late-arrival tolerance drops them; the overnight aggregate undercounts; late events then trickle into \emph{later} windows, inflating them.
+
+\subsection{Diagnosis}
+The reconciliation pattern is the tell: source-system counts exceed dashboard counts at 08:00 and converge by 14:00. Job metrics confirm \texttt{LateInputEvents} spiking in the morning reconnect wave. The dashboard is not broken; the \emph{time policy} encodes an assumption (always-connected clients) the product violates.
+
+\subsection{The Fix}
+\begin{enumerate}
+    \item \textbf{Policy:} raise late-arrival tolerance to the reporting contract---e.g., 24 hours for a daily report---with the adjust policy, and document what ``daily'' now means (a window that stays open a day).
+    \item \textbf{Two-speed reporting:} keep the real-time dashboard on short tolerances for operational freshness, and compute the \emph{official} daily number from the lake (Capture files, Chapter 13) where late events are simply reprocessed.
+    \item \textbf{Observability:} alert on late-input-event rate so a policy regression is caught in hours, not at month-end.
+\end{enumerate}
+
+\begin{notebox}
+The general principle outlives ASA: \emph{fast} answers and \emph{correct} answers to the same question are two pipelines with different time semantics. The stream gives you now-approximately; the lake gives you eventually-exactly. Mature platforms publish both, labeled.
+\end{notebox}
+
+\section{Architectural Decision Record Template}
+\index{architectural decision record}
+Per ASA job record: event-time field and its producer-side reliability, both tolerance windows with the business reporting contract they implement, adjust-versus-drop choices, SU sizing with utilization evidence, output delivery semantics, and the watermark-delay alert threshold.
+
+\section{Operational Deep Dive: Sizing and SU Utilization}
+\index{streaming units!sizing}
+SU consumption is driven by per-event work: joins against reference data, \texttt{COUNT(DISTINCT)}, UDFs, and high-cardinality GROUP BYs are the expensive shapes. Scale by adding SUs (6 is the practical per-job minimum for partitioned sources so partitions spread), parallelize by writing the query to be partition-embarrassing (\texttt{PARTITION BY PartitionId}), and re-test with realistic volume---SU utilization at 1\% of production load tells you nothing.
+
+\section{Troubleshooting Patterns}
+\index{troubleshooting!ASA}
+No output, no errors $\rightarrow$ input stall; check \texttt{Input Events} and the watermark delay metric before the query. Output drifting from source $\rightarrow$ late/out-of-order drops; check those metrics against your tolerance design. SU utilization pinned at 100\% $\rightarrow$ query shape (distinct counts, reference joins) or undersizing. Duplicate rows in SQL output $\rightarrow$ at-least-once delivery into a table without a natural unique key; add the window end plus dimensions as the key and use merge semantics.
+
+\section{Week 14 Lab Rubric}
+\index{rubric}
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.2cm}p{5.0cm}p{5.0cm}@{}}
+\toprule
+\textbf{Criterion} & \textbf{Meets expectation} & \textbf{Needs improvement} \\
+\midrule
+Time semantics & TIMESTAMP BY set; tolerances configured and tested & Arrival time by accident; default tolerances \\
+Window choice & Window type justified against the business question & Window picked by familiarity \\
+Outputs & Sink key design prevents duplicates & At-least-once duplicates visible in SQL \\
+Observability & Watermark and late-event metrics captured as evidence & No metrics; stalls indistinguishable from zero \\
+\bottomrule
+\end{tabular}
+\caption{Week 14 rubric for the Stream Analytics deliverables.}
+\label{tab:ch14-rubric}
+\end{table}
+
+\section{Interview Q\&A}
+\subsection{Concepts and Trade-offs}
+\begin{enumerate}
+    \item \textbf{Q: Contrast tumbling and hopping windows with an example.}\\
+    A: Both are fixed-size; tumbling buckets are disjoint (5-minute counts), hopping overlap (10-minute window every 2 minutes for a moving average).
+    \item \textbf{Q: What does the late-arrival tolerance control?}\\
+    A: How much older than the watermark an event may be; beyond it the event is adjusted to the tolerance edge or dropped, per policy.
+    \item \textbf{Q: Why does a silent input stall look like zero traffic?}\\
+    A: No events advance no watermark and emit no rows---identical to a genuinely empty period; only input/watermark metrics distinguish them.
+    \item \textbf{Q: How do you fix daily aggregates skewed by late mobile uploads?}\\
+    A: Raise and document the late-arrival tolerance for the reporting contract, and compute official dailies from the lake where late data reprocesses cleanly.
+\end{enumerate}
+
+\section{Further Reading}
+The Stream Analytics overview \cite{microsoft2025asa} and the windowing reference \cite{microsoft2025asaWindowing} are the primary sources. Compare against Spark Structured Streaming's watermark model \cite{apache2025structuredStreaming} ahead of Chapter 15, where the same concepts reappear with explicit state management.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item ASA is serverless SQL-over-streams: inputs, one continuous query, outputs; capacity in Streaming Units.
+    \item Event time (TIMESTAMP BY) is the only honest time axis; arrival time lies under real network conditions.
+    \item Tumbling for periodic KPIs, hopping for moving aggregates, sliding for detectors, session for activity bursts.
+    \item Late/out-of-order tolerances encode a business reporting contract; defaults silently drop offline data.
+    \item Watermark-delay and input-event alerts separate ``no input'' from ``zero traffic.''
+    \item At-least-once outputs need idempotent sink design: natural keys and merges, not blind inserts.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Explain why arrival-time windows looked correct in your test harness.
+    \item \textbf{(Conceptual)} Which window type answers ``did any device exceed 80\textdegree C for more than 3 minutes,'' and why?
+    \item \textbf{(Conceptual)} What does the adjust policy do to an event that is 10 minutes late under a 5-minute tolerance?
+    \item \textbf{(Hands-on)} Complete the Thursday project with the three disorder tests and metric evidence.
+    \item \textbf{(Hands-on)} Rewrite the click query as a hopping window and describe how the dashboard changes.
+    \item \textbf{(Hands-on)} Add a session-window query that reconstructs user sessions with a 20-minute gap timeout.
+    \item \textbf{(Design)} Specify the two-speed reporting design for the media app: tolerances, refresh cadences, and labels.
+    \item \textbf{(Design)} Write the ADR for ASA versus Structured Streaming for a rule-expressible-in-SQL fraud detector.
+    \item \textbf{(Design)} Design the SQL sink schema and merge logic that make ASA's at-least-once output idempotent.
+    \item \textbf{(Interview)} Prepare a two-minute answer to ``why do morning dashboards always undercount?''
+\end{enumerate}
+
+\section{Capstone Project: Windowed Engagement Aggregates with Explicit Time Policies}\label{sec:ch14-capstone}
+\index{capstone project}\index{Azure Stream Analytics!capstone}
+
+\begin{capstonebox}
+\textbf{Mission:} Ship a production-shaped ASA job: event-time windowed aggregates from Event Hubs to Azure SQL, explicit late/out-of-order policies tested with induced disorder, idempotent sink design, and watermark-delay alerting that distinguishes stalls from silence.
+
+\textbf{Estimated time:} 3--4 hours.
+
+\textbf{What you will practice:}
+\begin{itemize}
+    \item Window selection against a stated business question.
+    \item Tolerance configuration as an implemented reporting contract.
+    \item At-least-once-safe sink design.
+    \item Streaming observability: watermark, late events, SU utilization.
+\end{itemize}
+\end{capstonebox}
+
+\subsection*{Scenario}
+The media company from the Friday use case wants the fixed version: a real-time engagement dashboard plus a documented policy for how late mobile data is handled, with evidence that the policy works.
+
+\subsection*{Requirements}
+\begin{itemize}
+    \item \textbf{Query:} five-minute tumbling aggregates with event time from the payload.
+    \item \textbf{Policy:} late-arrival and out-of-order tolerances set deliberately, with adjust/drop documented and metric-tested.
+    \item \textbf{Sink:} Azure SQL table with a key design that tolerates duplicate delivery.
+    \item \textbf{Observability:} watermark-delay alert configured and fired in a stall test.
+\end{itemize}
+
+\subsection*{Reference Architecture}
+Event Hubs $\rightarrow$ ASA job (tumbling query, explicit policies) $\rightarrow$ Azure SQL $\rightarrow$ Power BI, with Azure Monitor watching watermark delay and late-event rates---the Chapter 16 capstone extends this into fraud detection.
+
+\subsection*{Implementation Steps}
+\begin{enumerate}
+    \item Create the job, input, output, and query (Listings~\ref{lst:ch14-asa}--\ref{lst:ch14-clicks}).
+    \item Configure tolerances; run the three disorder tests; capture metrics.
+    \item Implement the idempotent sink merge; prove duplicate delivery changes nothing.
+    \item Wire and fire the watermark-delay alert.
+\end{enumerate}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item Job definition JSON, query, sink DDL, and merge procedure.
+    \item Metric evidence for the disorder tests and the stall alert.
+    \item A one-page time-policy document written for the dashboard's consumers.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item Induced late events follow the documented policy with metric proof.
+    \item A forced output retry produces no duplicate rows in the sink.
+    \item The stall test pages the alert; zero traffic does not.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Add a reference-data join (device registry) and measure its SU cost.
+    \item Parallelize the query with \texttt{PARTITION BY PartitionId} and compare utilization.
+    \item Build the lake-side ``official daily'' job and reconcile it against the stream dashboard for one week.
+\end{itemize}

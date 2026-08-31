@@ -1,0 +1,228 @@
+\chapter{User-Defined Functions and Vectorized UDFs}
+\index{UDF}\index{vectorized UDF}\index{UDTF}\index{Week 14}%
+\begin{objectives}
+\begin{itemize}
+    \item Author scalar UDFs in SQL and Python and choose the right language per function.
+    \item Write vectorized Python UDFs with pandas and PyArrow batching for near-native performance.
+    \item Return tabular results from user-defined table functions (UDTFs).
+    \item Source third-party packages from the Anaconda channel and pin them safely.
+    \item Benchmark vectorized against scalar execution on a million-row text workload.
+    \item Architect a geospatial processing pipeline using custom Python UDFs over taxi trip data.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+In-engine user code is the great convergence: every warehouse learned to run Python where the data lives instead of shipping rows to it.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{2.8cm}p{3.0cm}p{3.0cm}p{3.0cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{AWS (Redshift)} & \textbf{Azure (Synapse/Fabric)} & \textbf{GCP (BigQuery)} \\
+\midrule
+Scalar UDF & SQL / Python UDFs & SQL / CLR lineage; Spark UDFs in Fabric & SQL / JavaScript UDFs \\
+Vectorized / remote ML & Lambda UDFs, Redshift ML & Spark pandas UDFs & Remote functions, BigQuery ML \\
+Table functions & SQL UDFs returning tables & OPENJSON-style TVFs & Table functions / TVFs \\
+Package management & Conda-ish via libraries & Spark environment packages & Remote function containers \\
+\addlinespace
+Snowflake equivalent & \multicolumn{3}{l}{SQL/Python UDFs, vectorized pandas UDFs, UDTFs, Anaconda channel packages} \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+\textbf{MongoDB} runs server-side JavaScript functions (legacy) and Atlas triggers; \textbf{Fabric} leans on Spark UDFs. Snowflake's differentiator is the sandboxed Python runtime with a curated Anaconda channel running inside the warehouse---no cluster to manage, and governance (RBAC on the function itself) included.
+\end{crosscloud}
+
+\section{Week 14 Roadmap}
+Chapter 13 moved computation to the data. Sometimes SQL cannot express the computation---text scoring, geospatial math, custom parsing. User-defined functions close the gap while keeping execution inside the warehouse's security and elasticity envelope \cite{snowflakeUdfPythonDocs}.
+
+Monday covers scalar UDFs in both languages. Tuesday introduces vectorization, the performance unlock. Wednesday generalizes to table-returning functions. Thursday builds and benchmarks a sentiment-scoring UDF. Friday designs a geospatial pipeline.
+
+\begin{keyterms}
+\textbf{Scalar UDF}: a function returning one value per input row.\quad
+\textbf{Vectorized UDF}: a Python UDF receiving batches as pandas DataFrames via PyArrow, amortizing per-row overhead.\quad
+\textbf{UDTF}: a user-defined table function returning zero or more rows per input row.\quad
+\textbf{Anaconda channel}: Snowflake's curated repository of third-party Python packages available in the runtime.\quad
+\textbf{Sandbox}: the restricted execution environment isolating Python code from the warehouse host.
+\end{keyterms}
+
+\section{Monday: Scalar UDFs in SQL and Python}
+\index{scalar UDF}\index{SQL UDF}
+A SQL UDF is a named, versioned expression: reusable logic with zero runtime overhead beyond the expression itself. Because the optimizer can inline it, a SQL UDF is often \emph{faster} than the equivalent Python UDF---no serialization, no sandbox boundary.
+
+\begin{lstlisting}[language=SQL, caption={The same function in two languages}]
+-- SQL UDF: inlinable, fastest, zero dependencies
+CREATE OR REPLACE FUNCTION margin_pct(revenue NUMBER, cost NUMBER)
+RETURNS NUMBER(10,2)
+AS $$ IFF(revenue = 0, NULL, ROUND(100.0 * (revenue - cost) / revenue, 2)) $$;
+
+-- Python UDF: when the logic needs real Python
+CREATE OR REPLACE FUNCTION normalize_sku(raw STRING)
+RETURNS STRING
+LANGUAGE PYTHON
+RUNTIME_VERSION = '3.10'
+HANDLER = 'normalize'
+AS
+$$
+import re
+def normalize(raw: str) -> str:
+    return re.sub(r'[^A-Z0-9]', '', (raw or '').upper())
+$$;
+\end{lstlisting}
+
+Choose SQL when the function is expressible in SQL (arithmetic, conditionals, string functions); choose Python when you need libraries, real data structures, or logic SQL makes unreadable. Every Python UDF pays a sandbox and serialization tax per invocation---which is exactly what Tuesday's vectorization removes.
+
+\begin{pitfall}
+\textbf{Python UDFs are not a substitute for set-based SQL.} A per-row Python function reimplementing \texttt{UPPER()} runs orders of magnitude slower than the native function and still consumes the same compute. Reach for Python when SQL genuinely cannot express the logic.
+\end{pitfall}
+
+\section{Tuesday: Vectorized UDFs with Pandas and PyArrow}
+\index{vectorized UDF}\index{pandas\_udf}\index{PyArrow}
+Scalar Python UDFs pay per-row overhead: serialize one row, cross into the sandbox, execute, return. \textbf{Vectorized UDFs} process \emph{batches}: Snowflake hands the handler a pandas DataFrame (hundreds to thousands of rows) serialized with Apache Arrow's columnar format, the handler computes with vectorized pandas/NumPy operations, and a batch of results returns \cite{snowflakeAnacondaDocs,arrowDocs}.
+
+\begin{lstlisting}[language=Python, caption={Vectorized pandas UDF for sentiment scoring}]
+from snowflake.snowpark.functions import pandas_udf
+import pandas as pd
+
+@pandas_udf(name="sentiment_score", is_permanent=True,
+            stage_location="@udf_stage", replace=True,
+            session=session)
+def sentiment_score(s: pd.Series) -> pd.Series:
+    return (s.str.count(r"(?i)great|love|excellent")
+           - s.str.count(r"(?i)bad|terrible|poor"))
+\end{lstlisting}
+
+Two rules make vectorized UDFs fast in practice:
+\begin{enumerate}
+    \item \textbf{Stay vectorized inside the handler.} A Python \texttt{for} loop over the batch surrenders the entire advantage; pandas/NumPy vector operations are the point.
+    \item \textbf{Type hints define the contract.} \texttt{pd.Series -> pd.Series} tells Snowflake the input and output shape; mismatches surface as deployment errors, not runtime mysteries.
+\end{enumerate}
+
+\begin{tipbox}
+Register permanent UDFs to a stage (\texttt{is\_permanent=True, stage\_location=@udf\_stage}) and manage them like code: versioned in git, deployed by CI, granted via roles. Session-scoped UDFs are for experiments.
+\end{tipbox}
+
+\section{Wednesday: User-Defined Table Functions}
+\index{UDTF}
+A \textbf{UDTF} returns rows, not values: one input row can produce zero, one, or many output rows. The classic use cases are parsers (one log line to many extracted fields), expanders (one subscription row to one row per active month), and row generators. Python UDTFs implement a class with \texttt{process()} per row (optionally \texttt{end\_partition()} for partition-level state) and are consumed with \texttt{TABLE(...)} in the FROM clause.
+
+\begin{lstlisting}[language=SQL, caption={A UDTF expanding subscriptions into active months}]
+CREATE OR REPLACE FUNCTION active_months(start_ts TIMESTAMP_NTZ,
+                                         end_ts TIMESTAMP_NTZ)
+RETURNS TABLE (customer_month DATE)
+LANGUAGE PYTHON
+RUNTIME_VERSION = '3.10'
+HANDLER = 'MonthExpander'
+AS
+$$
+from datetime import date
+class MonthExpander:
+    def process(self, start_ts, end_ts):
+        y, m = start_ts.year, start_ts.month
+        while (y, m) <= (end_ts.year, end_ts.month):
+            yield (date(y, m, 1),)
+            m += 1
+            if m == 13: y, m = y + 1, 1
+$$;
+
+SELECT s.customer_id, m.customer_month
+FROM silver.subscriptions s,
+     TABLE(active_months(s.start_ts, COALESCE(s.end_ts, CURRENT_TIMESTAMP()))) m;
+\end{lstlisting}
+
+Choose a UDTF over a scalar UDF whenever one input row must fan out to many---the alternative (lateral joins against generator tricks) is usually slower and always harder to read.
+
+\section{Thursday Hands-On Project: Million-Row Sentiment Benchmark}
+\index{hands-on project!vectorized UDF}
+This lab proves the vectorization thesis with numbers: scalar and vectorized sentiment UDFs over a million customer reviews, benchmarked head to head.
+
+\subsection*{Scenario}
+A retailer's review corpus needs sentiment scores computed nightly inside the warehouse. The data science team wrote a scalar Python UDF; it is too slow. You must quantify why and fix it.
+
+\subsection*{Procedure}
+\begin{enumerate}
+    \item Generate one million synthetic reviews (templated text with controlled positive/negative vocabulary) into \texttt{raw.reviews}.
+    \item Implement \texttt{sentiment\_score} as a scalar Python UDF and as the vectorized pandas UDF from Tuesday.
+    \item Run both over the full table into separate result tables; capture elapsed time and credits from query history.
+    \item Verify identical outputs with an anti-join in both directions.
+    \item Record rows per batch from the query profile and relate batch size to the speedup.
+\end{enumerate}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item \textbf{Both UDF implementations} with registration scripts.
+    \item \textbf{Benchmark table:} elapsed seconds, credits, rows/second for scalar versus vectorized at SMALL and MEDIUM warehouse sizes.
+    \item \textbf{Correctness proof:} the double anti-join showing identical results.
+    \item \textbf{Recommendation memo:} which UDF ships, and the batch-size observation that explains the gap.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item Vectorized output is bit-identical to scalar output.
+    \item The vectorized UDF shows a material speedup (expect 5--20$\times$) explained by batching, not caching.
+    \item Both UDFs are permanent, stage-registered, and role-governed.
+    \item The benchmark controls cache state and discloses warehouse sizes.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Vary batch payload size and plot throughput against batch rows to find the knee.
+    \item Replace regex counting with a small scikit-learn model loaded once per partition via UDTF-style state.
+    \item Compare against a pure-SQL regex UDF and discuss when the SQL version wins on cost.
+\end{itemize}
+
+\section{Friday Real-World Architecture: Geospatial Taxi Analytics}
+\index{Real-World Architecture!geospatial}\index{taxi trips}
+A mobility company analyzes millions of taxi trips daily: haversine distances, zone lookups, surge-zone classification. PostGIS exports are operationally hated; the goal is in-warehouse geospatial compute.
+
+\subsection{Design}
+Snowflake's native \texttt{GEOGRAPHY} type and \texttt{ST\_*} functions cover distance and containment; custom Python UDFs fill the gaps---proprietary surge classification, vendor-specific zone scoring, batch coordinate validation. The architecture: trips land raw (Chapter 6 streaming), a silver task computes \texttt{ST\_DISTANCE} and zone containment natively, and a vectorized \texttt{surge\_class} UDF applies the company's pricing rules in batch. Vectorization matters doubly here because geospatial math is CPU-heavy per row.
+
+\begin{pitfall}
+\textbf{Measure before assuming Python is needed.} Native \texttt{ST\_DISTANCE} on \texttt{GEOGRAPHY} columns is compiled, prunable, and credit-efficient. Custom UDFs are for logic the geospatial library genuinely lacks---every UDF row pays the sandbox tax.
+\end{pitfall}
+
+\begin{tipbox}
+Cache expensive per-key UDF results in a lookup table keyed by input hash. Zone classification of the same million pickup coordinates does not need recomputation nightly---join the cache, UDF only the misses (the same pattern Chapter 16 applies to paid API calls).
+\end{tipbox}
+
+\section{Interview Q\&A}
+\begin{enumerate}
+    \item \textbf{Q: What makes a vectorized UDF faster than a scalar UDF?}\\
+    A: Batching: pandas DataFrames of rows cross the sandbox boundary once per batch via Arrow, and pandas/NumPy vector operations replace per-row Python calls.
+    \item \textbf{Q: When do you choose a UDTF over a scalar UDF?}\\
+    A: When one input row must produce zero or many output rows---parsers, expanders, generators.
+    \item \textbf{Q: Why can a SQL UDF beat a Python UDF?}\\
+    A: The optimizer can inline SQL UDFs into the query plan with no serialization or sandbox overhead; Python UDFs pay both per invocation.
+    \item \textbf{Q: What serialization carries batches into Python UDFs?}\\
+    A: Apache Arrow's columnar format, surfaced to the handler as pandas DataFrames.
+    \item \textbf{Q: Where do Python UDF dependencies come from?}\\
+    A: Snowflake's curated Anaconda channel, declared in the function's \texttt{PACKAGES} clause and pinned for reproducibility.
+\end{enumerate}
+
+\section{Further Reading}
+Snowflake's Python UDF guide covers scalar, vectorized, and table functions plus package management \cite{snowflakeUdfPythonDocs,snowflakeAnacondaDocs}. Apache Arrow's documentation explains the columnar serialization underneath vectorization \cite{arrowDocs}. Chapter 15 wraps these functions in orchestrating stored procedures.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item SQL UDFs are inlinable and fastest; Python UDFs buy library power at a per-call sandbox tax.
+    \item Vectorized UDFs amortize that tax across Arrow batches---expect order-of-magnitude speedups.
+    \item UDTFs own the one-row-in, many-rows-out pattern.
+    \item Pin Anaconda packages; register permanent UDFs to stages; govern them with roles like any object.
+    \item Prefer native SQL and \texttt{ST\_*} geospatial functions; reserve UDFs for genuinely custom logic.
+    \item Cache deterministic per-key UDF results; recompute only cache misses.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Explain the per-invocation costs of a scalar Python UDF.
+    \item \textbf{(Conceptual)} Why does a Python loop inside a vectorized handler defeat the purpose?
+    \item \textbf{(Hands-on)} Implement \texttt{active\_months} and validate it against a recursive-CTE equivalent.
+    \item \textbf{(Hands-on)} Find your workload's batch-size knee by sweeping input sizes and recording throughput.
+    \item \textbf{(Hands-on)} Register a UDF with a pinned pandas version and prove the version inside the handler.
+    \item \textbf{(Design)} Design the surge-classification cache: key, invalidation, and miss-handling.
+    \item \textbf{(Design)} Decide SQL UDF, vectorized UDF, or UDTF for five listed business rules; justify each.
+    \item \textbf{(Operations)} Write the deploy checklist for a permanent UDF: stage, grants, tests, rollback.
+    \item \textbf{(Cost)} Model nightly credits for scalar versus vectorized scoring at 50M reviews/day.
+    \item \textbf{(Interview)} Explain why ``run it in Python'' is not automatically the modern answer.
+\end{enumerate}

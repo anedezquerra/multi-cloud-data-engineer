@@ -1,0 +1,252 @@
+\chapter{Snowpark Python Fundamentals: DataFrames and Pushdown}
+\index{Snowpark}\index{DataFrame}\index{lazy evaluation}\index{pushdown}\index{Week 13}%
+\begin{objectives}
+\begin{itemize}
+    \item Explain Snowpark's architecture: client-side lazy evaluation versus server-side pushdown execution.
+    \item Create Snowpark sessions securely with key-pair authentication and environment-managed configuration.
+    \item Compose DataFrame transformations---\texttt{select}, \texttt{filter}, \texttt{join}, \texttt{group\_by}---that translate to a single pushed-down SQL statement.
+    \item Verify pushdown with \texttt{explain()} and avoid the memory hazards of \texttt{collect()}.
+    \item Persist results with \texttt{save\_as\_table} and pin client versions to the server package channel.
+    \item Plan a PySpark-to-Snowpark migration that translates Spark DataFrames without extracting data.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+Every cloud now offers a DataFrame API that compiles to the engine's native execution---the API is the portable skill, the pushdown target is the vendor's edge.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{2.8cm}p{3.0cm}p{3.0cm}p{3.0cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{AWS} & \textbf{Azure / Fabric} & \textbf{GCP} \\
+\midrule
+DataFrame API & Spark on EMR / Glue & Spark on Synapse / Fabric notebooks & Spark on Dataproc; BigQuery DataFrames (BigFrames) \\
+Pushed-down execution & Redshift Spectrum / Athena federation & Fabric SQL endpoint pushdown & BigFrames compiles to BigQuery SQL \\
+Pandas-like local API & pandas on SageMaker & pandas in notebooks & pandas + BigFrames \\
+Python UDFs & Redshift Lambda UDFs / Glue & Synapse Spark UDFs & BigQuery remote/vectorized UDFs \\
+\addlinespace
+Snowflake equivalent & \multicolumn{3}{l}{Snowpark DataFrames compiled to SQL and executed on virtual warehouses} \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+\textbf{MongoDB} exposes aggregation pipelines through language drivers---a different algebra, the same client-side-builder pattern. Snowpark's defining property: \emph{the data never leaves Snowflake}. The client builds an expression tree; the warehouse executes it as SQL beside the data.
+\end{crosscloud}
+
+\section{Week 13 Roadmap}
+SQL is the lingua franca of this platform, but engineering teams build software in Python. Snowpark reconciles the two: an idiomatic Python DataFrame API whose operations compile to SQL and execute inside Snowflake's engine, combining Python's ecosystem with warehouse governance and elasticity \cite{snowflakeSnowparkPythonDocs}.
+
+Monday dissects lazy evaluation and pushdown. Tuesday covers sessions and DataFrame basics. Wednesday translates familiar SQL into Snowpark operations. Thursday builds a working client transformation. Friday plans the enterprise PySpark migration.
+
+\begin{keyterms}
+\textbf{Snowpark}: Snowflake's developer API (Python, Java, Scala) that compiles DataFrame operations into SQL.\quad
+\textbf{Lazy evaluation}: transformations build a plan; nothing executes until an action is called.\quad
+\textbf{Pushdown}: executing the compiled plan on the warehouse beside the data, not in the client.\quad
+\textbf{Action}: an operation that triggers execution---\texttt{collect()}, \texttt{count()}, \texttt{write.save\_as\_table()}.\quad
+\textbf{Session}: the authenticated Snowpark context carrying account, role, warehouse, and schema.
+\end{keyterms}
+
+\section{Monday: Lazy Evaluation and Pushdown Architecture}
+\index{lazy evaluation}\index{pushdown}
+A Snowpark DataFrame is not data---it is a \emph{plan}. Each transformation (\texttt{filter}, \texttt{join}, \texttt{group\_by}) appends a node to an expression tree held client-side. Only an \emph{action} triggers compilation: the tree becomes SQL, ships to the Cloud Services layer for optimization, and executes on the session's warehouse against micro-partitions that never move.
+
+\begin{definitionbox}
+\textbf{Lazy evaluation} means DataFrame transformations are recorded, not executed. \textbf{Pushdown} means the recorded plan executes as SQL inside Snowflake. Together they let Python developers compose arbitrarily complex transformations while the warehouse does the scanning, joining, and aggregating next to the data.
+\end{definitionbox}
+
+\begin{figure}[H]
+    \centering
+    \resizebox{0.95\textwidth}{!}{%
+    \begin{tikzpicture}[
+        cli/.style={rectangle, rounded corners, draw=primary, thick, fill=primary!6, align=center, minimum width=3.6cm, minimum height=1.1cm, font=\small\bfseries},
+        srv/.style={rectangle, rounded corners, draw=codegreen!60!black, thick, fill=green!8, align=center, minimum width=3.6cm, minimum height=1.1cm, font=\small\bfseries},
+        arrow/.style={-{Stealth[length=2.5mm]}, draw=primary, thick},
+        lbl/.style={font=\scriptsize\itshape, text=codegray}
+    ]
+        \node[cli] (py) at (0, 0) {Python client\\DataFrame transformations\\(lazy plan)};
+        \node[cli] (act) at (0, -2.2) {action: collect() /\\save\_as\_table()};
+        \node[srv] (cs) at (6.4, -1.1) {Cloud Services\\compile + optimize};
+        \node[srv] (wh) at (11.6, -1.1) {Virtual warehouse\\executes beside data};
+        \draw[arrow] (py) -- node[lbl, left]{plan} (act);
+        \draw[arrow] (act) -- node[lbl, above]{one SQL statement} (cs);
+        \draw[arrow] (cs) -- node[lbl, above]{optimized plan} (wh);
+        \draw[arrow, dashed] (wh) to[bend left=20] node[lbl, above]{results only} (act.east);
+    \end{tikzpicture}%
+    }
+    \caption{Snowpark pushdown: the client accumulates a plan; an action ships one SQL statement; only results cross the network.}
+    \label{fig:chapter13-pushdown}
+\end{figure}
+
+The discipline that follows: \textbf{transformations are free, actions are expensive}. \texttt{collect()} pulls the full result into client memory---fatal on a 50-million-row frame. The production action is \texttt{write.save\_as\_table()}, which keeps execution and results inside Snowflake. Verify pushdown with \texttt{df.explain()}: a well-formed pipeline shows a single SQL statement; a fragmented plan or unexpected local execution means something pulled data client-side.
+
+\begin{pitfall}
+\textbf{\texttt{collect()} on large frames exhausts client memory.} If a notebook kernel dies on a ``simple'' pipeline, the first suspect is an action that materialized the warehouse's output locally. Persist with \texttt{save\_as\_table} and inspect with \texttt{limit(n).collect()} or \texttt{show(n)}.
+\end{pitfall}
+
+\section{Tuesday: Sessions and DataFrame Operations}
+\index{Snowpark session}\index{key-pair authentication}
+The session carries identity and compute context. Production rule one: \textbf{never embed credentials in code}---use key-pair authentication or environment variables, exactly like any other Snowflake client \cite{snowflakeConnectorPythonDocs}.
+
+\begin{lstlisting}[language=Python, caption={Snowpark session from environment-managed config}]
+from snowflake.snowpark import Session
+from snowflake.snowpark.functions import col, avg, current_timestamp
+
+session = Session.builder.configs({
+    "account": "xy12345.us-east-1",
+    "user": "de_pipeline",
+    "private_key_file": "/run/secrets/snowpark_key.p8",
+    "role": "ENGINEER",
+    "warehouse": "ETL_WH",
+    "database": "ANALYTICS",
+    "schema": "SILVER",
+}).create()
+
+orders = session.table("bronze.orders")
+customers = session.table("gold.dim_customers")
+
+result = (orders
+    .filter(col("status") == "COMPLETE")
+    .join(customers, orders["customer_id"] == customers["customer_id"])
+    .group_by(customers["region"])
+    .agg(avg("order_total").alias("avg_order_value"))
+    .with_column("computed_ts", current_timestamp()))
+
+result.write.save_as_table("silver.regional_order_kpis",
+                           mode="overwrite")
+session.close()
+\end{lstlisting}
+
+Every line until \texttt{save\_as\_table} is lazy. Note the session hygiene: key material from a mounted secret, a least-privilege role, and an explicit \texttt{close()} so the warehouse is released.
+
+\begin{tipbox}
+Pin \texttt{snowflake-snowpark-python} to a version compatible with the server's package channel, and test upgrades in CI. Snowpark version skew between client and server is a recurring source of ``worked on my laptop'' failures.
+\end{tipbox}
+
+\section{Wednesday: Translating SQL to Snowpark}
+\index{Snowpark!SQL translation}
+Fluency means moving between the two idioms without thinking. The core mapping:
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{4.6cm}p{7.8cm}@{}}
+\toprule
+\textbf{SQL} & \textbf{Snowpark} \\
+\midrule
+\texttt{SELECT a, b} & \texttt{df.select("a", "b")} \\
+\texttt{WHERE x > 10} & \texttt{df.filter(col("x") > 10)} \\
+\texttt{JOIN t ON k} & \texttt{df.join(t, df["k"] == t["k"])} \\
+\texttt{GROUP BY r AGG AVG(v)} & \texttt{df.group\_by("r").agg(avg("v"))} \\
+\texttt{CASE WHEN ...} & \texttt{when(...).otherwise(...)} \\
+\texttt{WINDOW f OVER (...)} & \texttt{Window.partition\_by(...).order\_by(...)} \\
+\texttt{CREATE TABLE AS} & \texttt{df.write.save\_as\_table(...)} \\
+Raw SQL escape hatch & \texttt{session.sql("SELECT ...")} \\
+\bottomrule
+\end{tabular}
+\caption{SQL-to-Snowpark translation reference.}
+\label{tab:chapter13-sql-mapping}
+\end{table}
+
+When a transformation is easier to read as SQL---a gnarly regex, a lateral flatten---\texttt{session.sql()} drops to raw SQL and returns another DataFrame, so mixed pipelines stay composable. Choose per step whichever form the next maintainer will understand faster; the optimizer sees the same plan either way.
+
+\section{Thursday Hands-On Project: A Working Snowpark Transformation}
+\index{hands-on project!Snowpark}
+This lab builds a local Snowpark environment, composes a non-trivial transformation, and proves pushdown before persisting results.
+
+\subsection*{Scenario}
+Analytics engineering wants the regional order KPI pipeline maintained in Python with code review and unit tests, not in a Snowsight worksheet---without sacrificing warehouse-side execution.
+
+\subsection*{Procedure}
+\begin{enumerate}
+    \item Create a Python 3.10+ virtual environment; install the pinned \texttt{snowflake-snowpark-python}.
+    \item Configure key-pair authentication; store the key outside the repository and load it from an environment path.
+    \item Build the session and the filter--join--aggregate transformation from Tuesday's listing against \texttt{bronze.orders} and \texttt{gold.dim\_customers}.
+    \item Call \texttt{result.explain()} and confirm a single SQL statement; paste the generated SQL into the report.
+    \item Persist with \texttt{save\_as\_table(..., mode="overwrite")}; verify in Snowsight.
+    \item Benchmark: time \texttt{collect()} on a limited sample versus the pushed-down write; document client memory behavior.
+    \item Add a unit test that asserts the \emph{plan} (via \texttt{explain()} output) contains the expected join and filter.
+\end{enumerate}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item \textbf{Python module:} session factory plus the transformation as a testable function.
+    \item \textbf{Pushdown evidence:} \texttt{explain()} output showing one statement.
+    \item \textbf{Benchmark table:} limited collect versus warehouse-side write, with row counts.
+    \item \textbf{requirements.txt} with pinned versions matching the server channel.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item No credentials anywhere in code, config files, or git history.
+    \item The full filter--join--aggregate executes as one pushed-down SQL statement.
+    \item Results persist via \texttt{save\_as\_table}; no full-frame \texttt{collect()} appears in the code path.
+    \item The session is closed deterministically (context manager or explicit \texttt{close()}).
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Reproduce the transformation with \texttt{session.sql()} and compare generated plans.
+    \item Add a window function via the \texttt{Window} API and verify it stays pushed down.
+    \item Package the module as a stored procedure (preview of Chapter 15) and schedule it as a task.
+\end{itemize}
+
+\section{Friday Real-World Architecture: The PySpark-to-Snowpark Migration}
+\index{Real-World Architecture!PySpark migration}\index{Spark}
+An enterprise data team maintains 400 PySpark jobs on EMR: data lands in S3, Spark reads it, transforms, writes back, and Snowflake loads it for serving. Compute is duplicated, data crosses the network twice, and EMR clusters need patching. The mandate: migrate to Snowpark without changing business logic semantics \cite{sparkDocs}.
+
+\subsection{Migration Method}
+\begin{enumerate}
+    \item \textbf{Inventory by data flow.} Jobs reading and writing Snowflake via connector are pure wins---Snowpark removes the round trip entirely. Jobs joining S3 data lakes to warehouse data evaluate external tables or Iceberg access first.
+    \item \textbf{Translate API idioms mechanically.} \texttt{spark.read} becomes \texttt{session.table}; \texttt{.withColumn} becomes \texttt{.with\_column}; most \texttt{pyspark.sql.functions} have Snowpark counterparts. The trap is semantic drift: null handling in joins, timestamp time zones, and floating-point aggregation order.
+    \item \textbf{Replatform UDFs deliberately.} Spark UDFs become Snowpark vectorized UDFs (Chapter 14)---often \emph{faster}, because data stays in the engine.
+    \item \textbf{Test at the plan and the data level.} Plan tests assert pushdown; data tests reconcile migrated output against legacy Spark output on a frozen snapshot.
+    \item \textbf{Decommission EMR gradually.} Per-domain cutovers with cost dashboards: EMR spend falling, warehouse credits rising, net cost dropping.
+\end{enumerate}
+
+\begin{pitfall}
+\textbf{Semantic drift, not syntax, breaks Spark migrations.} The canonical bugs: timezone-naive timestamps reinterpreted, \texttt{NaN} versus \texttt{NULL} behavior in aggregations, and non-deterministic \texttt{row\_number()} without a total order. Reconcile migrated outputs row-for-row on a frozen dataset before cutover.
+\end{pitfall}
+
+\subsection{What the Enterprise Gains}
+One governance plane (RBAC, masking, and auditing now cover transformation code), one compute bill, no data egress, and Python developers who never leave their language. The migration's real product is not Snowpark---it is the disappearance of a second, parallel data platform.
+
+\section{Interview Q\&A}
+\begin{enumerate}
+    \item \textbf{Q: What does lazy evaluation mean for Snowpark DataFrames?}\\
+    A: Transformations accumulate into a plan client-side; nothing executes until an action such as \texttt{collect()} or \texttt{save\_as\_table()} compiles the plan to SQL.
+    \item \textbf{Q: How do you verify a transformation was pushed down?}\\
+    A: Call \texttt{df.explain()} and confirm the plan is a single SQL statement executed on the warehouse rather than fragmented local execution.
+    \item \textbf{Q: When does collect() become dangerous?}\\
+    A: On large result sets it materializes everything into client memory; production pipelines persist with \texttt{save\_as\_table} and sample with \texttt{limit()}.
+    \item \textbf{Q: Why pin the Snowpark client to the server package channel?}\\
+    A: Client/server version skew causes serialization and API mismatches; pinning plus CI testing prevents environment-dependent failures.
+    \item \textbf{Q: Which auth method should Snowpark client code use in CI?}\\
+    A: Key-pair authentication with the private key injected as a secret---never passwords in code or CI variables.
+\end{enumerate}
+
+\section{Further Reading}
+The Snowpark Python developer guide is the API reference \cite{snowflakeSnowparkPythonDocs}; the Python connector guide covers authentication mechanics \cite{snowflakeConnectorPythonDocs}. Spark's documentation provides the migration source vocabulary \cite{sparkDocs}. Chapters 14 and 15 extend Snowpark into UDFs and stored procedures.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item Snowpark DataFrames are lazy plans; actions compile them to one SQL statement executed beside the data.
+    \item Transformations are free, actions are expensive---persist with \texttt{save\_as\_table}, sample with \texttt{limit()}.
+    \item \texttt{explain()} is the pushdown audit; make it part of code review.
+    \item Key-pair auth, pinned versions, and closed sessions are the production hygiene baseline.
+    \item SQL and Snowpark compose freely through \texttt{session.sql()}; optimize for the next reader.
+    \item Spark migrations fail on semantics (time zones, nulls, ordering), not syntax---reconcile on frozen snapshots.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Explain why a Snowpark pipeline with five transformations and no action consumes zero warehouse credits.
+    \item \textbf{(Conceptual)} Compare \texttt{collect()}, \texttt{to\_pandas()}, and \texttt{save\_as\_table()} on a 20-million-row frame.
+    \item \textbf{(Hands-on)} Translate a three-table SQL report into Snowpark and verify single-statement pushdown.
+    \item \textbf{(Hands-on)} Write plan-level unit tests asserting filter and join presence from \texttt{explain()} output.
+    \item \textbf{(Hands-on)} Introduce a timezone bug in a timestamp comparison, observe the wrong result, and fix with explicit conversion.
+    \item \textbf{(Design)} Write the migration scoring rubric ranking 400 Spark jobs by Snowpark suitability.
+    \item \textbf{(Design)} Design the frozen-snapshot reconciliation harness for migration testing.
+    \item \textbf{(Operations)} Build the cutover cost dashboard: EMR spend versus warehouse credits per migrated domain.
+    \item \textbf{(Security)} Specify the secret-management design for Snowpark credentials in local dev, CI, and production.
+    \item \textbf{(Interview)} Argue to a Spark-platform owner which workloads should \emph{not} migrate to Snowpark.
+\end{enumerate}

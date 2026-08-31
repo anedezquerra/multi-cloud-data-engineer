@@ -1,0 +1,327 @@
+\chapter{Delta Lake Medallion Architecture and Pipeline Orchestration}
+\index{medallion architecture}\index{Delta Lake}\index{orchestration}\index{Apache Airflow}\index{Azure Logic Apps}\index{control flow}%
+\begin{objectives}
+\begin{itemize}
+    \item Design bronze, silver, and gold medallion zones with explicit quality contracts between them.
+    \item Apply Delta Lake operations---MERGE upserts, time travel, OPTIMIZE, VACUUM---as production pipeline primitives.
+    \item Compose advanced ADF control flow: ForEach, If Condition, Until, and Execute Pipeline.
+    \item Trigger pipelines from Event Grid blob events with correct folder and file parameter plumbing.
+    \item Position Managed Airflow in ADF for teams with existing DAG investments.
+    \item Use Azure Logic Apps for failure notification and business-process automation around pipelines.
+    \item Design a self-healing orchestration layer for a 15-system banking reconciliation, and complete the Part III milestone capstone.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+The medallion pattern and pipeline orchestration are cloud-agnostic disciplines. Bronze/silver/gold is the same idea whether the lake is S3, ADLS, or GCS, and every platform needs a scheduler with dependency graphs and failure semantics.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{3.0cm}p{2.9cm}p{3.1cm}p{3.2cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{AWS} & \textbf{Azure} & \textbf{GCP} \\
+\midrule
+Medallion zones & S3 raw/curated + Glue & ADLS Gen2 + Delta Lake & GCS + BigLake \\
+Managed Airflow & MWAA & Managed Airflow in ADF & Cloud Composer \\
+Control-flow orchestration & Step Functions & ADF pipeline activities & Workflows \\
+Event trigger & EventBridge $\rightarrow$ Lambda/Glue & Event Grid $\rightarrow$ ADF trigger & Eventarc $\rightarrow$ Workflows \\
+Notification workflows & SNS / Step Functions & Logic Apps & Cloud Functions + Workflows \\
+\addlinespace
+\multicolumn{4}{@{}l@{}}{\textbf{Fabric}: OneLake medallion + pipelines; \textbf{Snowflake}: tasks/streams DAGs; \textbf{MongoDB}: Atlas Triggers + Charts refresh.} \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+Airflow's DAG model---tasks, dependencies, retries, backfills---is itself the cross-cloud skill: MWAA, Cloud Composer, and Managed Airflow in ADF all execute the same Python DAG files \cite{apache2025airflow}.
+\end{crosscloud}
+
+\begin{keyterms}
+\textbf{Medallion architecture}: the bronze (raw fidelity), silver (validated, conformed), gold (business-ready) zone pattern over Delta Lake.\quad
+\textbf{MERGE}: Delta's upsert primitive matching source and target rows for insert/update/delete.\quad
+\textbf{Control flow}: ADF activities---ForEach, Until, If Condition, Execute Pipeline---that compose pipelines.\quad
+\textbf{Managed Airflow}: Apache Airflow hosted inside ADF, running standard DAG files.\quad
+\textbf{Self-healing}: orchestration that detects, retries, reroutes, and escalates failures without human intervention for known failure modes.
+\end{keyterms}
+
+\section{Week 12 Overview: From Moving Data to Operating Data Movement}
+Chapters 9--11 built the moving parts: ADF pipelines, integration runtimes, and Spark compute. Week 12 assembles them into an \emph{operated system}: pipelines that trigger on events, retry known-transient failures, route poison data aside, notify humans only for novel failures, and leave an audit trail. The medallion architecture gives the system its data-quality semantics; the orchestration layer gives it its failure semantics. Together they are the difference between a demo and a platform.
+
+\begin{definitionbox}
+The \textbf{medallion architecture} organizes a lakehouse into bronze (raw, append-only, full fidelity), silver (validated, deduplicated, conformed), and gold (aggregated, business-modeled) zones. Each hop is a contract: silver promises schema validity; gold promises business semantics.
+\end{definitionbox}
+
+\section{Monday: Medallion Zones as Quality Contracts}
+\index{medallion architecture!zones}
+
+\subsection{Bronze: Fidelity Above All}
+Bronze stores what the source said, when it said it, and how it arrived: raw payload plus ingestion metadata (\texttt{\_ingested\_at}, \texttt{\_source\_file}, \texttt{\_batch\_id}). No joins, no cleaning, no schema changes. When a silver bug is discovered six months later, bronze is what makes reprocessing possible. Append-only Delta tables with generous time-travel retention are the implementation.
+
+\subsection{Silver: Validated and Conformed}
+Silver applies the contract: schema enforced, nulls handled, duplicates removed, timestamps normalized, keys conformed across sources. The Chapter 11 contract gate feeds this zone. Silver is where \texttt{MERGE} upserts live---idempotent by natural key, so a re-run repairs rather than duplicates:
+
+\begin{lstlisting}[language=SQL,caption={Idempotent silver upsert: the re-run-safe MERGE.},label={lst:ch12-merge}]
+MERGE INTO silver.orders AS tgt
+USING staging.orders_batch AS src
+  ON tgt.order_id = src.order_id
+WHEN MATCHED AND src.updated_at > tgt.updated_at THEN
+  UPDATE SET *
+WHEN NOT MATCHED THEN
+  INSERT *
+WHEN NOT MATCHED BY SOURCE AND tgt._batch_id <> src._batch_id THEN
+  DELETE;  -- optional: propagate deletes explicitly, per your delete semantics
+\end{lstlisting}
+
+\subsection{Gold: Business-Modeled}
+Gold is the Chapter 5 star schema and the Chapter 7 serving views: declared grain, conformed dimensions, SCD2 history, aggregation tables. Gold tables are rebuilt from silver when logic changes; silver is rebuilt from bronze when contracts change. The reprocessing direction only ever flows backward through the zones---which is why bronze fidelity is non-negotiable.
+
+\begin{pitfall}
+\textbf{Skipping silver.} ``Bronze straight to gold'' pipelines embed validation and conformance inside business logic, where it cannot be reused and cannot be reprocessed independently. The zone you skip is the reprocessing you cannot do.
+\end{pitfall}
+
+\section{Tuesday: Advanced ADF Control Flow}
+\index{control flow}\index{ForEach}\index{Until}
+
+\subsection{The Control-Flow Toolkit}
+ADF pipelines compose with four control activities \cite{microsoft2025adfTriggers}:
+\begin{itemize}
+    \item \textbf{ForEach:} iterate a collection (files, tables, partitions) sequentially or in parallel batches---the fan-out for multi-entity loads.
+    \item \textbf{If Condition:} branch on an expression---route by file size, row count, or a quality-check result.
+    \item \textbf{Until:} loop until a predicate holds with timeout---poll for an upstream file, wait for a DMS task to reach steady state.
+    \item \textbf{Execute Pipeline:} call child pipelines with parameters---the decomposition mechanism that keeps pipelines small, testable, and reusable.
+\end{itemize}
+
+The composition pattern for a governed batch: parent pipeline per domain $\rightarrow$ ForEach over entities $\rightarrow$ Execute Pipeline (child) per entity $\rightarrow$ child does validate $\rightarrow$ transform $\rightarrow$ audit, with If Condition routing contract failures to quarantine. Parents own fan-out; children own the unit of work; the audit table owns the truth.
+
+\subsection{Event Grid Triggers}
+The blob-event trigger starts a pipeline when a blob lands in a watched path, passing \texttt{folderPath} and \texttt{fileName} as parameters \cite{microsoft2025eventGrid}:
+
+\begin{lstlisting}[language=json,caption={Blob-event trigger: fire only on completed uploads to the incoming path.},label={lst:ch12-trigger}]
+{
+  "name": "trg_blob_created",
+  "properties": {
+    "type": "BlobEventsTrigger",
+    "typeProperties": {
+      "blobPathBeginsWith": "/raw/incoming/",
+      "ignoreEmptyBlobs": true,
+      "events": ["Microsoft.Storage.BlobCreated"]
+    }
+  }
+}
+\end{lstlisting}
+
+\begin{pitfall}
+\textbf{Triggering on partial uploads.} A multi-part upload can emit \texttt{BlobCreated} before the file is complete. Have producers write to a temp path and rename (rename is atomic in ADLS Gen2) so only complete files appear under \texttt{/raw/incoming/}.
+\end{pitfall}
+
+\section{Wednesday: Managed Airflow and Logic Apps}
+\index{Managed Airflow}\index{Azure Logic Apps}
+
+\subsection{Managed Airflow in ADF}
+For teams with existing Airflow DAGs---or a deliberate multi-cloud posture---ADF hosts Managed Airflow: standard Python DAG files on Microsoft-operated Airflow infrastructure, integrated with the factory's identity and monitoring \cite{apache2025airflow}. The decision is portfolio-shaped: pure-Azure greenfield pipelines favor ADF's visual model; estates with hundreds of existing DAGs, or teams hired for Airflow skills, favor Managed Airflow. The two coexist; what must not coexist is \emph{two orchestrators scheduling the same table}.
+
+\subsection{Logic Apps: The Notification and Process Layer}
+Azure Logic Apps is the low-code workflow service with hundreds of connectors---Teams, Outlook, ServiceNow, SAP \cite{microsoft2025logicApps}. In a data platform it plays one role supremely: the \textbf{human-facing edge of pipeline failures}. A pipeline's on-failure path calls a Logic App webhook; the Logic App posts an adaptive Teams card with the run id, the failed activity, and buttons linking to the run and the runbook. Richer than an email, cheaper than an incident tool, and extensible into ticket creation later.
+
+\begin{tipbox}
+Route \emph{all} pipeline notifications through one Logic App ``router'' workflow that enriches and dispatches. When the on-call tool changes, you edit one workflow, not two hundred pipelines.
+\end{tipbox}
+
+\section{Thursday Hands-on Project: Event-Driven Databricks Orchestration with Failure Notification}
+\index{hands-on lab}\index{Event Grid!trigger}
+Build the canonical Part III pipeline: an Event Grid trigger fires on blob arrival, ADF runs a Databricks notebook, and a Logic App messages Teams on failure.
+
+\subsection{Wire the Trigger}
+Enable the Event Grid system topic on the storage account; create the ADF trigger from Listing~\ref{lst:ch12-trigger}; map \texttt{@triggerBody().folderPath} and \texttt{@triggerBody().fileName} into pipeline parameters. Verify with a test upload that the pipeline fires with the file's identity in its parameters.
+
+\subsection{Run the Notebook}
+Add a Databricks Notebook activity pointing at a notebook that receives \texttt{folder\_path}/\texttt{file\_name} via base parameters, validates the contract (Chapter 11), merges into silver (Listing~\ref{lst:ch12-merge}), and exits non-zero on hard failure. The notebook must be idempotent: merge on \texttt{order\_id}, never blind append.
+
+\subsection{Close the Failure Loop}
+Create the Logic App: HTTP trigger $\rightarrow$ parse ADF error payload $\rightarrow$ post Teams adaptive card. Add it as the pipeline's on-failure webhook activity. Test by uploading a contract-violating file: expect a quarantine record (soft failure, no page) and then a corrupted file that fails the notebook outright: expect the Teams card with a working link to the failed run.
+
+\section{Friday Use Case: Self-Healing Orchestration for Banking Reconciliation}
+\index{use case}\index{self-healing}
+A bank reconciles fifteen systems nightly: core banking, cards, payments, ledgers, and eleven feeds. Files arrive at different times, occasionally late, occasionally malformed. Today's cron-driven chain fails opaquely and pages humans for transient faults.
+
+\subsection{The Self-Healing Design}
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[node distance=1.2cm]
+        \node[store] (files) {15 feeds\\landing zones};
+        \node[stage, right=1.3cm of files] (eg) {Event Grid\\arrival events};
+        \node[stage, right=1.3cm of eg] (parent) {ADF parent\\per domain};
+        \node[stage, right=1.3cm of parent] (child) {Child pipelines\\validate, merge};
+        \node[store, right=1.3cm of child] (zones) {Bronze / Silver\\Delta zones};
+        \node[doc, above=0.9cm of parent] (logic) {Logic App router\\Teams + tickets};
+        \node[doc, below=0.9cm of child] (mon) {Azure Monitor\\failure alerts};
+        \draw[arrow] (files) -- (eg);
+        \draw[arrow] (eg) -- (parent);
+        \draw[arrow] (parent) -- (child);
+        \draw[arrow] (child) -- (zones);
+        \draw[arrow] (parent) -- (logic);
+        \draw[arrow] (child) -- (mon);
+    \end{tikzpicture}%
+    }
+    \caption{Self-healing reconciliation: event-driven fan-out, isolated child pipelines, quarantine routing, and a single notification router.}
+    \label{fig:ch12-self-healing}
+\end{figure}
+
+\textbf{Self-healing} here means five concrete behaviors. (1) \emph{Arrival-driven:} Event Grid triggers replace the schedule; a late feed starts when it arrives, and an Until activity with a deadline covers genuinely missing feeds. (2) \emph{Isolated:} each feed runs in its own child pipeline, so feed 7's failure never blocks feeds 1--6. (3) \emph{Retry-aware:} transient activities retry with backoff inside Until loops; only exhausted retries escalate. (4) \emph{Data-aware:} contract failures quarantine without paging; structural failures page through the Logic App router. (5) \emph{Auditable:} every child writes the audit table, and the morning reconciliation report is generated from it---the report \emph{is} the health check.
+
+\subsection{What Self-Healing Is Not}
+It is not retrying everything forever, and it is not suppressing pages. The design rule: automate the response to \emph{known} failure modes, escalate \emph{novel} ones immediately, and review the quarantine and retry logs weekly so recurring novel failures graduate into known ones.
+
+\section{Architectural Decision Record Template}
+\index{architectural decision record}
+Per orchestration domain record: trigger type and arrival SLA, parent/child decomposition, retry policy per activity class, quarantine path and reprocessing owner, notification routing, and the audit schema. For Airflow adoption, record the coexistence boundary: which orchestrator owns which tables.
+
+\section{Operational Deep Dive: Monitoring the Orchestrator}
+\index{Azure Monitor!ADF}
+Send factory diagnostics (PipelineRuns, TriggerRuns, ActivityRuns) to Log Analytics and build three alert classes: \textbf{failure alerts} (any pipeline failure, severity by domain criticality), \textbf{silence alerts} (expected run missing by deadline---the failure that produces no error), and \textbf{drift alerts} (duration or row counts outside the trailing band) \cite{microsoft2025azureMonitor}. Silence alerts are the ones teams omit and the ones that catch the worst incidents: the trigger that stopped firing alerts on nothing at all.
+
+\section{Troubleshooting Patterns}
+\index{troubleshooting!orchestration}
+Pipeline fires twice per file $\rightarrow$ two triggers or two subscriptions on the same topic. Trigger never fires $\rightarrow$ not published, or \texttt{blobPathBeginsWith} mismatch (paths are case-sensitive). ForEach slower than expected $\rightarrow$ sequential default; check the batch count setting. Child pipeline parameter empty $\rightarrow$ trigger parameter mapping lost in a refactor; the artifact JSON is the source of truth, not the canvas.
+
+\section{Week 12 Lab Rubric}
+\index{rubric}
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.2cm}p{5.0cm}p{5.0cm}@{}}
+\toprule
+\textbf{Criterion} & \textbf{Meets expectation} & \textbf{Needs improvement} \\
+\midrule
+Triggering & Event-driven with correct parameter plumbing; partial-upload safe & Polling schedule; partial-file race \\
+Failure design & Quarantine for data faults, page for structural faults, retries bounded & Everything pages, or nothing does \\
+Idempotency & Re-run of the same file changes nothing & Duplicate rows on replay \\
+Auditability & Audit table answers ``what ran, what moved, what failed'' & Portal screenshots as the only evidence \\
+\bottomrule
+\end{tabular}
+\caption{Week 12 rubric for the orchestration deliverables.}
+\label{tab:ch12-rubric}
+\end{table}
+
+\section{Interview Q\&A}
+\subsection{Concepts and Trade-offs}
+\begin{enumerate}
+    \item \textbf{Q: When would you use an Until activity instead of a ForEach?}\\
+    A: Until waits on a predicate with a timeout (poll for a file or task state); ForEach iterates a known collection. Waiting is Until's job.
+    \item \textbf{Q: What problem does Managed Airflow in ADF solve?}\\
+    A: It runs existing Airflow DAG estates on managed infrastructure with Azure identity integration---no Airflow operations burden, no rewrite.
+    \item \textbf{Q: Why route failure notifications through a Logic App instead of plain email?}\\
+    A: Structured payloads become rich Teams cards with run links and runbook buttons, and one router workflow centralizes the notification logic.
+    \item \textbf{Q: What makes an orchestration layer self-healing?}\\
+    A: Arrival-driven triggers, isolated units of work, bounded retries for known faults, quarantine for data faults, and audit-driven reconciliation---with novel failures still paging humans.
+\end{enumerate}
+
+\section{Further Reading}
+The ADF triggers and execution documentation \cite{microsoft2025adfTriggers}, the Airflow project \cite{apache2025airflow}, and the Logic Apps overview \cite{microsoft2025logicApps} are the primary sources. The Delta Lake paper \cite{armbrust2020delta} underpins the medallion zones, and the Data Engineer Handbook \cite{dataexpert2025handbook} collects reconciliation-pattern case studies.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item Bronze keeps fidelity, silver keeps validity, gold keeps business meaning; reprocessing flows backward only.
+    \item MERGE by natural key makes silver loads idempotent; blind appends make replays destructive.
+    \item ForEach fans out, Until waits, If routes, Execute Pipeline decomposes.
+    \item Event Grid triggers replace polling; producers must rename-commit so triggers see only complete files.
+    \item Managed Airflow serves DAG estates; Logic Apps serve the human edge of failures.
+    \item Self-healing automates known failure modes and escalates novel ones; the audit table is the health check.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Why is bronze append-only, and what reprocessing scenarios depend on it?
+    \item \textbf{(Conceptual)} Explain the double-fire and partial-upload hazards of blob-event triggers and their fixes.
+    \item \textbf{(Conceptual)} Why should one Logic App router own all pipeline notifications?
+    \item \textbf{(Hands-on)} Complete the Thursday project; capture the Teams card and the quarantine record from the two failure tests.
+    \item \textbf{(Hands-on)} Add a ForEach fan-out over five entity folders with parallelism 5; measure wall-clock versus sequential.
+    \item \textbf{(Hands-on)} Write the silence alert (expected run missing by 07:00) as a Log Analytics query and test it.
+    \item \textbf{(Design)} Decompose the 15-feed banking estate into parents and children; define the audit schema.
+    \item \textbf{(Design)} Write the ADR for Managed Airflow versus ADF pipelines for a team migrating 200 DAGs.
+    \item \textbf{(Design)} Design the retry policy matrix: which activity classes retry, how many times, with what backoff.
+    \item \textbf{(Interview)} Prepare a two-minute answer to ``a feed was late and nobody noticed until the board meeting---design that away.''
+\end{enumerate}
+
+\section{Milestone 3 Capstone: Automated Batch ELT Pipeline}\label{sec:ch12-capstone}
+\index{capstone project}\index{batch ELT}\index{Event Grid!capstone}
+
+\begin{capstonebox}
+\textbf{Mission:} Assemble Part III: an Event Grid-triggered ADF pipeline fires on file upload, runs a Databricks notebook that validates contracts, runs data-quality checks, and engineers ML features, quarantines failures, and bulk-loads the output into a Synapse dedicated pool with COPY---all observable, all idempotent.
+
+\textbf{Estimated time:} 8--10 hours.
+
+\textbf{What you will practice:}
+\begin{itemize}
+    \item Event-driven triggering with rename-commit producers.
+    \item Contract validation, quality checks, and quarantine in one notebook.
+    \item COPY with managed identity into a hash-distributed table.
+    \item Alerting, audit, and cost estimation across ADF, Databricks, and Synapse.
+\end{itemize}
+\end{capstonebox}
+
+\subsection*{Scenario}
+The retailer from Part II wants near-instant ingestion: when a store's nightly file lands, quality checks and feature engineering run immediately and the warehouse reflects the data within minutes. Bad files must be quarantined with reasons; the whole flow must survive a rerun without duplicating a single row.
+
+\subsection*{Requirements}
+\begin{itemize}
+    \item \textbf{Trigger:} blob-event trigger on \texttt{/raw/incoming/} with folder/file parameters; producers rename-commit.
+    \item \textbf{Processing:} Databricks notebook with contract gate, at least three data-quality checks with a demonstrated failing case, and feature engineering into a curated Delta table.
+    \item \textbf{Load:} ADF Copy activity with managed identity into a hash-dedicated Synapse table; merge-on-file-id idempotency.
+    \item \textbf{Operations:} failure notification via Logic App; ADF diagnostic logs in Log Analytics; one alert rule with evidence.
+    \item \textbf{Cost:} monthly estimate across ADF activities, Databricks DBUs, and Synapse DWU-hours with two optimizations.
+\end{itemize}
+
+\subsection*{Reference Architecture}
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[node distance=1.1cm]
+        \node[store] (lake) {ADLS Gen2\\raw uploads};
+        \node[stage, right=1.1cm of lake] (eg) {Event\\Grid};
+        \node[stage, right=1.1cm of eg] (adf) {ADF\\pipeline};
+        \node[stage, right=1.1cm of adf] (dbx) {Databricks\\DQ + features};
+        \node[store, right=1.1cm of dbx] (syn) {Synapse\\dedicated pool};
+        \node[doc, above=0.8cm of adf] (mon) {Azure Monitor\\+ Log Analytics};
+        \node[doc, below=0.8cm of adf] (logic) {Logic App\\Teams alert};
+        \draw[arrow] (lake) -- (eg);
+        \draw[arrow] (eg) -- (adf);
+        \draw[arrow] (adf) -- (dbx);
+        \draw[arrow] (dbx) -- (syn);
+        \draw[arrow, dashed] (adf) -- (mon);
+        \draw[arrow, dashed] (adf) -- (logic);
+    \end{tikzpicture}%
+    }
+    \caption{Milestone 3 architecture: event-driven ELT from lake arrival to warehouse load with quality gates and notifications.}
+    \label{fig:ch12-capstone-arch}
+\end{figure}
+
+\subsection*{Implementation Steps}
+\begin{enumerate}
+    \item Create the Event Grid system topic and the ADF blob-event trigger.
+    \item Write the Databricks notebook: schema check $\rightarrow$ quarantine-or-transform $\rightarrow$ quality checks $\rightarrow$ curated Delta.
+    \item Add the COPY load into the hash-distributed target; make the notebook merge idempotent on file id.
+    \item Wire the Logic App failure path and the Log Analytics alert.
+    \item Test the happy path, a poison file, and a deliberate rerun; produce the cost estimate.
+\end{enumerate}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item Repo with artifacts, notebook, and a README that runs end-to-end from a clean environment.
+    \item Architecture diagram and the audit/alert evidence pack.
+    \item Cost estimate with two documented optimization decisions.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item Uploading a file starts the pipeline with no manual step; a bad file lands in quarantine with a reason.
+    \item Re-running the same file leaves warehouse counts unchanged.
+    \item All connections use managed identities; no secrets in any artifact.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Add the silence alert for a feed that never arrives.
+    \item Replace the COPY step with a serverless CETAS materialization and compare cost at your volume.
+    \item Rebuild the orchestration as a Managed Airflow DAG and document the trade-offs you experienced.
+\end{itemize}

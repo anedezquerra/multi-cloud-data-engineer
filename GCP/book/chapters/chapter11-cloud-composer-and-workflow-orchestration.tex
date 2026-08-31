@@ -1,0 +1,258 @@
+\chapter{Change Data Capture with Datastream}
+\index{Datastream}\index{change data capture}\index{logical replication}\index{data contracts}\index{schema drift}
+
+\begin{objectives}
+\begin{itemize}
+    \item Explain change data capture concepts and Datastream's log-based architecture.
+    \item Configure Datastream sources for PostgreSQL, MySQL, and Oracle with correct prerequisites.
+    \item Choose between Cloud Storage and BigQuery destinations and design the load contract around schema enforcement.
+    \item Classify schema changes as breaking or non-breaking and assign data-contract ownership.
+    \item Build a Cloud SQL PostgreSQL to BigQuery CDC stream and test it with additive and renaming schema changes.
+    \item Architect zero-downtime replication from on-premises Oracle to BigQuery for real-time BI.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+Change data capture is a universal pattern: read the database's transaction log, not its tables, and deliver ordered insert/update/delete events to analytical targets.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{2.8cm}p{3.0cm}p{3.0cm}p{3.0cm}@{}} \\
+\toprule
+\textbf{Capability} & \textbf{GCP Datastream} & \textbf{AWS DMS} & \textbf{Azure} \\
+\midrule
+CDC engine & Log-based, serverless & DMS CDC tasks & Azure Data Factory CDC / SQL CDC \\
+PostgreSQL source & Logical replication (pgoutput / test\_decoding) & wal2json / test\_decoding & Azure Database for PG logical replication \\
+Oracle source & LogMiner / binary reader & LogMiner / binary reader & (via partner or self-managed) \\
+Managed targets & Cloud Storage, BigQuery & S3, Redshift, Kafka & ADLS, Synapse, Event Hubs \\
+Backfill & Built-in initial snapshot & Full load + CDC & Snapshot + CDC \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+Open-source \textbf{Debezium} on Kafka is the self-managed counterpart everywhere; \textbf{Snowflake} consumes CDC through Snowpipe and streams; \textbf{MongoDB} has change streams built into the database itself. The architectural constant: the transaction log is the source of truth, and every destination is a eventually-consistent projection of it.
+\end{crosscloud}
+
+\begin{keyterms}
+\textbf{Change data capture (CDC)}: extracting committed inserts, updates, and deletes from a database's transaction log rather than querying tables.
+\textbf{Datastream}: Google Cloud's serverless CDC and replication service.
+\textbf{Logical replication}: PostgreSQL's mechanism for streaming row-level changes from the write-ahead log (WAL).
+\textbf{Backfill}: the initial snapshot that establishes a baseline before incremental changes stream.
+\textbf{Data contract}: the agreed schema, semantics, and change policy between a data producer and its consumers.
+\textbf{Schema drift}: structural change at the source---added, renamed, or retyped columns---that a replication pipeline must absorb.
+\end{keyterms}
+
+\section{Week 11 Roadmap}
+Week~11 closes the gap between operational databases and analytical platforms without nightly batch windows. Monday covers CDC concepts and Datastream architecture. Tuesday configures PostgreSQL, MySQL, and Oracle sources. Wednesday covers destinations and the data-contract discipline that keeps replication from silently corrupting consumers. Thursday builds a Cloud SQL PostgreSQL to BigQuery stream and deliberately breaks it. Friday architects zero-downtime Oracle-to-BigQuery replication for real-time BI.
+
+\begin{definitionbox}
+\textbf{Change data capture} reads a database's transaction log---the PostgreSQL WAL, MySQL binlog, or Oracle redo logs---to produce an ordered stream of committed changes. Unlike polling queries, CDC captures every intermediate state change, adds near-zero load to the source, and sees deletes that queries can never observe \cite{googleclouddatastreamdocs}.
+\end{definitionbox}
+
+\section{Monday: CDC Concepts and Datastream Architecture}
+\index{CDC!log-based}\index{Datastream!architecture}\index{backfill}
+
+\subsection{Why the Log, Not the Table}
+Polling-based replication (\texttt{SELECT * WHERE updated\_at > :watermark}) misses deletes, misses intermediate updates between polls, requires perfect watermark discipline, and hammers the source with range scans. Log-based CDC reads the write-ahead log that the database already maintains for its own recovery: every committed insert, update, and delete, in commit order, with almost no additional load on the serving database. This is why CDC has become the default bridge from OLTP to analytics.
+
+\subsection{Datastream Architecture}
+Datastream is serverless: you define \textbf{connection profiles} (source and destination), a \textbf{stream} binding them with an object selection (schemas, tables, columns), and Datastream runs backfill plus continuous replication without servers to size. For BigQuery destinations, Datastream applies changes near-real-time into managed tables; for Cloud Storage, it lands change events as files (Avro or JSON) with a configurable rotation, leaving merge semantics to downstream pipelines---often Dataflow (Chapter~14) or scheduled BigQuery merges.
+
+\begin{figure}[H]
+    \centering
+    \resizebox{0.95\textwidth}{!}{%
+    \begin{tikzpicture}[
+        db/.style={cylinder, shape border rotate=90, aspect=0.25, draw=primary, thick, fill=primary!10, text width=2.8cm, minimum height=1.3cm, align=center, font=\small\bfseries},
+        svc/.style={rectangle, rounded corners, draw=primary, thick, fill=primary!6, text width=3.2cm, minimum height=1.0cm, align=center, font=\small\bfseries},
+        dst/.style={rectangle, rounded corners, draw=codegreen!60!black, thick, fill=green!7, text width=3.0cm, minimum height=1.0cm, align=center, font=\small\bfseries},
+        arrow/.style={-{Stealth[length=2.5mm]}, draw=primary, thick}
+    ]
+        \node[db] (src) at (0,0) {Cloud SQL\\PostgreSQL\\(WAL)};
+        \node[svc] (ds) at (5.2,0) {Datastream\\backfill + CDC};
+        \node[dst] (bq) at (10.4,1.4) {BigQuery\\native apply};
+        \node[dst] (gcs) at (10.4,-1.4) {Cloud Storage\\event files};
+
+        \draw[arrow] (src) -- node[above, font=\footnotesize]{log read} (ds);
+        \draw[arrow] (ds) -- (bq);
+        \draw[arrow] (ds) -- (gcs);
+    \end{tikzpicture}%
+    }
+    \caption{Datastream reads the source transaction log once and projects it to BigQuery or Cloud Storage.}
+    \label{fig:ch11-datastream-architecture}
+\end{figure}
+
+\begin{notebox}
+Backfill and CDC overlap by design: the snapshot establishes the baseline while the log stream buffers changes; Datastream reconciles the seam. Do not freeze source writes during backfill---that defeats the entire point of CDC-based zero-downtime migration.
+\end{notebox}
+
+\section{Tuesday: Source Configurations}
+\index{PostgreSQL!logical replication}\index{MySQL!binlog}\index{Oracle!LogMiner}
+
+\subsection{PostgreSQL}
+PostgreSQL sources require \texttt{wal\_level = logical}, a publication over the replicated tables, and a replication slot---the slot is the contract that tells the server to retain WAL segments until Datastream consumes them. Tables without a primary key need \texttt{REPLICA IDENTITY FULL} so updates and deletes carry enough row state. On Cloud SQL these map to database flags (\texttt{cloudsql.logical\_decoding = on}) plus a user with replication privileges.
+
+\subsection{MySQL and Oracle}
+MySQL sources stream from the binlog: enable binary logging, row-based format, and a server ID, with binlog retention long enough to survive outages. Oracle sources use LogMiner or binary log reading against redo and archive logs, with supplemental logging enabled on replicated tables---the Oracle path demands the most DBA cooperation and the longest lead time.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{2.8cm}p{5.0cm}p{4.6cm}@{}} \\
+\toprule
+\textbf{Source} & \textbf{Key prerequisites} & \textbf{Classic failure} \\
+\midrule
+PostgreSQL & Logical WAL level, publication, replication slot, replica identity & Slot fills disk when consumer stalls \\
+MySQL & Row-based binlog, retention window, server ID & Binlog purged before consumer catches up \\
+Oracle & Archive logging, supplemental logging, LogMiner access & Missing supplemental data breaks row reconstruction \\
+\bottomrule
+\end{tabular}
+\caption{CDC source prerequisites and classic failures \cite{googleclouddatastreamdocs}.}
+\label{tab:ch11-source-prereqs}
+\end{table}
+
+\begin{pitfall}
+A stalled consumer with a live replication slot retains WAL forever: PostgreSQL will fill its disk and take an outage rather than lose your changes. Monitor slot lag and alert long before the disk fills; this failure mode is the price of guaranteed delivery.
+\end{pitfall}
+
+\section{Wednesday: Destinations and Data Contracts}
+\index{BigQuery!schema enforcement}\index{data contracts!breaking changes}\index{schema drift!handling}
+
+\subsection{Cloud Storage versus BigQuery}
+The \textbf{BigQuery destination} applies changes directly into managed tables---append-only with metadata columns, or merged current state---giving near-real-time queryable replicas with zero downstream code. The \textbf{Cloud Storage destination} lands versioned change-event files: more control over merge semantics, a durable replayable archive of every change, and a natural hand-off to Dataflow or batch merges---at the cost of building that downstream logic yourself. Choose BigQuery for BI-facing replicas; choose Cloud Storage when you need the immutable event log, multi-target fan-out, or custom merge rules.
+
+\subsection{Schema Enforcement as Contract}
+BigQuery load jobs enforce schema by default: rows carrying unknown fields or mismatched types are rejected rather than silently absorbed. This rejection is the \emph{contract speaking}: the producer promised a shape, and the load is the enforcement point. Make the contract explicit---versioned schema, documented semantics, named producer and consumer owners---and treat enforcement failures as contract violations routed to an owner, not as noise to suppress.
+
+\subsection{Breaking versus Non-Breaking Changes}
+\textbf{Non-breaking}: adding a nullable column (old consumers ignore it, new consumers tolerate its absence in old rows), widening a type compatibly, adding a table. \textbf{Breaking}: renaming or dropping a column, changing a type incompatibly, changing key semantics. The policy follows directly: producers may ship non-breaking changes unilaterally; breaking changes require a versioned rollout---new column alongside old, consumer migration, then removal (the expand-contract pattern from Chapter~24).
+
+\begin{definitionbox}
+\textbf{Producer-owned contract}: the team writing the source system publishes and versions the schema, announces changes, and honors deprecation windows. \textbf{Consumer-owned}: consumers declare required fields and validate them. Healthy platforms do both: producers publish; consumers verify.
+\end{definitionbox}
+
+\begin{tipbox}
+Alert on Datastream's data-freshness metric and failed events, and write the runbook before the first incident: how to detect a stale log position, how to backfill through a Cloud Storage staging replay when BigQuery apply falls behind, and who owns the contract conversation with the source team.
+\end{tipbox}
+
+\section{Thursday Hands-On Project: PostgreSQL CDC to BigQuery with a Contract Test}
+\index{hands-on project}\index{publication}\index{replication slot}
+This lab configures logical replication on Cloud SQL for PostgreSQL, streams changes to BigQuery through Datastream, then tests the contract: add a nullable column (non-breaking) and rename one (breaking), observing Datastream's drift handling.
+
+\subsection{Prepare the Source}
+\begin{lstlisting}[language=bash,caption={Enabling logical decoding and creating a publication on Cloud SQL PostgreSQL.}]
+$env:PROJECT_ID = "my-gcp-datastream-lab"
+$env:INSTANCE = "cdc-source-lab"
+$env:REGION = "us-central1"
+
+gcloud sql instances create $env:INSTANCE `
+  --database-version=POSTGRES_16 --region=$env:REGION `
+  --database-flags=cloudsql.logical_decoding=on `
+  --tier=db-custom-2-7680
+
+gcloud sql users create cdc_user --instance=$env:INSTANCE --password='REPLACEME'
+
+# In psql as a privileged user:
+#   ALTER USER cdc_user WITH REPLICATION;
+#   CREATE TABLE shop.orders(order_id int PRIMARY KEY, amount numeric, status text);
+#   CREATE PUBLICATION ds_pub FOR TABLE shop.orders;
+\end{lstlisting}
+
+\subsection{Create the Stream}
+\begin{enumerate}
+    \item Create connection profiles: source (Cloud SQL PostgreSQL, private IP or forward-SSH tunnel per network) and destination (BigQuery).
+    \item Create the stream selecting \texttt{shop.orders}, with automatic backfill, targeting dataset \texttt{cdc\_replica}.
+    \item Validate the stream; watch it transition through backfill into CDC.
+    \item Insert, update, and delete rows in the source; confirm the changes appear in BigQuery within the freshness window.
+\end{enumerate}
+
+\subsection{Test the Contract}
+\begin{lstlisting}[language=SQL,caption={Non-breaking then breaking schema changes against the live stream.}]
+-- Non-breaking: add a nullable column. The stream absorbs it.
+ALTER TABLE shop.orders ADD COLUMN discount_pct numeric;
+
+-- Breaking: rename a column. Observe how the stream and
+-- downstream queries respond; document the remediation.
+ALTER TABLE shop.orders RENAME COLUMN status TO order_status;
+\end{lstlisting}
+
+Record what each change does to the destination table and to any consumer queries: the additive change should flow through with nulls in old rows; the rename should surface as a contract violation---old column frozen, new column appearing---requiring a coordinated consumer migration.
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item Screenshots or CLI output of the validated stream in CDC state, with the freshness metric.
+    \item A change log demonstrating insert/update/delete propagation within the measured latency.
+    \item A contract-test report: observed behavior for the additive and the renaming change, and the remediation runbook for the breaking case.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item The source uses logical replication with a publication and replication slot.
+    \item DML on the source appears in BigQuery near-real-time without batch jobs.
+    \item The two schema-change cases are executed and their destination behavior documented accurately.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Add a Cloud Monitoring alert on the stream's freshness metric and a notification channel.
+    \item Re-create the stream to a Cloud Storage destination and compare event-file semantics with the BigQuery apply.
+    \item Write a consumer-side view that tolerates both \texttt{status} and \texttt{order\_status} during a migration window.
+\end{itemize}
+
+\section{Friday Use Case and Architecture: Zero-Downtime Oracle to BigQuery}
+\index{Oracle migration}\index{real-time BI}\index{zero-downtime replication}
+
+\subsection{Scenario}
+A manufacturer's on-premises Oracle database runs the ERP of record. The BI team needs near-real-time dashboards in BigQuery; the business forbids downtime beyond a maintenance-minute cutover; the DBAs will permit read-only log access and nothing more.
+
+\subsection{Architecture}
+Datastream connects to Oracle through a secure network path (VPN or Interconnect) with LogMiner-based capture, supplemental logging enabled on the replicated schemas. Backfill establishes the baseline while production continues writing; CDC then keeps BigQuery within seconds of the source. A Cloud Monitoring alert on freshness is the operational heartbeat. For BI, expose curated views over the replica tables so dashboard queries never touch raw CDC metadata columns, and schedule a daily reconciliation (row counts and key checksums per table) between Oracle and BigQuery as the trust anchor.
+
+\begin{pitfall}
+Oracle redo/archive retention bounds how long the stream may be down. If retention is 48 hours and the stream stalls over a long weekend, the log position is unrecoverable and the table must be re-backfilled. Size archive storage and alert on stall duration against the retention budget, not against vibes.
+\end{pitfall}
+
+\begin{tipbox}
+Keep the initial object list narrow: the thirty tables the BI team needs this quarter, not all four thousand. Every replicated table is a schema-drift obligation; start with a contracted subset and expand deliberately.
+\end{tipbox}
+
+\section{Interview Q\&A}
+\subsection{Concepts and Trade-offs}
+\begin{enumerate}
+    \item \textbf{Q: How does Datastream capture changes without querying the source tables?}\\
+    A: It reads the transaction log (WAL, binlog, or redo logs) that the database maintains for recovery, yielding committed changes in order with minimal source load.
+
+    \item \textbf{Q: Which is a breaking contract change: adding a nullable column or renaming one?}\\
+    A: Renaming. Adding a nullable column is backward compatible; renaming breaks every consumer referencing the old name and requires a coordinated rollout.
+
+    \item \textbf{Q: What does BigQuery schema enforcement on load reject by default?}\\
+    A: Rows with unknown fields or type mismatches---the load is the contract enforcement point.
+
+    \item \textbf{Q: Who should own a data contract---producer, consumer, or both?}\\
+    A: Both: producers publish and version the schema with deprecation discipline; consumers declare and validate what they depend on.
+
+    \item \textbf{Q: What does the data freshness metric tell you about CDC lag?}\\
+    A: How far behind real time the destination is; a growing value signals a stalled consumer, a source outage, or an apply bottleneck before users notice stale dashboards.
+\end{enumerate}
+
+\section{Further Reading}
+Read the Datastream documentation for source prerequisites, stream configuration, and destination behavior \cite{googleclouddatastreamdocs}. Review Cloud SQL's logical-decoding flags \cite{googlecloudsqldocs} and BigQuery's load-time schema enforcement \cite{googlecloudbigquerydocs}. Cloud Monitoring documentation covers the freshness alerting that makes CDC operationally safe \cite{googlecloudmonitoringdocs}. For the migration context, Database Migration Service documentation describes the related homogeneous-migration path \cite{googleclouddmsdocs}.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item CDC reads the transaction log: complete, ordered, low-impact change streams that polling can never match.
+    \item Source prerequisites are the project: logical WAL, publications, retention, and replica identity must be right before any stream validates.
+    \item BigQuery destinations give queryable replicas; Cloud Storage destinations give replayable event logs---choose per downstream need.
+    \item Schema enforcement at load is the data contract speaking; route violations to owners instead of suppressing them.
+    \item Breaking changes demand expand-contract rollouts; non-breaking changes flow freely.
+    \item Freshness alerting and a backfill runbook are not optional extras---they are the difference between replication and hope.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Explain three classes of changes polling-based replication misses that log-based CDC captures.
+    \item \textbf{(Conceptual)} Why does a stalled consumer threaten the \emph{source} database's availability, and what alerts prevent it?
+    \item \textbf{(Hands-on)} Reproduce the Thursday lab, then measure end-to-end latency from source commit to BigQuery visibility across ten transactions.
+    \item \textbf{(Hands-on)} Force a failed-event condition (for example, a type mismatch) and document the recovery path.
+    \item \textbf{(Design)} Write the data-contract document for \texttt{shop.orders}: fields, semantics, versioning rule, change-announcement process, and owners.
+    \item \textbf{(Architecture)} Extend the Friday design with a Cloud Storage event-log destination feeding a replay-based disaster recovery procedure.
+\end{enumerate}

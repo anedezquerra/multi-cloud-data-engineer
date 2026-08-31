@@ -1,0 +1,311 @@
+% NOTE: Filename is fixed by the book outline; content teaches Week 18
+% (Amazon SageMaker Foundations) of the syllabus.
+\chapter{Amazon SageMaker Foundations for Data Engineers}
+\index{Amazon SageMaker}\index{SageMaker Studio}\index{Data Wrangler}\index{SageMaker Autopilot}\index{XGBoost}\index{SageMaker endpoints}\index{Batch Transform}%
+\begin{objectives}
+\begin{itemize}
+    \item Navigate SageMaker's surfaces: Studio, notebook instances, and Data Wrangler for interactive data preparation.
+    \item Choose between built-in algorithms, SageMaker Autopilot, and custom training containers.
+    \item Select the right inference shape: real-time, serverless, asynchronous, or Batch Transform.
+    \item Clean an S3 dataset in Data Wrangler, train XGBoost via Autopilot, and deploy to a serverless endpoint.
+    \item Design secure training-data access from a governed S3 lake through Lake Formation.
+    \item Architect a GPU training workflow for data scientists working on governed data.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+Managed ML platforms share a shape: a studio, managed training, a model registry, and deployment targets. The AWS names map onto their peers directly.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{2.8cm}p{3.0cm}p{3.0cm}p{3.0cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{AWS} & \textbf{Azure} & \textbf{GCP} \\
+\midrule
+ML studio & SageMaker Studio & Azure ML studio & Vertex AI Workbench \\
+Interactive data prep & Data Wrangler & Fabric Data Wrangler / Power Query & BigQuery DataFrames / Colab \\
+AutoML & SageMaker Autopilot & Azure ML AutoML & Vertex AI AutoML \\
+Managed training & SageMaker Training Jobs & Azure ML jobs & Vertex AI Training \\
+Real-time inference & Real-time endpoints & Managed online endpoints & Vertex AI endpoints \\
+Batch inference & Batch Transform & Batch endpoints & Batch prediction \\
+\addlinespace
+Custom code & BYO container (any framework) & Custom environments & Custom containers \\
+GPU access & ml.g/ml.p instances & GPU compute clusters & GPU nodes/Vertex \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+\textbf{Fabric} data science runs in-notebook with SynapseML against OneLake. \textbf{Snowflake} ML covers training and serving inside the warehouse boundary. \textbf{MongoDB} feeds these platforms as a source; its vector search serves retrieval rather than training.
+\end{crosscloud}
+
+\section{Week 18 Roadmap and Mental Model}
+Week~17 stayed inside the warehouse; Week~18 steps onto the full ML platform. SageMaker is not one service but a workbench: Studio for interactive development, Data Wrangler for visual data preparation, Training Jobs for managed compute, Autopilot for automated modeling, a registry for versions, and four shapes of inference infrastructure \cite{awsSageMakerDocs}.
+
+The data engineer's perspective on SageMaker is distinctive: your concerns are \emph{data access} (how does training read governed data lawfully?), \emph{data movement} (what is copied where, in what format?), and \emph{cost shape} (GPUs and always-on endpoints are where ML budgets go to die). This chapter builds the platform literacy that Week~19's pipelines and Week~20's AI services assume.
+
+\begin{definitionbox}
+\textbf{Amazon SageMaker} is a managed machine-learning platform covering the model lifecycle: data preparation (Data Wrangler), experimentation (Studio notebooks), automated and custom training (Autopilot, Training Jobs, custom containers), and deployment (real-time, serverless, asynchronous, and batch inference).
+\end{definitionbox}
+
+\begin{keyterms}
+\textbf{Studio}: the web-based IDE unifying SageMaker tools. \textbf{Data Wrangler}: visual data-prep tool that exports repeatable flows. \textbf{Autopilot}: automated model exploration producing candidate notebooks and a best model. \textbf{Built-in algorithm}: SageMaker-maintained implementation (XGBoost, BlazingText) run from a managed container. \textbf{Training job}: managed, ephemeral compute that reads training data, runs the container, and writes model artifacts to S3. \textbf{Endpoint}: managed inference infrastructure---real-time (persistent), serverless (scale-to-zero), or async; \textbf{Batch Transform}: offline scoring over a dataset.
+\end{keyterms}
+
+\section{Monday: Studio, Notebooks, and Data Wrangler}
+\subsection{The Working Surfaces}
+SageMaker Studio is the hub: hosted notebooks, the Data Wrangler canvas, Autopilot launches, pipeline visualization, and endpoint management---all under one IAM-governed domain. The data engineer's first question is never ``which notebook instance'' but ``what data can this domain's execution role reach?''---because the answer determines whether governance (Chapter~8) survives contact with the data science team.
+\index{SageMaker Studio}
+
+\subsection{Data Wrangler: Visual Prep That Exports}
+Data Wrangler is the interactive cleaning surface: connect S3, Athena, or Redshift; sample the data; apply from 300+ built-in transforms; see distributions and a quick model's feature importances as you work \cite{awsSageMakerDocs}. Its professional significance is the \emph{export}: an interactive session compiles to a repeatable artifact---a Processing Job script, a SageMaker Pipelines step, or a notebook---so the cleaning you did by hand becomes code that reruns. Interactive exploration that cannot be replayed is technical debt; Wrangler's export is how exploration graduates.
+\index{Data Wrangler}
+
+\begin{pitfall}
+\textbf{Hand-editing data in a notebook and calling the result a pipeline.} If cleaning exists only as executed cells in someone's session, it is unreproducible by definition. Export the Wrangler flow or write the transforms in a job; the notebook is the lab bench, not the factory.
+\end{pitfall}
+
+\section{Tuesday: Built-In Algorithms, Autopilot, and Custom Containers}
+\subsection{Three Ladders of Control}
+\textbf{Built-in algorithms}---XGBoost, BlazingText, linear learner, DeepAR, and others---are managed containers: you provide data in the expected format and hyperparameters; SageMaker runs a maintained, scalable implementation. XGBoost on tabular data remains the default first answer for good reason.
+
+\textbf{Autopilot} automates candidate generation: point it at a tabular dataset and a target, and it explores feature preprocessors, algorithms, and hyperparameters, returning a best model \emph{plus} the candidate notebooks---so you can read what it did. Autopilot is Week~17's engine exposed directly, with more control and more visibility.
+
+\textbf{Custom containers} are the escape hatch: bring any Docker image (PyTorch, XGBoost with custom objectives, domain libraries), and SageMaker Training runs it on managed instances with the same data-channel, artifact, and IAM conventions. The training contract stays constant; only the code is yours.
+\index{Autopilot}\index{custom container}
+
+\begin{tipbox}
+Stay on the lowest rung of the control ladder that meets the requirement. Built-ins are patched and tuned by AWS; Autopilot adds exploration you can inspect; custom containers add a supply chain you now own---base-image CVEs, dependency updates, and rebuilds are yours forever.
+\end{tipbox}
+
+\section{Wednesday: Inference Shapes---Real-Time, Serverless, Batch}
+\subsection{Four Ways to Serve}
+\begin{itemize}
+    \item \textbf{Real-time endpoints}: persistent instances behind an HTTPS endpoint, millisecond latency, billed while running. For interactive, SLA-bound traffic.
+    \item \textbf{Serverless endpoints}: scale to zero, cold starts in seconds, billed per request compute. For sporadic or unpredictable traffic.
+    \item \textbf{Asynchronous endpoints}: queue-backed, large payloads, up to hour-scale processing. For document/video-class payloads with relaxed latency.
+    \item \textbf{Batch Transform}: no endpoint at all---score a dataset from S3 to S3 on ephemeral compute. For nightly scoring of everything.
+\end{itemize}
+\index{real-time endpoint}\index{serverless endpoint}\index{Batch Transform}
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.0cm}p{3.6cm}p{3.4cm}p{3.2cm}@{}}
+\toprule
+\textbf{Shape} & \textbf{Latency} & \textbf{Cost shape} & \textbf{Best fit} \\
+\midrule
+Real-time & Milliseconds & Always-on instance-hours & Interactive, SLA-bound \\
+Serverless & Seconds (cold start) & Per-request compute & Sporadic traffic \\
+Asynchronous & Minutes--hours & Instance-hours while processing & Large payloads \\
+Batch Transform & Dataset-scale & Ephemeral job-hours & Periodic bulk scoring \\
+\bottomrule
+\end{tabular}
+\caption{Choosing an inference shape.}
+\label{tab:ch18-inference}
+\end{table}
+
+The data engineer's rule of thumb: if the consumer is a dashboard or nightly process, you want Batch Transform and a scored table (the Week~17 pattern at platform scale); if the consumer is an application with users waiting, you want an endpoint, and the serverless variant until traffic justifies always-on.
+
+\begin{pitfall}
+\textbf{An always-on endpoint for a model scored once a day.} A forgotten \texttt{ml.m5.xlarge} endpoint runs 730 hours a month to serve one batch---often dwarfing the entire training bill. Match the inference shape to the traffic shape, and audit for orphaned endpoints monthly.
+\end{pitfall}
+
+\section{Thursday Hands-on Project: Wrangler to Serverless Endpoint}
+\index{hands-on project!SageMaker Autopilot}
+Clean an S3 dataset in Data Wrangler, train an XGBoost model with Autopilot, deploy to a serverless endpoint, and send a test payload.
+
+\subsection*{Lab Objectives}
+\begin{itemize}
+    \item Prepare a governed S3 dataset and verify the Studio domain's access path.
+    \item Build a Data Wrangler flow (type fixes, null handling, one-hot encoding) and export it.
+    \item Launch an Autopilot experiment (XGBoost candidates included) on the cleaned data.
+    \item Deploy the best model to a serverless endpoint and score a payload.
+\end{itemize}
+
+\subsection*{Procedure}
+\begin{enumerate}
+    \item Stage the churn dataset from Week~17 (CSV) in a governed bucket; confirm the Studio execution role reads it through the Lake Formation grant, not a broad S3 policy.
+    \item In Data Wrangler: import the dataset, fix types, impute nulls in \texttt{avg\_session\_min}, one-hot encode \texttt{segment}, and export the flow as a Processing Job.
+    \item Run the exported job to produce the cleaned dataset---this, not the interactive session, is the pipeline artifact.
+    \item Create an Autopilot experiment on the cleaned data with \texttt{is\_churned} as target; inspect the candidate list and the best model's metrics.
+    \item Deploy the best candidate as a \textbf{serverless} endpoint.
+\end{enumerate}
+
+\begin{lstlisting}[language=Python,caption={Scoring a test payload against the serverless endpoint.},label={lst:ch18-invoke}]
+import json
+import boto3
+
+runtime = boto3.client("sagemaker-runtime", region_name="us-east-1")
+
+payload = "12,49.90,2,38.5,segment_b"   # CSV feature row for the model
+resp = runtime.invoke_endpoint(
+    EndpointName="churn-serverless-endpoint",
+    ContentType="text/csv",
+    Body=payload,
+)
+probability = float(resp["Body"].read().decode())
+print({"churn_probability": probability})
+\end{lstlisting}
+
+\subsection*{Verification}
+\begin{itemize}
+    \item The exported Wrangler flow reruns as a job and reproduces the cleaned dataset byte-comparably.
+    \item The Autopilot leaderboard is inspectable and the chosen model's validation metrics are recorded.
+    \item The endpoint returns a sane probability for the test payload; cold-start latency is measured and acceptable.
+    \item The endpoint scales to zero after idleness---verify zero instance-hours accrue overnight.
+    \item The Studio domain's Lake Formation-scoped access is demonstrated by a denied read of an unrelated PII table.
+\end{itemize}
+
+\section{Friday Use Case: GPU Training on a Governed Lake}
+\index{use case!governed GPU training}
+A retailer's data science team trains custom PyTorch demand models on GPU instances. The training data lives in the governed S3 lake from Part~2, including customer-level features behind Lake Formation column masks. Security requires that scientists never receive standing broad S3 access. Design the workflow.
+
+\subsection{Architecture}
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[
+        box/.style={rectangle, rounded corners, draw=primary, thick, fill=primary!6, align=center, minimum width=3.0cm, minimum height=1.0cm, font=\small\bfseries},
+        guard/.style={rectangle, rounded corners, draw=red!60!black, thick, fill=red!5, align=center, minimum width=2.7cm, minimum height=0.95cm, font=\footnotesize\bfseries},
+        storebox/.style={cylinder, shape aspect=0.25, draw=primary, thick, fill=blue!6, shape border rotate=90, align=center, text width=2.6cm, minimum height=1.25cm, font=\footnotesize\bfseries},
+        arr/.style={-{Stealth[length=2.5mm]}, draw=primary, thick}
+    ]
+        \node[storebox] (lake) at (0,0) {Governed S3 lake\\(curated features)};
+        \node[guard] (lf) at (0,2.2) {Lake Formation\\column-scoped grants};
+        \node[box] (extract) at (3.9,0) {Feature extract\\(Athena/Glue job)};
+        \node[storebox] (staging) at (7.8,0) {Training staging\\bucket (KMS)};
+        \node[box] (train) at (11.6,0) {SageMaker Training\\GPU instances, PyTorch};
+        \node[storebox] (art) at (15.0,0) {Model artifacts\\S3 + Registry};
+        \draw[arr] (lake) -- (extract);
+        \draw[arr] (extract) -- (staging);
+        \draw[arr] (staging) -- (train);
+        \draw[arr] (train) -- (art);
+        \draw[arr, dashed] (lf) -- (lake);
+    \end{tikzpicture}%
+    }
+    \caption{Governed GPU training: a catalog-scoped extraction job produces the training set; scientists' roles never touch the governed lake directly.}
+    \label{fig:ch18-gpu-workflow}
+\end{figure}
+
+\subsection{Design Decisions}
+\textbf{Access through the catalog, not around it.} Scientists submit feature requests; an approved extraction job (Athena or Glue, running under a role with the Lake Formation grants) materializes the training set into a KMS-encrypted staging bucket. Column masks apply at extraction, so PII columns never reach the staging area. The scientists' execution roles read only staging. Governance is enforced by architecture, not policy documents.
+
+\textbf{GPU discipline.} Training jobs are ephemeral and billed per second: right-size (a \texttt{ml.g5.xlarge} before an \texttt{ml.p4d.24xlarge}), use managed Spot training for fault-tolerant runs at a large discount with checkpointing to S3, and enforce \texttt{max\_runtime} so a hung job stops billing. Every job's input is a versioned S3 prefix and its output a versioned artifact---the training run is reproducible or it is not done.
+
+\textbf{Network containment.} Training runs in the platform VPC with no internet route and VPC endpoints for S3, ECR, and logs (Chapter~21's perimeter applies here). Exfiltration resistance is a property of the network, not of the notebook policy.
+
+\begin{pitfall}
+\textbf{Granting the Studio role s3:* ``temporarily.''} The governed lake's value is exactly the access boundary. One broad role on the domain and every column mask in Chapter~8 becomes decorative for the ML team. The extraction-job pattern costs an afternoon to build and protects the boundary permanently.
+\end{pitfall}
+
+\section{Interview Q\&A}
+\subsection{Concepts and Trade-offs}
+\begin{enumerate}
+    \item \textbf{Q: Real-time versus serverless versus Batch Transform: which fits sporadic traffic?}\\
+    A: Serverless endpoints---scale to zero between requests, pay per request compute, accept seconds of cold start. Real-time is for steady SLA-bound traffic; Batch Transform for bulk offline scoring.
+    \item \textbf{Q: What does SageMaker Data Wrangler export after interactive cleaning?}\\
+    A: A repeatable artifact: a Processing Job script, a pipeline step, or a notebook---so interactive prep becomes rerunnable code rather than a one-off session.
+    \item \textbf{Q: When do you need a custom container instead of built-in XGBoost?}\\
+    A: When the framework, architecture, or dependencies have no managed equivalent---custom PyTorch models, specialized libraries, or pinned research stacks. Otherwise stay on maintained images.
+    \item \textbf{Q: How does Autopilot pick its final model?}\\
+    A: It explores preprocessors, algorithms, and hyperparameters as candidates, evaluates them against the objective metric on validation splits, and ranks a best model---with candidate notebooks exposed for inspection.
+    \item \textbf{Q: Why route training-data access through Lake Formation instead of direct S3?}\\
+    A: So column masks and grants apply to the extraction: PII never reaches the staging bucket, scientists never hold broad lake access, and every training set is a governed, reproducible artifact.
+    \item \textbf{Q: What is managed Spot training and what does it require of your code?}\\
+    A: Training on spare capacity at a steep discount with possible interruption---requiring checkpointing to S3 so an interrupted job resumes rather than restarts.
+\end{enumerate}
+
+\section{Further Reading}
+The SageMaker Developer Guide covers Studio, Data Wrangler, Autopilot, Training Jobs, and all four inference shapes \cite{awsSageMakerDocs}. The Lake Formation guide's credential-vending model underpins the Friday architecture \cite{awsLakeFormationDocs}, and the KMS guide covers the staging-bucket encryption posture \cite{awsKMSDocs}. The Well-Architected Machine Learning Lens extends the analytics lens used throughout \cite{awsWellArchitectedAnalytics}.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item SageMaker is a workbench: Studio, Wrangler, Autopilot, Training, Registry, and four inference shapes.
+    \item Interactive data prep graduates only through export---Wrangler flows become jobs, or the pipeline is fiction.
+    \item Use the lowest control rung that fits: built-in, then Autopilot, then custom container with its supply-chain cost.
+    \item Match inference shape to traffic shape; the orphaned always-on endpoint is the classic ML budget leak.
+    \item Training data access goes through governed extraction, not broad roles; masks apply at extraction time.
+    \item GPU economics are instance-rightsizing, managed Spot with checkpoints, and hard runtime caps.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Explain why Batch Transform often beats a real-time endpoint for data-engineering consumers.
+    \item \textbf{(Conceptual)} What does Autopilot expose that Redshift ML (Week~17) does not, and why does that matter for governance reviews?
+    \item \textbf{(Hands-on)} Run the Thursday project; then redeploy the same model as Batch Transform over the full dataset and compare cost.
+    \item \textbf{(Hands-on)} Measure serverless cold-start latency across the first five invocations and report the distribution.
+    \item \textbf{(Hands-on)} Export the Wrangler flow as a Pipelines step (preview of Week~19) and execute it standalone.
+    \item \textbf{(Design)} Design the feature-request workflow for the Friday scenario: request, approval, extraction, staging TTL, and audit trail.
+    \item \textbf{(Design)} Write the GPU instance selection policy for the team: when g5, when p4d, when CPU is actually correct.
+    \item \textbf{(Architecture)} Extend the Friday architecture for two data-science teams with separate data domains and one shared model registry.
+\end{enumerate}
+
+\section{Capstone Project: A Governed ML Training Service}\label{sec:ch18-capstone}
+\index{capstone project}\index{SageMaker!capstone}
+
+\begin{capstonebox}
+\textbf{Mission.} Productize the Friday architecture: a self-service, governed path from feature request to trained model---catalog-scoped extraction, reproducible training on right-sized compute, artifacts in the registry, and inference shaped to the consumer.
+
+\textbf{Estimated time.} 6--8 hours in a sandbox AWS account.
+
+\textbf{What you\textquotesingle{}ll practice.}
+\begin{itemize}
+    \item The extraction-job pattern enforcing Lake Formation masks for ML consumers.
+    \item Reproducible training: versioned inputs, managed Spot, runtime caps, checkpointing.
+    \item Inference-shape selection with cost evidence per shape.
+    \item Endpoint lifecycle hygiene: scale-to-zero defaults and orphan audits.
+\end{itemize}
+\end{capstonebox}
+
+\subsection*{Scenario}
+The retailer's data platform team productizes ML access for two data scientists. Every model trained must be reproducible (inputs, code, config versioned), every training dataset must be a governed extraction, and every endpoint must justify its shape against a traffic estimate.
+
+\subsection*{Requirements}
+\textbf{Functional requirements.}
+\begin{itemize}
+    \item A parameterized extraction job (Athena or Glue) that materializes approved feature sets into a KMS-encrypted staging bucket with TTL.
+    \item A training template (PyTorch or XGBoost) with versioned input prefixes, S3 checkpointing, and \texttt{max\_runtime}.
+    \item Deployment to the shape justified by a documented traffic estimate; serverless is the default.
+    \item A registry entry per model with metrics and lineage to the training-set version.
+\end{itemize}
+
+\textbf{Non-functional requirements.}
+\begin{itemize}
+    \item No scientist role can read the governed lake directly; the denial is demonstrated.
+    \item Managed Spot is used where the framework's checkpointing allows; interruption recovery is demonstrated.
+    \item A monthly orphan-endpoint audit exists and has run at least once.
+\end{itemize}
+
+\subsection*{Implementation Steps}
+\begin{enumerate}
+    \item Build the extraction job and its approval-light workflow (a reviewed SQL file per feature set).
+    \item Implement the training template with checkpointing; run an interruption drill.
+    \item Register the model with metrics and input lineage.
+    \item Deploy serverless; document the traffic estimate and the shape decision.
+    \item Implement the orphan-endpoint audit as a scheduled Lambda report.
+    \item Write the team's operating guide: request to endpoint in five documented steps.
+\end{enumerate}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item The extraction job, training template, and deployment configuration in version control.
+    \item The interruption-drill evidence and the Spot savings estimate.
+    \item The registry entry with lineage and the shape-decision memo.
+    \item The access-denial evidence and the first orphan-audit report.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item A new model can go from approved feature set to endpoint using only the documented path.
+    \item Training resumes from checkpoint after a forced Spot interruption.
+    \item Every artifact (dataset, code, config, model) is version-linked in the registry.
+    \item Endpoint spend is attributable per model and per team.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Wrap the training template as a SageMaker Pipeline (preview of Week~19).
+    \item Add Autopilot as a baseline candidate that custom models must beat to register.
+    \item Implement data-quality checks on extractions (preview of Chapter~22) that block training on bad inputs.
+    \item Cost-compare the whole workflow against the Redshift ML path from Week~17 for the same problem.
+\end{itemize}

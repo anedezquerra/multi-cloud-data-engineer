@@ -1,0 +1,363 @@
+\chapter{Unstructured Data and AI APIs}
+\index{Vision API}\index{Natural Language API}\index{Video Intelligence}\index{Translation API}\index{OCR}\index{sentiment analysis}
+
+\begin{objectives}
+\begin{itemize}
+    \item Select among Vision, Video Intelligence, Natural Language, and Translation APIs for unstructured workloads.
+    \item Integrate per-call AI APIs inside Dataflow pipelines with batching, backoff, and rate-limit discipline.
+    \item Make OCR output searchable and joinable against structured data in BigQuery.
+    \item Forecast per-call API costs and choose between API calls, BQML, and custom models.
+    \item Build the streaming sentiment pipeline: Pub/Sub reviews, Natural Language API, BigQuery sink.
+    \item Architect terabyte-scale image ingestion with OCR, object tagging, and searchable metadata.
+    \item Complete the Milestone~5 capstone: an end-to-end MLOps pipeline with monitoring.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+Pretrained AI APIs are the fastest path from unstructured data to structured signal on every cloud; the pricing and rate-limit shapes differ, the integration patterns do not.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{2.8cm}p{3.0cm}p{3.0cm}p{3.0cm}@{}} \\
+\toprule
+\textbf{Capability} & \textbf{GCP} & \textbf{AWS} & \textbf{Azure} \\
+\midrule
+Image analysis/OCR & Vision API & Rekognition / Textract & Azure AI Vision / Document Intelligence \\
+Video analysis & Video Intelligence & Rekognition Video & Azure Video Indexer \\
+Text NLP & Natural Language API & Comprehend & Azure AI Language \\
+Translation & Translation API & Translate & Azure Translator \\
+Speech & Speech-to-Text & Transcribe & Azure Speech \\
+Generative/LLM & Gemini (Vertex AI) & Bedrock & Azure OpenAI \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+\textbf{MongoDB Atlas Vector Search} and \textbf{Snowflake Cortex} bring embeddings and LLM functions into the data layer; the GCP analog is Vertex AI's Gemini integration with BigQuery. The engineering constants: per-call pricing demands cost forecasting, and external calls inside distributed pipelines demand batching and backoff.
+\end{crosscloud}
+
+\begin{keyterms}
+\textbf{Vision API}: pretrained image understanding---labels, faces, landmarks, logos, OCR---per image call.
+\textbf{Natural Language API}: entity extraction, sentiment, syntax, and classification per text call.
+\textbf{InfoType-independent enrichment}: using pretrained APIs to derive structured fields (labels, sentiment, entities) from unstructured payloads.
+\textbf{OCR}: optical character recognition---text extraction from images and scanned documents.
+\textbf{Batching}: aggregating pipeline elements into a single API call to reduce overhead and rate-limit pressure.
+\textbf{Backoff}: retrying failed or throttled calls with increasing delays (exponential with jitter).
+\end{keyterms}
+
+\section{Week 20 Roadmap}
+Week~20 closes Part~V by bringing unstructured data into the platform. Monday covers Vision and Video Intelligence. Tuesday covers Natural Language and Translation. Wednesday is the integration day: AI APIs inside Dataflow. Thursday builds the streaming sentiment pipeline. Friday architects terabyte-scale image ingestion. The week ends with the Milestone~5 MLOps capstone.
+
+\begin{definitionbox}
+Google Cloud's \textbf{pretrained AI APIs} expose production-grade models---vision, language, translation, speech---behind simple per-call interfaces \cite{googlecloudaiapis}. They trade model control for operational simplicity: no training, no endpoints to size, per-call pricing, and immediate capability.
+\end{definitionbox}
+
+\section{Monday: Vision and Video Intelligence}
+\index{Vision API!features}\index{Video Intelligence!features}\index{OCR!document text}
+
+\subsection{Vision API}
+Vision's feature menu per image: \texttt{LABEL\_DETECTION} (objects and scenes), \texttt{TEXT\_DETECTION} (OCR; \texttt{DOCUMENT\_TEXT\_DETECTION} for dense pages), \texttt{SAFE\_SEARCH\_DETECTION} (moderation signals), \texttt{FACE\_DETECTION} (presence and attributes, not identity), \texttt{LOGO\_DETECTION}, and \texttt{OBJECT\_LOCALIZATION}. For data engineering, the design questions are throughput (images per second times cost per image), feature selection (each requested feature is billed), and storage of results (structured rows keyed by object URI, joining back to the Object Table from Chapter~8).
+
+\subsection{Video Intelligence}
+Video Intelligence annotates at shot, segment, and frame level: label detection over time, shot changes, explicit content, speech transcription, object tracking. The economics differ from images: one call per video with per-minute pricing, asynchronous operation, and results as annotation JSON. The platform pattern is event-driven: a Cloud Storage finalize event (or Object Tables plus a scheduled diff) triggers annotation, results land in BigQuery, and downstream queries answer ``videos containing logos after minute ten.''
+
+\begin{pitfall}
+Requesting every Vision feature on every image multiplies the bill by the feature count. Profile first: run a sample through all features, keep the two or three your downstream queries actually use, and make feature selection a reviewed pipeline parameter.
+\end{pitfall}
+
+\section{Tuesday: Natural Language and Translation APIs}
+\index{Natural Language API!entities}\index{sentiment score}\index{Translation API}
+
+\subsection{Natural Language API}
+The workhorse methods: \texttt{analyzeSentiment} (document and sentence scores, $-1$ to $1$, with magnitude), \texttt{analyzeEntities} (typed entities with salience), \texttt{classifyText} (content categories), and \texttt{analyzeEntitySentiment} (sentiment \emph{per entity}---the difference between ``the battery died but support was great''). Sentiment score needs magnitude to be interpretable: a score of $0.1$ with magnitude $8$ is a long, mildly positive document, not a neutral one.
+
+\subsection{Translation}
+The Translation API (Basic and Advanced tiers) translates between a hundred-plus languages, with glossaries and batch document translation on Advanced. In data platforms it appears in two places: normalizing multilingual text before NLP (translate to one analysis language, acknowledging translation-loss caveats) and as a data product itself (localized catalog content pipelines).
+
+\begin{tipbox}
+Translate-then-analyze versus analyze-in-language is a measurable decision, not a philosophy: sample both on your domain text and compare downstream metrics. Modern multilingual models have narrowed the gap, but domain vocabulary still travels badly through translation.
+\end{tipbox}
+
+\section{Wednesday: AI APIs Inside Dataflow Pipelines}
+\index{Dataflow!external API calls}\index{rate limiting}\index{batching!API calls}
+
+\subsection{The Integration Pattern}
+Calling a per-call API from a \texttt{ParDo} is correct and dangerous at scale: a streaming pipeline at ten thousand elements per second becomes ten thousand API calls per second---rate limits, tail latency, and cost explode together. The disciplined pattern: \textbf{batch} elements into bundles inside the DoFn (or use the API's batch method), call once per bundle with a bounded thread pool, apply exponential backoff with jitter on 429/5xx, and route permanently failing elements to a dead-letter output with the error attached. Beam's stateful timers (Chapter~15) implement token-bucket throttling when you need a hard calls-per-second ceiling.
+
+\begin{lstlisting}[language=Python,caption={Bounded-batch Natural Language calls with retry inside a DoFn.}]
+import time
+import apache_beam as beam
+from google.cloud import language_v1
+
+
+class SentimentFn(beam.DoFn):
+    def setup(self):
+        self.client = language_v1.LanguageServiceClient()
+        self.batch = []
+
+    def process(self, element):
+        self.batch.append(element)
+        if len(self.batch) >= 25:
+            yield from self.flush()
+
+    def finish_bundle(self):
+        for row in self.flush():
+            yield row
+
+    def flush(self):
+        results, batch = [], self.batch
+        self.batch = []
+        for element in batch:
+            results.append(self.call_with_backoff(element))
+        return results
+
+    def call_with_backoff(self, element):
+        doc = {"content": element["text"],
+               "type_": language_v1.Document.Type.PLAIN_TEXT}
+        for attempt in range(5):
+            try:
+                resp = self.client.analyze_sentiment(document=doc)
+                return {**element, "score": resp.document_sentiment.score,
+                        "magnitude": resp.document_sentiment.magnitude}
+            except Exception:
+                if attempt == 4:
+                    raise
+                time.sleep(min(2 ** attempt, 30))
+\end{lstlisting}
+
+\begin{pitfall}
+Retries without idempotency analysis double-bill: most AI API calls are safe to retry (pure functions of the payload), but billing is per call---a retry loop around a flaky network path is a billing multiplier. Alert on retry rate as a cost signal, not just a reliability one.
+\end{pitfall}
+
+\subsection{Choosing API versus BQML versus Custom}
+Call the API when the task is generic (OCR, sentiment, translation) and volume is moderate. Use BQML (Chapter~17) when the task is tabular and data already lives in BigQuery. Train custom (Chapter~18) when the domain is specific (medical imaging, proprietary taxonomies) or volume makes per-call pricing worse than owned inference. Write the per-1{,}000-units price of all three options on one slide before choosing; the answer is usually arithmetic.
+
+\section{Thursday Hands-On Project: Streaming Review Sentiment to BigQuery}
+\index{hands-on project}\index{sentiment pipeline}
+This lab streams support-review text from Pub/Sub through the Natural Language API into BigQuery, using the batching DoFn from Wednesday.
+
+\subsection{Provision and Publish}
+\begin{lstlisting}[language=bash,caption={Creating the reviews topic, BigQuery sink, and a test publish.}]
+$env:PROJECT_ID = "my-gcp-aiapi-lab"
+gcloud config set project $env:PROJECT_ID
+gcloud services enable language.googleapis.com dataflow.googleapis.com pubsub.googleapis.com
+
+gcloud pubsub topics create support-reviews
+gcloud pubsub subscriptions create support-reviews-sub --topic=support-reviews
+
+bq mk --dataset analytics
+bq query --nouse_legacy_sql `
+  "CREATE TABLE IF NOT EXISTS analytics.review_sentiment
+   (review_id STRING, text STRING, score FLOAT64, magnitude FLOAT64,
+    event_ts TIMESTAMP)"
+
+gcloud pubsub topics publish support-reviews `
+  --message='{"review_id":"r1","text":"The agent resolved my issue in minutes, wonderful!","event_ts":"2026-08-31T12:00:00Z"}'
+\end{lstlisting}
+
+\subsection{Run the Pipeline}
+Extend Wednesday's DoFn with Pub/Sub read, JSON parse, and \texttt{WriteToBigQuery} to \texttt{analytics.review\_sentiment} (Chapter~15's pattern), then launch on the Dataflow runner. Publish twenty reviews---including a mixed-sentiment one and one in Spanish---and query the sink.
+
+\begin{lstlisting}[language=SQL,caption={Inspecting scored reviews and sentiment distribution.}]
+SELECT review_id, LEFT(text, 40) AS snippet, score, magnitude
+FROM analytics.review_sentiment
+ORDER BY event_ts DESC
+LIMIT 20;
+
+SELECT CASE WHEN score >= 0.25 THEN 'positive'
+            WHEN score <= -0.25 THEN 'negative'
+            ELSE 'mixed/neutral' END AS bucket,
+       COUNT(*) AS reviews, AVG(magnitude) AS avg_magnitude
+FROM analytics.review_sentiment
+GROUP BY bucket;
+\end{lstlisting}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item The pipeline code with the batching/backoff DoFn and the dead-letter output path.
+    \item Query results showing scored reviews across the sentiment buckets.
+    \item A cost calculation: reviews per month times per-call price, versus the BQML-alternative estimate.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item API calls are batched and retried with backoff; poison messages reach a dead-letter output.
+    \item Every review lands in BigQuery with score, magnitude, and original identifiers.
+    \item The cost note compares per-call API pricing with at least one alternative.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Add \texttt{analyzeEntities} and store top entities per review as a repeated field.
+    \item Add Translation for non-English reviews before sentiment, and document the caveat.
+    \item Add a throughput ceiling with a stateful token bucket and load-test at one thousand messages per second.
+\end{itemize}
+
+\section{Friday Use Case and Architecture: Terabytes of User Images, Searchable}
+\index{image pipeline}\index{searchable metadata}\index{content moderation}
+
+\subsection{Scenario}
+A marketplace ingests terabytes of user-uploaded product images monthly. Requirements: extract embedded text (labels, serial numbers), tag objects and logos, flag policy-violating content, and make all of it searchable---sub-second---for trust-and-safety analysts and catalog search.
+
+\subsection{Architecture}
+Uploads land in a Cloud Storage raw bucket (Object Table indexes them for SQL enumeration, Chapter~8). A Dataflow batch job---triggered on schedule over new Object Table rows---calls Vision in batches for OCR, labels, logos, and safe-search scores, writing results to BigQuery tables keyed by object URI. A search index (Chapter~7) over the OCR text column makes extracted strings instantly searchable; entity rows join to catalog tables for ``images whose OCR mentions brand X without a listing relationship.'' Safe-search scores feed a moderation queue with human review for the borderline band. Cost is governed by feature selection, batch size, and a sampled preview pass on 1\% of volume to validate configuration before full runs.
+
+\begin{figure}[H]
+    \centering
+    \resizebox{0.95\textwidth}{!}{%
+    \begin{tikzpicture}[
+        src/.style={rectangle, rounded corners, draw=codegray, thick, fill=white, text width=2.7cm, minimum height=1.0cm, align=center, font=\small\bfseries},
+        svc/.style={rectangle, rounded corners, draw=primary, thick, fill=primary!6, text width=2.9cm, minimum height=1.0cm, align=center, font=\small\bfseries},
+        dst/.style={rectangle, rounded corners, draw=codegreen!60!black, thick, fill=green!7, text width=2.9cm, minimum height=1.0cm, align=center, font=\small\bfseries},
+        arrow/.style={-{Stealth[length=2.5mm]}, draw=primary, thick},
+        dasharrow/.style={-{Stealth[length=2.5mm]}, draw=codegray, thick, dashed}
+    ]
+        \node[src] (uploads) at (0,0) {User uploads\\(TB/month)};
+        \node[svc] (objt) at (3.8,0) {Object Table\\file index};
+        \node[svc] (df) at (7.6,0) {Dataflow\\batched Vision\\OCR + labels};
+        \node[dst] (bq) at (11.6,1.2) {BigQuery\\metadata +\\search index};
+        \node[dst] (queue) at (11.6,-1.2) {Moderation\\queue\\(human review)};
+
+        \draw[arrow] (uploads) -- (objt);
+        \draw[arrow] (objt) -- (df);
+        \draw[arrow] (df) -- (bq);
+        \draw[dasharrow] (df) -- (queue);
+    \end{tikzpicture}%
+    }
+    \caption{Image enrichment at scale: Object Tables enumerate, Dataflow batches API calls, BigQuery serves search.}
+    \label{fig:ch20-image-pipeline}
+\end{figure}
+
+\begin{tipbox}
+Per-call APIs turn volume into a financial forecast: images/month $\times$ features/image $\times$ unit price, with a growth scenario. Present that number at design review---it routinely converts ``call the API for everything'' into ``call it for what the queries need.''
+\end{tipbox}
+
+\begin{pitfall}
+OCR confidence is not uniform: stylized logos, low resolution, and handwritten text degrade silently. Sample-audit extraction quality weekly against human labels and track an accuracy metric; a search index over quietly-wrong text is worse than none because it looks authoritative.
+\end{pitfall}
+
+\section{Interview Q\&A}
+\subsection{Concepts and Trade-offs}
+\begin{enumerate}
+    \item \textbf{Q: When should a Dataflow pipeline call an AI API versus BQML?}\\
+    A: APIs for generic unstructured tasks (OCR, sentiment, translation) at moderate volume; BQML for tabular problems where the data already lives in BigQuery.
+
+    \item \textbf{Q: What rate-limit handling belongs around external API calls?}\\
+    A: Batching, bounded concurrency, exponential backoff with jitter, dead-lettering of permanent failures, and a throttle when a hard calls-per-second ceiling exists.
+
+    \item \textbf{Q: Which API extracts entities and sentiment from support text?}\\
+    A: The Natural Language API: \texttt{analyzeEntities}, \texttt{analyzeSentiment}, and \texttt{analyzeEntitySentiment} for per-entity sentiment.
+
+    \item \textbf{Q: How do you make OCR output searchable in BigQuery?}\\
+    A: Land extracted text in a structured column keyed by object URI and build a BigQuery search index over it for \texttt{SEARCH} queries.
+
+    \item \textbf{Q: What cost risk do per-call AI APIs add to streaming jobs?}\\
+    A: Cost scales linearly with throughput and feature count, invisible until the bill---plus retry multipliers; forecast and alert on both.
+\end{enumerate}
+
+\section{Further Reading}
+Read the Google Cloud AI API documentation for Vision, Video Intelligence, Natural Language, and Translation capabilities and quotas \cite{googlecloudaiapis}. The Beam documentation covers bundle lifecycle methods (\texttt{setup}, \texttt{finish\_bundle}) used by the batching DoFn \cite{apachebeamdocs}. Chapter~7's search-index reference and Chapter~8's Object Tables complete the architecture \cite{googlecloudbigquerydocs,googlecloudbiglake}. Dataflow documentation covers the runner-side tuning \cite{googleclouddataflowdocs}.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item Pretrained APIs trade model control for immediate capability and per-call pricing.
+    \item Select billed features deliberately; sample before scaling.
+    \item Inside distributed pipelines: batch, bound concurrency, back off, dead-letter.
+    \item OCR becomes searchable through structured landing tables plus a search index.
+    \item API versus BQML versus custom is an arithmetic decision: price all three.
+    \item Enrichment quality drifts silently---sample-audit extracted text against human labels.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Justify when Video Intelligence beats per-frame Vision calls, and vice versa.
+    \item \textbf{(Conceptual)} Explain score-versus-magnitude to a product manager who wants ``just a thumbs up/down.''
+    \item \textbf{(Hands-on)} Reproduce the Thursday lab, then add a per-language breakdown using detected language from a Translation call.
+    \item \textbf{(Hands-on)} Load one hundred sample images, run OCR via a batch pipeline, and measure accuracy against hand-transcribed text for a ten-image audit sample.
+    \item \textbf{(Design)} Produce the three-option cost slide (Vision API, custom Vision model on endpoints, hybrid) for the Friday scenario at three volume tiers.
+    \item \textbf{(Architecture)} Add abuse protections to the image pipeline: size limits, content pre-filters, and a cost circuit breaker.
+\end{enumerate}
+
+\section{Milestone 5 Capstone: End-to-End MLOps Pipeline}\label{sec:ch20-capstone}
+\index{Milestone 5 capstone}\index{MLOps!capstone}\index{Feature Store!capstone}
+
+\begin{capstonebox}
+\textbf{Mission:} Orchestrate with Composer a pipeline that extracts features from BigQuery, syncs them to Vertex AI Feature Store, trains a custom model on Vertex Training, gates registration on an evaluation threshold, deploys to an endpoint, and enables Vertex Model Monitoring for skew and drift---closing the loop the MLOps chapters built piece by piece.
+
+\textbf{Estimated time:} 10--12 hours.
+
+\textbf{What you'll practice:}
+\begin{itemize}
+    \item Feature extraction and Feature Store synchronization with freshness guarantees.
+    \item Custom training with evaluation-metric artifacts and a registration gate.
+    \item Endpoint deployment with traffic splitting and monitored skew/drift.
+    \item Composer orchestration of the whole ML lifecycle (Chapter~12 applied to Part~V).
+    \item Cost governance across training, endpoints, and monitoring.
+\end{itemize}
+\end{capstonebox}
+
+\subsection*{Scenario}
+The churn model from Chapters 17--18 must become a production system: features refreshed nightly, models retrained weekly and on drift, deployments gated and canaried, and every run leaving lineage evidence. The platform team owns it after you hand it over---the README is part of the deliverable.
+
+\subsection*{Requirements}
+\begin{itemize}
+    \item A Composer DAG orchestrating: feature extraction (BigQuery), Feature Store sync, Vertex Training, evaluation gate, registration, deployment, monitoring configuration.
+    \item The evaluation gate blocks registration below an AUC threshold and blocks deployment on a failed challenger comparison.
+    \item Vertex Model Monitoring configured for training-serving skew and prediction drift with a notification channel.
+    \item At least three automated tests: feature-quality checks, an evaluation-threshold gate test, a pipeline unit test.
+    \item A monthly cost estimate with two optimization decisions (machine types, endpoint min/max nodes, batch versus online).
+    \item Security review: least-privilege pipeline service account, no hardcoded secrets, training-data PII handling noted.
+\end{itemize}
+
+\subsection*{Reference Architecture}
+\begin{figure}[H]
+    \centering
+    \resizebox{0.95\textwidth}{!}{%
+    \begin{tikzpicture}[
+        svc/.style={rectangle, rounded corners, draw=primary, thick, fill=primary!6, text width=2.5cm, minimum height=1.0cm, align=center, font=\small\bfseries},
+        orch/.style={rectangle, rounded corners, draw=magenta, thick, fill=magenta!8, text width=2.6cm, minimum height=0.9cm, align=center, font=\footnotesize\bfseries},
+        arrow/.style={-{Stealth[length=2.5mm]}, draw=primary, thick},
+        dasharrow/.style={-{Stealth[length=2.5mm]}, draw=codegray, thick, dashed}
+    ]
+        \node[svc] (bq) at (0,0) {BigQuery\\(features)};
+        \node[svc] (fs) at (3.0,0) {Feature\\Store};
+        \node[svc] (train) at (6.0,0) {Vertex\\Training};
+        \node[svc] (reg) at (9.0,0) {Registry\\+ gate};
+        \node[svc] (ep) at (12.0,0) {Endpoint\\(serving)};
+        \node[orch] (orch) at (6.0,2.0) {Cloud Composer\\(orchestration)};
+        \node[orch] (mon) at (9.0,-2.0) {Model Monitoring\\(drift / skew)};
+
+        \draw[arrow] (bq) -- (fs);
+        \draw[arrow] (fs) -- (train);
+        \draw[arrow] (train) -- (reg);
+        \draw[arrow] (reg) -- (ep);
+        \draw[dasharrow] (orch) -- (train);
+        \draw[dasharrow] (orch) -- (bq);
+        \draw[dasharrow] (ep.south) -- (mon.east);
+        \draw[dasharrow] (mon) -- (orch);
+    \end{tikzpicture}%
+    }
+    \caption{Milestone 5 reference architecture: the full MLOps lifecycle orchestrated by Composer.}
+    \label{fig:ch20-capstone-mlops}
+\end{figure}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item A repository that runs the full lifecycle from a clean environment, with README and architecture diagram.
+    \item Evidence of the gate blocking a deliberately weakened candidate model.
+    \item Monitoring configuration export (or screenshots) showing skew and drift alerts.
+    \item The cost estimate, test suite with failing-case demonstration, and security review.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item One DAG run produces a registered, deployed, monitored model from raw features with no manual steps.
+    \item The gate demonstrably blocks a sub-threshold candidate; the incumbent keeps serving.
+    \item Drift injected into a shadow traffic sample triggers the monitoring alert and the documented runbook path.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Add a challenger-champion traffic split with automatic rollback on live-metric regression.
+    \item Trigger retraining from the monitoring alert via Pub/Sub and a preconditioned Cloud Function (Chapter~19's Friday design).
+    \item Publish model and feature freshness to Dataplex as data-product SLOs (previewing Chapter~22).
+\end{itemize}

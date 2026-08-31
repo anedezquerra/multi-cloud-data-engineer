@@ -1,0 +1,646 @@
+\chapter{Amazon Redshift Architecture and Dimensional Modeling}
+\index{Amazon Redshift}\index{data warehouse}\index{MPP}\index{RA3 nodes}\index{Redshift Serverless}\index{COPY}\index{dimensional modeling}\index{star schema}\index{slowly changing dimensions}%
+\begin{objectives}
+\begin{itemize}
+    \item Explain Amazon Redshift's massively parallel processing (MPP) architecture, the separation of leader and compute nodes, and the role of RA3 managed storage.
+    \item Compare Redshift Serverless and provisioned RA3 clusters on pricing, scaling behavior, and workload fit.
+    \item Load data with the COPY command and Auto-Copy from S3 using IAM role authentication, manifest files, and appropriate file formats.
+    \item Apply Kimball dimensional modeling: declare the fact-table grain, choose among transaction, periodic snapshot, and accumulating snapshot facts, and design conformed dimensions.
+    \item Implement slowly changing dimension (SCD) Type 1 and Type 2 logic in Redshift SQL, including MERGE-based upserts.
+    \item Estimate monthly cost and recommend an architecture for a BI workload that is heavily utilized only during end-of-month reporting.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+Week~5 introduces the cloud data warehouse. The MPP mental model---shared-nothing compute over distributed columnar storage---transfers directly to every other platform, even where the service hides it completely.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{2.8cm}p{3.0cm}p{3.0cm}p{3.0cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{AWS} & \textbf{Azure} & \textbf{GCP} \\
+\midrule
+Cloud data warehouse & Amazon Redshift & Synapse dedicated SQL pools / Fabric Warehouse & BigQuery \\
+Serverless warehouse & Redshift Serverless & Fabric capacity / Synapse serverless & BigQuery (default) \\
+Managed storage layer & RA3 managed storage & ADLS-backed separation & Capacitor on Colossus \\
+Bulk load command & COPY & COPY INTO / T-SQL bulk insert & LOAD DATA / bq load \\
+Change-data upsert & MERGE & MERGE & MERGE \\
+BI acceleration & Materialized views & Materialized views / semantic models & Materialized views, BI Engine \\
+\addlinespace
+Pricing lever (provisioned) & Node-hours + managed storage TB & DWU-hours + storage & Flat-rate slots \\
+Pricing lever (serverless) & RPU-hours & Capacity units (Fabric) & Bytes scanned / slots \\
+Concurrency burst & Concurrency scaling & Scaling / workload groups & Autoscaling slots \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+On \textbf{Microsoft Fabric}, the warehouse and lakehouse share OneLake storage with Delta--Parquet tables, blurring the warehouse/lake boundary that Redshift and S3 keep explicit. \textbf{Snowflake} separates storage, virtual warehouses, and cloud services into three independently scaled layers---the closest conceptual cousin to RA3. \textbf{MongoDB} is an operational document store, not a warehouse; the comparison highlights why analytical star schemas live outside the OLTP system of record.
+\end{crosscloud}
+
+\section{Week 5 Roadmap and Mental Model}
+Amazon Redshift is the analytical centerpiece of most AWS data platforms. Where S3 stores objects and DynamoDB serves millisecond key-value lookups, Redshift answers a different question: how do you aggregate, join, and scan terabytes of structured data with interactive SQL? The answer is a columnar, massively parallel processing engine whose architecture you must understand before you can model, load, or tune it \cite{awsRedshiftDocs}.
+
+The mental model for the week has three layers. First, the \emph{physical layer}: a Redshift cluster or workgroup is a set of compute nodes that own slices of data and execute query fragments in parallel. Second, the \emph{logical layer}: a dimensional star schema---fact tables at a declared grain surrounded by conformed dimensions---gives that engine a workload it is good at \cite{kimballDWToolkit}. Third, the \emph{economic layer}: Serverless versus provisioned RA3 is a capacity-purchasing decision that should follow your utilization curve, not fashion. Chapters~5 and~6 move through these layers in order; this chapter covers architecture, loading, and modeling, and Chapter~6 covers performance tuning.
+
+\begin{definitionbox}
+\textbf{Amazon Redshift} is a fully managed, petabyte-scale cloud data warehouse. Data is stored in a compressed columnar format distributed across compute nodes; SQL queries are compiled into parallel execution plans whose fragments run on the nodes that hold the relevant data slices.
+\end{definitionbox}
+
+\begin{keyterms}
+\textbf{MPP}: massively parallel processing; each node processes its local data slice in parallel with all other nodes. \textbf{Leader node}: plans and coordinates queries, returns results. \textbf{Compute node}: stores data slices and executes query fragments. \textbf{RA3}: node family with managed storage that scales independently of compute. \textbf{RPU}: Redshift Processing Unit, the capacity unit of Redshift Serverless. \textbf{COPY}: the bulk-load command that ingests files from S3 in parallel. \textbf{Grain}: the precise business definition of one row of a fact table. \textbf{SCD}: slowly changing dimension; Type 1 overwrites history, Type 2 preserves it with versioned rows.
+\end{keyterms}
+
+\section{Monday: Redshift MPP Architecture}
+\subsection{Shared-Nothing Parallelism}
+Redshift is a shared-nothing MPP database. A table's rows are divided into \emph{slices}, and each slice lives on one compute node. When you submit a query, the leader node parses and optimizes it, compiles an execution plan, and ships compiled code segments to the compute nodes. Each node runs its segments against its local slices, intermediate results flow across the cluster interconnect for joins and aggregations, and the leader assembles the final result \cite{awsRedshiftDocs}. The practical consequence: query speed is bounded by how evenly data is distributed and how little of it must move across the network---topics Chapter~6 develops in depth.
+\index{slice}\index{leader node}\index{compute node}\index{shared-nothing}
+
+\begin{figure}[H]
+    \centering
+    \resizebox{0.92\textwidth}{!}{%
+    \begin{tikzpicture}[
+        leader/.style={rectangle, rounded corners, draw=primary, thick, fill=primary!8, align=center, minimum width=3.2cm, minimum height=1.2cm, font=\small\bfseries},
+        cnode/.style={rectangle, rounded corners, draw=primary, thick, fill=white, align=center, minimum width=3.0cm, minimum height=1.0cm, font=\small\bfseries},
+        slicebox/.style={rectangle, draw=codegray, thick, fill=backcolour, align=center, minimum width=1.3cm, minimum height=0.55cm, font=\scriptsize},
+        flow/.style={-{Stealth[length=2.5mm]}, draw=primary, thick},
+        note/.style={font=\footnotesize\itshape, text=codegray}
+    ]
+        \node[leader] (leader) at (4.5,2.4) {Leader node\\parse, optimize, coordinate};
+        \node[cnode] (n1) at (0,0) {Compute node 1};
+        \node[cnode] (n2) at (4.5,0) {Compute node 2};
+        \node[cnode] (n3) at (9,0) {Compute node 3};
+        \node[slicebox] (s1a) at (-0.75,-1.1) {slice a};
+        \node[slicebox] (s1b) at (0.75,-1.1) {slice b};
+        \node[slicebox] (s2a) at (3.75,-1.1) {slice c};
+        \node[slicebox] (s2b) at (5.25,-1.1) {slice d};
+        \node[slicebox] (s3a) at (8.25,-1.1) {slice e};
+        \node[slicebox] (s3b) at (9.75,-1.1) {slice f};
+        \draw[flow] (leader.south) -- (n1.north);
+        \draw[flow] (leader.south) -- (n2.north);
+        \draw[flow] (leader.south) -- (n3.north);
+        \draw (n1.south) -- (s1a.north); \draw (n1.south) -- (s1b.north);
+        \draw (n2.south) -- (s2a.north); \draw (n2.south) -- (s2b.north);
+        \draw (n3.south) -- (s3a.north); \draw (n3.south) -- (s3b.north);
+        \node[note] at (4.5,-2.1) {Each compute node owns data slices; the leader never stores user data.};
+    \end{tikzpicture}%
+    }
+    \caption{Redshift MPP architecture: the leader node plans and coordinates; compute nodes own data slices and execute query fragments in parallel.}
+    \label{fig:redshift-mpp}
+\end{figure}
+
+\subsection{Columnar Storage and Zone Maps}
+Within a slice, Redshift stores each column separately in 1~MB blocks. Columnar layout means a query that touches three of a table's two hundred columns reads only the blocks for those three columns. Each block carries metadata---minimum and maximum values---that Redshift uses as a \emph{zone map} to skip blocks that cannot contain matching rows. Compression encodings reduce storage and I/O further, and because I/O is usually the bottleneck in analytical scans, compression is effectively a performance feature, not merely a cost feature.
+\index{columnar storage}\index{zone map}\index{compression encoding}
+
+\begin{tipbox}
+Run \texttt{ANALYZE} after large loads and let \texttt{AUTO} table properties stay enabled unless you have measured a reason to override them. Modern Redshift automates much of the encoding, sort-key, and vacuum work that older documentation describes as manual chores.
+\end{tipbox}
+
+\subsection{RA3 Nodes and Managed Storage}
+RA3 nodes decouple compute from storage. Hot data lives on local NVMe solid-state cache; the durable copy lives in Redshift Managed Storage, which is backed by S3 and scales to petabytes independently of the node count \cite{awsRedshiftDocs}. This matters for three reasons. First, you can scale compute without redistributing the entire dataset. Second, you pay for managed storage per terabyte-month, so keeping historical data in the warehouse is cheaper than on older dense-storage node types. Third, RA3 enables data sharing and cross-AZ relocation features that later chapters use.
+\index{RA3}\index{managed storage}
+
+\section{Tuesday: Redshift Serverless Versus Provisioned}
+\subsection{Two Ways to Buy Capacity}
+Provisioned Redshift bills per node-hour for a cluster you size, start, pause, and resize. Redshift Serverless bills in Redshift Processing Unit (RPU) hours, per second, with the workgroup scaling capacity up and down automatically between a base and maximum RPU setting \cite{awsRedshiftServerlessDocs}. Neither model is universally cheaper; the right choice is an arithmetic function of your utilization curve.
+
+\begin{definitionbox}
+\textbf{Redshift Serverless} provisions capacity automatically: you set base and maximum RPUs, and the service scales compute to query demand, billing per RPU-second. \textbf{Provisioned RA3} allocates a fixed node count that you manage, billed per node-hour while running.
+\end{definitionbox}
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.2cm}p{4.4cm}p{5.6cm}@{}}
+\toprule
+\textbf{Dimension} & \textbf{Redshift Serverless} & \textbf{Provisioned RA3} \\
+\midrule
+Billing unit & RPU-hours, per-second & Node-hours + managed storage per TB-month \\
+Best fit & Spiky, intermittent, or unpredictable workloads; fast onboarding & Steady 24/7 workloads at scale with predictable load \\
+Scaling & Automatic between base and max RPUs & Manual resize, elastic resize, pause/resume \\
+Watch-out & Base-RPU floor runs 24/7; unbounded max RPU spikes the bill & Idle capacity is paid for; resizing is an operational event \\
+Controls & Usage limits and query monitoring rules & WLM queues, concurrency scaling limits, pause schedules \\
+\bottomrule
+\end{tabular}
+\caption{Serverless versus provisioned Redshift as an economic and operational decision.}
+\label{tab:redshift-serverless-vs-ra3}
+\end{table}
+
+\subsection{Reading the Utilization Curve}
+A workload that runs queries eight hours a month---end-of-month reporting, quarterly close, occasional audit extracts---cannot justify a cluster that bills 730 hours a month. A workload that keeps a cluster at 60--80\% CPU all day every day usually pays less on provisioned capacity, because steady utilization amortizes the idle-capacity premium that Serverless charges for elasticity. The Friday use case works this arithmetic end to end.
+
+\begin{pitfall}
+\textbf{Leaving the Serverless maximum RPU unbounded.} A runaway dashboard refresh or an unpartitioned cross join can scale the workgroup to its ceiling and burn the month's budget in an afternoon. Always set a maximum RPU and usage limits, and alarm on RPU-hours in CloudWatch.
+\end{pitfall}
+
+\subsection{The Broader Analytical Pricing Landscape}
+Redshift is not the only way to run SQL over your data on AWS, and the warehouse decision should be made against the alternatives. Table~\ref{tab:analytics-pricing} summarizes the four options this part of the book uses repeatedly.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{2.9cm}p{3.2cm}p{3.6cm}p{4.4cm}@{}}
+\toprule
+\textbf{Option} & \textbf{Billing model} & \textbf{Best for} & \textbf{Watch-outs} \\
+\midrule
+Redshift Serverless & RPU-hours, billed per second & Spiky or intermittent BI workloads, fast onboarding & Base-RPU floor cost; unbounded concurrency spikes the bill \\
+Redshift RA3 (provisioned) & Node-hours plus managed storage per TB-month & Steady, predictable 24/7 analytics at scale & Paying for idle capacity; resize/pause planning needed \\
+Athena & Per TB scanned & Ad-hoc SQL on S3 with zero infrastructure & Unpartitioned CSV scans explode cost; no indexes \\
+Redshift Spectrum & Per TB scanned, plus a running Redshift cluster & Joining S3 lake data with Redshift tables in one query & Requires an active cluster; per-TB fees accumulate on wide scans \\
+\bottomrule
+\end{tabular}
+\caption{Analytical engines on AWS compared by billing model and fit. Chapter~7 covers Athena and Spectrum in depth.}
+\label{tab:analytics-pricing}
+\end{table}
+
+\section{Wednesday: Loading Data and Kimball Dimensional Modeling}
+\subsection{COPY: The Parallel Bulk Loader}
+The COPY command is the only sane way to load serious volume into Redshift. It reads files from S3 (or DynamoDB, EMR, or remote hosts via SSH) in parallel across compute nodes, so each node ingests the files assigned to its slices \cite{awsRedshiftCOPY}. Three rules govern COPY performance. First, split input into multiple files---a single 100~GB file serializes the load on one node, while one hundred 1~GB files parallelize it. Second, prefer columnar or compressible formats: Parquet and ORC map directly onto Redshift's columnar layout, and COPY can read JSON, CSV, and Avro when needed. Third, authenticate with an IAM role attached to the cluster or workgroup, never with embedded access keys.
+\index{COPY}\index{IAM role}\index{Parquet}\index{manifest}
+
+\begin{lstlisting}[language=SQL,caption={COPY with an IAM role, a manifest, and Parquet input.},label={lst:ch5-copy}]
+COPY staging.sales_raw
+FROM 's3://acme-analytics-raw/manifests/sales_2026_08.manifest'
+IAM_ROLE 'arn:aws:iam::123456789012:role/RedshiftS3ReadRole'
+FORMAT AS PARQUET
+MANIFEST;
+\end{lstlisting}
+
+\subsection{Auto-Copy for Continuous Micro-Batches}
+COPY is a command you run; Auto-Copy is a job you declare. A copy job attached to an S3 prefix monitors for new objects and loads them automatically, turning micro-batch ingestion into a configuration rather than a scheduled script \cite{awsRedshiftCOPY}. Auto-Copy suits continuously arriving files---vendor drops, CDC output from DMS (Chapter~11), Firehose delivery (Chapter~14)---where the alternative is an EventBridge-triggered Lambda that issues COPY on every upload. Reserve manual COPY for controlled bulk loads and backfills where you want explicit transaction boundaries.
+\index{Auto-Copy}\index{micro-batch}
+
+\begin{notebox}
+A manifest file is the safe way to COPY a precise set of objects. Prefix-based COPY picks up whatever matches at run time; a manifest pins the load to an explicit file list with optional mandatory flags, which makes retries and audits deterministic.
+\end{notebox}
+
+\subsection{Declare the Grain First}
+Kimball dimensional modeling begins with a discipline that feels bureaucratic and pays for itself forever: before writing any DDL, state the grain of the fact table in one sentence \cite{kimballDWToolkit}. ``One row per order line item'' and ``one row per order'' are different tables with different measures, different dimensions, and different correct answers to the same business question. Every column added to a fact table must be true at the declared grain; a column that is only meaningful at a coarser grain (order-level shipping cost on an order-line fact) invites double-counting.
+\index{grain}\index{fact table}\index{Kimball}
+
+\subsection{Three Fact Table Types}
+\begin{itemize}
+    \item \textbf{Transaction facts} record one row per business event---a sale, a click, a swipe---at the lowest useful grain. They are the largest and most flexible facts, answering any question that aggregates events.
+    \item \textbf{Periodic snapshot facts} record one row per entity per period---daily account balance, monthly inventory level. They answer ``state at a point in time'' questions that transaction facts answer awkwardly.
+    \item \textbf{Accumulating snapshot facts} record one row per workflow instance---an order, a claim, a shipment---updated as the workflow passes milestones (ordered, shipped, delivered, returned). Multiple date foreign keys and overwritten milestone columns are normal here.
+\end{itemize}
+\index{transaction fact}\index{periodic snapshot}\index{accumulating snapshot}
+
+\subsection{Conformed Dimensions and the Bus Matrix}
+A \emph{conformed dimension} is shared, identical, and governed across data marts: \texttt{dim\_customer} means the same thing in the sales mart and the support mart. Conformance is what makes cross-mart queries and enterprise consistency possible. The design tool is the bus matrix: rows are business processes (facts), columns are shared dimensions, and the matrix forces agreement on which dimensions each process uses before anyone writes SQL.
+\index{conformed dimension}\index{bus matrix}
+
+\begin{figure}[H]
+    \centering
+    \resizebox{0.85\textwidth}{!}{%
+    \begin{tikzpicture}[
+        node distance=0.7cm and 1.2cm,
+        entity/.style={rectangle, rounded corners, draw=primary, thick, fill=gray!8, align=left, font=\scriptsize, inner sep=4pt},
+        rel/.style={-{Stealth}, thick},
+        lbl/.style={font=\scriptsize\itshape, fill=white, inner sep=1pt}
+    ]
+    \node[entity] (fact) {\textbf{FACT\_SALES}\\date\_key (FK)\\customer\_key (FK)\\product\_key (FK)\\store\_key (FK)\\qty, amount};
+    \node[entity, above left=0.7cm and 1.2cm of fact] (dimdate) {\textbf{DIM\_DATE}\\date\_key (PK)\\day, month\\quarter, year};
+    \node[entity, below left=0.7cm and 1.2cm of fact] (dimcust) {\textbf{DIM\_CUSTOMER}\\customer\_key (PK)\\segment, city\\valid\_from / valid\_to\\is\_current (SCD2)};
+    \node[entity, above right=0.7cm and 1.2cm of fact] (dimprod) {\textbf{DIM\_PRODUCT}\\product\_key (PK)\\sku\\category, brand};
+    \node[entity, below right=0.7cm and 1.2cm of fact] (dimstore) {\textbf{DIM\_STORE}\\store\_key (PK)\\store\_id\\region, format};
+    \draw[rel] (dimdate) -- node[lbl, above left] {1:N} (fact);
+    \draw[rel] (dimcust) -- node[lbl, below left] {1:N} (fact);
+    \draw[rel] (dimprod) -- node[lbl, above right] {1:N} (fact);
+    \draw[rel] (dimstore) -- node[lbl, below right] {1:N} (fact);
+    \end{tikzpicture}%
+    }
+    \caption{Star schema for the Thursday project: \texttt{fact\_sales} at the order-line grain with four conformed dimensions.}
+    \label{fig:ch5-star-schema}
+\end{figure}
+
+\subsection{Slowly Changing Dimensions}
+Dimension attributes change: customers move cities, products change categories. \textbf{SCD Type 1} overwrites the attribute---simple, but history is lost and last quarter's report now restates under today's values. \textbf{SCD Type 2} inserts a new row with effective dates (\texttt{valid\_from}, \texttt{valid\_to}) and an \texttt{is\_current} flag, preserving exactly what the organization knew at any point in time. Choose per attribute, not per table: correcting a typo in a customer name is Type 1; tracking segment reassignment for commission calculation is Type 2.
+\index{SCD Type 1}\index{SCD Type 2}\index{effective dating}
+
+Redshift's MERGE statement makes Type 2 upserts expressible in two passes: close the rows whose tracked attributes changed, then insert the new current versions.
+
+\begin{lstlisting}[language=SQL,caption={SCD Type 2 upsert in Redshift: close changed rows, then insert new versions.},label={lst:ch5-scd2}]
+-- SCD Type 2 upsert in Redshift: close changed rows, then insert new versions
+MERGE INTO dim_customer tgt
+USING stg_customer src
+  ON tgt.customer_id = src.customer_id AND tgt.is_current = TRUE
+WHEN MATCHED AND (tgt.segment <> src.segment OR tgt.city <> src.city)
+THEN UPDATE SET valid_to = CURRENT_DATE, is_current = FALSE
+WHEN NOT MATCHED
+THEN INSERT (customer_id, segment, city, valid_from, valid_to, is_current)
+     VALUES (src.customer_id, src.segment, src.city,
+             CURRENT_DATE, DATE '9999-12-31', TRUE);
+
+-- second pass: insert the new current versions of the rows just closed
+INSERT INTO dim_customer (customer_id, segment, city, valid_from, valid_to, is_current)
+SELECT src.customer_id, src.segment, src.city,
+       CURRENT_DATE, DATE '9999-12-31', TRUE
+FROM stg_customer src
+JOIN dim_customer tgt
+  ON tgt.customer_id = src.customer_id
+ AND tgt.is_current = FALSE
+ AND tgt.valid_to = CURRENT_DATE;
+\end{lstlisting}
+
+\begin{pitfall}
+\textbf{SCD Type 2 on every attribute.} Versioning a dimension on every change---including corrected typos---explodes row counts and complicates every query with effective-date joins. Reserve Type 2 for attributes whose history has analytical or regulatory value, and document the choice per attribute in the data dictionary.
+\end{pitfall}
+
+\section{Thursday Hands-on Project: Load a Star Schema into Redshift Serverless}
+\index{hands-on project!Redshift Serverless star schema}
+This project builds the working core of a dimensional warehouse: a Redshift Serverless workgroup, a ten-million-row fact load from S3 with COPY, and three conformed dimensions around a declared grain.
+
+\subsection*{Lab Objectives}
+\begin{itemize}
+    \item Provision a Redshift Serverless endpoint with an attached IAM role that can read an S3 staging bucket.
+    \item Generate or obtain ten million rows of synthetic order-line JSON in S3, split across multiple files.
+    \item Declare the grain of \texttt{fact\_sales}, create the table plus \texttt{dim\_customer}, \texttt{dim\_product}, and \texttt{dim\_date}, and load them with COPY.
+    \item Practice the SCD Type 2 MERGE from \cref{lst:ch5-scd2} against a staged customer extract.
+\end{itemize}
+
+\subsection*{Procedure}
+Create the Serverless workgroup and namespace with the AWS CLI, then grant S3 read access through an IAM role. Replace every placeholder before running.
+
+\begin{lstlisting}[language=bash,caption={Provisioning a Redshift Serverless workgroup with an IAM role.},label={lst:ch5-serverless-setup}]
+# PowerShell: set variables first, then run the CLI calls.
+$Region     = "us-east-1"
+$AccountId  = "123456789012"
+$RoleName   = "RedshiftS3ReadRole"
+$Bucket     = "acme-analytics-raw-123456789012"
+$Namespace  = "week5-ns"
+$Workgroup  = "week5-wg"
+
+# Trust policy: allow Redshift to assume the role.
+$TrustJson = @"
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Principal": { "Service": "redshift.amazonaws.com" },
+    "Action": "sts:AssumeRole"
+  }]
+}
+"@
+$TrustJson | Set-Content -Path trust.json -Encoding ascii
+
+aws iam create-role --role-name $RoleName `
+  --assume-role-policy-document file://trust.json
+
+# Least-privilege read on the staging bucket only.
+$PolicyJson = @"
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Action": ["s3:GetObject", "s3:ListBucket"],
+    "Resource": [
+      "arn:aws:s3:::$Bucket",
+      "arn:aws:s3:::$Bucket/*"
+    ]
+  }]
+}
+"@
+$PolicyJson | Set-Content -Path s3-read.json -Encoding ascii
+
+aws iam put-role-policy --role-name $RoleName `
+  --policy-name ReadAnalyticsRaw --policy-document file://s3-read.json
+
+aws redshift-serverless create-namespace `
+  --namespace-name $Namespace `
+  --iam-roles "arn:aws:iam::${AccountId}:role/$RoleName"
+
+aws redshift-serverless create-workgroup `
+  --workgroup-name $Workgroup `
+  --namespace-name $Namespace `
+  --base-capacity 8 `
+  --max-capacity 32 `
+  --publicly-accessible
+\end{lstlisting}
+
+Generate the synthetic fact data locally and upload it as multiple files so COPY parallelizes. The generator below writes ten files of one million JSON lines each.
+
+\begin{lstlisting}[language=Python,caption={Generating ten million synthetic order-line rows and uploading to S3.},label={lst:ch5-generate}]
+import json
+import random
+from datetime import date, timedelta
+
+import boto3
+
+BUCKET = "acme-analytics-raw-123456789012"
+s3 = boto3.client("s3", region_name="us-east-1")
+
+random.seed(42)
+base = date(2026, 1, 1)
+
+def make_row(i: int) -> dict:
+    return {
+        "order_line_id": i,
+        "order_date": str(base + timedelta(days=random.randint(0, 240))),
+        "customer_id": random.randint(1, 500_000),
+        "product_id": random.randint(1, 50_000),
+        "store_id": random.randint(1, 2_000),
+        "qty": random.randint(1, 5),
+        "amount": round(random.uniform(5.0, 500.0), 2),
+    }
+
+row_id = 0
+for part in range(10):
+    lines = []
+    for _ in range(1_000_000):
+        row_id += 1
+        lines.append(json.dumps(make_row(row_id)))
+    s3.put_object(
+        Bucket=BUCKET,
+        Key=f"raw/sales/part-{part:02d}.json",
+        Body="\n".join(lines).encode("utf-8"),
+    )
+    print(f"uploaded part {part}")
+\end{lstlisting}
+
+With the data staged, declare the schema. The grain statement is a design artifact: write it in a comment above the DDL so reviewers and future maintainers inherit it.
+
+\begin{lstlisting}[language=SQL,caption={Star schema DDL with the grain declared as a design comment.},label={lst:ch5-ddl}]
+-- GRAIN: one row per order line item (order x product), as sold.
+-- Every column below must be true at that grain.
+CREATE TABLE dim_date (
+    date_key    INTEGER PRIMARY KEY,   -- yyyymmdd
+    day         SMALLINT,
+    month       SMALLINT,
+    quarter     SMALLINT,
+    year        SMALLINT
+);
+
+CREATE TABLE dim_customer (
+    customer_key BIGINT IDENTITY(1,1) PRIMARY KEY,
+    customer_id  BIGINT NOT NULL,       -- natural key from source
+    segment      VARCHAR(32),
+    city         VARCHAR(64),
+    valid_from   DATE,
+    valid_to     DATE,
+    is_current   BOOLEAN
+);
+
+CREATE TABLE dim_product (
+    product_key BIGINT IDENTITY(1,1) PRIMARY KEY,
+    product_id  BIGINT NOT NULL,
+    sku         VARCHAR(32),
+    category    VARCHAR(64),
+    brand       VARCHAR(64)
+);
+
+CREATE TABLE dim_store (
+    store_key  BIGINT IDENTITY(1,1) PRIMARY KEY,
+    store_id   INTEGER NOT NULL,
+    region     VARCHAR(32),
+    format     VARCHAR(32)
+);
+
+CREATE TABLE fact_sales (
+    order_line_id BIGINT,
+    date_key      INTEGER REFERENCES dim_date(date_key),
+    customer_key  BIGINT  REFERENCES dim_customer(customer_key),
+    product_key   BIGINT  REFERENCES dim_product(product_key),
+    store_key     BIGINT  REFERENCES dim_store(store_key),
+    qty           INTEGER,
+    amount        DECIMAL(12,2)
+);
+\end{lstlisting}
+
+Load the staging table and dimensions, then the fact. COPY with JSONPaths handles the raw JSON; production loads should prefer Parquet.
+
+\begin{lstlisting}[language=SQL,caption={Loading the fact table from staged JSON with COPY.},label={lst:ch5-load}]
+CREATE TABLE staging.sales_raw (
+    order_line_id BIGINT, order_date DATE, customer_id BIGINT,
+    product_id BIGINT, store_id INTEGER, qty INTEGER, amount DECIMAL(12,2)
+);
+
+COPY staging.sales_raw
+FROM 's3://acme-analytics-raw-123456789012/raw/sales/'
+IAM_ROLE 'arn:aws:iam::123456789012:role/RedshiftS3ReadRole'
+FORMAT AS JSON 'auto'
+REGION 'us-east-1';
+
+-- Load dimensions from curated sources (omitted), then resolve keys:
+INSERT INTO fact_sales
+SELECT s.order_line_id,
+       d.date_key,
+       c.customer_key,
+       p.product_key,
+       st.store_key,
+       s.qty,
+       s.amount
+FROM staging.sales_raw s
+JOIN dim_date d      ON d.date_key = TO_CHAR(s.order_date, 'YYYYMMDD')::INT
+JOIN dim_customer c  ON c.customer_id = s.customer_id AND c.is_current
+JOIN dim_product p   ON p.product_id = s.product_id
+JOIN dim_store st    ON st.store_id = s.store_id;
+
+ANALYZE fact_sales;
+\end{lstlisting}
+
+\subsection*{Verification}
+\begin{itemize}
+    \item \texttt{SELECT COUNT(*) FROM fact\_sales;} returns ten million.
+    \item \texttt{SELECT COUNT(*) FROM fact\_sales f LEFT JOIN dim\_customer c ON f.customer\_key = c.customer\_key WHERE c.customer\_key IS NULL;} returns zero---no orphan keys.
+    \item \texttt{SELECT date\_key, SUM(amount) FROM fact\_sales GROUP BY 1 ORDER BY 1 LIMIT 5;} completes in seconds, demonstrating the MPP scan.
+    \item Running the SCD Type 2 MERGE twice against the same staged extract is idempotent: the second run closes and inserts nothing.
+\end{itemize}
+
+\begin{tipbox}
+Redshift Serverless bills RPU-seconds whenever the workgroup is active. Set the workgroup's idle timeout and a low base capacity for the lab, and check \texttt{AWS/Billing} or the Serverless usage dashboard after the load to see what ten million rows actually cost---usually pennies.
+\end{tipbox}
+
+\section{Friday Use Case: Costing a Month-End BI Workload}
+\index{use case!month-end BI cost model}
+A retailer's BI platform runs heavy workloads only during the first three business days of each month, when 120 analysts refresh close-of-month dashboards and run allocation queries against a 4~TB warehouse. The rest of the month sees a handful of ad-hoc queries per day. The finance team asks for a cost estimate and an architecture recommendation: provisioned RA3 or Serverless?
+
+\subsection{Requirements and Assumptions}
+Assume the heavy window needs the equivalent of 32 RPUs for about 10 hours per day across 3 days (300 RPU-hours), and the quiet weeks need about 2 RPU-hours per day across 27 days (54 RPU-hours). Managed storage holds 4~TB. Current published prices are illustrative; the point is the method, so substitute live pricing before committing to a decision.
+
+\subsection{The Arithmetic}
+\textbf{Serverless.} Compute is billed per RPU-second; at an illustrative \$0.375 per RPU-hour, the monthly compute is roughly $(300 + 54) \times \$0.375 \approx \$133$, plus a base-RPU floor if the workgroup must stay warm for sub-second dashboard latency. Managed storage is billed per TB-month regardless of model: $4 \times \$24 \approx \$96$ at an illustrative rate. Total: roughly \$230--\$500 per month depending on the base capacity floor.
+
+\textbf{Provisioned RA3.} The smallest configuration that comfortably serves the peak might be two ra3.xlplus nodes. At an illustrative \$1.086 per node-hour each, a month is $2 \times 730 \times \$1.086 \approx \$1{,}586$ plus the same managed storage. Pausing the cluster outside the heavy window reduces this, but pausing makes the warehouse unavailable for the ad-hoc queries, and resume takes minutes---a poor trade for a workload with daily light use.
+
+\textbf{Recommendation.} Serverless wins for this utilization curve by a factor of roughly three to six, because the workload's defining property is idle time. The answer flips when utilization climbs: a workload that sustains 32 RPUs around the clock bills about $32 \times 730 \times \$0.375 \approx \$8{,}760$ on Serverless, against roughly \$1{,}586 for the equivalent provisioned capacity.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{4.2cm}p{3.6cm}p{4.6cm}@{}}
+\toprule
+\textbf{Cost driver} & \textbf{Serverless estimate} & \textbf{Provisioned RA3 estimate} \\
+\midrule
+Peak capacity & 32 RPUs, auto-scaled & 2 $\times$ ra3.xlplus \\
+Monthly compute & $\sim$\$133 (354 RPU-hours) & $\sim$\$1{,}586 (always on) \\
+Managed storage (4 TB) & $\sim$\$96 & $\sim$\$96 \\
+Idle-time exposure & Base-RPU floor only & Full node-hours \\
+Decision driver & Intermittent utilization & --- \\
+\bottomrule
+\end{tabular}
+\caption{Illustrative month-end BI cost comparison. Substitute live pricing and measured RPU consumption before committing.}
+\label{tab:ch5-cost-model}
+\end{table}
+
+\subsection{Architecture Decisions}
+\textbf{Capacity controls.} Set base capacity to the minimum that keeps dashboard queries snappy (4--8 RPUs), maximum capacity to 32--48 RPUs to bound the month-end spike, and a usage limit with an alarm at 80\% of the monthly RPU budget.
+
+\textbf{Data layout.} The month-end dashboards aggregate the same dozen queries; Chapter~6's materialized views and sort keys will cut the RPU consumption of those queries far more cheaply than any capacity choice.
+
+\textbf{Governance.} Attach a query monitoring rule that aborts individual queries exceeding a cost threshold, so one unfiltered cross join cannot consume the month-end budget.
+
+\begin{pitfall}
+\textbf{Recommending architecture from peak load alone.} The correct inputs are the full utilization curve, the latency requirements during idle periods, and the operational cost of pause/resume or resize. A peak-driven recommendation over-provisions by the ratio of idle to busy hours.
+\end{pitfall}
+
+\section{Interview Q\&A}
+\subsection{Concepts and Trade-offs}
+\begin{enumerate}
+    \item \textbf{Q: Why must you declare the grain before adding columns to a fact table?}\\
+    A: Because every column and measure must be true at exactly one row of the fact. Without a declared grain, order-level and line-level measures mix, and every aggregate risks double-counting.
+    \item \textbf{Q: How do periodic snapshot and accumulating snapshot facts differ?}\\
+    A: A periodic snapshot records state at regular intervals (daily balances) and rows are never updated. An accumulating snapshot tracks one workflow instance (an order) and updates milestone columns as the process advances.
+    \item \textbf{Q: When is SCD Type 2 required instead of Type 1?}\\
+    A: When the analytical or regulatory question depends on what the attribute value was at the time of the event---commission by historical segment, pricing by historical category. Pure corrections use Type 1.
+    \item \textbf{Q: COPY versus Auto-Copy: which suits continuous micro-batch loads from S3?}\\
+    A: Auto-Copy. It monitors a prefix and loads new objects as they land, removing the scheduler. Manual COPY suits controlled bulk loads where you want explicit transactions and manifests.
+    \item \textbf{Q: When does Redshift Serverless beat provisioned RA3 on cost?}\\
+    A: When utilization is spiky or intermittent---idle hours dominate the month. Steady 24/7 workloads amortize provisioned node-hours better than per-second RPU billing.
+    \item \textbf{Q: What does the leader node do during a COPY?}\\
+    A: It plans the load and distributes input files across compute nodes; each node ingests its assigned files into its own slices in parallel. The leader never stores user data.
+\end{enumerate}
+
+\section{Further Reading}
+Start with the Amazon Redshift Database Developer Guide for architecture, COPY, and table design \cite{awsRedshiftDocs}, and the Redshift Serverless documentation for RPU billing, base and maximum capacity, and usage limits \cite{awsRedshiftServerlessDocs}. The COPY reference covers formats, manifests, IAM authentication, and Auto-Copy jobs \cite{awsRedshiftCOPY}. For dimensional modeling, Kimball and Ross remains the canonical text: grain declaration, fact types, conformed dimensions, and SCD handling are all treated in depth \cite{kimballDWToolkit}. The AWS Well-Architected Analytics Lens frames the cost and reliability review questions used in the Friday use case \cite{awsWellArchitectedAnalytics}.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item Redshift is a shared-nothing MPP, columnar warehouse: the leader plans, compute nodes own slices, and performance follows data distribution and scan minimization.
+    \item RA3 decouples compute from managed storage; Serverless decouples you from cluster management at a per-RPU-second price.
+    \item Serverless versus provisioned is an arithmetic decision over the utilization curve, with capacity limits as the safety control either way.
+    \item COPY with multiple input files, columnar formats, manifests, and IAM roles is the correct bulk-load pattern; Auto-Copy automates micro-batch arrival.
+    \item Declare the fact grain first, choose the fact type deliberately, conform dimensions across marts, and apply SCD Type 2 only where history has value.
+    \item Month-end-style intermittent BI workloads are the canonical Serverless win; model cost before recommending.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Explain why a single 100~GB input file loads more slowly with COPY than one hundred 1~GB files on a multi-node cluster.
+    \item \textbf{(Conceptual)} A product's \texttt{list\_price} is corrected after a typo, and its \texttt{category} is reassigned quarterly for reporting. Which attributes take SCD Type 1 and which Type 2, and why?
+    \item \textbf{(Conceptual)} Your CFO asks why the Serverless bill doubled while query count stayed flat. List three plausible causes and the CloudWatch metric you would check for each.
+    \item \textbf{(Hands-on)} Run the Thursday lab, then rerun the COPY command immediately. Inspect \texttt{stl\_load\_commits} and explain what happens to duplicate loads and how you would make the pipeline idempotent.
+    \item \textbf{(Hands-on)} Convert the ten million JSON rows to Parquet with a Glue job or local PyArrow script, reload with \texttt{FORMAT AS PARQUET}, and compare load times and storage.
+    \item \textbf{(Design)} Declare the grain and choose fact types for: (a) a ride-sharing trip record, (b) daily warehouse inventory, (c) an insurance claim lifecycle. Sketch the dimension lists.
+    \item \textbf{(Design)} Extend \cref{fig:ch5-star-schema} with a promotion dimension and a returns fact. State each new grain and identify which dimensions conform.
+    \item \textbf{(Architecture)} Rebuild the Friday cost model with live prices from the AWS pricing pages. At what sustained utilization does provisioned RA3 become cheaper than Serverless at your workload's peak?
+\end{enumerate}
+
+\section{Capstone Project: A Dimensional Retail Warehouse on Redshift Serverless}\label{sec:ch5-capstone}
+\index{capstone project}\index{Redshift!capstone}\index{dimensional modeling!capstone}
+
+\begin{capstonebox}
+\textbf{Mission.} Build a governed, cost-controlled dimensional warehouse for a retail chain on Redshift Serverless: land five years of order data from S3, model it as a star schema with declared grains, implement SCD Type 2 customers, and produce a defensible monthly cost model.
+
+\textbf{Estimated time.} 4--6 hours in a sandbox AWS account, plus optional time for the cost model.
+
+\textbf{What you\textquotesingle{}ll practice.}
+\begin{itemize}
+    \item Provisioning Redshift Serverless with base/maximum RPU controls and least-privilege IAM.
+    \item Bulk loading with COPY, manifests, and columnar formats.
+    \item Kimball modeling: grain declaration, transaction and snapshot facts, conformed dimensions, SCD Type 2.
+    \item Building a Serverless-versus-RA3 cost model from a measured utilization curve.
+\end{itemize}
+\end{capstonebox}
+
+\subsection*{Scenario}
+A retail chain with 2{,}000 stores is consolidating five years of order-line history---about ten million rows per year---into a warehouse for merchandising and finance analysts. Source systems drop nightly JSON extracts into an S3 landing bucket. The finance team wants month-end close dashboards, merchandising wants ad-hoc category analysis, and both want consistent customer and product definitions. Utilization is heavily month-end-weighted, so cost discipline is part of the deliverable.
+
+\subsection*{Requirements}
+\textbf{Functional requirements.}
+\begin{itemize}
+    \item Provision a Redshift Serverless namespace and workgroup with base capacity of 8 RPUs, maximum capacity of 64 RPUs, and an IAM role limited to the landing bucket.
+    \item Land nightly extracts in \texttt{s3://<bucket>/raw/sales/} as multiple JSON or Parquet files and load them with COPY; document why Auto-Copy was or was not chosen for the nightly drop.
+    \item Model \texttt{fact\_sales} at the order-line grain with conformed \texttt{dim\_date}, \texttt{dim\_customer} (SCD Type 2), \texttt{dim\_product}, and \texttt{dim\_store}.
+    \item Implement the SCD Type 2 MERGE for \texttt{dim\_customer} and demonstrate idempotent re-runs.
+    \item Provide a month-end reporting query set (five queries) that the cost model uses as its load profile.
+\end{itemize}
+
+\textbf{Non-functional requirements.}
+\begin{itemize}
+    \item No credentials in code: IAM role authentication for COPY and workgroup access only.
+    \item Usage limits and a CloudWatch alarm on RPU-hours at 80\% of the monthly budget.
+    \item Every fact table carries its grain declaration as a header comment; every SCD decision is documented per attribute.
+    \item The cost model states assumptions, uses measured RPU consumption from the lab, and names the utilization level at which provisioned RA3 would win.
+\end{itemize}
+
+\subsection*{Reference Architecture}
+\begin{figure}[H]
+    \centering
+    \resizebox{0.9\textwidth}{!}{%
+    \begin{tikzpicture}[
+        stage/.style={rectangle, rounded corners, draw=primary, thick, fill=primary!6, align=center, minimum width=2.8cm, minimum height=1.0cm, font=\small\bfseries},
+        store/.style={cylinder, shape aspect=0.25, draw=primary, thick, fill=blue!6, shape border rotate=90, align=center, text width=2.4cm, minimum height=1.35cm, font=\small\bfseries},
+        control/.style={rectangle, rounded corners, draw=red!60!black, thick, fill=red!5, align=center, minimum width=2.6cm, minimum height=0.9cm, font=\footnotesize\bfseries},
+        flow/.style={-{Stealth[length=2.5mm]}, draw=primary, thick}
+    ]
+        \node[store] (s3) at (0,0) {S3 landing\\nightly extracts};
+        \node[stage] (copy) at (3.4,0) {COPY\\(IAM role)};
+        \node[stage] (stg) at (6.6,1.0) {staging\\schema};
+        \node[stage] (star) at (6.6,-1.0) {star schema\\fact + dims};
+        \node[stage] (bi) at (9.8,-1.0) {analysts\\BI tools};
+        \node[control] (guard) at (9.8,1.0) {RPU limits\\CloudWatch alarms};
+        \draw[flow] (s3) -- (copy);
+        \draw[flow] (copy) -- (stg);
+        \draw[flow] (stg) -- (star);
+        \draw[flow] (star) -- (bi);
+        \draw[flow, dashed] (guard) -- (stg);
+        \draw[flow, dashed] (guard) -- (star);
+    \end{tikzpicture}%
+    }
+    \caption{Capstone reference architecture: S3 landing, COPY into a staging schema, star-schema marts in Redshift Serverless, with RPU guardrails.}
+    \label{fig:ch5-capstone-arch}
+\end{figure}
+
+\subsection*{Implementation Steps}
+\begin{enumerate}
+    \item \textbf{Provision.} Create the namespace, workgroup, and IAM role from \cref{lst:ch5-serverless-setup}; record the workgroup endpoint.
+    \item \textbf{Land and stage.} Generate five years of synthetic order lines (reuse \cref{lst:ch5-generate} with a wider date range) and upload as at least ten files per year.
+    \item \textbf{Model.} Write the DDL from \cref{lst:ch5-ddl} with grain comments; load \texttt{dim\_date} with a calendar generator and the other dimensions from curated sources.
+    \item \textbf{Load and resolve.} COPY the extracts to staging, resolve surrogate keys into \texttt{fact\_sales}, and run \texttt{ANALYZE}.
+    \item \textbf{Version customers.} Apply the SCD Type 2 MERGE from \cref{lst:ch5-scd2} to a changed-customer extract; verify closure and reinsertion.
+    \item \textbf{Measure.} Run the five month-end queries, record RPU-seconds from the Serverless usage dashboard, and extrapolate the monthly bill.
+    \item \textbf{Decide.} Write the one-page cost memo: Serverless versus RA3 at your measured utilization, with the crossover point.
+\end{enumerate}
+
+\subsection*{Deliverables}
+Submit a concise engineering packet containing:
+\begin{itemize}
+    \item A one-page architecture summary with the workgroup configuration, capacity limits, and the declared grain of every fact table.
+    \item All DDL, the COPY commands, and the SCD Type 2 MERGE with evidence of an idempotent second run.
+    \item Row-count and orphan-key verification output for every fact load.
+    \item The five-query month-end workload and its measured RPU consumption.
+    \item The cost memo with live pricing, assumptions, and the Serverless-to-RA3 crossover utilization.
+    \item A cleanup plan for the workgroup, namespace, IAM role, and staging objects.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item The workgroup has explicit base and maximum RPU settings and a usage limit with an alarm.
+    \item The IAM role used by COPY can read only the landing bucket, demonstrated by an access-denied test against another prefix.
+    \item Every fact table carries a grain comment, and every column is defensible at that grain.
+    \item \texttt{dim\_customer} implements SCD Type 2 with \texttt{valid\_from}, \texttt{valid\_to}, and \texttt{is\_current}, and a rerun of the MERGE changes nothing.
+    \item Fact loads show zero orphan foreign keys after surrogate-key resolution.
+    \item The cost memo compares Serverless and RA3 with measured---not assumed---RPU consumption and names the crossover utilization.
+    \item No credentials or access keys appear in any submitted artifact.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Convert the nightly extracts to partitioned Parquet and quantify the COPY time and scanned-bytes improvement.
+    \item Add a periodic snapshot fact for daily store inventory and an accumulating snapshot for the order lifecycle; document the grain of each.
+    \item Configure Auto-Copy on the landing prefix and compare its operational simplicity and latency against scheduled COPY.
+    \item Add a bus matrix covering sales, returns, and inventory processes with conformed dimensions marked.
+    \item Build the same schema on a small provisioned RA3 cluster, measure identical workloads on both, and validate the cost model empirically.
+    \item Introduce a data-sharing datashare from this warehouse to a second Serverless workgroup and document the governance implications (preview of Chapter~8).
+\end{itemize}

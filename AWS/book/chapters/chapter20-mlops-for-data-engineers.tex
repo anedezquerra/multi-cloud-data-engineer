@@ -1,0 +1,340 @@
+% NOTE: Filename is fixed by the book outline; content teaches Week 20
+% (Unstructured Data & AI Services) of the syllabus, plus the Milestone 5 capstone.
+\chapter{Unstructured Data and Managed AI Services}
+\index{Amazon Textract}\index{Amazon Rekognition}\index{Amazon Comprehend}\index{Amazon Translate}\index{Amazon OpenSearch}\index{OCR}\index{unstructured data}%
+\begin{objectives}
+\begin{itemize}
+    \item Extract text, key--value pairs, and tables with Amazon Textract, and label image/video content with Amazon Rekognition.
+    \item Apply Amazon Comprehend (NLP) and Amazon Translate to document text at pipeline scale.
+    \item Integrate AI APIs into Lambda and Glue pipelines with the synchronous/asynchronous boundary respected.
+    \item Index extracted metadata into OpenSearch for discovery.
+    \item Manage PII risk in persisted OCR output.
+    \item Architect a terabyte-scale image pipeline: OCR, object tagging, searchable metadata---and deliver the Milestone~5 end-to-end MLOps capstone.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+Pre-trained AI APIs---vision, OCR, NLP, translation---are commodity building blocks on every cloud; the skill is pipeline integration, not model building.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{2.8cm}p{3.0cm}p{3.0cm}p{3.0cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{AWS} & \textbf{Azure} & \textbf{GCP} \\
+\midrule
+OCR / document parsing & Textract & Document Intelligence & Document AI \\
+Image/video labeling & Rekognition & Azure AI Vision & Vision AI / Video AI \\
+NLP (entities, sentiment, PII) & Comprehend & Azure AI Language & Natural Language AI \\
+Translation & Translate & Translator & Translation API \\
+Search over metadata & OpenSearch & AI Search & Vertex AI Search \\
+Async document jobs & Textract async APIs & Batch APIs & Batch processing \\
+\addlinespace
+PII detection & Comprehend PII + Macie & Language PII + Purview & Sensitive Data Protection \\
+Custom models & Rekognition Custom Labels, Comprehend custom & Custom Vision & Vertex custom training \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+\textbf{Fabric} exposes Azure AI services natively in notebooks and pipelines. \textbf{Snowflake} offers Document AI and Cortex functions---extraction as SQL. \textbf{MongoDB} stores the extracted JSON naturally; its vector search serves the retrieval side of the same estate.
+\end{crosscloud}
+
+\section{Week 20 Roadmap and Mental Model}
+So far, ``data'' meant rows. Week~20 opens the other 80\% of enterprise information: scanned forms, PDFs, images, video, free text. The week's services are \emph{pre-trained APIs}---you do not train Textract or Rekognition; you integrate them. That shifts the engineering content entirely to the pipeline: event-driven invocation, sync/async boundaries, cost per thousand pages, error handling and retries, result persistence, indexing, and the privacy posture of everything the APIs emit \cite{awsTextractDocs,awsRekognitionDocs}.
+
+The mental model: an AI API is a \emph{per-record enrichment transform} with a network boundary. Everything learned in Part~4 about Lambda transforms applies; everything in Part~2 about catalogs and governance applies to the outputs.
+
+\begin{definitionbox}
+\textbf{Managed AI services} are pre-trained, API-accessible models---vision, OCR, NLP, translation---billed per unit of input (page, image, character block). They convert unstructured content into structured, catalog-able, indexable data without any model training.
+\end{definitionbox}
+
+\begin{keyterms}
+\textbf{Textract}: OCR plus structure---key--value pairs, tables, forms; synchronous for single pages, asynchronous for multi-page documents. \textbf{Rekognition}: label, face, text, and moderation detection for images and video. \textbf{Comprehend}: entities, sentiment, key phrases, PII detection, custom classification. \textbf{Translate}: neural machine translation. \textbf{OpenSearch}: managed search/analytics engine for the extracted metadata. \textbf{Confidence score}: every API result carries one; thresholds are a pipeline design input.
+\end{keyterms}
+
+\section{Monday: Rekognition and Textract}
+\subsection{Vision as an API}
+Rekognition answers ``what is in this image/video?'': labels with confidence scores, detected text, faces (analysis, and recognition against a collection you manage), and content moderation categories \cite{awsRekognitionDocs}. For data pipelines the pattern is uniform: S3 object in, JSON result out, confidence thresholds applied downstream.
+
+\subsection{Textract: Structure from Documents}
+Textract goes beyond raw OCR: \texttt{AnalyzeDocument} returns forms (key--value pairs) and tables as structured blocks, and \texttt{DetectDocumentText} returns lines and words \cite{awsTextractDocs}. The critical operational boundary: the synchronous APIs accept single-page documents up to a few MB; multi-page PDFs and TIFFs require the \emph{asynchronous} API (\texttt{StartDocumentAnalysis}), which runs a job and publishes completion to SNS. Every document pipeline of consequence is therefore asynchronous---which means it is an event pipeline (S3 upload $\rightarrow$ job $\rightarrow$ SNS $\rightarrow$ result handling), and Chapter~12's orchestration discipline applies.
+\index{Textract}\index{asynchronous jobs}
+
+\begin{pitfall}
+\textbf{Calling the synchronous Textract API on multi-page PDFs.} It fails or truncates---and teams then split PDFs into single pages and call sync APIs per page, paying per-page latency and building a distributed fan-out by accident. Use the async API with SNS completion; that is what it exists for.
+\end{pitfall}
+
+\section{Tuesday: Comprehend and Translate}
+\subsection{NLP as Enrichment}
+Comprehend turns text into structured signal: entities (people, places, organizations), sentiment, key phrases, language, and---crucially for this book's governance thread---\emph{PII detection} with entity types and offsets \cite{awsComprehendDocs}. Custom classifiers and entity recognizers cover domain-specific needs when the general model is not enough. Translate handles language conversion at character-billed volume. Both integrate the same way: text in, JSON out, per-unit pricing---and both are happiest called in batches from a Lambda or Glue job rather than per row from a query engine.
+\index{Comprehend}\index{Translate}
+
+\begin{tipbox}
+Comprehend's PII detection and Macie (Chapter~23) overlap but serve different moments: Comprehend is \emph{in-pipeline} (redact or route before persistence); Macie is \emph{at-rest discovery} (find what already landed). Mature designs use both.
+\end{tipbox}
+
+\section{Wednesday: Integrating AI APIs into Data Pipelines}
+\subsection{The Integration Pattern}
+The canonical shape: \textbf{S3 event $\rightarrow$ Lambda (or Glue job) $\rightarrow$ AI API $\rightarrow$ structured JSON to S3 $\rightarrow$ catalog + index}. Lambda suits per-object, sub-15-minute work; Glue suits bulk backfills and joins against existing tables. Three disciplines matter at scale:
+
+\textbf{Idempotency and cost.} API calls are billed per unit; a retried pipeline that re-analyzes every object pays twice. Persist results keyed by object etag/version and skip already-processed inputs---Chapter~10's bookmark discipline applied to APIs.
+
+\textbf{Result persistence as a dataset.} Extraction results are data: write them as versioned JSON under a governed prefix, register them in the catalog, and treat their schema as a contract (Chapter~11). ``The JSON from Textract'' becomes a table analysts join against everything else.
+
+\textbf{Indexing for discovery.} Extracted metadata earns its keep when searchable: an OpenSearch domain indexed from the results stream (via Lambda or Firehose, Chapter~14) turns ten million processed documents into a queryable corpus \cite{awsOpenSearchDocs}.
+\index{OpenSearch}
+
+\subsection{PII in OCR Output}
+OCR output is faithful: if the scanned form contained a national ID number, the JSON contains it too. Persisting raw extraction JSON is persisting PII. The pipeline must decide per field: keep (governed zone, masked grants), redact (Comprehend PII + substitution), or route to quarantine (Chapter~23's workflow). The default for raw outputs is the restricted zone with a TTL; curated, reviewed extracts are what analysts see.
+
+\section{Thursday Hands-on Project: S3-Triggered Textract Extraction}
+\index{hands-on project!Textract extraction}
+Write a Lambda function triggered by an S3 upload that sends a scanned PDF to Textract, extracts key--value pairs, and saves them as JSON back to S3.
+
+\subsection*{Lab Objectives}
+\begin{itemize}
+    \item Wire an S3 event notification to Lambda on a \texttt{raw/documents/} prefix.
+    \item Call Textract (async for multi-page), parse the block structure into key--value JSON.
+    \item Persist results idempotently under \texttt{extracted/documents/}.
+    \item Handle a failure path visibly.
+\end{itemize}
+
+\subsection*{Procedure}
+For the lab's single-page forms the synchronous API suffices; the code notes where the async boundary sits.
+
+\begin{lstlisting}[language=Python,caption={S3-triggered Lambda extracting key--value pairs with Textract.},label={lst:ch20-textract}]
+import json
+import os
+from urllib.parse import unquote_plus
+
+import boto3
+
+s3 = boto3.client("s3")
+textract = boto3.client("textract")
+OUT_PREFIX = os.environ.get("OUT_PREFIX", "extracted/documents/")
+
+def lambda_handler(event, context):
+    for rec in event["Records"]:
+        bucket = rec["s3"]["bucket"]["name"]
+        key = unquote_plus(rec["s3"]["object"]["key"])
+
+        # Idempotency: skip if already extracted for this exact object version.
+        out_key = f"{OUT_PREFIX}{key.rsplit('/', 1)[-1]}.json"
+        head = s3.head_object(Bucket=bucket, Key=key)
+        etag = head["ETag"].strip('"')
+        try:
+            existing = s3.head_object(Bucket=bucket, Key=out_key)
+            if existing.get("Metadata", {}).get("source-etag") == etag:
+                continue
+        except s3.exceptions.ClientError:
+            pass
+
+        # Sync API: single-page documents only. Multi-page -> StartDocumentAnalysis
+        # with SNS completion and a second Lambda handling the result.
+        resp = textract.analyze_document(
+            Document={"S3Object": {"Bucket": bucket, "Name": key}},
+            FeatureTypes=["FORMS"],
+        )
+
+        # Reconstruct key-value pairs from the block graph.
+        blocks = {b["Id"]: b for b in resp["Blocks"]}
+        kv = {}
+        for b in resp["Blocks"]:
+            if b["BlockType"] == "KEY_VALUE_SET" and "KEY" in b["EntityTypes"]:
+                key_text = _text_of(b, blocks)
+                val_text = ""
+                for rel in b.get("Relationships", []):
+                    if rel["Type"] == "VALUE":
+                        for vid in rel["Ids"]:
+                            vb = blocks[vid]
+                            val_text = _text_of(vb, blocks)
+                if key_text:
+                    kv[key_text] = val_text
+
+        s3.put_object(
+            Bucket=bucket, Key=out_key,
+            Body=json.dumps({"source": key, "fields": kv}, indent=2).encode(),
+            ContentType="application/json",
+            Metadata={"source-etag": etag},
+        )
+
+def _text_of(block, blocks):
+    parts = []
+    for rel in block.get("Relationships", []):
+        if rel["Type"] == "CHILD":
+            for cid in rel["Ids"]:
+                child = blocks[cid]
+                if child["BlockType"] == "WORD":
+                    parts.append(child["Text"])
+    return " ".join(parts)
+\end{lstlisting}
+
+\subsection*{Verification}
+\begin{itemize}
+    \item Uploading a sample form produces a JSON file with the expected key--value pairs.
+    \item Re-uploading the identical object does not re-call Textract (idempotency via the etag metadata check).
+    \item A corrupted file produces a visible failure (Lambda error metric, retry, then a documented dead-letter outcome).
+    \item The output prefix is registered in the catalog and queryable in Athena.
+\end{itemize}
+
+\section{Friday Use Case: Terabyte-Scale Image Understanding with Search}
+\index{use case!image processing pipeline}
+A photo-sharing platform receives terabytes of user images daily. Product wants every image searchable by its content (``receipts,'' ``dogs on beaches,'' ``documents with signatures''), and trust-and-safety wants moderation at upload. Design the pipeline.
+
+\subsection{Architecture}
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[
+        box/.style={rectangle, rounded corners, draw=primary, thick, fill=primary!6, align=center, minimum width=2.9cm, minimum height=1.0cm, font=\small\bfseries},
+        storebox/.style={cylinder, shape aspect=0.25, draw=primary, thick, fill=blue!6, shape border rotate=90, align=center, text width=2.5cm, minimum height=1.25cm, font=\footnotesize\bfseries},
+        guard/.style={rectangle, rounded corners, draw=red!60!black, thick, fill=red!5, align=center, minimum width=2.6cm, minimum height=0.9cm, font=\footnotesize\bfseries},
+        arr/.style={-{Stealth[length=2.5mm]}, draw=primary, thick}
+    ]
+        \node[storebox] (raw) at (0,0) {S3 uploads\\(raw images)};
+        \node[box] (fn) at (3.2,0) {Lambda\\orchestrator};
+        \node[box] (rek) at (6.4,1.1) {Rekognition\\labels, moderation};
+        \node[box] (tex) at (6.4,-1.1) {Textract\\embedded text};
+        \node[storebox] (meta) at (9.8,0) {S3 metadata\\(cataloged JSON)};
+        \node[box] (os) at (13.0,0) {OpenSearch\\searchable index};
+        \node[guard] (mod) at (9.8,2.2) {Moderation queue\\(confidence-gated)};
+        \draw[arr] (raw) -- (fn);
+        \draw[arr] (fn) -- (rek);
+        \draw[arr] (fn) -- (tex);
+        \draw[arr] (rek) -- (meta);
+        \draw[arr] (tex) -- (meta);
+        \draw[arr] (meta) -- (os);
+        \draw[arr, dashed] (rek) -- (mod);
+    \end{tikzpicture}%
+    }
+    \caption{Image understanding pipeline: parallel enrichment by Rekognition and Textract, cataloged JSON metadata, OpenSearch indexing, and a confidence-gated moderation path.}
+    \label{fig:ch20-image-pipeline}
+\end{figure}
+
+\subsection{Design Decisions}
+\textbf{Fan-out per image.} One S3 event triggers a Lambda that invokes Rekognition (labels + moderation) and, only for images with detected text density, Textract---conditional invocation is a cost decision at terabyte scale. Results converge into one metadata document per image.
+
+\textbf{Confidence thresholds as policy.} Labels below 80\% confidence are stored but not searchable; moderation scores above the action threshold route to a human-review queue with the image reference---never auto-deletion on a model's say-so. Thresholds are configuration, versioned, and tuned from review-outcome statistics.
+
+\textbf{The metadata is the product.} Cataloged JSON (labels, OCR text, moderation verdict, EXIF) in the governed lake feeds analytics; an OpenSearch index fed from the same documents serves interactive search. Two consumers, one extraction: the write-once, read-many discipline of the whole book applied to AI output.
+
+\textbf{Cost shape.} Per-image Rekognition calls dominate; Textract runs on a filtered subset; OpenSearch sizing follows index volume and query rate. The monthly model states per-1{,}000-image costs and the levers (label-only tiers, text-density gating, index refresh interval).
+
+\begin{pitfall}
+\textbf{Persisting OCR text without a PII posture.} User images contain documents, ID cards, and screenshotted messages. The extracted text is PII-bearing data the moment it lands: govern the raw outputs, redact in the searchable index, and let Chapter~23's Macie scanning verify the posture continuously.
+\end{pitfall}
+
+\section{Interview Q\&A}
+\subsection{Concepts and Trade-offs}
+\begin{enumerate}
+    \item \textbf{Q: Textract versus Comprehend: which extracts key--value pairs from scanned forms?}\\
+    A: Textract---\texttt{AnalyzeDocument} with \texttt{FORMS} returns the form's key--value structure. Comprehend operates on already-digital text (entities, sentiment, PII), often as Textract's downstream.
+    \item \textbf{Q: Why trigger AI APIs from S3 events via Lambda?}\\
+    A: Arrival-driven processing with no polling and per-object scale-out; the event carries the object identity, and Lambda's concurrency model matches spiky upload patterns.
+    \item \textbf{Q: When must you switch from synchronous to asynchronous Textract jobs?}\\
+    A: For multi-page PDFs/TIFFs or large documents. The async API runs a job and signals completion via SNS; the sync API is single-page only.
+    \item \textbf{Q: How do you make extracted document metadata searchable?}\\
+    A: Persist normalized JSON results, then index them into OpenSearch (via Lambda or Firehose) while also registering the results in the catalog for SQL analytics.
+    \item \textbf{Q: What PII risks exist when persisting raw OCR output?}\\
+    A: OCR is faithful---IDs, account numbers, and addresses in the document appear in the JSON. Raw outputs need a restricted zone, field-level redaction for curated zones, and at-rest discovery scanning.
+    \item \textbf{Q: How do you keep retried pipelines from re-billing API calls?}\\
+    A: Idempotency keyed on object identity: persist results with the source etag/version and skip already-processed inputs.
+\end{enumerate}
+
+\section{Further Reading}
+The Textract and Rekognition developer guides cover block structure, async jobs, and confidence semantics \cite{awsTextractDocs,awsRekognitionDocs}; the Comprehend guide covers NLP and PII detection \cite{awsComprehendDocs}; the OpenSearch guide covers indexing patterns \cite{awsOpenSearchDocs}. The event and Lambda foundations are in \cite{awsEventBridgeDocs,awsLambdaDocs}.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item Managed AI APIs are per-record enrichment transforms with a network boundary; pipeline discipline is the engineering content.
+    \item The sync/async boundary (single-page versus multi-page) determines pipeline shape; async means event-driven completion.
+    \item Persist extraction results as governed, cataloged datasets with idempotency keyed on object identity.
+    \item Confidence thresholds are versioned policy, and moderation decisions stay human-gated.
+    \item Raw OCR output is PII-bearing data: restrict it, redact for curated use, and scan continuously.
+    \item One extraction, many consumers: catalog for analytics, OpenSearch for interactive discovery.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Explain why an asynchronous document API forces an event-driven pipeline design.
+    \item \textbf{(Conceptual)} Why store low-confidence labels but exclude them from search, rather than discarding them?
+    \item \textbf{(Hands-on)} Run the Thursday lab; then convert a multi-page PDF path to the async API with SNS completion.
+    \item \textbf{(Hands-on)} Add Comprehend PII detection to the extraction Lambda and redact detected spans in the curated output.
+    \item \textbf{(Hands-on)} Index the extracted JSON into a small OpenSearch domain and query it.
+    \item \textbf{(Design)} Design the moderation-review workflow: queueing, reviewer tooling inputs, decision persistence, and threshold tuning feedback.
+    \item \textbf{(Design)} Build the monthly cost model for the Friday pipeline at 50 million images/day; identify the top two cost levers.
+    \item \textbf{(Architecture)} Extend the architecture for video uploads: which Rekognition APIs apply, and what changes about latency and cost?
+\end{enumerate}
+
+\section{Milestone 5 Capstone: End-to-End MLOps Pipeline}\label{sec:ch20-capstone}
+\index{capstone project}\index{Milestone 5 capstone}\index{MLOps!capstone}
+
+\begin{capstonebox}
+\textbf{Mission.} Deliver the full MLOps lifecycle orchestrated by MWAA: Athena extracts features into SageMaker Feature Store, a custom training job produces a model, the Model Registry gates it, and Model Monitor watches the serving endpoint for training/serving skew---with MWAA owning the schedule and the alerts.
+
+\textbf{Estimated time.} 8--10 hours in a sandbox AWS account.
+
+\textbf{What you\textquotesingle{}ll practice.}
+\begin{itemize}
+    \item Feature engineering from the lake (Athena) into Feature Store (Weeks 18--19).
+    \item Custom SageMaker training with versioned inputs.
+    \item Registry gating, monitored deployment, and drift feedback.
+    \item Airflow orchestration of the whole lifecycle (Week~12).
+\end{itemize}
+\end{capstonebox}
+
+\subsection*{Scenario}
+The retailer's personalization team ships a propensity model monthly. The platform team must turn that into infrastructure: one DAG run produces features, a trained model, an evaluated registry entry, and a monitored deployment---with serving skew watched continuously.
+
+\subsection*{Requirements}
+\textbf{Functional requirements.}
+\begin{itemize}
+    \item An Athena feature extraction writing to a feature group (offline for training, online for serving).
+    \item A SageMaker Pipeline (preprocess $\rightarrow$ train $\rightarrow$ evaluate $\rightarrow$ register) with a metric gate.
+    \item MWAA orchestration from feature extraction through pipeline execution.
+    \item A monitored endpoint with a skew/violation alarm to SNS and an MWAA failure alert.
+\end{itemize}
+
+\textbf{Non-functional requirements.}
+\begin{itemize}
+    \item End-to-end runs from a clean environment per the README.
+    \item At least three automated tests: feature validation, a model-quality gate, and a drift-injection test demonstrating a Monitor violation.
+    \item A monthly cost estimate (training instance-hours, endpoint versus Batch Transform, Feature Store reads/writes) with two documented optimizations.
+    \item Security review: training access scoped via Lake Formation, artifacts in a KMS-encrypted bucket, no credentials in notebooks.
+\end{itemize}
+
+\subsection*{Reference Architecture}
+The pipeline follows \cref{fig:ch19-mlops-loop}: Athena extraction $\rightarrow$ Feature Store $\rightarrow$ Pipeline $\rightarrow$ Registry $\rightarrow$ monitored endpoint, with MWAA orchestrating and drift violations feeding back through EventBridge to retraining with human approval.
+
+\subsection*{Implementation Steps}
+\begin{enumerate}
+    \item Create the feature group and the Athena-to-Feature-Store ingestion step.
+    \item Define the pipeline with the quality gate (F1 $\geq$ 0.80) and registry integration.
+    \item Author the MWAA DAG: extraction $\rightarrow$ pipeline start $\rightarrow$ status watch $\rightarrow$ notify.
+    \item Deploy the approved model with data capture; build the baseline and monitoring schedule.
+    \item Implement the three tests, including drift injection producing a real violation.
+    \item Write the cost model and the security review.
+\end{enumerate}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item The DAG, pipeline definition, and training code in version control.
+    \item Test evidence, including the injected drift violation and the gate rejection of a weak model.
+    \item Alarm configurations and one fired alert of each kind.
+    \item The cost model with two optimizations and the security review.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item One DAG run carries a dataset from extraction to a gated, registered, deployable model.
+    \item A weak model is rejected at the gate; a drift event reaches SNS with context.
+    \item Training data access is demonstrably catalog-governed; artifacts are KMS-encrypted.
+    \item Endpoint shape is justified against the traffic estimate (serverless or batch by default).
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Add a champion/challenger shadow deployment with live comparison metrics.
+    \item Wire the Week~20 enrichment outputs as additional features and measure lift.
+    \item Add lineage emission (OpenLineage) from the DAG and pipeline.
+    \item Automate monthly baseline refresh tied to the retraining cadence.
+\end{itemize}

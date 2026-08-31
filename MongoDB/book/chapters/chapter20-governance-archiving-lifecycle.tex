@@ -1,0 +1,259 @@
+\chapter{Governance, Archiving, and Lifecycle Management}
+\index{Atlas}\index{Online Archive}\index{federated query}\index{data lifecycle}\index{retention}\index{governance}\index{Parquet}\index{PITR}%
+
+\begin{objectives}
+\begin{itemize}
+    \item Configure Atlas Online Archive with partition-aligned date keys and query it through federated endpoints.
+    \item Describe cloud backup strategies, snapshot management, and PITR at the level governance requires (mechanics and drills in Chapter 23).
+    \item Design a data-lifecycle policy: hot, warm, archive, and destroy tiers with legal-hold exceptions.
+    \item Quantify archive query cost as a function of partition alignment.
+    \item Run the Online Archive + federated query lab in the Thursday project.
+    \item Architect a seven-year financial-retention lifecycle with queryable archives and auditable destruction.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+Backup and tiering are solved problems at every vendor---the differentiator is whether restores are drilled and whether the cold tier stays queryable.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{2.9cm}p{3.0cm}p{3.0cm}p{3.0cm}@{}} 
+\toprule
+\textbf{Capability} & \textbf{AWS} & \textbf{Azure} & \textbf{GCP} \\
+\midrule
+Managed backup & RDS snapshots + PITR & Automated backups + PITR & Cloud SQL PITR \\
+Continuous/PITR & 35-day window & 7--35 days & 7--35 days \\
+Cold tiering & S3 Glacier & Blob Archive & Archive Storage \\
+Query over archive & Athena / Redshift Spectrum & Synapse / Fabric OneLake & BigQuery external tables \\
+Long-term retention & Glacier Deep Archive & Archive tier & Archive class \\
+Restore testing & Manual / scripted drills & Same & Same \\
+\addlinespace
+Snowflake / Fabric & \multicolumn{3}{l}{Time Travel + Fail-safe replace user-managed backups; Fabric OneLake shortcuts play the federated-query role} \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+Atlas's version of the pattern: continuous cloud backups with PITR granularity inside the oplog window, Online Archive tiering cold data to object storage as Parquet, and Atlas Data Federation querying live and archived data in one statement \cite{mongodbAtlasBackupDocs,mongodbOnlineArchiveDocs}.
+\end{crosscloud}
+
+\section{Week 20 Roadmap: The Data Lifecycle as One System}
+Backup, archiving, and retention are usually taught as three products. Operationally they are one question---\emph{how long does each byte stay hot, warm, cold, and provably recoverable?}---answered by one lifecycle policy. This week covers Atlas's implementation of the aging tiers (Online Archive, federation) and the governance layer (retention schedules, evidence) that makes the policy real; the backup mechanics and restore drills that protect the hot tier follow in Chapter 23 \cite{mongodbAtlasBackupDocs,mongodbOnlineArchiveDocs}.
+
+\begin{definitionbox}
+\textbf{Atlas Online Archive} tiers documents matching an archival rule---a date threshold on a partition-aligned key---from the live cluster to cloud object storage as Parquet, keeping them queryable through Atlas Data Federation. \textbf{Point-In-Time Recovery (PITR)} reconstructs the database state at any moment within a retention window by restoring the nearest snapshot and replaying the oplog forward.
+\end{definitionbox}
+
+\begin{keyterms}
+\textbf{Snapshot}: a consistent point-in-time copy of cluster data. \textbf{Oplog window (backup)}: the replayable range enabling PITR granularity. \textbf{RPO}: recovery point objective---maximum tolerated data loss. \textbf{RTO}: recovery time objective---maximum tolerated restore duration. \textbf{Online Archive}: Atlas tier moving aged data to cloud object storage as Parquet. \textbf{Federated query}: one query across live collections and archived data.
+\end{keyterms}
+
+\section{Monday: Atlas Online Archive}
+\subsection{Tiering to Object Storage}
+Online Archive moves documents matching an archival rule---a date threshold on a partition-aligned key---from the live cluster to cloud object storage in Parquet format, on a schedule you set. The partition-key alignment is the cost control: archive queries are billed per byte scanned, so archiving on the same date key that queries filter by lets the archive prune partitions instead of scanning the lake. An archive partitioned on a key nobody queries is a scanning invoice with a retention policy.
+
+\section{Tuesday: Federated Database Instances}
+\subsection{Atlas Data Federation}
+A federated database instance unions live collections and Online Archive partitions behind one query endpoint: the seven-year report reads this quarter from the cluster and 2019--2025 from Parquet with the same aggregation pipeline. Performance asymmetry is the design constraint: live-tier predicates are index-served (Part II), archive-tier predicates are partition-pruned scans---keep archive queries date-bounded and push selective filters into the pipeline's first stage \cite{mongodbOnlineArchiveDocs}.
+
+\begin{lstlisting}[language=JavaScript, caption={Federated query across live and archived ledger data.}]
+// Federated endpoint "ledgerFed" with:
+//   live:  cluster db.ledger.entries
+//   cold:  online archive of entries (partitioned by postedAt)
+use ledgerFed;
+db.entries.aggregate([
+  { $match: { postedAt: { $gte: ISODate("2019-01-01"),
+                          $lt:  ISODate("2019-02-01") } } },   // partition-aligned
+  { $group: { _id: "$currency", total: { $sum: "$amount" } } }
+]);
+\end{lstlisting}
+
+\begin{tipbox}
+Date-bounded archive queries and crypto-shredded subjects compose cleanly: QE-encrypted fields archived to Parquet remain ciphertext, and Chapter 18's key destruction covers archived copies too.
+\end{tipbox}
+
+\section{Wednesday: Backup Strategies, Cloud Backups, and PITR}
+\subsection{Snapshots Plus Oplog}
+Atlas continuous backup takes periodic snapshots and retains the oplog between them; a PITR request restores the snapshot preceding the target time and replays oplog entries forward. The RPO implication: with continuous backup, RPO approaches the oplog replication lag---seconds to minutes---rather than the snapshot interval. The RTO implication: restore time is dominated by snapshot size and transfer, so the RTO objective drives snapshot schedule and the ``restore to a new cluster'' topology choice, not the other way around.
+
+\subsection{The Recovery-Objective Contract}
+Every backup configuration must trace to a written RPO/RTO pair per data class. Financial ledgers: RPO $< 1$ minute (continuous + PITR), RTO $< 15$ minutes (pre-provisioned restore target or rapid restore process). Analytics aggregates: RPO of 24 hours may be fine if the aggregates are recomputable from sources---which makes their ``backup'' the regeneration pipeline (Chapter 11) rather than snapshots. The senior move is refusing to pay for RPO-seconds backups on recomputable data.
+
+\begin{pitfall}
+\textbf{A backup that has never been restored.} Untested backups fail in ways nobody predicts: wrong IAM on the restore target, insufficient disk, a corrupt snapshot chain, a 14-hour RTO against a 1-hour objective. Schedule restore drills (Thursday) and alert on backup job failures themselves---a silently broken backup is the worst surprise in this book.
+\end{pitfall}
+
+
+\begin{notebox}
+PITR mechanics (snapshot plus oplog replay), the recovery-objective contract, and the hands-on restore drill live with the rest of backup operations in Chapter 23; this chapter's focus is where data goes to age---and how it stays queryable.
+\end{notebox}
+
+\section{Thursday Hands-On Project: Online Archive with a Federated Query}
+Configure Atlas Online Archive on a time-series collection and read across the hot/cold boundary with one federated query.
+
+\subsection{Lab Protocol}
+\begin{enumerate}
+    \item Seed a lab cluster with a time-series-style collection spanning three synthetic years of monthly telemetry documents (\texttt{postedAt} spread across 36 months).
+    \item Configure an Online Archive rule: archive documents older than 13 months, partitioned on \texttt{postedAt} (the same key queries filter on), with a frequent archive schedule for the lab.
+    \item Wait for archiving to complete; verify with collection counts and the archive's partition listing that months 14--36 moved.
+    \item Create a federated database instance unioning the live collection and the archive; run the seven-year-style report aggregation twice: once date-bounded to a single archived month (partition-pruned) and once unbounded, recording scanned bytes for both.
+    \item Document the scanned-bytes difference as the cost evidence for partition alignment.
+\end{enumerate}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item The seeding script, the archive rule configuration (exported as code), and the federation setup.
+    \item The two federated query runs with scanned-bytes evidence.
+    \item A paragraph explaining the partition-alignment cost rule to a teammate.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item The archive contains exactly the documents older than the cutoff, verified by counts.
+    \item The date-bounded federated query scans a small fraction of the unbounded baseline.
+    \item The federated endpoint returns correct merged results across hot and cold tiers (validated against a pre-archive baseline).
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Add a misaligned archive rule (partitioned on a non-query key) and measure the scanned-bytes penalty.
+    \item Combine with Chapter 18: archive a QE-encrypted field and prove the ciphertext round-trips through federation.
+\end{itemize}
+
+\section{Friday Use Case and Architecture: Seven-Year Financial Retention}
+\subsection{The Lifecycle Policy and Tiers}
+The policy table names, per data class: the hot window (on-cluster, indexed), the warm window (on-cluster, possibly un-indexed or compressed), the archive window (Online Archive, partition-aligned), and the destruction rule (TTL or scheduled purge, subject to legal hold). Retention clocks start from business-meaningful timestamps (transaction date, not ingestion date), and every tier transition is a scheduled, logged job---not a manual task.
+
+\subsection{Scenario and Requirements}
+A payments company must retain financial logs for seven years, keep the last 13 months interactive for operations, make older data queryable for audits within hours, and destroy data promptly at expiry---with legal-hold exceptions and full audit evidence.
+
+\subsection{Architecture}
+The lifecycle in one pass: ledger entries live on-cluster for 13 months with the ESR index set (Part III). Online Archive, partitioned on \texttt{postedAt}, tiers months 14--84 to Parquet in object storage; the federated endpoint unions both for audit queries, which are always date-bounded. At month 85 a scheduled destruction job purges archive partitions wholesale (partition drops, not row deletes) unless a legal-hold flag on the partition's date range blocks it---the same hold registry as Chapter 18's key quarantine. Continuous backup with PITR covers the hot window; a quarterly restore drill measures RTO; and every tier transition, hold, and destruction writes to the audit stream shipped to the SIEM.
+
+\begin{figure}[H]
+    \centering
+    \resizebox{0.98\textwidth}{!}{%
+    \begin{tikzpicture}[
+        tier/.style={rectangle, rounded corners, draw=primary, fill=primary!6, minimum width=3.1cm, minimum height=1.5cm, align=center, font=\small\bfseries},
+        cold/.style={rectangle, rounded corners, draw=codepurple, fill=codepurple!8, minimum width=3.1cm, minimum height=1.5cm, align=center, font=\small\bfseries},
+        gov/.style={rectangle, rounded corners, draw=red!60!black, fill=red!5, minimum width=3.1cm, minimum height=1.0cm, align=center, font=\small\bfseries},
+        arrow/.style={-{Stealth[length=2.5mm]}, draw=primary, thick}
+    ]
+        \node[tier] (hot) at (0,0) {Hot: 0--13 mo\\cluster + ESR\\+ PITR backup};
+        \node[cold] (arch) at (5.3,0) {Archive: 14--84 mo\\Online Archive\\(Parquet, by month)};
+        \node[gov] (hold) at (5.3,-2.4) {Legal-hold\\registry};
+        \node[gov] (destroy) at (10.8,0) {Destroy: month 85\\partition drop\\(hold-checked)};
+        \node[tier] (fed) at (2.65,2.4) {Federated endpoint\\(audit queries)};
+        \draw[arrow] (hot) -- (arch);
+        \draw[arrow] (arch) -- (destroy);
+        \draw[arrow, dashed] (hold) -- (destroy);
+        \draw[arrow, dashed] (fed) -- (hot);
+        \draw[arrow, dashed] (fed) -- (arch);
+    \end{tikzpicture}%
+    }
+    \caption{Seven-year lifecycle: hot tier with PITR, partition-aligned archive, hold-checked destruction, federated audit access.}
+    \label{fig:ch19-lifecycle}
+\end{figure}
+
+\subsection{Cost and Compliance Notes}
+Archive queries bill per byte scanned; the partition alignment and date-bounded audit query templates keep audits cheap. Destruction by partition drop is O(metadata) rather than a seven-year \texttt{deleteMany}. The compliance pack assembles itself from the tier-transition logs, the drill reports, and the hold registry---all emitted by the same jobs that do the work.
+
+\section{Interview Q\&A}
+\subsection{Backup and Lifecycle}
+\begin{enumerate}
+    \item \textbf{Q: How does PITR reconstruct an arbitrary point in time?}\\
+    A: Restore the snapshot preceding the target, then replay retained oplog entries forward to the exact timestamp---which is why PITR granularity equals the oplog retention, not the snapshot interval.
+
+    \item \textbf{Q: Why partition Online Archive on the query date key?}\\
+    A: Archive queries bill per byte scanned; partition-aligned pruning reads only relevant Parquet partitions. Wrong partition key, unbounded scans, unbounded invoice.
+
+    \item \textbf{Q: Why restore to a new cluster during drills?}\\
+    A: A restore drill must never endanger the source of truth; restoring beside production also validates that the recovery topology actually works, not just the snapshot.
+
+    \item \textbf{Q: When is recomputation better than backup?}\\
+    A: For derived data whose source of truth is elsewhere (aggregates, materialized views): the regeneration pipeline \emph{is} the backup, and paying for RPO-seconds snapshots of it is waste.
+
+    \item \textbf{Q: What makes destruction auditable?}\\
+    A: Scheduled partition drops gated by a hold registry, each writing an audit event with actor, scope, rule citation, and timestamp---retrievable years later.
+\end{enumerate}
+
+\section{Further Reading}
+Atlas backup and PITR are documented in the Atlas backup guide \cite{mongodbAtlasBackupDocs}, Online Archive and federation in their respective manuals \cite{mongodbOnlineArchiveDocs,mongodbDataFederationDocs}, and monitoring/alerting ties forward to Chapter 23 \cite{mongodbAtlasMonitoringDocs}. The open-table-format contrast (Iceberg) from the syllabus provides the lakehouse comparison point \cite{apacheIcebergRepo}, and the RPO/RTO discipline is SRE standard practice \cite{sreBook}.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item PITR = snapshot + oplog replay; RPO and RTO objectives choose the configuration, not vice versa.
+    \item Untested restores are not backups: drill quarterly, measure RTO, alert on backup job failure.
+    \item Online Archive bills per byte scanned; partition on the query key or pay for full scans.
+    \item Federated queries union hot and cold tiers; keep archive queries date-bounded.
+    \item Lifecycle policies name hot/warm/archive/destroy windows with logged, hold-checked transitions.
+    \item Recomputable derived data needs pipelines, not snapshots.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Derive the snapshot+oplog schedule implied by RPO 1 minute / RTO 15 minutes on a 2 TB cluster; state assumptions.
+    \item \textbf{(Conceptual)} Why is destruction-by-partition-drop preferable to a filtered delete at seven-year scale?
+    \item \textbf{(Conceptual)} What changes in the lifecycle design if legal hold applies to a data \emph{subject} rather than a date range? (Hint: Chapter 18.)
+    \item \textbf{(Hands-on)} Run the full PITR drill of Chapter 23 on a free-tier Atlas cluster and produce the parity report.
+    \item \textbf{(Hands-on)} Configure Online Archive on a lab time-series collection and compare scanned bytes for aligned vs.\ misaligned queries.
+    \item \textbf{(Design)} Write the lifecycle policy for a healthcare platform: hot, archive, destroy, holds, and the evidence each transition emits.
+    \item \textbf{(Design)} Design the backup-failure alert and its runbook, including the ``last known good restore'' evidence field.
+    \item \textbf{(Interview)} ``Our audit query over the archive took 9 hours and cost \$400.'' Diagnose and fix.
+\end{enumerate}
+
+\section{Milestone 5 Capstone: Hardened Enterprise Healthcare Platform}\label{sec:ch20-capstone}
+
+\begin{capstonebox}
+\textbf{Mission:} integrate Weeks 17--20 into one audited platform: x.509/OIDC service authentication with least-privilege RBAC (Chapter 17), Queryable Encryption of patient PII with per-subject crypto-shredding keys (Chapter 18), a PrivateLink-only zero-trust perimeter with scoped auditing to a SIEM (Chapter 19), and a seven-year lifecycle with partition-aligned archiving and hold-checked destruction (this chapter)---proven by scripted tests, not documents.
+
+\textbf{Estimated time:} 8--10 hours across the week.
+
+\textbf{What you will practice:}
+\begin{itemize}
+    \item Composing identity, encryption, network, and lifecycle controls into defense in depth.
+    \item Producing audit-grade evidence for each control as a byproduct of operation.
+    \item Costing a regulated platform, including QE storage overhead and archive tiers.
+\end{itemize}
+\end{capstonebox}
+
+\subsection*{Scenario}
+A healthcare provider launches a patient-records platform under HIPAA, with GDPR-style erasure obligations for EU patients and a regulator who tests claims. Every layer of this part''s architecture must be deployed, and every claim must carry its evidence.
+
+\subsection*{Requirements}
+\begin{itemize}
+    \item \textbf{Identity:} OIDC federation for humans, x.509 for services, custom least-privilege roles with the grant matrix in Git, and the deny-test suite passing (Chapter 17).
+    \item \textbf{Encryption:} QE on \texttt{patients.name} and \texttt{patients.ssn} with per-subject DEKs; a crypto-shredding erasure drill proving unreadability across live data, streams, and backup artifacts (Chapter 18).
+    \item \textbf{Network and audit:} PrivateLink-only connectivity verified adversarially, TLS 1.3 under a custom CA, scoped audit filter shipped off-host, and one SIEM detection demonstrated (Chapter 19).
+    \item \textbf{Lifecycle:} Online Archive tiering records older than 13 months, partition-aligned; a federated audit query with scanned-bytes evidence; hold-checked destruction demonstrated passing and blocked (this chapter).
+    \item \textbf{Evidence pack:} per-control test outputs, the architecture diagram showing all layers, and a monthly cost estimate including QE overhead and archive storage with two documented optimizations.
+\end{itemize}
+
+\subsection*{Implementation Steps}
+\begin{enumerate}
+    \item \textbf{Identity first.} Deploy the cluster with service certificates and roles; run the deny tests.
+    \item \textbf{Encrypt.} Configure QE with per-subject keys; run the round-trip and erasure drills.
+    \item \textbf{Isolate and audit.} Close the network path; deploy the audit filter; fire the detection.
+    \item \textbf{Age and destroy.} Configure the archive; run the federated query; demonstrate hold-gated destruction.
+    \item \textbf{Assemble.} Build the evidence pack and the cost model; rehearse the regulator walkthrough.
+\end{enumerate}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item All configuration as code, the test suites, and the four drill reports.
+    \item The layered architecture diagram and the evidence pack.
+    \item The cost model and the security review notes.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item An unauthenticated, unencrypted, or out-of-network connection fails closed with evidence.
+    \item An erased subject is unreadable at every layer, proven by the drill matrix.
+    \item Every regulated-collection access appears in the shipped audit log within one minute.
+    \item The archive query scans the pruned partition set only, and destruction respects the legal hold.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Add the Chapter 21 pipeline so every control in this capstone deploys from CI with plan evidence.
+    \item Extend the erasure drill to cover the Online Archive tier explicitly (ciphertext in Parquet).
+\end{itemize}

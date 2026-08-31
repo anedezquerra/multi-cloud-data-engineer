@@ -1,0 +1,315 @@
+\chapter{Compliance, Data Privacy, and Certification Exam Preparation}
+\index{Dynamic Data Masking}\index{Always Encrypted}\index{Transparent Data Encryption}\index{GDPR}\index{crypto-shredding}\index{DP-203}\index{DP-700}%
+\begin{objectives}
+\begin{itemize}
+    \item Apply Dynamic Data Masking in Azure SQL and Synapse and verify masked views with a read-only user.
+    \item Distinguish Always Encrypted from Transparent Data Encryption and identify which threats each addresses.
+    \item Use Azure Policy and Microsoft Defender for Cloud for continuous auditing and threat detection.
+    \item Execute a GDPR right-to-erasure via crypto-shredding across lake, warehouse, streaming, and cache copies.
+    \item Handle legal-hold exceptions during erasure without breaking the audit trail.
+    \item Design a pipeline that tokenizes third-party PII with Key Vault before loading Synapse.
+    \item Plan a certification preparation program for DP-203/DP-700 using domain weighting and mock-exam feedback.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+Data-privacy primitives---masking, client-side encryption, erasure, and policy audit---exist on every platform, and certification exams test them as a family.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{3.0cm}p{2.9cm}p{3.1cm}p{3.2cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{AWS} & \textbf{Azure} & \textbf{GCP} \\
+\midrule
+Dynamic masking & Redshift dynamic masking & SQL/Synapse Dynamic Data Masking & BigQuery column-level + masking \\
+Client-side encryption & client-side encryption SDKs & Always Encrypted & client-side encryption / CSEK \\
+At-rest encryption & KMS-backed TDE equivalents & TDE (+ CMK via Key Vault) & Google-managed / CMEK \\
+Policy enforcement & AWS Config + SCPs & Azure Policy & Organization Policy \\
+Threat detection & GuardDuty / Security Hub & Microsoft Defender for Cloud & Security Command Center \\
+PII discovery & Macie & Purview classifications & Sensitive Data Protection \\
+\addlinespace
+\multicolumn{4}{@{}l@{}}{\textbf{Fabric}: OneLake security + MIP labels; \textbf{Snowflake}: masking policies + tag-based access; \textbf{MongoDB}: client-side field-level encryption.} \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+Crypto-shredding---encrypt per data subject, erase by destroying the subject's key---is the cross-platform answer to ``delete everywhere, including backups,'' because backups become unreadable ciphertext when the key is gone.
+\end{crosscloud}
+
+\begin{keyterms}
+\textbf{Dynamic Data Masking (DDM)}: presentation-layer masking for non-privileged users; the underlying data is unchanged.\quad
+\textbf{Always Encrypted}: client-side column encryption where the database never sees plaintext or keys.\quad
+\textbf{TDE}: transparent data encryption of the database files at rest.\quad
+\textbf{Crypto-shredding}: rendering a subject's data unreadable everywhere by destroying their encryption key.\quad
+\textbf{Legal hold}: a compliance directive suspending deletion for specified data subjects.
+\end{keyterms}
+
+\section{Week 23 Overview: Privacy Engineering and the Exam}
+The final technical week covers the compliance layer---masking, encryption, policy audit, and the erasure machinery privacy law actually requires---and this chapter doubles as your certification preparation. The pairing is deliberate: DP-203 (Data Engineering on Microsoft Azure, retired in 2025) and its successor DP-700 (Fabric Data Engineer Associate) test exactly the design judgment this book has practiced, and the privacy topics are the most scenario-heavy part of both exams \cite{microsoft2025dp203,microsoft2025dp700}. Learn the material as engineering; prepare for the exam as a separate, mechanical discipline.
+
+\section{Monday: Dynamic Data Masking}
+\index{Dynamic Data Masking}
+
+\subsection{Presentation-Layer Protection}
+DDM defines masking rules on columns---\texttt{default()} (xxxx), \texttt{email()} (aXXX@XX.com), \texttt{partial()}---and applies them at query time for users without the \texttt{UNMASK} permission \cite{microsoft2025ddm}. The crucial property: \emph{data at rest and for privileged users is unmasked}. DDM is a convenience control for read-only consumers---support tools, analysts who need shapes but not values---not a security boundary. A user who can run \texttt{SELECT ... WHERE email LIKE 'a\%'} repeatedly can infer masked values; treat DDM as defense-in-depth, never as the PII control.
+
+\begin{lstlisting}[language=SQL,caption={Masking email and phone; verifying as a read-only user.},label={lst:ch23-ddm}]
+ALTER TABLE dbo.Customers
+  ALTER COLUMN Email ADD MASKED WITH (FUNCTION = 'email()');
+ALTER TABLE dbo.Customers
+  ALTER COLUMN Phone ADD MASKED WITH (FUNCTION = 'partial(0,"XXX-",4)');
+
+CREATE USER ro_user WITHOUT LOGIN;
+GRANT SELECT ON dbo.Customers TO ro_user;
+-- EXECUTE AS USER = 'ro_user'; SELECT Email, Phone FROM dbo.Customers;
+-- yields aXXX@XX.com, XXX-1234 ; privileged users see plaintext
+\end{lstlisting}
+
+\section{Tuesday: Always Encrypted vs.\ TDE}
+\index{Always Encrypted}\index{Transparent Data Encryption}
+
+\subsection{Two Encryptions, Two Threat Models}
+\textbf{TDE} encrypts database files at rest: the threat is stolen media or backup files; the database engine decrypts transparently, so anyone with query access sees plaintext. \textbf{Always Encrypted} encrypts sensitive columns \emph{client-side}: keys live in Key Vault, decryption happens in the client driver, and the database---including its administrators---only ever holds ciphertext \cite{microsoft2025alwaysEncrypted}. The exam-favorite distinction: Always Encrypted protects data \emph{from the DBA}; TDE does not. The engineering price: encrypted columns support limited query shapes (equality, and with secure enclaves, more), so encrypt the columns whose sensitivity justifies the restriction---national IDs, not every string.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.4cm}p{4.6cm}p{5.0cm}@{}}
+\toprule
+\textbf{Property} & \textbf{TDE} & \textbf{Always Encrypted} \\
+\midrule
+Encrypts & Whole database files at rest & Selected columns, end-to-end \\
+Plaintext visible to & Anyone with query access & Only clients holding the key \\
+Protects from DBA & No & Yes \\
+Query restrictions & None & Equality-only (more with enclaves) \\
+Key custody & Service or CMK & Always client-side (Key Vault) \\
+\bottomrule
+\end{tabular}
+\caption{TDE and Always Encrypted answer different threat models; use both when both threats are real.}
+\label{tab:ch23-encryption}
+\end{table}
+
+\section{Wednesday: Policy, Defender, and the Legal-Hold Interaction}
+\index{Azure Policy}\index{Microsoft Defender for Cloud}\index{legal hold}
+
+\subsection{Continuous Audit}
+Azure Policy enforces configuration at deploy time and audits continuously: deny public network access, require tags, require CMK for in-scope resources. Microsoft Defender for Cloud adds the threat plane: vulnerability assessment, anomalous-activity alerts (unusual data access patterns, suspicious extraction volume), and a secure score that doubles as the platform's security backlog \cite{microsoft2025defender}. Together they convert Chapter 21's posture script from a point-in-time check into standing controls.
+
+\subsection{Legal Hold Meets Erasure}
+Privacy operations collide: a GDPR erasure request arrives for a subject under litigation hold. The compliant behavior is \emph{deferral with evidence}: the subject is flagged, erasure propagation is suspended for their records, and the audit trail records who requested, who deferred, under which hold, and when it resumed. Azure Policy effects, resource locks, and Purview retention labels can all technically block deletion---the design work is making that block \emph{intentional, recorded, and reversible}, with reprocessing queued for when the hold lifts.
+
+\begin{pitfall}
+\textbf{Erasing under legal hold.} Deleting a held subject's data is spoliation---often a worse legal outcome than a late erasure. The erasure pipeline's first step is always the hold check, and its output is always an auditable record, including when the answer is ``not now.''
+\end{pitfall}
+
+\section{Thursday Hands-on Project: Masking and a Crypto-Shredding Erasure Drill}
+\index{hands-on lab}\index{crypto-shredding!drill}
+Two drills in one day: implement DDM with a verified read-only view, then execute a full right-to-erasure for one synthetic data subject across every copy of their data.
+
+\subsection{Drill 1: DDM}
+Apply Listing~\ref{lst:ch23-ddm} to a PII table; query as a privileged user and as \texttt{ro\_user}; capture both result sets as the evidence that the mask works and that its boundary is the \texttt{UNMASK} permission.
+
+\subsection{Drill 2: Crypto-Shredding Erasure}
+The drill assumes the privacy architecture: each subject's PII fields are encrypted with a per-subject key in Key Vault (envelope encryption---the data key encrypts the payload, the Key Vault key wraps the data key). To erase subject \texttt{S}:
+
+\begin{enumerate}
+    \item \textbf{Hold check:} confirm \texttt{S} is not under legal hold; record the check.
+    \item \textbf{Destroy the key:} delete \texttt{S}'s key from Key Vault. Every copy---raw and curated ADLS zones, Synapse dedicated and serverless tables, events inside the Event Hubs retention window, derived tables, Redis caches, \emph{backups and Delta time-travel history}---is now permanently unreadable ciphertext.
+    \item \textbf{Prove it:} attempt decryption paths; document that none succeed.
+    \item \textbf{Handle the non-encryptable:} identifiers used as join keys (which must be pseudonymous tokens, never raw PII) are purged per-store via the documented runbook; soft-delete and backup windows are inventoried so the erasure certificate can state when the last copy expires.
+    \item \textbf{Certify:} write the erasure record---who, when, what copies, which windows, which hold check---to the immutable audit log.
+\end{enumerate}
+
+\begin{notebox}
+Naive \texttt{DELETE} is not erasure: soft-delete windows, blob versioning, backups, Delta time travel, and stream retention all keep copies after the delete commits. Crypto-shredding is the only design where ``every copy'' includes the ones you cannot reach.
+\end{notebox}
+
+\section{Friday Use Case: Tokenized Third-Party PII Ingestion}
+\index{use case}\index{tokenization}
+A retailer ingests customer files from a third-party data broker. Design: files land in an isolated raw zone; a Function tokenizes PII fields on arrival---replacing emails and names with keyed hashes, with the tokenization keys in Key Vault and the mapping table in an Always Encrypted column---and only the tokenized payload proceeds to silver and Synapse. Purview classifies both zones; the raw zone carries the tightest ACLs, the shortest lifecycle, and CMK; erasure is crypto-shredding the subject's wrapping key. The analytics estate \emph{never holds raw PII}, which is the strongest possible answer to most privacy review questions.
+
+\begin{pitfall}
+\textbf{Tokens that are re-identifiable.} An unsalted hash of an email is a rainbow table away from plaintext. Tokenization keys must be keyed (HMAC) with vault-custodied secrets, rotated, and never co-located with the data they protect.
+\end{pitfall}
+
+\section{Certification Preparation: DP-203 Legacy and DP-700 Reality}
+\index{DP-203}\index{DP-700}\index{exam preparation}
+DP-203 was retired in 2025; \textbf{DP-700} (Implementing Data Engineering Solutions Using Microsoft Fabric) is its successor for the Azure data-engineering credential \cite{microsoft2025dp700}. The preparation method is identical either way, and this book's twenty-four weeks map onto both exams' domains.
+
+\subsection{Domain-Weighted Study Plan}
+Pull the current skills-measured document for your target exam and score yourself per domain: ingestion and transformation (this book's Parts III--IV), storage and serving (Parts I--II), monitoring and optimization (Chapters 8, 22), security and governance (Chapters 21--23), and for DP-700 specifically, Fabric's lakehouse, warehouse, eventstream, and DirectLake surfaces. Weight revision time by \emph{domain weight $\times$ your weakness}, not by comfort---the failure mode is re-reading what you already know.
+
+\subsection{Mock-Exam Loop}
+Take a full-length mock under time pressure; classify every miss as \emph{knowledge gap} (study the topic), \emph{misread} (slow down on negatives like ``all EXCEPT''), or \emph{judgment gap} (the ``best'' answer among working ones---usually the one with least operational toil and least privilege). Re-mock the weak domains after one week; schedule the real exam when two consecutive full mocks clear 80\%. The week following this program's Week 24 is the right window: material is fresh, and the capstone work is your scenario-practice.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{4.6cm}p{4.0cm}p{4.2cm}@{}}
+\toprule
+\textbf{Exam skill area} & \textbf{Book chapters} & \textbf{Evidence you know it} \\
+\midrule
+Design and implement storage & 1--4, 6 & You chose tiers, redundancy, formats on evidence \\
+Ingest and transform & 5, 9--12 & You built event-driven, idempotent pipelines \\
+Streaming & 13--16 & You reason about watermarks and exactly-once \\
+Serving, BI, ML & 5--8, 17--20 & You shipped models and semantic models \\
+Security and governance & 21--23 & You built the perimeter and the erasure drill \\
+Monitoring, optimization, cost & 8, 22 & You run the monthly review \\
+Fabric specifics (DP-700) & 6, 7 (DirectLake), crosscloud boxes & You can map every Azure service to its Fabric surface \\
+\bottomrule
+\end{tabular}
+\caption{Mapping this book to the certification skill areas.}
+\label{tab:ch23-exam-map}
+\end{table}
+
+\section{Architectural Decision Record Template}
+\index{architectural decision record}
+Per privacy design record: which columns are masked, encrypted client-side, or tokenized with the threat model each addresses; key custody and rotation ownership; the erasure architecture (crypto-shredding scope, per-store purge runbook, retention-window inventory); the legal-hold procedure; and the audit-log schema for privacy operations.
+
+\section{Operational Deep Dive: The Privacy Operations Calendar}
+\index{privacy operations}
+Privacy controls decay without a calendar: quarterly---erasure drill on a synthetic subject (like Thursday's), DDM permission review, tokenization-key rotation; monthly---Defender recommendation triage, policy-compliance report, hold-list reconciliation with legal; continuously---anomalous-access alerts, classification coverage as new sources onboard. The erasure SLA (typically 30 days) is measured from request, so the drill's timing evidence is the SLA's foundation.
+
+\section{Troubleshooting Patterns}
+\index{troubleshooting!compliance}
+Masked values visible to a report user $\rightarrow$ the user was granted \texttt{UNMASK} by a broad role assignment. Always Encrypted insert failures $\rightarrow$ the client driver lacks key access or the column encryption key rotated without re-encryption. Erasure drill finds plaintext in a forgotten copy $\rightarrow$ the data inventory was incomplete; fix the inventory, then re-drill. Defender alerts ignored $\rightarrow$ alert fatigue; tune to actionable severities or the one real alert drowns.
+
+\section{Week 23 Lab Rubric}
+\index{rubric}
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.2cm}p{5.0cm}p{5.0cm}@{}}
+\toprule
+\textbf{Criterion} & \textbf{Meets expectation} & \textbf{Needs improvement} \\
+\midrule
+Masking & Masked view verified as read-only user; UNMASK scope reviewed & Masking asserted, never verified \\
+Encryption & DDM vs.\ TDE vs.\ Always Encrypted chosen per threat model & One control applied to every threat \\
+Erasure & Full crypto-shredding drill with certificate and hold check & DELETE-only erasure; copies unexamined \\
+Audit & Immutable record of every privacy operation & Operations performed, evidence absent \\
+\bottomrule
+\end{tabular}
+\caption{Week 23 rubric for the compliance deliverables.}
+\label{tab:ch23-rubric}
+\end{table}
+
+\section{Interview Q\&A}
+\subsection{Concepts and Trade-offs}
+\begin{enumerate}
+    \item \textbf{Q: Who still sees unmasked values when Dynamic Data Masking is enabled?}\\
+    A: Users with the UNMASK permission---DDM is presentation-layer; the data and privileged access are unchanged.
+    \item \textbf{Q: Always Encrypted vs.\ TDE---which protects data from database admins?}\\
+    A: Always Encrypted: keys are client-side in Key Vault and the engine holds only ciphertext; TDE decrypts transparently for anyone with query access.
+    \item \textbf{Q: Why tokenize PII before loading it into Synapse?}\\
+    A: So the analytics estate never holds raw PII---analysts work on tokens, and the mapping stays in a tightly controlled, separately encrypted store.
+    \item \textbf{Q: Why is naive DELETE not GDPR erasure?}\\
+    A: Soft-delete windows, versioning, backups, Delta time travel, and stream retention all keep copies; crypto-shredding renders them unreadable by destroying the key.
+\end{enumerate}
+
+\section{Further Reading}
+Dynamic Data Masking \cite{microsoft2025ddm}, Always Encrypted \cite{microsoft2025alwaysEncrypted}, and Defender for Cloud \cite{microsoft2025defender} cover the privacy layer. For certification, study the current skills outline for DP-700 \cite{microsoft2025dp700} (and the DP-203 record for legacy context \cite{microsoft2025dp203}), then return to each cited chapter for hands-on depth.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item DDM is presentation-layer defense-in-depth; Always Encrypted is the control that hides data from administrators; TDE protects files at rest.
+    \item Azure Policy prevents misconfiguration at deploy time; Defender detects threats at run time; you need both.
+    \item Erasure means every copy, including backups and time travel---crypto-shredding is the scalable answer.
+    \item Legal holds suspend erasure by design, with an auditable deferral and a reprocessing queue.
+    \item Tokenize third-party PII at the boundary so analytics never holds the raw values.
+    \item Certification prep is domain weighting plus mock-exam feedback loops; the engineering is already done---practice the exam format mechanically.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Construct the inference attack that defeats DDM, and name the control that actually prevents it.
+    \item \textbf{(Conceptual)} Why does Always Encrypted restrict query shapes, and which column types deserve that cost?
+    \item \textbf{(Conceptual)} Explain why the hold check precedes key destruction in the erasure pipeline.
+    \item \textbf{(Hands-on)} Complete both Thursday drills; produce the masking evidence and the erasure certificate.
+    \item \textbf{(Hands-on)} Enable Defender for Cloud on the lab subscription and triage the top five recommendations.
+    \item \textbf{(Hands-on)} Write the Azure Policy that denies public network access on storage accounts and test a violating deployment.
+    \item \textbf{(Design)} Design the tokenization service for the broker pipeline: key custody, rotation, and the mapping store.
+    \item \textbf{(Design)} Write the ADR for crypto-shredding versus per-store purge for a platform with 90-day backup retention.
+    \item \textbf{(Design)} Build your personal eight-week DP-700 study plan from the skills outline with domain weightings.
+    \item \textbf{(Interview)} Prepare a two-minute answer to ``a customer demands deletion, but backups keep their data for 90 days---what do you tell legal?''
+\end{enumerate}
+
+\section{Capstone Project: The Erasure-Capable Privacy Architecture}\label{sec:ch23-capstone}
+\index{capstone project}\index{GDPR!capstone}
+
+\begin{capstonebox}
+\textbf{Mission:} Build the privacy architecture end-to-end at lab scale: tokenized ingestion, DDM and Always Encrypted where each fits, per-subject encryption keys, a full erasure drill with certificate, a legal-hold deferral demonstration, and the policy/Defender audit layer.
+
+\textbf{Estimated time:} 6--8 hours.
+
+\textbf{What you will practice:}
+\begin{itemize}
+    \item Layered privacy controls chosen per threat model.
+    \item Crypto-shredding across every storage copy, proven.
+    \item Legal-hold interaction with a preserved audit trail.
+    \item Continuous compliance via Azure Policy and Defender.
+\end{itemize}
+\end{capstonebox}
+
+\subsection*{Scenario}
+The broker-ingestion retailer must pass a privacy audit: demonstrate that any subject can be erased within 30 days across every copy, that PII is never queryable in raw form by analysts, and that holds suspend erasure with evidence.
+
+\subsection*{Requirements}
+\begin{itemize}
+    \item \textbf{Ingestion:} tokenization at the boundary; raw zone isolated, CMK-encrypted, short-lived.
+    \item \textbf{Controls:} DDM for read-only SQL users; Always Encrypted for the token-mapping table; TDE throughout.
+    \item \textbf{Erasure:} per-subject keys; drill proves unreadability in lake, warehouse, stream retention, and caches; certificate issued.
+    \item \textbf{Hold:} one subject under hold is deferred with the full audit record and a reprocessing entry.
+    \item \textbf{Audit:} the deny-public-access policy and Defender triage report committed as evidence.
+\end{itemize}
+
+\subsection*{Reference Architecture}
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[node distance=1.2cm]
+        \node[stage] (broker) {Broker\\files};
+        \node[store, right=1.3cm of broker] (raw) {Raw zone\\CMK, isolated};
+        \node[stage, right=1.3cm of raw] (tok) {Tokenization\\(Key Vault keys)};
+        \node[store, right=1.3cm of tok] (silver) {Silver/Synapse\\tokens only};
+        \node[doc, above=0.9cm of tok] (kv) {Per-subject keys\\(shred = erase)};
+        \node[doc, below=0.9cm of silver] (audit) {Audit log +\\hold registry};
+        \draw[arrow] (broker) -- (raw);
+        \draw[arrow] (raw) -- (tok);
+        \draw[arrow] (tok) -- (silver);
+        \draw[arrow, dashed] (kv) -- (tok);
+        \draw[arrow, dashed] (silver) -- (audit);
+    \end{tikzpicture}%
+    }
+    \caption{Capstone privacy architecture: tokenize at the boundary, hold only tokens downstream, erase by destroying keys.}
+    \label{fig:ch23-capstone-arch}
+\end{figure}
+
+\subsection*{Implementation Steps}
+\begin{enumerate}
+    \item Build the tokenization boundary and the isolated raw zone.
+    \item Apply DDM, Always Encrypted, and TDE per the threat-model table.
+    \item Run the erasure drill for one synthetic subject; produce the certificate.
+    \item Place a second subject under hold; demonstrate deferral and resume.
+    \item Deploy the policy, triage Defender, and assemble the audit pack.
+\end{enumerate}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item Tokenization code, key-custody configuration, and the zone ACL evidence.
+    \item The erasure drill record, certificate, and hold-deferral record.
+    \item The policy definition, compliance report, and Defender triage.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item Post-erasure, no path---including time travel and backups---yields the subject's plaintext.
+    \item The held subject's records survive with an auditable deferral and are erased on resume.
+    \item Analysts can query the full analytics estate without ever seeing raw PII.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Automate the erasure SLA clock: request timestamp to certificate, with alerting at day 25.
+    \item Add Purview retention labels to the raw zone and reconcile them with the erasure runbook.
+    \item Run the quarterly privacy calendar once end-to-end and time every drill.
+\end{itemize}

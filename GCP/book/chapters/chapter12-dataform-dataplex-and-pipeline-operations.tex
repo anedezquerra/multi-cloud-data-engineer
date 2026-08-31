@@ -1,0 +1,350 @@
+\chapter{Pipeline Orchestration with Cloud Composer}
+\index{Cloud Composer}\index{Apache Airflow}\index{DAG}\index{operators}\index{sensors}\index{XComs}
+
+\begin{objectives}
+\begin{itemize}
+    \item Author Airflow DAGs using operators, sensors, dependencies, XComs, and trigger rules.
+    \item Explain Cloud Composer 2 architecture: GKE-based, autoscaled, and environment-scoped.
+    \item Orchestrate cross-service work---GCS sensors, Dataproc jobs, BigQuery loads---from one DAG.
+    \item Implement idempotent, retry-safe tasks with failure notification and exponential backoff.
+    \item Build the file-triggered Dataproc-to-BigQuery DAG with email-on-failure semantics.
+    \item Design a self-healing orchestration layer for a banking reconciliation across fifteen systems.
+    \item Complete the Milestone~3 capstone: a scheduled, monitored, end-to-end batch ELT pipeline.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+Managed Airflow is the most portable orchestration story in cloud data engineering---the same DAG Python runs on every platform.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{2.8cm}p{3.0cm}p{3.0cm}p{3.0cm}@{}} \\
+\toprule
+\textbf{Capability} & \textbf{GCP Composer} & \textbf{AWS MWAA} & \textbf{Azure / Fabric} \\
+\midrule
+Managed Airflow & Composer 2 (GKE, autoscaling) & MWAA (ECS-based) & Managed Airflow in ADF / Fabric \\
+Triggering & Cloud Scheduler, sensors, API & EventBridge, sensors & Event Grid, tumbling window triggers \\
+Secret storage & Secret Manager integration & Secrets Manager & Key Vault \\
+Worker identity & GKE Workload Identity & IAM task roles & Managed identity \\
+DAG storage & Cloud Storage bucket synced & S3 bucket synced & ADLS / Git integration \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+Alternatives map by philosophy: \textbf{Snowflake Tasks} and \textbf{dbt Cloud} schedules keep orchestration in-warehouse for SQL-only pipelines; \textbf{Microsoft Fabric pipelines} target low-code orchestration; \textbf{Dagster} and \textbf{Prefect} offer asset-centric alternatives. Airflow's task-centric DAG model remains the lingua franca the others are compared against.
+\end{crosscloud}
+
+\begin{keyterms}
+\textbf{DAG}: a directed acyclic graph---an Airflow pipeline definition of tasks and their dependencies.
+\textbf{Operator}: a task template performing an action (run a job, execute SQL); a \textbf{sensor} is an operator that waits for a condition.
+\textbf{XCom}: Airflow's mechanism for passing small values between tasks.
+\textbf{Trigger rule}: the condition under which a task runs relative to its upstream states (e.g., \texttt{all\_done}).
+\textbf{Catchup}: Airflow's behavior of running missed historical schedule intervals when a DAG is unpaused.
+\textbf{Cloud Composer}: Google Cloud's managed Airflow; version 2 runs on autoscaling GKE clusters.
+\end{keyterms}
+
+\section{Week 12 Roadmap}
+Week~12 assembles Part~III's services into coordinated systems. Monday covers Airflow's mental model: DAGs, operators, tasks, XComs. Tuesday opens the Composer 2 box. Wednesday orchestrates across Dataproc, Dataflow, and BigQuery. Thursday builds the file-triggered DAG with failure notification. Friday designs the fifteen-system banking reconciliation. The week closes with the Milestone~3 capstone.
+
+\begin{definitionbox}
+\textbf{Cloud Composer} is Google Cloud's managed Apache Airflow service. It hosts the scheduler, web server, metadata database, and---in version 2---an autoscaling pool of GKE workers, so teams write DAGs rather than operate Airflow infrastructure \cite{googlecloudcomposerdocs,apacheairflowdocs}.
+\end{definitionbox}
+
+\section{Monday: Airflow Concepts---DAGs, Operators, Tasks, XComs}
+\index{Airflow!DAG}\index{Airflow!operators}\index{Airflow!XComs}\index{idempotency}
+
+\subsection{The DAG Mental Model}
+A DAG declares \emph{what} depends on \emph{what}, not \emph{when} code runs beyond the schedule. The scheduler materializes DAG runs per logical interval; each task instance executes an operator with rendered context (the logical date \texttt{ds}, run IDs). Dependencies set with \verb|>>| define execution order. The discipline that makes all of it safe: \textbf{idempotent tasks}---any task, run twice for the same logical date, produces the same effect as running once. Overwrite the partition; never append blindly.
+
+\subsection{Sensors and Deferrable Execution}
+Sensors wait: \texttt{GCSObjectExistenceSensor} pokes until a file appears. Classic sensors occupy a worker slot while poking; \textbf{deferrable} sensors release the worker and resume from a trigger process---the production-correct choice for long waits. Use sensors for external readiness (a partner's file), schedules for time-based cadence; mixing them---schedule daily, then sense for the file---covers the real world where ``daily'' means ``when the upstream delivers.''
+
+\subsection{XComs: Small Messages Only}
+XComs pass \emph{small} values between tasks---a row count, a validated path, a quality verdict. They are stored in the metadata database and serialized per push. Passing DataFrames, file contents, or large JSON payloads through XComs stalls the scheduler and bloats the metadata database; pass references (a \texttt{gs://} path) and let tasks read the payload themselves.
+
+\begin{pitfall}
+\texttt{catchup=True} on a newly deployed DAG floods the environment with weeks of backfill runs at once, contending for workers and rate limits. Disable catchup for routine DAGs, or cap \texttt{max\_active\_runs} and schedule deliberate backfills instead.
+\end{pitfall}
+
+\section{Tuesday: Cloud Composer 2 Architecture}
+\index{Composer 2}\index{GKE!Composer}\index{environment sizing}
+
+\subsection{Under the Hood}
+A Composer 2 environment is a tenant project running GKE: the Airflow scheduler, web server, triggerer, and workers are workloads on an autoscaling cluster; the metadata database is a managed Cloud SQL instance; the DAGs folder is a Cloud Storage bucket synced continuously. You size the environment by workload config (scheduler and worker CPU/memory), worker count bounds, and environment size tier---then Airflow's Kubernetes executor scales workers with task demand.
+
+\subsection{Operational Surface}
+The operational levers are few but sharp: worker autoscaling bounds, the \texttt{[core] parallelism} family of settings, DAG-folder sync (push code by writing to the bucket, ideally via CI), PyPI package installation into the environment image, and environment snapshots for backup and disaster recovery. Monitor scheduler heartbeat, task-queue depth, and the metadata database; most Composer incidents are exhausted workers, a wedged scheduler, or a metadata database under-sized for thousands of task instances.
+
+\begin{tipbox}
+Pin PyPI dependencies and Airflow provider versions in the environment configuration. An unpinned provider upgrade changing an operator's parameters is a deploy failure disguised as a platform upgrade; treat provider upgrades as code changes with review and testing.
+\end{tipbox}
+
+\begin{notebox}
+Composer environments are regional and have a base cost floor---schedulers and database run continuously even with zero DAGs. Consolidate small teams onto shared environments with clear \texttt{dag\_prefix} conventions rather than one environment per team.
+\end{notebox}
+
+\section{Wednesday: Cross-Service Orchestration}
+\index{cross-service orchestration}\index{DataprocSubmitJobOperator}\index{BigQueryInsertJobOperator}
+
+\subsection{Google Cloud Operators}
+The Google provider package supplies operators and sensors for the whole platform: \texttt{GCSObjectExistenceSensor}, \texttt{DataprocSubmitJobOperator} (and \texttt{DataprocCreateClusterOperator}/\texttt{DataprocDeleteClusterOperator} for ephemeral clusters), \texttt{DataflowTemplatedJobStartOperator}, \texttt{BigQueryInsertJobOperator} for SQL, and \texttt{GCSToBigQueryOperator} for loads. A well-formed cross-service DAG sequences the services from earlier chapters: sense the arrival, run the Spark job on an ephemeral cluster, load the partition, verify quality, notify.
+
+\subsection{Design Rules for Orchestrated Pipelines}
+Three rules keep multi-service DAGs operable. \textbf{Deterministic paths}: every task derives its inputs and outputs from the logical date, so reruns overwrite rather than duplicate. \textbf{Verify between stages}: insert cheap data-quality gates (row-count reconciliation, freshness checks) as tasks between expensive stages, so a bad input fails fast. \textbf{Notify on the terminal task}: attach failure callbacks or an \texttt{all\_done} terminal notifier, so humans hear about every completion state exactly once.
+
+\begin{lstlisting}[language=Python,caption={The daily-sales DAG: sense, transform, load, notify.}]
+from datetime import datetime, timedelta
+from airflow import DAG
+from airflow.providers.google.cloud.sensors.gcs import GCSObjectExistenceSensor
+from airflow.providers.google.cloud.operators.dataproc import DataprocSubmitJobOperator
+from airflow.providers.google.cloud.operators.bigquery import BigQueryInsertJobOperator
+from airflow.operators.email import EmailOperator
+
+default_args = {"retries": 2, "retry_delay": timedelta(minutes=5)}
+
+with DAG("daily_sales_elt", schedule="@daily", start_date=datetime(2026, 1, 1),
+         default_args=default_args, catchup=False) as dag:
+    wait_for_file = GCSObjectExistenceSensor(
+        task_id="wait_for_file", bucket="raw-sales", object="daily/{{ ds }}/sales.csv")
+    spark_job = DataprocSubmitJobOperator(
+        task_id="spark_transform", project_id="my-project", region="us-central1",
+        job={"placement": {"cluster_name": "ephemeral-etl"},
+             "pyspark_job": {"main_python_file_uri": "gs://code/transform.py"}})
+    load_bq = BigQueryInsertJobOperator(
+        task_id="load_bq",
+        configuration={"query": {"query": "CALL analytics.refresh_daily_sales()",
+                                 "useLegacySql": False}})
+    notify = EmailOperator(task_id="notify", to=["data-oncall@example.com"],
+                           subject="daily_sales_elt finished", html_content="Done.",
+                           trigger_rule="all_done")
+    wait_for_file >> spark_job >> load_bq >> notify
+\end{lstlisting}
+
+\begin{pitfall}
+Append-mode loads double-count rows when a task retries. Always write with deterministic partition targets---\texttt{WRITE\_TRUNCATE} on the logical-date partition or a deterministic object path---so retries and backfills are safe by construction.
+\end{pitfall}
+
+\section{Thursday Hands-On Project: The File-Triggered ELT DAG}
+\index{hands-on project}\index{GCSObjectExistenceSensor}\index{failure notification}
+This lab deploys the Wednesday DAG to a Composer environment: it waits for a daily file in Cloud Storage, triggers a Dataproc job, loads results to BigQuery, and sends email on completion or failure.
+
+\subsection{Prepare the Environment}
+\begin{lstlisting}[language=bash,caption={Creating a Composer 2 environment and locating its DAGs bucket.}]
+$env:PROJECT_ID = "my-gcp-composer-lab"
+$env:REGION = "us-central1"
+$env:ENV = "daily-elt-lab"
+
+gcloud composer environments create $env:ENV `
+  --location=$env:REGION --image-version=composer-2-airflow-2
+
+# Find the DAGs bucket:
+gcloud composer environments describe $env:ENV --location=$env:REGION `
+  --format="value(config.dagGcsPrefix)"
+\end{lstlisting}
+
+\subsection{Deploy and Test}
+\begin{enumerate}
+    \item Copy the DAG file to the environment's DAGs prefix with \texttt{gcloud storage cp}; wait for the DAG to parse (check the Airflow UI for import errors).
+    \item Create the BigQuery dataset and the \texttt{analytics.refresh\_daily\_sales()} procedure (a simple partition-overwrite insert for the lab).
+    \item Trigger the DAG unparsed and confirm the sensor waits; upload \texttt{daily/2026-07-31/sales.csv} to \texttt{raw-sales} and watch the run proceed through all four tasks.
+    \item Force a failure (point the Dataproc job at a missing script), confirm the email arrives and the retry policy engages.
+\end{enumerate}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item The DAG file with a README describing the schedule, sensor target, and notification path.
+    \item Screenshots of the successful and failed runs in the Airflow grid view.
+    \item A one-paragraph idempotency argument: why rerunning any date is safe.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item The DAG gates on file existence rather than wall-clock assumptions.
+    \item Retries use backoff and the terminal task notifies under \texttt{all\_done}.
+    \item Rerunning a historical date via the Airflow UI produces no duplicate BigQuery rows.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Convert the sensor to its deferrable variant and compare worker-slot occupancy.
+    \item Wrap the Dataproc stage in create/delete cluster operators for a fully ephemeral run.
+    \item Add a data-quality task between transform and load that fails the DAG when row counts regress by more than 10\%.
+\end{itemize}
+
+\section{Friday Use Case and Architecture: Fifteen-System Banking Reconciliation}
+\index{banking reconciliation}\index{self-healing pipelines}\index{SLA}
+
+\subsection{Scenario}
+A bank reconciles fifteen dependent systems nightly: core banking extracts, card network files, general ledger, fraud case queue, and more. Files arrive at different times from different parties; a late file must not silently produce a wrong reconciliation; failures at 03:00 must page the right team with enough context to act.
+
+\subsection{Design}
+Model the reconciliation as one orchestrated DAG per business date with explicit system-level tasks. Each of the fifteen inputs gets a sensor with a deadline; a per-system validation task (schema, row counts against control totals, duplicate detection) gates its ingestion; reconciliation tasks consume only validated inputs; a final task writes a signed-off reconciliation report and control totals to an audit table. SLAs are declared on the DAG (\texttt{sla} on critical tasks plus Cloud Monitoring alerts on SLA misses), and every task is idempotent so the on-call runbook is ``fix the input, clear the task, rerun.''
+
+\begin{figure}[H]
+    \centering
+    \resizebox{0.95\textwidth}{!}{%
+    \begin{tikzpicture}[
+        src/.style={rectangle, rounded corners, draw=codegray, thick, fill=white, text width=2.6cm, minimum height=0.9cm, align=center, font=\footnotesize\bfseries},
+        svc/.style={rectangle, rounded corners, draw=primary, thick, fill=primary!6, text width=2.9cm, minimum height=1.0cm, align=center, font=\small\bfseries},
+        gate/.style={rectangle, rounded corners, draw=magenta, thick, fill=magenta!8, text width=2.9cm, minimum height=0.9cm, align=center, font=\footnotesize\bfseries},
+        outbox/.style={rectangle, rounded corners, draw=codegreen!60!black, thick, fill=green!7, text width=2.9cm, minimum height=1.0cm, align=center, font=\small\bfseries},
+        arrow/.style={-{Stealth[length=2.5mm]}, draw=primary, thick}
+    ]
+        \node[src] (s1) at (0,1.6) {Core banking\\extract};
+        \node[src] (s2) at (0,0.2) {Card network\\files};
+        \node[src] (s3) at (0,-1.2) {\ldots 12 more\\systems};
+        \node[svc] (sense) at (3.8,0.2) {Composer\\sensors +\\validation gates};
+        \node[svc] (recon) at (7.6,0.2) {Reconciliation\\tasks (idempotent)};
+        \node[outbox] (report) at (11.4,1.2) {Signed report\\+ audit table};
+        \node[gate] (page) at (11.4,-0.9) {Pager + SLA\\miss alerts};
+
+        \draw[arrow] (s1) -- (sense);
+        \draw[arrow] (s2) -- (sense);
+        \draw[arrow] (s3) -- (sense);
+        \draw[arrow] (sense) -- (recon);
+        \draw[arrow] (recon) -- (report);
+        \draw[arrow] (recon) -- (page);
+    \end{tikzpicture}%
+    }
+    \caption{Banking reconciliation: sensed, validated inputs; idempotent reconciliation; signed output and alerting.}
+    \label{fig:ch12-banking-reconciliation}
+\end{figure}
+
+\begin{tipbox}
+``Self-healing'' is bounded automation, not magic: retries with exponential backoff for transient failures, automatic rerun-after-fix for data failures, and a page only when the system has exhausted safe recovery. Every page should represent a decision a human must actually make.
+\end{tipbox}
+
+\section{Interview Q\&A}
+\subsection{Concepts and Trade-offs}
+\begin{enumerate}
+    \item \textbf{Q: Why must Airflow tasks be idempotent for safe retries?}\\
+    A: Retries, backfills, and clears rerun tasks freely; only idempotent tasks---deterministic partition overwrites, upserts---make reruns indistinguishable from first runs.
+
+    \item \textbf{Q: What does the \texttt{all\_done} trigger rule guarantee here?}\\
+    A: The notification task runs after all upstream tasks finish regardless of success or failure, so the team hears exactly once about every run outcome.
+
+    \item \textbf{Q: What runs underneath Cloud Composer 2?}\\
+    A: An autoscaling GKE cluster hosting Airflow scheduler, workers, web server, and triggerer, plus a managed Cloud SQL metadata database and a synced Cloud Storage DAG bucket.
+
+    \item \textbf{Q: When should you use a GCS sensor instead of a schedule?}\\
+    A: When readiness is event-driven---a partner file arrives at variable times---so the pipeline gates on the artifact, not the clock.
+
+    \item \textbf{Q: What information should flow through XComs---and what should not?}\\
+    A: Small control values: paths, counts, verdicts. Never payloads, DataFrames, or large JSON---those belong in storage with a passed reference.
+\end{enumerate}
+
+\section{Further Reading}
+Read the Apache Airflow documentation for DAG semantics, sensors, trigger rules, and XComs \cite{apacheairflowdocs}, and the Cloud Composer documentation for environment sizing, snapshots, and operations \cite{googlecloudcomposerdocs}. Review Cloud Scheduler for external cron triggering \cite{googlecloudschedulerdocs} and Cloud Monitoring for SLA-miss and failure alerting \cite{googlecloudmonitoringdocs}. The Dataproc and Dataflow operator references live in their service documentation \cite{googleclouddataprocdocs,googleclouddataflowdocs}.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item A DAG declares dependencies and cadence; idempotent tasks make retries, backfills, and clears safe.
+    \item Sensors gate on external readiness; prefer deferrable sensors for long waits.
+    \item XComs carry control signals, never payloads.
+    \item Composer 2 is managed GKE-based Airflow: size workers, pin providers, snapshot environments.
+    \item Cross-service DAGs sequence the platform: sense, transform on ephemeral compute, load with partition overwrite, verify, notify.
+    \item Resilient orchestration pages humans only for decisions automation cannot make.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Explain why \texttt{catchup=True} plus \texttt{max\_active\_runs} defaults can destabilize a new production DAG.
+    \item \textbf{(Conceptual)} Contrast task-centric (Airflow) and asset-centric (Dagster) orchestration for the banking use case.
+    \item \textbf{(Hands-on)} Reproduce the Thursday DAG, then add a SLA to the load task and trigger an SLA miss on purpose.
+    \item \textbf{(Hands-on)} Refactor the DAG to create and delete its own ephemeral Dataproc cluster per run.
+    \item \textbf{(Design)} Specify the fifteen-sensor section of the banking DAG: per-system deadlines, validation tasks, and the dependency structure that isolates one system's lateness.
+    \item \textbf{(Architecture)} Design environment topology (dev/staging/prod), promotion of DAG code through CI, and snapshot-based DR for Composer.
+\end{enumerate}
+
+\section{Milestone 3 Capstone: Automated Batch ELT Pipeline}\label{sec:ch12-capstone}
+\index{Milestone 3 capstone}\index{batch ELT}\index{capstone!Composer}
+
+\begin{capstonebox}
+\textbf{Mission:} Use Cloud Scheduler to trigger a Composer DAG that verifies a Datastream CDC sync, triggers a Serverless Dataproc Spark job computing ML features, loads them into BigQuery with partition-overwrite idempotency, and refreshes a materialized view---with data-quality tests, failure notification, and a latency alert.
+
+\textbf{Estimated time:} 8--10 hours.
+
+\textbf{What you'll practice:}
+\begin{itemize}
+    \item Wiring Cloud Scheduler into Composer via Pub/Sub or the Airflow REST API.
+    \item Verifying CDC freshness and row counts as a pipeline gate.
+    \item Running idempotent Spark feature jobs on serverless compute.
+    \item Loading BigQuery partitions with \texttt{WRITE\_TRUNCATE} and refreshing materialized views.
+    \item Producing monitoring evidence: failure notification plus a latency alert policy.
+\end{itemize}
+\end{capstonebox}
+
+\subsection*{Scenario}
+Northwind Analytics ships ML features nightly: customer order behavior from the Chapter~11 CDC replica, aggregated by Spark, served to downstream models and dashboards. The pipeline must be fully automated, retry-safe, and observable---no manual steps, no silent staleness.
+
+\subsection*{Requirements}
+\begin{itemize}
+    \item Cloud Scheduler triggers the Composer DAG on a nightly schedule.
+    \item The DAG first verifies CDC: row-count reconciliation between source and BigQuery replica plus a freshness threshold.
+    \item A serverless Dataproc Spark job computes features (\texttt{orders\_30d}, \texttt{spend\_30d}) into a deterministic \texttt{gs://} path keyed by logical date.
+    \item BigQuery load uses \texttt{WRITE\_TRUNCATE} on the logical-date partition; a materialized view refreshes afterward.
+    \item At least three automated data-quality tests with a demonstrated failing case.
+    \item Failure email plus a Cloud Monitoring latency alert; cost estimate with two documented optimizations.
+\end{itemize}
+
+\subsection*{Reference Architecture}
+\begin{figure}[H]
+    \centering
+    \resizebox{0.95\textwidth}{!}{%
+    \begin{tikzpicture}[
+        svc/.style={rectangle, rounded corners, draw=primary, thick, fill=primary!6, text width=2.9cm, minimum height=1.0cm, align=center, font=\small\bfseries},
+        db/.style={cylinder, shape border rotate=90, aspect=0.25, draw=primary, thick, fill=primary!10, text width=2.8cm, minimum height=1.2cm, align=center, font=\small\bfseries},
+        gate/.style={rectangle, rounded corners, draw=magenta, thick, fill=magenta!8, text width=2.8cm, minimum height=0.9cm, align=center, font=\footnotesize\bfseries},
+        arrow/.style={-{Stealth[length=2.5mm]}, draw=primary, thick},
+        dasharrow/.style={-{Stealth[length=2.5mm]}, draw=codegray, thick, dashed}
+    ]
+        \node[svc] (sched) at (0,0) {Cloud\\Scheduler};
+        \node[svc] (composer) at (3.6,0) {Cloud Composer\\(Airflow DAG)};
+        \node[svc] (dataproc) at (7.4,1.4) {Serverless Dataproc\\Spark features};
+        \node[db] (datastream) at (7.4,-1.4) {Datastream CDC\\BigQuery replica};
+        \node[db] (bq) at (11.2,0) {BigQuery\\features + MV};
+        \node[gate] (mon) at (3.6,-2.4) {Cloud Monitoring\\alerts + runbooks};
+
+        \draw[arrow] (sched) -- (composer);
+        \draw[arrow] (composer) -- (dataproc);
+        \draw[dasharrow] (composer) -- (datastream);
+        \draw[arrow] (dataproc) -- (bq);
+        \draw[arrow] (datastream) -- (bq);
+        \draw[dasharrow] (composer) -- (mon);
+    \end{tikzpicture}%
+    }
+    \caption{Milestone 3 reference architecture: scheduled batch ELT with CDC verification gates.}
+    \label{fig:ch12-capstone-batch-elt}
+\end{figure}
+
+\subsection*{Implementation Steps}
+\begin{enumerate}
+    \item \textbf{Trigger.} Create the Cloud Scheduler job targeting the DAG (Pub/Sub to a sensor or REST \texttt{dagRuns} call).
+    \item \textbf{Gate.} First task: compare source versus replica row counts for the logical date; fail fast on divergence beyond tolerance.
+    \item \textbf{Compute.} Submit the serverless Spark batch with deterministic output path \texttt{gs://ml-features/dt=\{\{ ds \}\}}.
+    \item \textbf{Load.} \texttt{BigQueryInsertJobOperator} executing a partition-scoped \texttt{WRITE\_TRUNCATE} insert, then the MV refresh call.
+    \item \textbf{Verify and notify.} Quality tasks (reconciliation, freshness, null-rate), then the \texttt{all\_done} notifier.
+    \item \textbf{Evidence.} Export the alert policies, the cost estimate, and a screenshot of a deliberately failed quality gate paging the channel.
+\end{enumerate}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item A repository that runs end-to-end from a clean environment: DAG, Spark job, SQL, and README.
+    \item The architecture diagram and the data-quality test suite with failing-case demonstration.
+    \item Monitoring evidence and the monthly cost estimate with two optimizations.
+    \item A security review: per-service service accounts, no hardcoded secrets, PII handling noted.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item Scheduler-triggered runs complete without manual steps; reruns and backfills are duplicate-free.
+    \item The CDC gate demonstrably blocks the pipeline on stale or divergent replicas.
+    \item Quality tests fail the DAG visibly; notifications fire on success and failure exactly once each.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Add an in-DAG backfill command that safely reprocesses a date range with capped parallelism.
+    \item Move feature computation into BigQuery SQL and compare cost and latency with the Spark path.
+    \item Publish feature freshness to Dataplex as a data-product SLO (previewing Chapter~22).
+\end{itemize}

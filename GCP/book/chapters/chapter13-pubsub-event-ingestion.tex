@@ -1,0 +1,273 @@
+\chapter{Asynchronous Messaging with Pub/Sub}
+\index{Pub/Sub}\index{topics}\index{subscriptions}\index{dead-letter topic}\index{snapshot and seek}\index{message schema}
+
+\begin{objectives}
+\begin{itemize}
+    \item Model Pub/Sub topics, subscriptions (push and pull), and acknowledgements correctly.
+    \item Enforce data contracts at the edge with Avro or Protocol Buffer topic schemas.
+    \item Publish resiliently with retry and exponential backoff, and deduplicate at-least-once delivery downstream.
+    \item Configure dead-letter topics, retry policies, and snapshot/seek replay.
+    \item Compare Pub/Sub Standard and Pub/Sub Lite on cost and operational overhead.
+    \item Architect a global telemetry ingestion point for five million mobile games with exactly-once processing semantics.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+Managed messaging services share one mental model---producers publish to named channels, consumers subscribe, and the broker owns durability and delivery---with different knobs for ordering, replay, and cost.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{2.8cm}p{3.0cm}p{3.0cm}p{3.0cm}@{}} \\
+\toprule
+\textbf{Capability} & \textbf{GCP Pub/Sub} & \textbf{AWS} & \textbf{Azure} \\
+\midrule
+Managed pub/sub & Pub/Sub (global) & SNS + SQS / EventBridge & Service Bus / Event Grid \\
+Kafka-compatible & Managed Service for Apache Kafka & MSK & Event Hubs (Kafka surface) \\
+Dead-lettering & Dead-letter topics & SQS DLQs / EventBridge DLQ & Service Bus dead-letter queues \\
+Replay & Snapshots + seek & (archive + replay in EventBridge) & (replay via offsets on Event Hubs) \\
+Schema enforcement & Avro / Proto topic schemas & EventBridge schemas & Schema registry (Event Hubs) \\
+Cost-profiled tier & Pub/Sub Lite (zonal, capacity) & Kinesis on-demand vs provisioned & Event Hubs throughput units \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+Self-managed \textbf{Apache Kafka} remains the industry reference point for partition-based, replayable logs \cite{apachekafkadocs}. Pub/Sub differs deliberately: global by default, partition-free for the user, and priced per GiB delivered rather than per provisioned broker.
+\end{crosscloud}
+
+\begin{keyterms}
+\textbf{Topic}: a named channel to which publishers send messages.
+\textbf{Subscription}: a named cursor over a topic delivering messages to consumers by push or pull.
+\textbf{Acknowledgement (ack)}: the consumer's confirmation that a message was processed; unacked messages are redelivered.
+\textbf{Dead-letter topic}: a topic receiving messages that exceeded a subscription's maximum delivery attempts.
+\textbf{Snapshot/seek}: Pub/Sub's replay mechanism, rewinding a subscription to a retained point in time.
+\textbf{Exactly-once delivery}: a subscription mode where Pub/Sub itself suppresses redelivery of already-acked messages within a region.
+\end{keyterms}
+
+\section{Week 13 Roadmap}
+Week~13 opens Part~IV with the front door of every streaming platform. Monday covers topics, subscriptions, acknowledgements, and schema enforcement at the edge. Tuesday covers failure engineering: dead-letter topics, retry policies, snapshots, and seek. Wednesday compares Pub/Sub Lite with Standard. Thursday publishes mock financial transactions with a dead-letter safety net. Friday architects global game telemetry with exactly-once semantics.
+
+\begin{definitionbox}
+\textbf{Pub/Sub} is Google Cloud's global, serverless messaging service. Publishers send messages to topics; subscriptions deliver them to consumers with at-least-once semantics by default, message retention, flow control, and optional exactly-once delivery and ordering keys \cite{googlecloudpubsubdocs}.
+\end{definitionbox}
+
+\section{Monday: Topics, Subscriptions, Acks, and Schema Enforcement}
+\index{Pub/Sub!topics}\index{Pub/Sub!subscriptions}\index{acknowledgement}\index{topic schema}
+
+\subsection{The Delivery Model}
+A topic is global and durable; messages are retained for a configurable window regardless of consumption. Each subscription is an independent cursor: ten subscriptions on one topic each receive every message---fan-out is free, which is why a single ingestion topic commonly feeds a serving pipeline, an analytics sink, and an audit archive simultaneously. Pull subscriptions have consumers request batches; push subscriptions deliver to an HTTPS endpoint with OIDC authentication---push fits serverless consumers (Cloud Run, Cloud Functions) that should not run polling loops.
+
+\subsection{Acknowledgement Semantics}
+Delivery is at-least-once: Pub/Sub redelivers any message not acked within the subscription's acknowledgement deadline. Consumers must therefore be idempotent or deduplicate. Ack deadlines can be extended per message (\texttt{modifyAckDeadline}) while processing continues; abandoning extensions is how a slow consumer generates its own duplicate storm.
+
+\subsection{Schema Validation at the Edge}
+Attaching an Avro or Protocol Buffer schema to a topic makes the broker reject non-conforming publishes: the data contract enforced at the edge, before a malformed message can reach any of the ten subscriptions. Schema evolution follows compatibility rules (additive fields); versioning lives on the schema, and breaking changes mean a new schema revision with a deployment plan.
+
+\begin{pitfall}
+Schema enforcement protects message \emph{shape}, not message \emph{semantics}. A schema-valid message can still carry a negative price or a timestamp from 1970. Edge validation is the first contract layer, not the only one---validate semantics in the pipeline (Chapters 14--15) and at load (Chapter~11).
+\end{pitfall}
+
+\begin{tipbox}
+Publish with attributes (\texttt{origin}, \texttt{schema\_version}, \texttt{event\_type}) even when the payload is self-describing. Attributes are filterable on subscriptions and visible in dead-letter triage without deserializing the body.
+\end{tipbox}
+
+\section{Tuesday: Dead Letters, Retries, Snapshots, and Seek}
+\index{dead-letter topic!configuration}\index{retry policy}\index{snapshot}\index{seek}
+
+\subsection{Dead-Letter Topics}
+Configure a dead-letter topic \emph{on the subscription} with a maximum delivery attempt count: after N failed deliveries the message forwards to the DLQ with its attempt metadata attached. The DLQ is a first-class topic---subscribe an alerting pipeline to it, sample its messages daily, and own the triage runbook. A DLQ nobody reads is a data-loss mechanism with good branding.
+
+\subsection{Retry Policies and Backoff}
+Subscription retry policies add exponential backoff between redeliveries (minimum and maximum delay), smoothing thundering-herb redelivery against a struggling consumer. Publisher-side, the client libraries retry transient failures with their own backoff; both layers compose, so reason about worst-case latency of a message that retries on both sides.
+
+\subsection{Snapshots and Seek}
+\textbf{Snapshots} capture a subscription's ack state; \textbf{seek} rewinds a subscription to a snapshot or a timestamp within the topic retention window. Seek is the streaming answer to ``the consumer had a bug for six hours'': fix the consumer, seek back to before the bad deploy, replay. It is also the migration tool for consumer changes that must reprocess history.
+
+\begin{lstlisting}[language=bash,caption={DLQ configuration and a seek-based replay from PowerShell.}]
+$env:PROJECT_ID = "my-gcp-pubsub-lab"
+
+# DLQ is configured on the subscription, not the publisher:
+gcloud pubsub subscriptions create card-sub `
+  --topic=card-transactions `
+  --dead-letter-topic=card-dlq `
+  --max-delivery-attempts=5 `
+  --min-retry-delay=10s --max-retry-delay=600s
+
+# Replay: seek the subscription back two hours after fixing a consumer bug.
+gcloud pubsub subscriptions seek card-sub --time=$((Get-Date).ToUniversalTime().AddHours(-2).ToString('yyyy-MM-ddTHH:mm:ssZ'))
+\end{lstlisting}
+
+\begin{notebox}
+Seek replays within retention. A topic retaining one day cannot replay last week's incident. Size retention to your recovery-time expectations, not to the default.
+\end{notebox}
+
+\section{Wednesday: Pub/Sub Lite versus Pub/Sub Standard}
+\index{Pub/Sub Lite}\index{cost vs operational overhead}
+
+Pub/Sub Lite trades Standard's global, fully-managed elasticity for zonal, capacity-provisioned, partition-based topics at substantially lower per-GiB cost. Lite requires you to reason about partitions, throughput reservations, and zonal availability; Standard reasons about none of them. The decision rule: Standard by default; Lite when message volume is large and steady, latency tolerance includes zonal failure modes, and the team can operate capacity planning. Many platforms use both: Standard for control-plane and low-volume topics, Lite for the firehose.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.6cm}p{4.4cm}p{4.4cm}@{}} \\
+\toprule
+\textbf{Dimension} & \textbf{Pub/Sub Standard} & \textbf{Pub/Sub Lite} \\
+\midrule
+Scope & Global, multi-zone durability & Zonal (Lite) or regional \\
+Pricing & Per GiB delivered + retention & Provisioned capacity, lower per-GiB \\
+Partitions & Abstracted away & Explicit; ordering per partition \\
+Capacity & Elastic & Reserved throughput \\
+Best for & Default; variable workloads & High steady volume, cost-sensitive \\
+\bottomrule
+\end{tabular}
+\caption{Pub/Sub Standard versus Lite \cite{googlecloudpubsubdocs}.}
+\label{tab:ch13-lite-vs-standard}
+\end{table}
+
+\section{Thursday Hands-On Project: Financial Transactions with a Dead-Letter Net}
+\index{hands-on project}\index{publisher retry}\index{exponential backoff}
+This lab creates a topic and pull subscription, publishes one thousand mock card transactions from Python with retry and backoff, and routes poison messages to a dead-letter topic.
+
+\subsection{Provision}
+\begin{lstlisting}[language=bash,caption={Creating topic, DLQ, and subscription with delivery guardrails.}]
+$env:PROJECT_ID = "my-gcp-pubsub-lab"
+gcloud config set project $env:PROJECT_ID
+gcloud services enable pubsub.googleapis.com
+
+gcloud pubsub topics create card-transactions
+gcloud pubsub topics create card-dlq
+
+gcloud pubsub subscriptions create card-sub `
+  --topic=card-transactions `
+  --dead-letter-topic=card-dlq `
+  --max-delivery-attempts=5 `
+  --ack-deadline=60
+\end{lstlisting}
+
+\subsection{Publish with Backoff}
+\begin{lstlisting}[language=Python,caption={Publishing mock card transactions with retry and exponential backoff.}]
+import json, random, time
+from google.cloud import pubsub_v1
+
+publisher = pubsub_v1.PublisherClient(
+    publisher_options=pubsub_v1.types.PublisherOptions(
+        retry=pubsub_v1.types.Retry(initial=0.1, maximum=10.0, multiplier=2.0)))
+topic_path = publisher.topic_path("my-project", "card-transactions")
+
+def publish(txn):
+    future = publisher.publish(topic_path, json.dumps(txn).encode("utf-8"),
+                               origin="pos-simulator")
+    future.add_done_callback(lambda f: print("acked:", f.result()))
+
+for i in range(1000):
+    publish({"card_id": f"card-{random.randint(1, 500)}",
+             "amount": round(random.uniform(1, 500), 2),
+             "city": random.choice(["NYC", "LON", "TYO"]), "ts": time.time()})
+\end{lstlisting}
+
+\subsection{Consume, Fail, and Inspect the DLQ}
+Write a pull consumer that acks valid messages and deliberately nacks (or lets the ack deadline expire on) messages with \texttt{amount > 490} to simulate a consumer bug. After five attempts those messages should land in \texttt{card-dlq}; pull from a DLQ subscription to verify, and inspect the \texttt{delivery\_attempt} attribute.
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item Publisher and consumer scripts with a README describing retry and DLQ behavior.
+    \item Evidence of poison messages arriving in \texttt{card-dlq} with delivery-attempt metadata.
+    \item A screenshot of subscription metrics: oldest unacked message age and ack rate during the run.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item The publisher retries transient failures with exponential backoff.
+    \item The DLQ receives exactly the messages that exhaust delivery attempts---no more, no fewer.
+    \item The consumer is idempotent: redelivered messages do not double-apply effects.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Attach an Avro schema to the topic and show a non-conforming publish rejected.
+    \item Enable exactly-once delivery on the subscription and describe what changes.
+    \item Seek the subscription back fifteen minutes and observe redelivery of acked messages.
+\end{itemize}
+
+\section{Friday Use Case and Architecture: Telemetry for Five Million Mobile Games}
+\index{mobile telemetry}\index{exactly-once processing}\index{global ingestion}
+
+\subsection{Scenario}
+A games publisher ingests session telemetry from five million concurrent mobile clients worldwide: events per second in the hundreds of thousands at peak, highly variable per region, with fraud, analytics, and live-ops consumers. The requirement reads ``exactly-once processing''---which must be decomposed before it can be built.
+
+\subsection{Decomposing Exactly-Once}
+No system delivers exactly-once \emph{delivery} across arbitrary failures; what platforms build is exactly-once \emph{effect}. The chain: publishers retry with backoff (duplicates possible); Pub/Sub deduplicates within its window and offers exactly-once delivery mode within a region; the Dataflow consumer (Chapters 14--15) uses Streaming Engine's exactly-once shuffle; the sink is BigQuery's Storage Write API in exactly-once mode or an idempotent key-based write. Each hop removes a duplicate class; the composition yields exactly-once effect end to end \cite{akidau2015dataflow}.
+
+\begin{figure}[H]
+    \centering
+    \resizebox{0.95\textwidth}{!}{%
+    \begin{tikzpicture}[
+        src/.style={rectangle, rounded corners, draw=codegray, thick, fill=white, text width=2.7cm, minimum height=1.0cm, align=center, font=\small\bfseries},
+        svc/.style={rectangle, rounded corners, draw=primary, thick, fill=primary!6, text width=2.9cm, minimum height=1.0cm, align=center, font=\small\bfseries},
+        dst/.style={rectangle, rounded corners, draw=codegreen!60!black, thick, fill=green!7, text width=2.9cm, minimum height=1.0cm, align=center, font=\small\bfseries},
+        arrow/.style={-{Stealth[length=2.5mm]}, draw=primary, thick},
+        dasharrow/.style={-{Stealth[length=2.5mm]}, draw=codegray, thick, dashed}
+    ]
+        \node[src] (games) at (0,0) {5M game\\clients};
+        \node[svc] (ps) at (3.8,0) {Pub/Sub\\global topics\\schema-enforced};
+        \node[svc] (df) at (7.6,0) {Dataflow\\exactly-once\\shuffle};
+        \node[dst] (bq) at (11.4,1.2) {BigQuery\\Storage Write\\(exactly-once)};
+        \node[dst] (bt) at (11.4,-1.2) {Bigtable\\live-ops state};
+
+        \draw[arrow] (games) -- (ps);
+        \draw[arrow] (ps) -- (df);
+        \draw[arrow] (df) -- (bq);
+        \draw[arrow] (df) -- (bt);
+    \end{tikzpicture}%
+    }
+    \caption{Global game telemetry: edge schema enforcement, exactly-once shuffle, idempotent sinks.}
+    \label{fig:ch13-game-telemetry}
+\end{figure}
+
+\subsection{Operational Reality}
+The interesting failures are not message loss---retention and redelivery cover that---but backlog: alert on oldest unacked message age and backlog bytes per subscription, because a consumer that falls behind at global scale catches up slowly. Per-region traffic shaping is free via subscription flow control; per-tenant abuse is handled by publisher-side quotas and schema/attribute filtering rather than by the broker.
+
+\begin{pitfall}
+Exactly-once delivery mode is regional and changes redelivery behavior; combining it casually with ordering keys and high fan-out can surprise throughput. Validate the mode under a load test that includes consumer crashes---the scenario it exists for.
+\end{pitfall}
+
+\section{Interview Q\&A}
+\subsection{Concepts and Trade-offs}
+\begin{enumerate}
+    \item \textbf{Q: What happens to a message that exceeds max delivery attempts?}\\
+    A: It forwards to the subscription's dead-letter topic with attempt metadata, where a triage process owns it---it is not silently deleted.
+
+    \item \textbf{Q: How does a topic schema enforce a data contract at publish time?}\\
+    A: The broker validates every published message against the Avro/Proto schema and rejects non-conforming publishes before any subscriber sees them.
+
+    \item \textbf{Q: Why is Pub/Sub publishing at-least-once, and how do you deduplicate?}\\
+    A: Acknowledgements can be lost after successful processing, forcing redelivery; deduplicate with message IDs, idempotent consumers, Dataflow exactly-once mode, or exactly-once sinks.
+
+    \item \textbf{Q: When does Pub/Sub Lite beat Standard on cost?}\\
+    A: At high, steady throughput where provisioned zonal capacity is cheaper per GiB than Standard's elastic per-GiB pricing and the team can operate partitions.
+
+    \item \textbf{Q: What does the oldest-unacked-message-age metric warn you about?}\\
+    A: Consumer lag or stuck messages: a growing value means the pipeline is falling behind or specific messages are never being acked (poison messages heading for the DLQ).
+\end{enumerate}
+
+\section{Further Reading}
+Read the Pub/Sub documentation for subscriptions, schemas, exactly-once delivery, and Lite \cite{googlecloudpubsubdocs}. The Kafka documentation provides the partition-log comparison point \cite{apachekafkadocs}. The Dataflow Model paper is the theoretical foundation for the exactly-once chain assembled in the Friday use case \cite{akidau2015dataflow}, and Cloud Monitoring documentation covers the backlog alerting \cite{googlecloudmonitoringdocs}.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item Fan-out is free: model one ingestion topic with many subscriptions rather than many producer paths.
+    \item Edge schemas reject malformed messages before they reach any consumer---shape first, semantics next.
+    \item At-least-once delivery makes idempotent consumers and deduplication a requirement, not an optimization.
+    \item DLQs, retry policies, and seek are the failure-engineering kit; a DLQ without triage is data loss.
+    \item Pub/Sub Lite trades operational simplicity for cost at high steady volume.
+    \item Exactly-once is a property of the whole chain---publisher, broker, shuffle, sink---assembled deliberately.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Walk a single message through publish, delivery, ack-loss, redelivery, and deduplication, naming the duplicate-suppression mechanism at each hop.
+    \item \textbf{(Conceptual)} A product manager demands ``no duplicate analytics events, ever.'' Explain what is and is not achievable, and the design that satisfies the intent.
+    \item \textbf{(Hands-on)} Reproduce the Thursday lab, then raise \texttt{max-delivery-attempts} and observe the latency before DLQ arrival.
+    \item \textbf{(Hands-on)} Attach a Proto schema, publish a non-conforming message, and capture the rejection error.
+    \item \textbf{(Design)} Choose Lite versus Standard for three workloads: 200 msg/s control events, 2 GB/s steady telemetry, and 50 GB/s Black-Friday bursts.
+    \item \textbf{(Architecture)} Add a replay drill to the telemetry design: consumer bug deployed for six hours, detected, fixed, and replayed via seek---write the runbook.
+\end{enumerate}

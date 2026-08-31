@@ -1,0 +1,338 @@
+\chapter{Dataflows Gen2}
+\index{Dataflows Gen2}\index{Power Query}\index{output destinations}\index{incremental refresh}\index{data quality}\index{quarantine}\index{staging}%
+
+\begin{objectives}
+\begin{itemize}
+    \item Build visual data transformations with Power Query Online in Dataflows Gen2.
+    \item Configure output destinations---lakehouse, warehouse, Azure SQL---and explain staging versus destination behavior.
+    \item Configure incremental refresh and reason about what it avoids recomputing.
+    \item Gate Gold writes with data-quality assertions and quarantine rejected rows with error context.
+    \item Build a Dataflow Gen2 that connects to a web API, pivots and cleans JSON, and lands in a Gold lakehouse table.
+    \item Evaluate Mapping Dataflows, Dataflows Gen2, and Spark notebooks for a team migrating from Excel-based ETL.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+Low-code, self-service data transformation with a visual query designer appears in every ecosystem, usually powered by the same M engine lineage or a visual DAG builder.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{2.8cm}p{3.2cm}p{3.2cm}p{3.2cm}p{3.2cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{Fabric} & \textbf{AWS} & \textbf{GCP} & \textbf{Snowflake} \\
+\midrule
+Visual/low-code ETL & Dataflows Gen2 (Power Query) & Glue DataBrew / Glue Studio & Data Fusion / Dataprep heritage & Snowsight worksheets, dbt, partner tools \\
+Output destinations & Lakehouse, warehouse, Azure SQL, more & S3, Redshift, databases & BigQuery, Cloud Storage & Snowflake tables \\
+Incremental refresh & Yes (per query, date-column driven) & Job bookmarks (Glue) & Incremental pipelines (Data Fusion) & Streams + tasks, dynamic tables \\
+Transformation engine & Mashup engine (M) & Spark (Glue Studio) / visual recipes & Data Fusion (Dataproc) & SQL pushdown / Snowpark \\
+Data-quality gating & Notebook assertions / pipeline gates & Glue Data Quality & Dataplex data quality & Snowflake data metric functions \\
+Escape hatch to code & M formulas; hand off to Spark notebooks & Glue PySpark & Dataflow/Beam & Snowpark / SQL \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+Databricks offers lakehouse-native notebooks and Delta Live Tables rather than a visual designer; MongoDB's Compass aggregation builder plays a similar analyst-facing role. The portable idea: \emph{visual tools lower the authoring barrier, but quality gates and destinations are what make their output production-grade}.
+\end{crosscloud}
+
+\begin{keyterms}
+\textbf{Dataflow Gen2}: a Fabric item that authors Power Query transformations and lands results into explicit destinations. \quad
+\textbf{Power Query Online}: the browser-based visual transformation designer powered by the M formula language. \quad
+\textbf{Output destination}: the dataflow setting that writes query results into a lakehouse, warehouse, Azure SQL database, or other target. \quad
+\textbf{Staging}: intermediate computation inside the dataflow, separate from what is published to a destination. \quad
+\textbf{Incremental refresh}: refreshing only new or changed partitions based on a date column. \quad
+\textbf{Quarantine}: routing rows that fail quality checks to a rejected-records table with error context instead of dropping or silently accepting them.
+\end{keyterms}
+
+\section{Week 10 Roadmap}
+Week~10 brings the analysts into the pipeline. Monday covers Power Query Online and visual transformation authoring. Tuesday adds output destinations---the feature that separates Dataflows Gen2 from its Power-BI-only ancestor. Wednesday covers staging versus destinations, incremental refresh, and the data-quality patterns (assertions, quarantine) that make analyst-built flows safe for Gold. Thursday is the hands-on project: a dataflow from a web API through Power Query shaping into a Gold lakehouse table, gated by notebook assertions. Friday evaluates Mapping Dataflows, Dataflows Gen2, and Spark notebooks for a team of Excel-migrating business analysts.
+
+Dataflows Gen2 matters because transformation demand always exceeds data-engineering supply. A governed, destination-aware, quality-gated low-code path lets analysts own the cleansing they understand best, while engineers keep the contracts and the Gold writes \cite{microsoftFabricDataflows}.
+
+\begin{notebox}
+The Week~9 framework governs \emph{which tables move}; Dataflows Gen2 governs \emph{how they are shaped}. They compose: a pipeline can trigger a dataflow, validate its output, and quarantine its rejects---as Thursday's project demonstrates.
+\end{notebox}
+
+\section{Monday: Power Query Online}
+\index{Power Query Online}\index{M language}
+Power Query Online is the authoring surface of Dataflows Gen2: a visual, step-by-step transformation designer in the browser. Every click---filter rows, rename columns, pivot, merge---becomes a step in the Applied Steps pane, and every step compiles to the M formula language, visible and editable in the Advanced Editor \cite{microsoftFabricDataflows}.
+
+\begin{definitionbox}
+\textbf{Power Query} is a case-insensitive, functional data-preparation engine whose M language expresses transformations as an ordered pipeline of steps over immutable intermediate tables.
+\end{definitionbox}
+
+The engineering virtues of the model: each step is inspectable, reorderable, and removable; the step list is effectively a readable diff of intent; and because steps are lazy, the engine folds many operations back to the source (query folding) instead of pulling raw data to the client. The vices: visual logic is harder to unit-test than code, and a talented analyst can build an unreviewable 60-step flow in an afternoon. The week's discipline: short flows, named steps, code-review by reading the M.
+
+\begin{tipbox}
+Name every step in business language (\texttt{Remove Test Accounts}, not \texttt{Filtered Rows}). When a flow breaks six months later, the step names are the documentation.
+\end{tipbox}
+
+\section{Tuesday: Output Destinations}
+\index{output destinations}\index{Lakehouse!dataflow destination}\index{Data Warehouse!dataflow destination}
+Dataflows Gen2's defining advance over classic dataflows is the output destination: each query in the flow can publish its result to a lakehouse table, a warehouse table, an Azure SQL database, or other supported targets \cite{microsoftFabricDataflows}. The dataflow stops being a Power BI preprocessing accessory and becomes an ingestion and transformation tool in its own right.
+
+Destination semantics worth memorizing: append versus replace behavior is configurable per query; schema changes at the destination are handled deliberately (new columns can be allowed or rejected, matching Week~9's contract discipline); and the destination write is where batch identity should be stamped---a load timestamp or batch tag column added as the final step.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.4cm}p{5.2cm}p{5.2cm}@{}}
+\toprule
+\textbf{Destination} & \textbf{Best for} & \textbf{Watch-outs} \\
+\midrule
+Lakehouse table & Analyst-curated Silver/Gold tables consumed by Spark, SQL endpoint, and Direct Lake & Schema drift control; concurrent writes from other tools \\
+Warehouse table & T-SQL-first consumers and stored-procedure estates & Permissions model differs from lakehouse; plan grants \\
+Azure SQL DB & Operational systems of engagement & Throughput limits; not an analytical store \\
+\bottomrule
+\end{tabular}
+\caption{Dataflow Gen2 output destinations.}
+\label{tab:chapter10-destinations}
+\end{table}
+
+\begin{pitfall}
+A dataflow writing directly to a Gold table with append semantics has no quality gate. Anything the flow produces---including a half-transformed batch after a mid-run failure---is live for every consumer. Stage first, gate, then publish (Wednesday's pattern).
+\end{pitfall}
+
+\section{Wednesday: Staging, Incremental Refresh, and Data Quality}
+\index{staging}\index{incremental refresh}\index{data quality}\index{quarantine}
+\subsection{Staging versus Destinations}
+Within a dataflow, some queries compute intermediate shapes (staging) while others publish to destinations. Keeping the distinction explicit---staging queries are not published, destination queries are thin final projections---makes flows readable and prevents intermediate garbage from materializing into the lakehouse.
+
+\subsection{Incremental Refresh}
+Incremental refresh partitions the destination by a date column and refreshes only partitions inside a rolling window. It avoids recomputing (and re-billing) history that cannot change. The prerequisites: a reliable date/datetime column at the destination grain, a window sized to the late-arrival reality of the source, and append-friendly destination semantics.
+
+\subsection{Data-Quality Gates}
+The production pattern for analyst-built flows lands output in staging, asserts quality in code, quarantines violations, and only then publishes Gold \cite{microsoftFabricDataflows,greatExpectations}:
+
+\begin{lstlisting}[language=Python,caption={Data-quality assertions gating the Gold write, with quarantine.},label={lst:chapter10-dq-gate}]
+from pyspark.sql import functions as F
+
+df = spark.read.table("silver.orders")
+
+null_pk  = df.filter(F.col("order_id").isNull()).count()
+dup_keys = (df.groupBy("order_id").count()
+              .filter("count > 1").count())
+
+assert null_pk == 0,  f"DQ FAIL: {null_pk} null order_id values"
+assert dup_keys == 0, f"DQ FAIL: {dup_keys} duplicate order_id keys"
+
+# Quarantine bad rows instead of failing silently
+rejected = df.filter(F.col("amount") < 0)
+if rejected.count() > 0:
+    (rejected.withColumn("reject_reason", F.lit("negative_amount"))
+             .write.format("delta").mode("append")
+             .saveAsTable("gold.rejected_orders"))
+
+(df.filter(F.col("amount") >= 0)
+   .write.format("delta").mode("overwrite")
+   .saveAsTable("gold.orders"))
+\end{lstlisting}
+
+\begin{notebox}
+Production rule for the week: never fail silently on bad rows. Quarantine records that violate expectations to a rejected Delta table with an error-context column, alert via pipeline notification, and keep the Gold write clean. Failing the entire batch on a handful of bad rows breaks the SLA; ignoring them corrupts every downstream aggregate.
+\end{notebox}
+
+\begin{pitfall}
+Assertions that only run in development are decorations. The gate must execute in the production path---a pipeline step between staging and Gold---or it does not exist as far as consumers are concerned.
+\end{pitfall}
+
+\section{Thursday: Hands-on Project}
+\index{hands-on lab}\index{Dataflows Gen2!web API}
+The Week~10 lab builds a Dataflow Gen2 that connects to a web API, pivots and cleans the JSON response in Power Query, and sets the destination to a Gold lakehouse table---with a notebook data-quality assertion cell gating the Gold write.
+
+\subsection{Goal and Architecture}
+Create workspace \texttt{fabric-de-week10} with lakehouse \texttt{lh\_products}. Use a public test API (for example a JSON-placeholder products or exchange-rate endpoint) or an instructor-provided mock. The dataflow lands a staged table; a notebook validates and publishes; a pipeline wires the sequence so the gate is structural, not aspirational.
+
+\subsection{Step-by-Step Actions}
+\begin{enumerate}
+    \item Create the dataflow \texttt{df\_api\_products}; add a Web source for the endpoint.
+    \item In Power Query, expand the JSON records, promote headers, pivot the nested price fields, and set explicit types.
+    \item Name every step; add a final step stamping \texttt{load\_ts} with the current timestamp.
+    \item Set the output destination to \texttt{lh\_products} table \texttt{staging\_api\_products} (append).
+    \item In a notebook, implement the assertion cell: primary-key uniqueness, no nulls in required fields, price range sanity.
+    \item Add quarantine: violations append to \texttt{gold.rejected\_api\_products} with \texttt{reject\_reason}.
+    \item Publish passing rows to \texttt{gold.api\_products}; wrap dataflow $\rightarrow$ notebook in a pipeline.
+    \item Break the API response deliberately (instructor mock) and prove the gate rejects and quarantines.
+\end{enumerate}
+
+\begin{lstlisting}[language=Python,caption={Week 10 lab gate: assert, quarantine, publish.},label={lst:chapter10-lab-gate}]
+from pyspark.sql import functions as F
+
+df = spark.read.table("staging_api_products")
+
+assert df.filter(F.col("product_id").isNull()).count() == 0, "DQ FAIL: null product_id"
+assert (df.groupBy("product_id").count()
+          .filter("count > 1").count()) == 0, "DQ FAIL: duplicate product_id"
+
+bad = df.filter((F.col("price") < 0) | (F.col("price") > 100000))
+(bad.withColumn("reject_reason", F.lit("price_out_of_range"))
+    .write.format("delta").mode("append")
+    .saveAsTable("gold.rejected_api_products"))
+
+(df.subtract(bad)
+   .write.format("delta").mode("overwrite")
+   .saveAsTable("gold.api_products"))
+\end{lstlisting}
+
+\subsection{Validation Checklist}
+\begin{itemize}
+    \item The dataflow refreshes end-to-end from the API to the staging table.
+    \item Every Power Query step has a business-language name.
+    \item The assertion notebook fails loudly on nulls and duplicates.
+    \item Out-of-range prices land in the quarantine table with reasons, not in Gold.
+    \item The pipeline runs dataflow then gate; disabling the gate is impossible without editing the pipeline.
+    \item Gold contains only validated rows, stamped with \texttt{load\_ts}.
+\end{itemize}
+
+\section{Friday: Use Case and Architecture}
+\index{Dataflows Gen2!evaluation}\index{Mapping Dataflows}\index{Spark notebooks!versus dataflows}
+A 40-person analyst team runs the company's reporting on Excel-based ETL: manual extracts, VLOOKUP chains, and heroically maintained workbooks. IT must pick the migration target. The candidates: Mapping Dataflows (the ADF-flavored engine), Dataflows Gen2, and Spark notebooks.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.0cm}p{3.6cm}p{3.6cm}p{3.6cm}@{}}
+\toprule
+\textbf{Criterion} & \textbf{Mapping Dataflows} & \textbf{Dataflows Gen2} & \textbf{Spark notebooks} \\
+\midrule
+Authoring & Visual DAG (Spark-backed) & Visual Power Query (M) & Code (PySpark/SQL) \\
+Skill match for Excel analysts & Moderate & High (same engine as Excel's Get Data) & Low \\
+Scale-out & Strong (Spark cluster) & Moderate (mashup engine) & Strong \\
+Testability & Moderate & Low--moderate & High (unit tests, CI) \\
+Destinations & Broad & Lakehouse, warehouse, SQL, more & Anything Spark reaches \\
+Governance fit & Pipeline-centric & Workspace-centric with pipeline gates & Full engineering rigor \\
+\bottomrule
+\end{tabular}
+\caption{Three transformation tools for an Excel-migrating analyst team.}
+\label{tab:chapter10-evaluation}
+\end{table}
+
+\subsection{Recommendation}
+Dataflows Gen2 for the analyst-owned cleansing layer---the M engine is literally the technology many already use inside Excel---behind the Week~9/10 gate pattern: staging destination, notebook assertions, quarantine, Gold publish. Spark notebooks for the heavy, shared, engineered transformations. Mapping Dataflows only where existing ADF estates and Spark-scale visual DAGs already justify it. The architecture is a portfolio, not a winner.
+
+\begin{pitfall}
+Letting each analyst pick their own tool recreates the Excel sprawl in a new medium. The platform team's job is to make the governed path (dataflow $\rightarrow$ gate $\rightarrow$ Gold) the \emph{easiest} path, and to measure adoption rather than assume it.
+\end{pitfall}
+
+\section{Operational Guidance for Week 10}
+Analyst-built flows are production software the moment a destination table feeds a report. Apply engineering discipline proportional to consumption, not authorship.
+
+\subsection{Performance and Reliability}
+Prefer query folding; watch for steps that break folding and pull full tables to the mashup engine. Size incremental refresh windows to late-arrival reality. Keep destination writes append-stamped with batch identity. Monitor refresh failures like pipeline failures---they are pipeline failures.
+
+\subsection{Security and Governance Checklist}
+\begin{itemize}
+    \item Store API credentials in the dataflow's connection settings, never in M text or notebook cells.
+    \item Require the gate pattern (staging $\rightarrow$ assertions $\rightarrow$ Gold) for any flow feeding certified data.
+    \item Review dataflows by reading the M in Advanced Editor, not by clicking through steps.
+    \item Record flow owners; orphaned flows with destinations are unmaintained production code.
+    \item Quarantine tables must have owners, retention, and a consumer (someone reads the rejects).
+    \item Version dataflow definitions in Git where tenant support allows.
+\end{itemize}
+
+\section{Interview Q\&A}
+\begin{enumerate}
+    \item \textbf{Q: What is an output destination in Dataflows Gen2?}\\
+    A: The setting that publishes a query's result into an external target---lakehouse, warehouse, Azure SQL---turning the dataflow from a BI preprocessor into a general ingestion and transformation tool.
+    \item \textbf{Q: Why stage data before writing to a destination?}\\
+    A: Staging separates computation from publication so quality gates can run between them; a flow that writes Gold directly has no point at which bad rows can be stopped.
+    \item \textbf{Q: What does incremental refresh avoid recomputing?}\\
+    A: Historical partitions outside the rolling refresh window---only partitions containing new or changed dates are reprocessed, saving compute and time.
+    \item \textbf{Q: Why quarantine bad rows instead of failing the whole batch?}\\
+    A: A handful of bad rows should not break the SLA for millions of good ones; quarantine preserves the batch, records the violations with context, and keeps Gold clean for consumers.
+    \item \textbf{Q: When are Spark notebooks preferable to Dataflows Gen2?}\\
+    A: When transformations need scale-out compute, unit tests, code review, and CI---the engineering rigor a shared, complex transformation deserves.
+    \item \textbf{Q: What does Power Query compile visual steps into?}\\
+    A: The M formula language, visible in the Advanced Editor---which is why code review of a dataflow means reading M, not watching clicks.
+\end{enumerate}
+
+\section{Further Reading}
+Review the Dataflows Gen2 overview \cite{microsoftFabricDataflows} and the Power Query documentation behind it \cite{microsoftPowerQuery}. The quality-gating pattern extends the Delta semantics of \cite{deltaLakeDocs} and borrows expectation vocabulary from Great Expectations \cite{greatExpectations}. Orchestration of the gate pattern appears in Chapter~12 \cite{microsoftFabricMonitoringHub} and pipeline mechanics in Chapter~9 \cite{microsoftFabricPipelines}.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item Dataflows Gen2 = Power Query authoring plus first-class output destinations; it is an ingestion tool, not a BI accessory.
+    \item Every visual step compiles to M; review the M, name the steps, keep flows short.
+    \item Destinations make schema and append/replace semantics explicit---choose them as deliberately as pipeline sinks.
+    \item Incremental refresh reprocesses only the rolling window; size the window to late-arrival reality.
+    \item The production pattern is staging $\rightarrow$ assertions $\rightarrow$ quarantine $\rightarrow$ Gold publish, wired structurally by a pipeline.
+    \item Quarantine with reasons, alert, and keep Gold clean; never fail silently and never nuke the batch for a few bad rows.
+    \item Tool selection for analyst teams is a portfolio decision; governance, not the tool, is what makes output trustworthy.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Explain query folding and why a single step can silently disable it for everything downstream.
+    \item \textbf{(Conceptual)} Compare append and replace destination semantics; give one scenario where each is dangerous.
+    \item \textbf{(Hands-on)} Add incremental refresh to the lab dataflow on \texttt{order\_date} with a 7-day window; prove a historical correction outside the window requires a full refresh.
+    \item \textbf{(Hands-on)} Extend the gate with a third assertion (referential integrity against \texttt{dim\_product}) and a corresponding quarantine reason.
+    \item \textbf{(Design)} Write the platform policy that decides when an analyst's dataflow may publish directly to Gold (hint: the honest answer is ``never''---defend or amend it).
+    \item \textbf{(Design)} Sketch the migration wave plan for the 40-analyst Excel estate: which workbooks move first, and what evidence proves each wave succeeded?
+    \item \textbf{(Interview)} In five sentences, explain to an Excel power user why their new dataflow cannot write directly to the finance Gold table.
+    \item \textbf{(Operational)} Write the runbook for ``quarantine table grew 10$\times$ overnight''---detection, triage, producer contact, and consumer communication.
+\end{enumerate}
+
+\section{Capstone Project: Analyst-Grade API Ingestion with Quality Gates}\label{sec:ch10-capstone}
+\index{capstone project}\index{data quality!capstone}\index{Dataflows Gen2!capstone}
+
+\begin{capstonebox}
+\textbf{Mission.} Deliver the complete analyst-safe ingestion path: a Dataflow Gen2 from a live web API through staged, named Power Query steps; a notebook gate enforcing three assertions with quarantine; a pipeline wiring the sequence; and an incremental-refresh configuration justified by the source's late-arrival behavior. Prove it with a deliberately broken payload.
+
+\textbf{Estimated time.} 4--6 hours.
+
+\textbf{What you'll practice.}
+\begin{itemize}
+    \item Production-grade Power Query authoring: named steps, explicit types, batch stamping.
+    \item Destination semantics and incremental refresh windows.
+    \item Assertion-based quality gates with quarantine and reasons.
+    \item Structural orchestration that makes bypassing the gate impossible.
+\end{itemize}
+\end{capstonebox}
+
+\subsection*{Scenario}
+Contoso's pricing analysts need a daily feed of competitor product data from a public API. Their last solution was a spreadsheet refreshed by hand. The platform team will provide the governed path; the analysts will own the dataflow's transformation logic going forward.
+
+\subsection*{Requirements}
+\begin{itemize}
+    \item Dataflow \texttt{df\_competitor\_prices} with named steps, explicit types, and \texttt{load\_ts} stamping, landing in \texttt{staging\_competitor\_prices}.
+    \item Incremental refresh on the destination with a written window justification.
+    \item Gate notebook with three assertions (key uniqueness, required-field nulls, price sanity) and quarantine with \texttt{reject\_reason}.
+    \item Pipeline \texttt{PL\_daily\_competitor\_prices} running dataflow $\rightarrow$ gate on a schedule.
+    \item Evidence run: a mocked payload violating each assertion, with quarantine rows captured.
+    \item One-page handoff document enabling the analysts to own the flow.
+\end{itemize}
+
+\subsection*{Implementation Steps}
+\begin{enumerate}
+    \item Build and stage the dataflow; verify typed, stamped output.
+    \item Configure incremental refresh; document the window rationale.
+    \item Implement the gate notebook and quarantine table.
+    \item Wire and schedule the pipeline; verify the gate cannot be skipped.
+    \item Execute the broken-payload evidence run; capture quarantine evidence.
+    \item Write the analyst handoff document.
+\end{enumerate}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item Exported dataflow definition and gate notebook in the repository.
+    \item Quarantine evidence from the broken-payload run.
+    \item Pipeline run history showing dataflow $\rightarrow$ gate sequencing.
+    \item The incremental-refresh justification and analyst handoff documents.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item[\(\square\)] The scheduled pipeline runs end-to-end without manual steps.
+    \item[\(\square\)] Each of the three assertions demonstrably rejects and quarantines a violating payload.
+    \item[\(\square\)] Gold contains only validated rows, each stamped with batch identity.
+    \item[\(\square\)] Incremental refresh reprocesses only the configured window.
+    \item[\(\square\)] The pipeline fails visibly (not silently) when the gate asserts.
+    \item[\(\square\)] No credentials appear in M text, notebooks, or the repository.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Add a Great Expectations suite alongside the notebook assertions and compare the authoring experience.
+    \item Publish a small operations report over the quarantine table (rejects by reason, by day).
+    \item Add a second API source to the same dataflow with a merge step, keeping step names readable.
+    \item Parameterize the gate thresholds through a config table so analysts tune sensitivity without code edits.
+\end{itemize}

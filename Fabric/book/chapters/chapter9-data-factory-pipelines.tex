@@ -1,0 +1,353 @@
+\chapter{Data Factory Pipelines}
+\index{Data Factory}\index{pipelines}\index{Copy activity}\index{Lookup activity}\index{ForEach}\index{control flow}\index{parameters}\index{dynamic expressions}\index{data contracts}\index{metadata-driven ingestion}%
+
+\begin{objectives}
+\begin{itemize}
+    \item Build Fabric pipelines using the Copy activity, Lookup, and Get Metadata.
+    \item Compose control flow with ForEach, If Condition, Until, and Switch.
+    \item Parameterize pipelines with parameters, variables, and dynamic expressions.
+    \item Enforce data contracts: validate expected schema before writing to Silver, and classify breaking versus non-breaking changes.
+    \item Build a metadata-driven pipeline that copies a list of tables from Azure SQL Database to OneLake with a Lookup and a ForEach loop.
+    \item Design an ingestion framework that onboards hundreds of tables without manual pipeline creation.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+The visual, activity-based orchestrator with a rich connector library is a pattern every cloud offers. Fabric Pipelines descends directly from Azure Data Factory, so the mapping is especially tight in the Microsoft column.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{2.8cm}p{3.2cm}p{3.2cm}p{3.2cm}p{3.2cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{Fabric} & \textbf{AWS} & \textbf{GCP} & \textbf{Snowflake} \\
+\midrule
+Visual orchestrator & Data Factory pipelines & Glue Workflows / Step Functions & Cloud Composer (Airflow) / Data Fusion & Tasks / Snowpark orchestration \\
+Bulk copy & Copy activity (90+ connectors) & Glue ETL / DMS & Data Fusion / Datastream & \texttt{COPY INTO} / connectors \\
+Lookup/enumeration & Lookup, Get Metadata & DynamoDB/S3 lookups in Step Functions & Airflow operators & Metadata queries in tasks \\
+Control flow & ForEach, If, Until, Switch & Step Functions states & Airflow DAG logic & Task DAGs \\
+Parameterization & Parameters, variables, expressions & Step Functions JSONPath & Airflow templating (Jinja) & Task parameters \\
+Code-first alternative & Notebooks in pipelines & Lambda / Glue scripts & Composer DAGs as code & Snowpark Python \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+Databricks orchestrates with Workflows; MongoDB with Atlas Triggers and Functions. The portable skill is the metadata-driven mindset this chapter teaches: config rows enumerate work, and one parameterized pipeline executes all of it---that idea survives any tool migration.
+\end{crosscloud}
+
+\begin{keyterms}
+\textbf{Pipeline}: an orchestrated graph of activities that moves and transforms data on a schedule or trigger. \quad
+\textbf{Copy activity}: the managed data-movement activity connecting sources to sinks across dozens of connectors. \quad
+\textbf{Lookup}: an activity that reads a small result set (a config table, a file listing) for use by downstream activities. \quad
+\textbf{ForEach}: a control-flow activity that iterates child activities over an array. \quad
+\textbf{Dynamic expression}: the \texttt{@function(...)} expression language that parameterizes activity properties at run time. \quad
+\textbf{Data contract}: a producer-published, consumer-validated specification of schema and semantics for a dataset.
+\end{keyterms}
+
+\section{Week 9 Roadmap}
+Week~9 opens Part~III, the batch-processing and orchestration arc. Monday introduces Fabric pipelines: Copy, Lookup, and Get Metadata. Tuesday covers control flow---ForEach, If Condition, Until, Switch. Wednesday is the conceptual core: parameters, variables, and dynamic expressions, plus data contracts and schema enforcement. Thursday is the hands-on project: a metadata-driven pipeline that reads table names from a configuration source and copies each from Azure SQL Database to OneLake, with an expected-schema validation gate. Friday scales the pattern into an ingestion framework that onboards hundreds of tables automatically.
+
+Pipelines are the circulatory system of a data platform. Chapter~5's \texttt{COPY INTO} loads files already staged; pipelines are how the files get staged, on a schedule, with retries and alerts \cite{microsoftFabricPipelines}. The metadata-driven pattern taught this week is the difference between an estate of 300 hand-built pipelines and one parameterized pipeline governed by a config table.
+
+\begin{notebox}
+Fabric Pipelines inherits the Azure Data Factory lineage: if you have ADF or Synapse pipeline experience, the concepts transfer directly. What changes in Fabric is the destination gravity---everything lands in OneLake---and the shared capacity billing model.
+\end{notebox}
+
+\section{Monday: Pipelines, Copy, Lookup, and Get Metadata}
+\index{Copy activity}\index{Lookup activity}\index{Get Metadata}
+A pipeline is a directed graph of \emph{activities}. Three activities dominate ingestion work \cite{microsoftFabricPipelines,microsoftFabricDataFactory}:
+
+\begin{itemize}
+    \item \textbf{Copy activity} moves data between a source and a sink through managed connectors: databases, SaaS applications, file stores, and OneLake itself. It supports full and incremental loads, schema mapping, and fault tolerance settings.
+    \item \textbf{Lookup} executes a query or reads a small file and returns its result to the pipeline---classically, ``which tables are active in the config table right now?''
+    \item \textbf{Get Metadata} inspects a storage location or dataset---file existence, column lists, modified dates---and returns structural facts the pipeline can branch on.
+\end{itemize}
+
+\begin{definitionbox}
+A \textbf{metadata-driven pipeline} is one whose work items come from data---a configuration table or manifest---rather than from activities hardcoded per source. Adding a new source is an \texttt{INSERT}, not a deployment.
+\end{definitionbox}
+
+The mental model: Lookup and Get Metadata \emph{decide what to do}; Copy \emph{does it}; control flow (Tuesday) \emph{shapes the doing}; parameters and expressions (Wednesday) \emph{make it reusable}.
+
+\begin{pitfall}
+Lookup is for small control sets, not data movement. A Lookup that returns a million rows to a ForEach creates a million Copy activities---slow, expensive, and un-debuggable. Enumerate \emph{batches} with Lookup; move \emph{rows} with Copy.
+\end{pitfall}
+
+\section{Tuesday: Control Flow}
+\index{ForEach}\index{If Condition}\index{Until}\index{Switch}
+Control-flow activities shape execution \cite{microsoftFabricPipelines}:
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{2.8cm}p{5.6cm}p{5.4cm}@{}}
+\toprule
+\textbf{Activity} & \textbf{Behavior} & \textbf{Canonical use} \\
+\midrule
+ForEach & Iterates child activities over an array; sequential by default, parallel with a batch-size cap & Copy each table returned by a Lookup \\
+If Condition & Branches on a boolean expression & Route breaking schema changes to quarantine \\
+Until & Loops until a condition holds or timeout & Poll an external job's completion status \\
+Switch & Multi-way branch on an expression's value & Dispatch per-source-type loading logic \\
+\bottomrule
+\end{tabular}
+\caption{Control-flow activities and their canonical uses.}
+\label{tab:chapter9-control-flow}
+\end{table}
+
+Every activity also carries dependency conditions---\emph{On Success}, \emph{On Failure}, \emph{On Completion}, \emph{On Skip}---that wire activities into a graph rather than a line. Chapter~12 builds the full orchestration and alerting discipline on these edges; this week's discipline is simpler: every Copy inside a loop should have an explicit failure path, even if that path is only ``record the failure and continue.''
+
+\begin{tipbox}
+ForEach runs sequentially by default. For many-table ingestion, enable parallelism with a bounded batch count (start at 4--8). Unbounded parallelism against a source database is a self-inflicted denial-of-service attack.
+\end{tipbox}
+
+\section{Wednesday: Parameters, Variables, and Data Contracts}
+\index{parameters}\index{variables}\index{dynamic expressions}\index{data contracts}\index{schema enforcement}
+\subsection{Parameters and Variables}
+\emph{Parameters} are set at trigger time and immutable during the run---use them for batch dates, environment names, and source-system selectors. \emph{Variables} mutate during the run---use them for watermarks advanced mid-flight, accumulated counts, and control flags. \emph{Dynamic expressions} (\texttt{@concat(...)}, \texttt{@activity('Lookup').output.value}, \texttt{@item().table\_name}) wire the two into activity properties at run time.
+
+\subsection{Data Contracts}
+A data contract is the producer's published promise about a dataset's schema and semantics, and the consumer's right to validate against it. In Fabric the natural split is: the \emph{producer workspace} publishes and versions the contract; \emph{consumer workspaces} validate incoming batches against it before writing to Silver \cite{microsoftFabricPipelines}.
+
+Enforcement has two layers. At the storage layer, Delta Lake enforces schema by default---writes with mismatched columns are rejected---while \texttt{mergeSchema} and \texttt{overwriteSchema} permit controlled evolution \cite{deltaLakeDocs}. At the pipeline layer, an explicit validation step classifies each incoming change:
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.4cm}p{4.8cm}p{5.6cm}@{}}
+\toprule
+\textbf{Change} & \textbf{Class} & \textbf{Pipeline response} \\
+\midrule
+New nullable column added & Non-breaking (additive) & Allow; log contract version bump \\
+Column renamed or dropped & Breaking & Reject batch; quarantine; alert producer \\
+Column type widened compatibly & Borderline & Allow only if contract versioning policy says so \\
+Required column loses nullability & Breaking & Reject batch; alert producer \\
+\bottomrule
+\end{tabular}
+\caption{Classifying schema changes against a data contract.}
+\label{tab:chapter9-contracts}
+\end{table}
+
+\begin{pitfall}
+Delta's default schema enforcement catches structural violations but not \emph{semantic} ones. A renamed column arriving with the same type as an existing column can pass storage enforcement while corrupting meaning. The contract validation step---an explicit column-list comparison---is what catches it.
+\end{pitfall}
+
+\section{Thursday: Hands-on Project}
+\index{hands-on lab}\index{metadata-driven ingestion!hands-on}
+The Week~9 lab builds the pattern this part of the book is named for: a dynamic pipeline that looks up a list of table names from a configuration source and uses a ForEach loop to copy each from an Azure SQL Database to OneLake---plus an expected-schema validation step that rejects breaking changes and allows additive ones.
+
+\subsection{Goal and Architecture}
+Create workspace \texttt{fabric-de-week09} with lakehouse \texttt{lh\_ingest}. Stand up (or simulate with a small Azure SQL free tier) a source database containing \texttt{cfg.ingest\_config} and three sample tables. The pipeline \texttt{PL\_Metadata\_Ingest} reads the config, validates each table's schema against a recorded expectation, and copies conforming tables to Bronze Delta tables partitioned by batch tag.
+
+\subsection{Step-by-Step Actions}
+\begin{enumerate}
+    \item Create \texttt{cfg.ingest\_config} with columns \texttt{schema\_name}, \texttt{table\_name}, \texttt{is\_active}, \texttt{watermark}, and \texttt{expected\_columns} (a delimited column list).
+    \item Insert three rows for the sample tables; seed each sample table with a few hundred rows.
+    \item Build the pipeline: Lookup over active config rows feeding a ForEach.
+    \item Inside the ForEach, add a script/lookup step that compares the source's current column list to \texttt{expected\_columns}.
+    \item Branch with an If Condition: additive-only differences proceed to Copy; renamed or dropped columns route to a Set Variable that records the rejection.
+    \item Copy each valid table to \texttt{bronze.<table\_name>} with a batch-tag partition.
+    \item Test: rename a source column (batch rejected), add a nullable column (batch allowed), and confirm both outcomes are recorded.
+\end{enumerate}
+
+\begin{lstlisting}[language=json,caption={Pipeline JSON (abridged): Lookup feeds ForEach; expressions parameterize the Copy.},label={lst:chapter9-pipeline-json}]
+{
+  "name": "PL_Metadata_Ingest",
+  "variables": { "vBatchTag": { "type": "String", "defaultValue": "daily" } },
+  "activities": [
+    { "name": "LookupTables", "type": "Lookup",
+      "typeProperties": { "sqlReaderQuery":
+        "SELECT schema_name, table_name FROM cfg.ingest_config WHERE is_active = 1" } },
+    { "name": "CopyEachTable", "type": "ForEach",
+      "dependsOn": [ { "activity": "LookupTables", "dependencyConditions": ["Succeeded"] } ],
+      "typeProperties": {
+        "items": "@activity('LookupTables').output.value",
+        "activities": [ { "name": "CopyToOneLake", "type": "Copy",
+          "typeProperties": {
+            "source": { "sqlReaderQuery":
+              "@concat('SELECT * FROM ', item().schema_name, '.', item().table_name)" },
+            "sink": { "type": "LakehouseTable",
+              "tableOption": "autoCreate",
+              "partitionOption": "@concat(variables('vBatchTag'), '/',
+                                          item().table_name)" } } } ] } } ]
+}
+\end{lstlisting}
+
+\begin{lstlisting}[language=Python,caption={Contract validation as a notebook gate: breaking changes reject the batch.},label={lst:chapter9-contract-gate}]
+# Notebook invoked per table before the Copy (or as post-landing gate)
+expected = ["order_id", "order_date", "customer_id", "net_amount"]
+actual = [f.name for f in spark.read.table("bronze.orders_staging").schema]
+
+missing = set(expected) - set(actual)   # renamed/dropped -> breaking
+added   = set(actual) - set(expected)   # new columns      -> additive
+
+assert not missing, f"BREAKING contract change, missing columns: {missing}"
+if added:
+    print(f"NON-BREAKING additive columns accepted: {sorted(added)}")
+\end{lstlisting}
+
+\subsection{Validation Checklist}
+\begin{itemize}
+    \item The pipeline copies all active config rows with no per-table authoring.
+    \item A renamed source column rejects the batch and records the rejection.
+    \item A new nullable source column passes and is logged as additive.
+    \item Adding a fourth table to the config requires zero pipeline edits.
+    \item Bronze tables carry the batch-tag partition column.
+    \item ForEach parallelism, if enabled, is bounded and documented.
+\end{itemize}
+
+\section{Friday: Use Case and Architecture}
+\index{metadata-driven ingestion!framework}\index{ingestion framework}
+A wholesale platform acquires two companies per year; each arrives with 50--150 operational tables that must flow to OneLake. Hand-building a pipeline per table is a permanent backlog. The deliverable is a metadata-driven ingestion framework: one parameterized pipeline family governed entirely by configuration.
+
+\subsection{The Framework Anatomy}
+\begin{itemize}
+    \item \textbf{Configuration store}: \texttt{cfg.ingest\_config} rows per table---source connection key, query or full-load flag, watermark column, expected schema, target layer, owner, SLA.
+    \item \textbf{Orchestrator}: a master pipeline that looks up due tables (by schedule column) and ForEach-dispatches to a child pipeline, bounded parallelism.
+    \item \textbf{Worker}: a parameterized child pipeline executing contract validation, copy, watermark advancement, and run logging for exactly one table.
+    \item \textbf{Run ledger}: \texttt{cfg.ingest\_run} rows per attempt---status, rows, duration, error---feeding the Monitoring Hub story of Chapter~12.
+    \item \textbf{Onboarding path}: a new table is one config row plus a recorded contract, reviewed like code.
+\end{itemize}
+
+\begin{figure}[H]
+    \centering
+    \begin{tikzpicture}[node distance=8mm and 10mm]
+        \node[store] (cfg) at (0,0) {cfg.ingest\_config\\+ run ledger};
+        \node[stage] (master) at (4.6,0) {Master pipeline\\(Lookup, ForEach)};
+        \node[stage] (worker) at (9.6,0) {Worker pipeline\\(validate, copy, log)};
+        \node[store] (lh) at (14.4,0) {OneLake\\Bronze Delta};
+
+        \draw[arrow] (cfg) -- (master);
+        \draw[arrow] (master) -- node[above, font=\scriptsize]{per table} (worker);
+        \draw[arrow] (worker) -- (lh);
+        \draw[arrow, dashed] (worker.south) to[out=-90,in=-90] node[below, font=\scriptsize]{run rows} (cfg.south);
+
+        \node[note, text width=12.5cm, align=center] at (7.2,-2.4) {Onboarding a table = inserting a config row. No pipeline is ever edited to add a source.};
+    \end{tikzpicture}
+    \caption{Metadata-driven ingestion framework.}
+    \label{fig:chapter9-framework}
+\end{figure}
+
+\begin{pitfall}
+Metadata-driven frameworks amplify both discipline and sloppiness. One bad default in the worker pipeline now affects every table. Treat the worker's contract-validation and run-logging behavior as the most reviewed code in the estate, and version the config schema itself.
+\end{pitfall}
+
+\section{Operational Guidance for Week 9}
+A pipeline you cannot rerun safely is a liability. Every pattern this week---manifests, watermarks, contract gates---exists so that a failed 3 a.m.\ run can be retried by an on-call engineer following a runbook, not reverse-engineered.
+
+\subsection{Performance and Reliability}
+Advance watermarks only on success. Bound ForEach parallelism. Prefer incremental queries (\texttt{WHERE ts > @watermark}) over full reloads once tables outgrow a few million rows. Keep Lookup result sets small. Record every run in the ledger---the ledger is what makes ``did last night work?'' a query rather than an investigation.
+
+\subsection{Security and Governance Checklist}
+\begin{itemize}
+    \item Store connection credentials in managed connections or Key Vault references, never in pipeline JSON.
+    \item Restrict who can edit \texttt{cfg.ingest\_config}---it is executable configuration.
+    \item Version the contract per table; record the owning producer workspace.
+    \item Quarantine rejected batches to a visible location with reasons, not to the void.
+    \item Review worker-pipeline changes with the rigor of a schema migration.
+    \item Document each table's SLA and retry unit in the config row.
+\end{itemize}
+
+\section{Interview Q\&A}
+\begin{enumerate}
+    \item \textbf{Q: What makes an ingestion framework metadata-driven?}\\
+    A: Work items come from configuration data---a table of sources, schemas, and schedules---that a parameterized pipeline reads at run time, so onboarding a source is an \texttt{INSERT}, not a new pipeline.
+    \item \textbf{Q: Which activity iterates over a Lookup result set?}\\
+    A: ForEach, with the Lookup's \texttt{output.value} as its \texttt{@items}; parallelism is opt-in and should be bounded.
+    \item \textbf{Q: What distinguishes a breaking from a non-breaking schema change?}\\
+    A: Breaking changes remove or rename what consumers depend on (dropped/renamed columns, tightened nullability); non-breaking changes only add---a new nullable column. The contract validation gate rejects the first and allows the second.
+    \item \textbf{Q: Who owns the data contract: producer or consumer workspace?}\\
+    A: The producer publishes and versions it; consumers validate against it. Ownership ambiguity is itself a contract failure.
+    \item \textbf{Q: What does \texttt{mergeSchema} allow that default Delta writes reject?}\\
+    A: Writes whose schema adds columns beyond the table's current schema; default enforcement rejects any mismatch, which is exactly the protection you want until a reviewed contract bump says otherwise.
+    \item \textbf{Q: Why should watermarks advance only on success?}\\
+    A: Because the watermark defines what the next run reads. Advancing on failure silently skips uncommitted data; advancing on success makes rerun safe and duplicates impossible.
+\end{enumerate}
+
+\section{Further Reading}
+Review the Data Factory in Fabric documentation \cite{microsoftFabricDataFactory} and pipeline activity reference \cite{microsoftFabricPipelines}. The schema-enforcement behavior underneath is Delta Lake's \cite{deltaLakeDocs}. For the orchestration layer that monitors these pipelines, Chapter~12 builds on the Monitoring Hub \cite{microsoftFabricMonitoringHub}. Metadata-driven patterns generalize the warehouse loading discipline of Chapter~5 \cite{microsoftFabricCopyInto}.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item Pipelines compose Copy, Lookup, and Get Metadata with control flow to move and validate data on a schedule.
+    \item Lookup enumerates work; Copy moves data; never reverse the roles at scale.
+    \item Parameters are immutable per run, variables mutate, and dynamic expressions wire both into activities.
+    \item Data contracts make schema changes explicit: additive changes flow, breaking changes are rejected and quarantined.
+    \item Delta's default schema enforcement is the storage-layer backstop; the pipeline's validation step is the semantic gate.
+    \item Metadata-driven design turns onboarding into configuration and concentrates risk in one well-reviewed worker pipeline.
+    \item Watermarks advance on success only---that single rule is most of idempotent ingestion.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Explain why ``enumerate batches, move rows'' is the correct division of labor between Lookup and Copy.
+    \item \textbf{(Conceptual)} Classify each as breaking or non-breaking: new nullable column; renamed column; widened \texttt{INT} to \texttt{BIGINT}; column reordered; dropped column.
+    \item \textbf{(Hands-on)} Add an Until activity that polls an external job status every 60 seconds with a 20-minute timeout.
+    \item \textbf{(Hands-on)} Extend the lab pipeline with a run-ledger write after each Copy---status, rows, duration.
+    \item \textbf{(Design)} Design the config schema for a framework spanning Azure SQL, REST APIs, and SFTP sources. Which columns become polymorphic, and how do you keep the worker pipeline sane?
+    \item \textbf{(Design)} Two hundred tables, three source systems, one capacity: propose ForEach parallelism settings and scheduling windows, with reasoning.
+    \item \textbf{(Interview)} In five sentences, explain how a contract gate and Delta schema enforcement complement rather than duplicate each other.
+    \item \textbf{(Operational)} Write the runbook for ``config row added but table never lands''---the five checks in order.
+\end{enumerate}
+
+\section{Capstone Project: Config-Driven Multi-Source Ingestion}\label{sec:ch9-capstone}
+\index{capstone project}\index{metadata-driven ingestion!capstone}\index{data contracts!capstone}
+
+\begin{capstonebox}
+\textbf{Mission.} Build a two-tier, metadata-driven ingestion framework: a master pipeline that dispatches due tables to a parameterized worker pipeline performing contract validation, incremental copy, watermark advancement, and run logging. Prove it by onboarding a new table with a single \texttt{INSERT}, and by rejecting a deliberately breaking schema change.
+
+\textbf{Estimated time.} 5--7 hours.
+
+\textbf{What you'll practice.}
+\begin{itemize}
+    \item Master/worker pipeline composition with bounded ForEach parallelism.
+    \item Contract validation distinguishing breaking from additive changes.
+    \item Watermark-driven incremental loads with a success-only advance rule.
+    \item Run-ledger design that makes operations queryable.
+\end{itemize}
+\end{capstonebox}
+
+\subsection*{Scenario}
+Contoso's analytics platform must absorb three source systems---an Azure SQL ERP, a REST export dropped as files, and a legacy CSV feed---with new tables arriving monthly. The data engineering team is two people. The framework, not headcount, must absorb the growth.
+
+\subsection*{Requirements}
+\begin{itemize}
+    \item \texttt{cfg.ingest\_config} and \texttt{cfg.ingest\_run} tables with the columns this chapter specifies.
+    \item Master pipeline \texttt{PL\_Master\_Ingest} dispatching due config rows to worker \texttt{PL\_Worker\_Ingest} with parallelism capped at four.
+    \item Worker pipeline performing: contract gate $\rightarrow$ incremental copy \texttt{WHERE ts > @watermark} $\rightarrow$ watermark advance on success $\rightarrow$ ledger write on every outcome.
+    \item Evidence: one table onboarded by config insert only; one breaking change rejected with quarantine; one additive change flowing through.
+    \item A README section describing the onboarding procedure in five steps.
+\end{itemize}
+
+\subsection*{Implementation Steps}
+\begin{enumerate}
+    \item Create the config and ledger tables; seed four tables across two source types.
+    \item Build the worker pipeline end-to-end for one table, manually triggered.
+    \item Build the master pipeline; verify dispatch and parallelism cap.
+    \item Execute the three evidence scenarios and capture ledger rows for each.
+    \item Write the onboarding README and a failure runbook.
+\end{enumerate}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item Pipeline JSON exports (master and worker) under version control.
+    \item Config and ledger table contents after the evidence scenarios.
+    \item Screenshot of a bounded-parallelism ForEach run in the Monitoring Hub.
+    \item Onboarding README and failure runbook.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item[\(\square\)] A new table flows end-to-end after one config \texttt{INSERT} and no pipeline edits.
+    \item[\(\square\)] A renamed source column rejects the batch, writes a quarantine record, and alerts via the ledger.
+    \item[\(\square\)] A new nullable source column flows through and is logged as an additive contract change.
+    \item[\(\square\)] Watermarks advance only on successful runs; a failed run replays the same slice.
+    \item[\(\square\)] Every run---success, rejection, or failure---produces exactly one ledger row.
+    \item[\(\square\)] No credentials appear in pipeline JSON or the repository.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Add per-table SLA columns and a ledger query that flags tables breaching their SLA.
+    \item Add a Switch activity dispatching different copy shapes per source type.
+    \item Generate the config row for a new source table automatically from source system metadata.
+    \item Publish a small Power BI operations report over the run ledger.
+\end{itemize}

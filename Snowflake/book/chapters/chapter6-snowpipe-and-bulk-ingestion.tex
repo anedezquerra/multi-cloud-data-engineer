@@ -1,0 +1,285 @@
+\chapter{Continuous Ingestion with Snowpipe and Snowpipe Streaming}
+\index{Snowpipe}\index{Snowpipe Streaming}\index{continuous ingestion}\index{Week 6}%
+\begin{objectives}
+\begin{itemize}
+    \item Explain Snowpipe's serverless, event-driven architecture and how cloud notifications trigger loads.
+    \item Configure auto-ingest Snowpipe with SQS events and verify health with \texttt{SYSTEM\$PIPE\_STATUS}.
+    \item Call the Snowpipe REST API for programmatic, client-driven file ingestion.
+    \item Stream row sets with the Snowpipe Streaming API and enforce exactly-once ingestion with channel offset tokens.
+    \item Diagnose and bound micro-batch backlogs before latency and credit burn spike.
+    \item Compare classic Snowpipe, Snowpipe Streaming, and bulk \texttt{COPY INTO} for a real-time fraud-detection feed.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+Event-driven ingestion is a universal cloud pattern: an object lands, an event fires, a serverless loader reacts. Only the service names change.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{2.8cm}p{3.0cm}p{3.0cm}p{3.0cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{AWS} & \textbf{Azure} & \textbf{GCP} \\
+\midrule
+New-object event & S3 event $\rightarrow$ SQS / EventBridge & Event Grid & Pub/Sub notification \\
+Queue / notification & SQS & Storage Queue / Event Grid & Pub/Sub \\
+Serverless loader trigger & Lambda / Snowpipe & Function / Snowpipe & Cloud Run / Snowpipe \\
+Managed streaming & Kinesis / MSK (Kafka) & Event Hubs & Pub/Sub \\
+Row-streaming ingest & Kinesis Firehose $\rightarrow$ Redshift & Event Hubs capture & BigQuery Storage Write API \\
+Exactly-once mechanism & Offset tokens / transactional sinks & Checkpointing & Offset tokens (Storage Write) \\
+\addlinespace
+Snowflake equivalent & Snowpipe auto-ingest (SQS) & Snowpipe auto-ingest (Event Grid) & Snowpipe auto-ingest (Pub/Sub) \\
+Row-set streaming & \multicolumn{3}{l}{Snowpipe Streaming API (cloud-agnostic; channels + offset tokens)} \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+\textbf{Microsoft Fabric} routes events through Eventstream into KQL databases or lakehouse tables; \textbf{MongoDB} ingests through drivers and change streams rather than file events. Snowflake's distinctive move is that \emph{the pipe is serverless}: there is no cluster to size, and billing is per-second of compute used by the pipe itself plus a per-file notification charge.
+\end{crosscloud}
+
+\section{Week 6 Roadmap}
+Chapter 5 ended with hourly \texttt{COPY INTO} sweeps. This chapter removes the schedule: files load seconds after they land, and eventually rows flow directly without files at all. The trade-off is a new operational surface---notifications, serverless compute, streaming channels---that must be monitored as carefully as any warehouse \cite{snowflakeSnowpipeDocs}.
+
+Monday studies Snowpipe's event-driven architecture. Tuesday covers the REST API for systems that cannot emit cloud events. Wednesday introduces Snowpipe Streaming and its exactly-once offset-token semantics, plus the backlog mathematics that govern every micro-batch system. Thursday wires a real S3 notification into a pipe. Friday applies the whole toolkit to credit-card fraud ingestion.
+
+\begin{keyterms}
+\textbf{Pipe}: a Snowflake object wrapping a \texttt{COPY INTO} statement that Snowpipe executes as files arrive.\quad
+\textbf{Auto-ingest}: pipe mode driven by cloud event notifications rather than manual REST calls.\quad
+\textbf{Snowpipe Streaming}: a client API that writes row sets directly into tables through named channels.\quad
+\textbf{Offset token}: a client-supplied, monotonically increasing token per channel that makes retried batches idempotent.\quad
+\textbf{Backlog}: files or messages produced faster than the pipe drains them; the primary health signal of continuous ingestion.
+\end{keyterms}
+
+\section{Monday: Snowpipe Architecture and Auto-Ingest}
+\index{Snowpipe!architecture}\index{auto-ingest}\index{SQS}
+A Snowpipe \textbf{pipe} object stores a parameterized \texttt{COPY INTO} statement. In \emph{auto-ingest} mode, creating the pipe provisions a notification channel (an SQS queue on AWS). Subscribing that queue to the bucket's event notifications completes the loop: a new object produces an event, the event reaches Snowflake, and Snowflake's serverless compute fleet loads the file---typically within a minute, without any customer warehouse running \cite{snowflakeSnowpipeDocs}.
+
+\begin{definitionbox}
+\textbf{Snowpipe} is Snowflake's serverless continuous-ingestion service. A pipe contains a \texttt{COPY INTO} statement; Snowflake-managed compute executes it per triggering event or REST call, billing pipe compute by the second plus a per-file overhead.
+\end{definitionbox}
+
+\begin{lstlisting}[language=SQL, caption={Snowpipe auto-ingest with SQS notification}]
+CREATE PIPE raw.raw_csv_pipe AUTO_INGEST = TRUE AS
+  COPY INTO raw.events (id, payload, load_ts)
+  FROM (
+    SELECT $1, $2, CURRENT_TIMESTAMP()
+    FROM @raw_stage/events/
+  )
+  FILE_FORMAT = (TYPE = CSV SKIP_HEADER = 1
+                 FIELD_OPTIONALLY_ENCLOSED_BY = '"');
+
+-- Show the SQS notification channel for the S3 event rule
+SHOW PIPES LIKE 'raw_csv_pipe';
+-- Wire notification_channel ARN into the S3 bucket
+-- event configuration, then verify:
+SELECT SYSTEM$PIPE_STATUS('raw_csv_pipe');
+\end{lstlisting}
+
+The \texttt{notification\_channel} value shown by \texttt{SHOW PIPES} is the queue ARN to paste into the S3 event configuration. \texttt{SYSTEM\$PIPE\_STATUS} then reports the pipe's execution state, pending file count, and last-received event timestamps---the first place to look when data stops flowing.
+
+\begin{pitfall}
+\textbf{An S3 event rule on the wrong prefix silently starves the pipe.} Events fire, but for files the pipe never sees (or vice versa). Validate by uploading one known file and watching \texttt{SYSTEM\$PIPE\_STATUS} and \texttt{COPY\_HISTORY} before declaring the feed live.
+\end{pitfall}
+
+\subsection{At-Least-Once Semantics and Deduplication}
+\index{at-least-once}\index{deduplication}
+Cloud queues occasionally redeliver events, so Snowpipe is \emph{at-least-once}: the same file may be submitted twice. Protection comes from the underlying \texttt{COPY INTO} idempotency---a file already loaded into the table within 64 days is skipped---but only if file names are stable. Pipelines that rewrite files under new names must deduplicate downstream (Chapter 7's streams and idempotent \texttt{MERGE} patterns are the standard tool).
+
+\begin{notebox}
+Enable pipe error notifications via \texttt{ERROR\_INTEGRATION} (SNS or EventBridge) so failed loads page the on-call engineer, and use \texttt{INFORMATION\_SCHEMA.COPY\_HISTORY} to retry only failed files.
+\end{notebox}
+
+\section{Tuesday: The Snowpipe REST API}
+\index{Snowpipe!REST API}
+Not every producer can emit cloud events: on-premises systems, partner SFTP relays, and mainframe extracts still push files. For them, Snowpipe exposes a REST endpoint---\texttt{insertFiles}---that submits an explicit file list for a pipe. The client authenticates with key-pair JWT, names the stage files, and Snowpipe loads them with the same serverless mechanics as auto-ingest.
+
+The REST pattern inverts responsibility: instead of the cloud announcing files, the client announces them after each upload. This makes the client part of the reliability story---it must track which files were submitted, retry transient failures, and reconcile against \texttt{COPY\_HISTORY} just as an event-driven design would.
+
+\begin{lstlisting}[caption={Snowpipe REST call (Python, key-pair JWT)}]
+import requests, jwt, time, hashlib, base64
+
+def insert_files(host, pipe, files, jwt_token):
+    return requests.post(
+        f"https://{host}/v1/data/pipes/{pipe}/insertFiles",
+        headers={"Authorization": f"Bearer {jwt_token}",
+                 "Content-Type": "application/json"},
+        json={"files": [{"path": f} for f in files]},
+        timeout=30)
+
+resp = insert_files("xy12345.us-east-1.snowflakecomputing.com",
+                    "raw.raw_csv_pipe",
+                    ["events/batch-1042.csv"], token)
+resp.raise_for_status()
+\end{lstlisting}
+
+\begin{tipbox}
+REST-ingested files benefit from the same 64-day load history as auto-ingest. Submit stable file paths and let Snowflake's history deduplicate retry storms instead of building a client-side ledger.
+\end{tipbox}
+
+\section{Wednesday: Snowpipe Streaming and Exactly-Once Channels}
+\index{Snowpipe Streaming}\index{offset token}\index{exactly-once}
+Files are an awkward intermediate for data that is already rows in a producer's memory. The \textbf{Snowpipe Streaming API} removes the file entirely: a Java or Python client opens \emph{channels} to a table and appends row batches; Snowflake commits them with sub-second to seconds-scale latency, writing the same micro-partition storage as any other load \cite{snowflakeSnowpipeStreamingDocs}.
+
+\begin{definitionbox}
+A \textbf{channel} is a named, ordered ingestion stream into one table. The client attaches a monotonically increasing \textbf{offset token} to each committed batch; Snowflake persists the latest committed token with the data, so a retried batch re-sending the same token is discarded as a duplicate---exactly-once ingestion at the channel level.
+\end{definitionbox}
+
+Offset tokens turn the client into a checkpoint manager. After a crash, the client reopens the channel, asks Snowflake for the last committed token, and resumes from its own source (Kafka offsets, a sequence file) at exactly that point. This mirrors Kafka consumer-offset discipline and is the reason streaming ingestion pairs naturally with Kafka deployments \cite{kafkaDocs}.
+
+\subsection{The Backlog Mathematics of Micro-Batches}
+\index{backlog}\index{micro-batch}
+Every continuous-ingestion design lives or dies on one inequality: sustained producer rate must stay below sustained drain rate. When producers outpace a pipe's throughput, queued files or messages grow without bound; end-to-end latency climbs from seconds to hours; and when the backlog finally drains, catch-up credit burn spikes precisely when the business is already angry about stale data.
+
+Three disciplines keep backlogs bounded:
+\begin{enumerate}
+    \item \textbf{Size for peak rate, not average rate.} Measure drain throughput (files/second or rows/second) under realistic file sizes, then compare against peak production.
+    \item \textbf{Alert on backlog depth, not just pipe errors.} A perfectly healthy pipe can drown quietly; \texttt{pendingFileCount} in \texttt{SYSTEM\$PIPE\_STATUS} and consumer lag on the streaming side are the leading indicators.
+    \item \textbf{Batch deliberately.} A thousand 10 KB files per minute will strangle a file-based pipe; the same bytes as a few larger files, or as streaming row batches, flow easily.
+\end{enumerate}
+
+\begin{pitfall}
+\textbf{Monitoring only for errors misses the slow disaster.} Pipe status ``RUNNING'' with a growing \texttt{pendingFileCount} means latency is exploding while every dashboard looks green. Backlog depth is a first-class alert metric.
+\end{pitfall}
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.4cm}p{3.2cm}p{3.2cm}p{3.2cm}@{}}
+\toprule
+ & \textbf{COPY INTO} & \textbf{Snowpipe} & \textbf{Snowpipe Streaming} \\
+\midrule
+Unit of work & File set & File & Row batch \\
+Latency & Scheduled (minutes--hours) & Seconds--minutes & Sub-second--seconds \\
+Compute & Customer warehouse & Serverless (per-second + per-file) & Serverless (per-channel throughput) \\
+Delivery & Idempotent per file & At-least-once (dedup via load history) & Exactly-once per channel token \\
+Best for & Bulk backfills, hourly feeds & File-producing sources & Kafka, applications, sensors \\
+\bottomrule
+\end{tabular}
+\caption{Choosing among Snowflake's three ingestion mechanics.}
+\label{tab:chapter6-ingestion-comparison}
+\end{table}
+
+\section{Thursday Hands-On Project: Event-Driven CSV Ingestion}
+\index{hands-on project!Snowpipe}
+This project builds the auto-ingest loop end to end: S3 event $\rightarrow$ SQS $\rightarrow$ Snowpipe $\rightarrow$ table, verified with pipe status functions.
+
+\subsection*{Scenario}
+The logistics client from Chapter 5 now needs trip files visible in Snowflake within two minutes of landing, with no warehouse left running between arrivals.
+
+\subsection*{Procedure}
+\begin{enumerate}
+    \item Recreate or reuse the Chapter 5 stage and CSV file format against \texttt{s3://logistics-telemetry/fleet/csv/}.
+    \item Create \texttt{raw.raw\_csv\_pipe} with \texttt{AUTO\_INGEST = TRUE} using the listing from Monday's section.
+    \item Run \texttt{SHOW PIPES} and copy the \texttt{notification\_channel} ARN.
+    \item In the S3 console, add an event notification on the \texttt{fleet/csv/} prefix for object-create events, targeting that SQS ARN.
+    \item Upload three CSV files a minute apart; poll \texttt{SYSTEM\$PIPE\_STATUS('raw.raw\_csv\_pipe')} and \texttt{COPY\_HISTORY} until all three appear.
+    \item Upload one deliberately malformed file; observe the failure path, then query \texttt{COPY\_HISTORY} for its error.
+    \item Measure end-to-end latency per file (upload timestamp to \texttt{COPY\_HISTORY} load timestamp).
+\end{enumerate}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item \textbf{SQL script:} pipe DDL, status queries, and history queries.
+    \item \textbf{Event configuration evidence:} the S3 notification rule JSON and the pipe's notification channel.
+    \item \textbf{Latency table:} per-file upload time, load time, and computed latency, including the malformed file's behavior.
+    \item \textbf{Alerting sketch:} the \texttt{ERROR\_INTEGRATION} DDL you would add for production and the backlog metric you would alert on.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item All valid files load with no warehouse running and no manual \texttt{COPY INTO}.
+    \item Median upload-to-visible latency is under two minutes, measured from \texttt{COPY\_HISTORY}.
+    \item The malformed file neither blocks later files nor disappears silently---its failure is visible in load history.
+    \item A re-uploaded identical file is not double-loaded, demonstrating load-history idempotency.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Convert the feed to Snowpipe Streaming with a Python client, assign offset tokens per batch, kill the client mid-batch, and demonstrate exactly-once recovery.
+    \item Flood the bucket with 5,000 tiny files; chart \texttt{pendingFileCount} over time and compute the drain rate.
+    \item Compare monthly cost of the pipe versus an equivalently latent warehouse-resident \texttt{COPY} task.
+\end{itemize}
+
+\section{Friday Real-World Architecture: Card Fraud Ingestion}
+\index{Real-World Architecture!fraud detection}\index{credit card swipes}
+A payments processor must make card swipes queryable for fraud scoring within seconds. Two designs compete: classic micro-batch---transactions buffered to files, dropped to S3, picked up by Snowpipe---and direct streaming through the Snowpipe Streaming API.
+
+\subsection{The Case Against Micro-Batch Here}
+Micro-batching introduces three stacked latencies: buffer time before a file is closed, event propagation, and per-file serverless load overhead. At swipe volumes, either files stay tiny (file-count overhead dominates, backlog risk climbs) or buffers grow (freshness dies). For a fraud decision measured in seconds, the architecture is fighting itself.
+
+\subsection{The Streaming Design}
+Transaction gateways append each swipe---authorization ID, card token, merchant, amount, timestamp---to Snowpipe Streaming channels, one channel per region for parallelism and blast-radius isolation. The offset token is the processor's existing authorization sequence number, which is already monotonic: crash recovery replays from the last committed sequence with zero custom ledger code. A \texttt{fraud\_features} table lands rows in seconds; Chapter 7's streams propagate inserts to a scoring mart, and Chapter 14's UDFs can score in-database.
+
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[
+        src/.style={rectangle, rounded corners, draw=orange!70!black, thick, fill=orange!10, align=center, minimum width=2.8cm, minimum height=1.0cm, font=\small\bfseries},
+        sf/.style={rectangle, rounded corners, draw=primary, thick, fill=primary!6, align=center, minimum width=2.8cm, minimum height=1.0cm, font=\small\bfseries},
+        tbl/.style={rectangle, rounded corners, draw=codegreen!60!black, thick, fill=green!8, align=center, minimum width=2.8cm, minimum height=1.0cm, font=\small\bfseries},
+        arrow/.style={-{Stealth[length=2.5mm]}, draw=primary, thick},
+        lbl/.style={font=\scriptsize\itshape, text=codegray}
+    ]
+        \node[src] (pos) at (0, 1.5) {POS / e-commerce\\gateways};
+        \node[sf] (ch) at (4.2, 1.5) {Streaming channels\\(one per region)};
+        \node[tbl] (raw) at (8.4, 1.5) {raw.swipes\\(seconds latency)};
+        \node[tbl] (feat) at (12.4, 1.5) {fraud features\\stream $\rightarrow$ MERGE};
+        \node[sf] (pipe) at (4.2, -1.5) {Snowpipe (files)\\settlement batches};
+        \node[tbl] (settle) at (8.4, -1.5) {raw.settlements\\(hourly OK)};
+        \draw[arrow] (pos) -- node[lbl, above]{row batches + offset tokens} (ch);
+        \draw[arrow] (ch) -- (raw);
+        \draw[arrow] (raw) -- (feat);
+        \draw[arrow] (pos) |- node[lbl, left, align=center]{end-of-hour\\files}(pipe.west);
+        \draw[arrow] (pipe) -- (settle);
+    \end{tikzpicture}%
+    }
+    \caption{Fraud ingestion: latency-critical swipes stream through channels; latency-tolerant settlement files ride classic Snowpipe.}
+    \label{fig:chapter6-fraud-architecture}
+\end{figure}
+
+\subsection{Hybrid Reality}
+The mature design is hybrid: swipes stream (seconds matter), nightly settlement files ride classic Snowpipe (minutes are fine, files already exist), and quarterly backfills use bulk \texttt{COPY INTO}. Choosing the cheapest mechanism per data product---not one mechanism for everything---is the engineering maturity this chapter is building toward.
+
+\begin{tipbox}
+Offset tokens should reuse an identifier the producer already has (Kafka offset, sequence number, authorization ID). A second, invented sequence is one more thing to keep consistent under failure.
+\end{tipbox}
+
+\section{Interview Q\&A}
+\begin{enumerate}
+    \item \textbf{Q: What triggers Snowpipe auto-ingest on AWS?}\\
+    A: An S3 object-create event published to the pipe's SQS notification channel; Snowflake's serverless fleet then executes the pipe's \texttt{COPY INTO}.
+    \item \textbf{Q: How does Snowpipe Streaming differ from classic Snowpipe?}\\
+    A: It writes row batches directly through named channels with no files, reaching sub-second-to-seconds latency, and supports exactly-once delivery via offset tokens.
+    \item \textbf{Q: How does a channel offset token provide exactly-once ingestion?}\\
+    A: The client tags each batch with a monotonically increasing token; Snowflake persists the latest committed token, so a retried batch with an old token is discarded as a duplicate.
+    \item \textbf{Q: Why is classic Snowpipe at-least-once, and how do you deduplicate?}\\
+    A: Cloud queues can redeliver events. Snowflake's per-table load history skips already-loaded files for 64 days; unstable file names need downstream dedup via keys.
+    \item \textbf{Q: What do you alert on to catch backlog growth?}\\
+    A: \texttt{pendingFileCount} from \texttt{SYSTEM\$PIPE\_STATUS} (and consumer lag for streaming), because a healthy-looking pipe can still drown in queue depth.
+\end{enumerate}
+
+\section{Further Reading}
+The Snowpipe and Snowpipe Streaming guides define auto-ingest, REST ingestion, channels, and billing \cite{snowflakeSnowpipeDocs,snowflakeSnowpipeStreamingDocs}. The Kafka documentation provides the consumer-offset mental model that offset tokens mirror \cite{kafkaDocs}. AWS S3 event notification and SQS documentation cover the cloud side of the auto-ingest loop \cite{awsSqsDocs}.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item Snowpipe is serverless file ingestion: no warehouse to run, billed per second of pipe compute plus per-file overhead.
+    \item Auto-ingest is an event loop---object event to queue to pipe---and the prefix on the event rule is a silent-failure boundary.
+    \item The REST API serves producers that cannot emit cloud events; the client then owns submission bookkeeping.
+    \item Snowpipe Streaming removes files entirely; per-channel offset tokens deliver exactly-once semantics through crash recovery.
+    \item Backlog depth, not error count, is the leading health metric of continuous ingestion; size for peak rate.
+    \item Match mechanism to data product: streaming for seconds, pipes for minutes, bulk COPY for backfills.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Walk through every hop between an S3 \texttt{PUT} and a committed row, naming the component that could silently break each hop.
+    \item \textbf{(Conceptual)} Why does at-least-once delivery plus stable file names equal effectively-once loading?
+    \item \textbf{(Conceptual)} A producer emits 2,000 files/minute of 20 KB each; the pipe drains 1,000 files/minute. Compute backlog depth after one hour and the latency of the last file.
+    \item \textbf{(Hands-on)} Reconfigure the Thursday pipe with \texttt{ERROR\_INTEGRATION} notifications and trigger a deliberate failure.
+    \item \textbf{(Hands-on)} Write a Python streaming client that resumes from Snowflake's last committed offset token after a simulated crash.
+    \item \textbf{(Design)} A source system can only SFTP files to a VM. Design the ingestion path and identify who owns submission bookkeeping.
+    \item \textbf{(Design)} Choose mechanisms for three feeds: IoT heartbeats (5 s SLA), partner invoices (hourly), and a 10 TB history backfill. Justify each.
+    \item \textbf{(Operations)} Write the daily health query over \texttt{COPY\_HISTORY} that reports per-pipe file counts, error counts, and oldest pending file.
+    \item \textbf{(Cost)} Compare monthly cost of Snowpipe versus a per-minute warehouse task for a feed averaging 50 files/minute.
+    \item \textbf{(Interview)} Explain why ``we monitor for pipe errors'' is an incomplete ingestion-monitoring strategy.
+\end{enumerate}

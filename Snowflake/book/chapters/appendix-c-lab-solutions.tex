@@ -1,0 +1,123 @@
+\chapter{Lab Solutions and Reference Implementations}
+\index{lab solutions}\index{reference implementations}%
+This appendix provides solution sketches for the Thursday hands-on projects, Chapters 1--24. Each sketch lists the key implementation moves, the expected evidence, and the grading-relevant pitfalls. These are \emph{reference} solutions: any implementation meeting a chapter's acceptance criteria is valid, and deviations defended with measurements are encouraged.
+
+\section{Chapter 1: Synthetic CDR Clustering Lab}
+\textbf{Key moves.} Generate 10M rows with \texttt{GENERATOR} and \texttt{SEQ4}/\texttt{UNIFORM}; randomize region per row so natural load order prunes dates but not regions. Baseline \texttt{SYSTEM\$CLUSTERING\_INFORMATION} on \texttt{(event\_date, region)}, run the selective query, then \texttt{ALTER TABLE ... CLUSTER BY (event\_date, region)} and re-measure after reclustering settles.
+\textbf{Expected evidence.} Average depth and overlaps fall; partitions scanned for the date+region predicate drops materially; elapsed time improves with \texttt{USE\_CACHED\_RESULTS=FALSE}.
+\textbf{Grading pitfalls.} Measuring against a warm result cache; concluding before background reclustering finishes (check depth trending over hours); recommending Automatic Clustering without a cost comparison.
+
+\section{Chapter 2: Warehouse Sizing and Multi-Cluster}
+\textbf{Key moves.} Run the same aggregation suite on XSMALL/SMALL/MEDIUM with caching disabled; record elapsed and credits (size $\times$ duration). Then submit N concurrent dashboard queries against a 1--3 cluster warehouse under Standard and Economy policies.
+\textbf{Expected evidence.} A price-performance knee (often SMALL--MEDIUM for scans); queueing visible in query history under fixed clusters, absorbed under multi-cluster; Economy delays scale-up measurably.
+\textbf{Grading pitfalls.} Comparing wall time without credits; benchmarking with auto-suspend too aggressive (cold-cache noise); leaving the multi-cluster warehouse running after the lab.
+
+\section{Chapter 3: Table Types, Views, and Search Optimization}
+\textbf{Key moves.} Create permanent, transient, and temporary variants of the same dataset; compare \texttt{STORAGE\_USAGE} and retention behavior. Build a normal view, a secure view, and a materialized view over a large fact; enable Search Optimization and compare a selective point lookup before/after.
+\textbf{Expected evidence.} Transient/temporary avoid Fail-safe storage; materialized view refreshes automatically on base change; Search Optimization cuts bytes scanned on the point lookup by orders of magnitude.
+\textbf{Grading pitfalls.} Judging the materialized view on first-run cost (maintenance is amortized); testing the secure view only as the owner role.
+
+\section{Chapter 4: UNDROP, Time Travel, and Cloning}
+\textbf{Key moves.} Drop a table, \texttt{UNDROP} it, and verify contents; run a destructive \texttt{DELETE}, recover rows via \texttt{BEFORE (STATEMENT=>...)}; clone a database, mutate the clone, and prove the source is untouched via row counts and storage accounting.
+\textbf{Expected evidence.} Recovery timestamps reconciled to statement IDs; clone shares storage until writes diverge (copy-on-write visible in storage metrics).
+\textbf{Grading pitfalls.} Assuming 90-day retention exists on the lab's edition/object type; confusing \texttt{AT} with \texttt{BEFORE} around the bad statement.
+
+\section{Chapter 5: S3 Storage Integration and Patterned Load}
+\textbf{Key moves.} IAM role trust policy built from \texttt{DESC INTEGRATION} outputs (user ARN + external ID); permission policy scoped to one prefix; stage with the integration; \texttt{VALIDATION\_MODE=RETURN\_ERRORS} before the real load with \texttt{PATTERN}.
+\textbf{Expected evidence.} \texttt{LIST} shows files; \texttt{COPY\_HISTORY} records exactly-once loads with \texttt{METADATA\$FILENAME} lineage; a trust-policy rotation rehearsal without DDL changes.
+\textbf{Grading pitfalls.} Wildcard IAM resources (fails least privilege); missing trailing slash on the stage URL; skipping the validation pass.
+
+\section{Chapter 6: Auto-Ingest Snowpipe}
+\textbf{Key moves.} Pipe with \texttt{AUTO\_INGEST=TRUE}; S3 event rule on the exact prefix targeting the pipe's SQS channel; latency measured upload-to-\texttt{COPY\_HISTORY}; malformed file injected to exercise the error path.
+\textbf{Expected evidence.} Median latency under two minutes with no warehouse running; failed file visible in history without blocking successors; re-uploaded file skipped by load-history idempotency.
+\textbf{Grading pitfalls.} Event rule on the bucket root while the pipe reads a prefix; alerting only on errors instead of \texttt{pendingFileCount}.
+
+\section{Chapter 7: Stream-to-Target CDC}
+\textbf{Key moves.} Standard stream on the landing table; mutate with INSERT/UPDATE/DELETE; consume with the chapter's \texttt{MERGE}; re-run to prove idempotency; inspect the update pair via \texttt{METADATA\$ISUPDATE}.
+\textbf{Expected evidence.} Stream empties only after committed consumption; update propagates as close+write, not duplication; induced rollback leaves the offset untouched.
+\textbf{Grading pitfalls.} Counting the DELETE+INSERT pair as two changes; filtering the stream during consumption and discarding unseen changes.
+
+\section{Chapter 8: Gated Three-Task Graph}
+\textbf{Key moves.} Anchor root on a schedule; merge child gated by \texttt{WHEN SYSTEM\$STREAM\_HAS\_DATA}; cleanup child after the merge; \texttt{ERROR\_INTEGRATION} plus \texttt{SUSPEND\_TASK\_AFTER\_NUM\_FAILURES=3}; resume children before root.
+\textbf{Expected evidence.} \texttt{TASK\_HISTORY} shows skip (no data), success, and contained failure; notification fires; post-fix retry applies deltas exactly once.
+\textbf{Grading pitfalls.} Resuming the root first and reporting ``nothing runs''; cleanup not depending on merge success; non-idempotent bodies double-applying on retry.
+
+\section{Chapter 9: Clickstream Flattening and Contract}
+\textbf{Key moves.} Land nested JSON in \texttt{VARIANT}; chained \texttt{LATERAL FLATTEN} to per-item rows; CHECK constraint contract on the silver table; drifted batch (\texttt{event\_kind}) rejected and quarantined.
+\textbf{Expected evidence.} Row counts reconcile raw-to-flattened; rejects carry reasons in the dead-letter table; a new optional key passes unchanged.
+\textbf{Grading pitfalls.} Hard casts without quarantine (pipeline outage instead of quarantine); treating missing keys and JSON nulls as equivalent.
+
+\section{Chapter 10: Slow-Query Diagnosis}
+\textbf{Key moves.} Baseline profile of the naive query; written diagnosis before changes; refactor (sargable dates, early filter, pre-aggregation, deduped dimension); resize only if remote spill persists; controlled cache state throughout.
+\textbf{Expected evidence.} Partitions scanned/total and spill bytes improve; credits fall even where wall time is similar; every change justified by a profile metric.
+\textbf{Grading pitfalls.} Declaring victory on a warm result cache; resizing before refactoring; no uniqueness check on the exploding join key.
+
+\section{Chapter 11: Three-Tier Dynamic Tables}
+\textbf{Key moves.} Bronze/Silver/Gold dynamic tables at 5/15/60-minute lags; observe auto-ordered refresh; force a schema change and catch the full-refresh fallback in \texttt{DYNAMIC\_TABLE\_REFRESH\_HISTORY}.
+\textbf{Expected evidence.} Refresh history shows incremental steady state; the DDL-induced full refresh is captured with its credit delta; lag-budget worksheet validated.
+\textbf{Grading pitfalls.} Downstream lag shorter than upstream lag plus refresh time; no monitor for refresh-type flips.
+
+\section{Chapter 12: Star Schema with SCD2}
+\textbf{Key moves.} Grain statement written first; \texttt{fct\_orders} uniqueness proven; 30-day moving average with \texttt{QUALIFY}; transactional two-step SCD2 from the stream (close, then insert).
+\textbf{Expected evidence.} No customer ever holds two current rows; the CUBE report reconciles at every grain; moving average verified against a hand-computed sample.
+\textbf{Grading pitfalls.} Filtering before windowing (corrupt rolling metrics); the SCD steps in separate transactions allowing transient dual-current states.
+
+\section{Chapter 13: Snowpark Transformation with Pushdown}
+\textbf{Key moves.} Key-pair session from environment secrets; filter--join--aggregate DataFrame; \texttt{explain()} showing one SQL statement; \texttt{save\_as\_table} persistence; pinned client version.
+\textbf{Expected evidence.} Single-statement pushdown; no full-frame \texttt{collect()} anywhere; session closed; plan-level unit test green.
+\textbf{Grading pitfalls.} Credentials in code or git; client-version skew against the server channel; \texttt{to\_pandas()} on a large frame.
+
+\section{Chapter 14: Vectorized Sentiment UDF Benchmark}
+\textbf{Key moves.} Scalar and \texttt{@pandas\_udf} implementations over 1M reviews; both registered permanently to a stage; identical-output proof by double anti-join; timing at two warehouse sizes.
+\textbf{Expected evidence.} 5--20$\times$ vectorized speedup explained by Arrow batching; identical outputs; batch-size observation recorded from the profile.
+\textbf{Grading pitfalls.} A Python loop inside the ``vectorized'' handler; unpinned packages; benchmark run on cached results.
+
+\section{Chapter 15: scikit-learn Training Procedure}
+\textbf{Key moves.} Parameterized procedure with an identifier whitelist; pinned \texttt{PACKAGES}; training and prediction write in one transaction; run log with metrics; scheduled as a serverless task.
+\textbf{Expected evidence.} Nightly run-log rows with $R^2$ and row counts; no partial prediction writes on induced failure; owner's- vs.\ caller's-rights experiment documented.
+\textbf{Grading pitfalls.} Raw string interpolation of the table parameter; unpinned scikit-learn changing model behavior between deploys.
+
+\section{Chapter 16: Geocoding Function and CRM Sync}
+\textbf{Key moves.} API integration scoped to one endpoint with a least-privilege role; cache-first external-function calls keyed by normalized-input hash; stream-gated task syncing only changed segment members to the mock CRM.
+\textbf{Expected evidence.} Cache-hit rate climbs across runs; no-change cycle makes zero API calls; endpoint failure replays exactly once.
+\textbf{Grading pitfalls.} Third-party keys stored in Snowflake; full-resync instead of change-only sync; per-row calls without batching or caching.
+
+\section{Chapter 17: Production RBAC Schema}
+\textbf{Key moves.} Access roles (\texttt{READ\_GOLD}, \texttt{WRITE\_SILVER}) with future grants rolled into functional roles; users granted functional roles only; audit queries over \texttt{GRANTS\_TO\_ROLES}/\texttt{GRANTS\_TO\_USERS}.
+\textbf{Expected evidence.} Analyst reads gold and is denied silver writes; escalation attempt captured; ``who can read table X'' answered through inheritance.
+\textbf{Grading pitfalls.} Direct user grants ``temporarily''; objects created under the wrong primary role; \texttt{PUBLIC} grants left from experimentation.
+
+\section{Chapter 18: Tag-Based Masking and Row Filtering}
+\textbf{Key moves.} Taxonomy tags with allowed values; masking policy bound to tags; entitlements-table-driven row access policy; adversarial tests per role including aggregate-inference and entitlements-tamper attempts.
+\textbf{Expected evidence.} New tagged column masked with zero policy edits; regional filtering holds through joins and aggregates; bypass attempts documented and closed.
+\textbf{Grading pitfalls.} Testing only as admin; masking without inference analysis; rollout without the tagging CI gate.
+
+\section{Chapter 19: Publish and Consume a Secure Share}
+\textbf{Key moves.} Secure views only in the share; consumer mount; liveness demonstrated by provider mutation; revocation verified immediately.
+\textbf{Expected evidence.} Base tables unreachable consumer-side; masking/row policies enforce across the boundary; consumer compute billed to the consumer.
+\textbf{Grading pitfalls.} Sharing a base table for convenience; no revocation test; reader accounts without resource monitors.
+
+\section{Chapter 20: Two-Party Clean Room}
+\textbf{Key moves.} Normalized, keyed-hashed identifiers in secure views; approved overlap template with \texttt{HAVING COUNT(DISTINCT h) >= k}; attack log for dictionary and differencing probes; seeded DP noise with accuracy/privacy trade-off.
+\textbf{Expected evidence.} Small cohorts suppressed by the template; attacks yield nothing row-level; $\varepsilon$ rationale documented.
+\textbf{Grading pitfalls.} Unsalted hashes; cohort floor enforced by convention instead of in the template; unlimited query volume enabling differencing.
+
+\section{Chapter 21: Hybrid Orders Under Concurrent Writes}
+\textbf{Key moves.} Hybrid tables with enforced PK/FK/unique plus a status index; parallel single-row writer; three violation classes provably rejected; point-latency distribution measured; live join to a columnar table.
+\textbf{Expected evidence.} Millisecond-class point operations; correct live join with no replication; hybrid-vs-columnar aggregation trade-off quantified.
+\textbf{Grading pitfalls.} Assuming constraint enforcement without testing it; benchmarking point lookups against a cold warehouse; indexing columns with no real access path.
+
+\section{Chapter 22: PDF-to-Answer RAG Pipeline}
+\textbf{Key moves.} \texttt{PARSE\_DOCUMENT} $\rightarrow$ structural chunking with overlap $\rightarrow$ \texttt{EMBED\_TEXT\_768} into \texttt{VECTOR(FLOAT,768)} $\rightarrow$ top-$k$ cosine retrieval $\rightarrow$ grounded \texttt{COMPLETE} with citations; 10-question evaluation; token metering.
+\textbf{Expected evidence.} Answers cite chunk IDs; failure modes classified (chunking/retrieval/prompting); resource monitor demonstrated; nothing leaves the account.
+\textbf{Grading pitfalls.} Fixed-character chunking through sentence boundaries; unfiltered Cortex calls over full tables; no evaluation set---``it looks right'' is not measurement.
+
+\section{Chapter 23: CI/CD with Observability}
+\textbf{Key moves.} schemachange migrations + dbt build on PRs against QA; Terraform-managed warehouse and monitor (75\% notify / 100\% suspend); cost-anomaly alert over \texttt{WAREHOUSE\_METERING\_HISTORY}; DMFs scheduled; expand--contract rename across two PRs with a shim view and contract gate.
+\textbf{Expected evidence.} Bad PR blocked by a failing test; migration ledger complete per environment; alert fired and delivered; rename shipped with zero consumer-visible downtime.
+\textbf{Grading pitfalls.} Password secrets in CI; expand and contract in one release; incremental models without \texttt{unique\_key}.
+
+\section{Chapter 24: Timed Practice Exam and Portfolio}
+\textbf{Key moves.} 115-minute closed-book attempt; per-domain scoring; error log with chapter references; hands-on remediation of each miss; second attempt showing the log emptied.
+\textbf{Expected evidence.} Every domain above threshold twice consecutively; confidence calibration honest (guessed-correct treated as misses); portfolio READMEs reproducible from clean.
+\textbf{Grading pitfalls.} Studying aggregate score while a 30\% domain lags; memorizing practice answers; booking the exam on confidence rather than measured readiness.

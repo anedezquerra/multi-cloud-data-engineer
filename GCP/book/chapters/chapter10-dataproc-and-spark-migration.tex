@@ -1,0 +1,226 @@
+\chapter{Visual ETL with Cloud Data Fusion}
+\index{Cloud Data Fusion}\index{CDAP}\index{Wrangler}\index{visual ETL}\index{plugins}\index{macros}
+
+\begin{objectives}
+\begin{itemize}
+    \item Explain Data Fusion's CDAP foundations, instance architecture, and private IP deployment.
+    \item Use Wrangler for interactive, visual data cleaning and directive-based transformation.
+    \item Compose pipelines from plugins, parameterize them with macros, and schedule recurring runs.
+    \item Build a no-code pipeline that cleans messy customer data and loads it into BigQuery.
+    \item Evaluate Data Fusion versus Dataflow for analyst-led teams and justify the recommendation.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+Visual, low-code ETL tools target the same persona everywhere---analysts and integration engineers who need governed pipelines without writing Spark or Beam code.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{2.8cm}p{3.0cm}p{3.0cm}p{3.0cm}@{}} \\
+\toprule
+\textbf{Capability} & \textbf{GCP Data Fusion} & \textbf{AWS} & \textbf{Azure / Fabric} \\
+\midrule
+Visual ETL studio & Data Fusion Studio & Glue Studio & Data Factory pipelines / Fabric Data Factory \\
+Interactive cleaning & Wrangler & Glue DataBrew & Power Query / Dataflow Gen2 \\
+Execution engine & Spark on ephemeral Dataproc & Glue Spark runtime & Spark / Data Factory IR \\
+Extensibility & Plugin Hub (CDAP) & Glue connectors / custom transforms & Linked services \& connectors \\
+Scheduling & Built-in schedules + triggers & Glue triggers / EventBridge & ADF triggers / Fabric schedules \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+\textbf{Snowflake} users reach for partner tools (Matillion, Fivetran transformations, dbt) for the same low-code niche; \textbf{MongoDB} users lean on Atlas Data Federation and Compass aggregations. The shared trade-off: visual tools democratize pipeline building but can hide cost and semantics behind a friendly canvas.
+\end{crosscloud}
+
+\begin{keyterms}
+\textbf{Cloud Data Fusion}: Google Cloud's managed, visual ETL/ELT service built on the open-source CDAP framework.
+\textbf{Wrangler}: Data Fusion's interactive data-preparation surface where analysts apply directives to sample data.
+\textbf{Plugin}: a packaged source, transform, sink, or action available from the Hub or built custom.
+\textbf{Macro}: a runtime parameter placeholder such as a logical date or file path resolved when the pipeline runs.
+\textbf{Pipeline}: a directed graph of plugins deployed to an instance and executed on an ephemeral Dataproc cluster.
+\textbf{Private instance}: a Data Fusion instance reachable only over private IP within a VPC.
+\end{keyterms}
+
+\section{Week 10 Roadmap}
+Week~10 addresses a different builder: the analyst or integration specialist who owns business logic but not Java or Beam. Monday covers CDAP concepts, instance architecture, and private networking. Tuesday is Wrangler, the interactive cleaning workbench. Wednesday covers plugins, macros, and scheduling. Thursday builds the no-code customer-cleansing pipeline. Friday weighs Data Fusion against Dataflow for analyst teams.
+
+\begin{definitionbox}
+\textbf{Cloud Data Fusion} is a fully managed, cloud-native data integration service built on CDAP (the Cask Data Application Platform). Pipelines are designed visually as graphs of plugins and executed at scale on ephemeral Dataproc clusters that the service provisions and tears down per run \cite{googleclouddatafusiondocs}.
+\end{definitionbox}
+
+\section{Monday: CDAP Concepts, Architecture, and Private IPs}
+\index{CDAP!concepts}\index{Data Fusion!architecture}\index{private IP!Data Fusion}
+
+\subsection{The CDAP Foundation}
+Data Fusion is managed CDAP. Every pipeline is a CDAP application; every node on the canvas is a plugin with a schema, configuration, and connections to neighbors. Because CDAP is open source, pipeline definitions are portable artifacts (exported JSON) rather than proprietary lock-in---teams version-control them, diff them in review, and promote them across development, test, and production instances.
+
+\subsection{Instances and Editions}
+A Data Fusion \textbf{instance} is the managed environment hosting the design studio, pipeline store, and execution coordinator. Editions (Basic versus Enterprise) differ in execution guarantees and features; Enterprise adds capabilities such as higher pipeline concurrency and triggers between pipelines. Execution itself does not run in the instance: at run time, Data Fusion provisions an ephemeral Dataproc cluster in your project, runs the pipeline as a Spark job, and deletes the cluster---the ephemeral discipline from Chapter~9, automated.
+
+\subsection{Private Instances}
+Data sources in regulated environments rarely expose public endpoints. A \textbf{private instance} places Data Fusion on private IP within your VPC, using private services access, so pipelines reach on-premises databases over VPN/Interconnect and internal Cloud SQL instances without public exposure. Pair it with VPC Service Controls (Chapter~21) for a perimeter that contains both the design environment and the data paths.
+
+\begin{pitfall}
+A private instance cannot reach the public internet by default. Plugin downloads from the Hub, and calls to public APIs, fail unless you provide Cloud NAT or an explicit egress path---a common first-day surprise that looks like a product bug.
+\end{pitfall}
+
+\section{Tuesday: Wrangler---Interactive Data Cleaning}
+\index{Wrangler!directives}\index{data preparation}
+
+\subsection{The Wrangler Workflow}
+Wrangler presents a sample of source data as a spreadsheet-like grid. Each cleaning gesture---filter, split, parse, extract, mask, rename---compiles into a \textbf{directive}, a declarative transformation step listed beside the grid. The analyst iterates on the sample until the data looks right, then ``creates a pipeline'' that embeds the Wrangler node with its directives, to be executed at full scale on Spark. This sample-first loop is the core productivity claim: cleaning logic is validated interactively before it ever touches production volume.
+
+\subsection{Directives in Practice}
+Directives cover parsing (CSV, JSON, dates), extraction (regex groups, URL and email components), quality rules (null handling, type coercion), and masking. For the Thursday lab, the key directive extracts the domain from an email column: split on the \texttt{@} and keep the right-hand side, lowercased. Directives are readable enough to serve as reviewable documentation of business cleaning rules.
+
+\begin{tipbox}
+Increase the Wrangler sample size when a rule depends on rare values---a 1{,}000-row default sample can hide the malformed rows that motivated the rule. Also profile columns (null rate, distinct count, min/max) before writing directives, not after.
+\end{tipbox}
+
+\begin{notebox}
+Wrangler directives execute on Spark at run time; they are not a separate engine. Anything Wrangler cannot express drops down to a custom transform plugin---the escape hatch keeps the visual tool honest without blocking edge cases.
+\end{notebox}
+
+\section{Wednesday: Plugins, Macros, and Scheduling}
+\index{plugins!Hub}\index{macros!runtime arguments}\index{pipeline scheduling}
+
+\subsection{The Plugin Ecosystem}
+The Hub offers hundreds of plugins: sources (Cloud Storage, BigQuery, relational databases via JDBC, SaaS connectors), transforms (joins, aggregations, Wrangler, Python via custom plugins), and sinks (BigQuery, Cloud Storage, Pub/Sub). Choosing a plugin is a governance decision: prefer maintained first-party plugins, pin versions, and review what each connector does with credentials---database plugins want a service account or stored credentials, which belong in secure keys, not in exported pipeline JSON.
+
+\subsection{Macros and Parameterization}
+Macros make one pipeline definition serve many contexts: \texttt{\$\{logicalStartTime\}} resolves to the run's logical date, \texttt{\$\{input.path\}} to a runtime argument. The canonical pattern parameterizes input and output paths by date---\texttt{gs://bucket/raw/dt=\$\{logicalStartTime(yyyy-MM-dd)\}}---so backfills, reruns, and daily schedules all flow through one pipeline definition with deterministic, idempotent paths.
+
+\subsection{Scheduling and Triggers}
+Deployed pipelines run on time-based schedules (cron-like), on triggers from another pipeline's completion, or on-demand via REST. For the daily-reporting pattern: a single time schedule, macros for the date, and a downstream BigQuery load that truncates the target partition keep the whole chain idempotent.
+
+\begin{pitfall}
+Do not let every analyst deploy a personal schedule against production sources. Ungoverned schedules multiply load on source systems and duplicate loads into BigQuery. Centralize scheduling, require partition-overwrite sinks, and alert on unexpected run counts.
+\end{pitfall}
+
+\section{Thursday Hands-On Project: No-Code Customer Cleansing to BigQuery}
+\index{hands-on project}\index{email domain extraction}\index{bigquery sink}
+This lab builds a Data Fusion pipeline that reads messy customer CSVs from Cloud Storage, cleans them in Wrangler---including extracting the domain from each email---and writes curated rows to BigQuery. Work in a sandbox instance; delete the instance after the lab.
+
+\subsection{Stage the Messy Data}
+\begin{lstlisting}[language=bash,caption={Staging a deliberately messy customer CSV.}]
+$env:BUCKET = "my-gcp-datafusion-lab"
+
+@'
+customer_id,full_name,email,signup_date,country
+1,Ada Lovelace,Ada@Example.COM,2026-07-01,UK
+2,grace hopper,GRACE.HOPPER@example.com,07/02/2026,usa
+3,Alan Turing,,2026-07-03,UK
+4,Katherine Johnson,kjohnson@EXAMPLE.org,2026-07-03,USA
+'@ | Set-Content -Path .\customers-messy.csv
+
+gcloud storage cp .\customers-messy.csv `
+  gs://$env:BUCKET/raw/customers/customers-messy.csv
+\end{lstlisting}
+
+\subsection{Build the Pipeline}
+\begin{enumerate}
+    \item In the Data Fusion Studio, add a \textbf{Cloud Storage source} plugin pointing at the raw prefix, format CSV, with header.
+    \item Add a \textbf{Wrangler} node. On the sample: parse the CSV, title-case \texttt{full\_name}, lowercase and trim \texttt{email}, extract the email domain into \texttt{email\_domain}, normalize \texttt{country} to ISO codes, and filter rows where \texttt{email} is null.
+    \item Add a \textbf{BigQuery sink} plugin writing to \texttt{curated.customers} with the table schema explicitly defined, and the write disposition set to truncate the target table (idempotent re-runs).
+    \item Validate the pipeline (the Studio checks schema propagation), then run once on demand and inspect the BigQuery table.
+    \item Deploy the pipeline with a daily schedule and a macro-parameterized input path.
+\end{enumerate}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item The exported pipeline JSON committed to the repository (credentials externalized as secure keys).
+    \item A screenshot of the Wrangler directives panel alongside the raw sample.
+    \item The resulting \texttt{curated.customers} rows showing cleaned names, lowercase emails, extracted domains, and dropped null-email rows.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item The pipeline runs end-to-end from the Studio with no hand-written code.
+    \item Wrangler directives implement the domain extraction and the null-email filter.
+    \item The BigQuery sink is idempotent: re-running the same date produces no duplicate rows.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Parameterize the input path with the logical-date macro and run a simulated backfill for three dates.
+    \item Add a conditional branch that routes rows with unknown countries to a quarantine prefix.
+    \item Export the pipeline JSON and re-import it into a second instance to prove portability.
+\end{itemize}
+
+\section{Friday Use Case and Architecture: Data Fusion versus Dataflow for Analyst Teams}
+\index{Data Fusion vs Dataflow}\index{tool selection}\index{analyst enablement}
+
+\subsection{Scenario}
+A retailer's business analysts must build and maintain fifteen daily reporting pipelines: POS extracts, loyalty feeds, inventory snapshots. They are fluent in SQL and spreadsheets but write no Java or Python. Today each pipeline is a support ticket to a central engineering team with a six-week queue.
+
+\subsection{Decision Framework}
+Data Fusion fits when builders are analysts, sources and sinks are standard, transformations are row-level cleaning and joins, and the platform team can govern instances, plugins, and schedules centrally. Dataflow (Chapters~14--15) fits when pipelines need custom logic, streaming semantics, windowing, or per-record state---capabilities worth the engineering cost. The honest hybrid, and the recommendation here: Data Fusion for the analyst-owned daily feeds on governed shared instances, Dataflow reserved for the streaming and custom-logic minority, and BigQuery SQL (Chapter~24's Dataform) for in-warehouse transformations.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{4.0cm}p{4.4cm}p{4.4cm}@{}} \\
+\toprule
+\textbf{Criterion} & \textbf{Choose Data Fusion} & \textbf{Choose Dataflow} \\
+\midrule
+Builder persona & Analysts, integration engineers & Software engineers \\
+Logic complexity & Row cleaning, joins, lookups & Custom state, windowing, ML calls \\
+Streaming requirements & Batch (or CDAP replication) & First-class, exactly-once streaming \\
+Connector needs & Standard sources/sinks in Hub & Arbitrary custom I/O \\
+Governance model & Central instance, curated plugins & Code review, CI/CD, templates \\
+Cost shape & Instance + ephemeral Dataproc & Per-job worker vCPU/memory \\
+\bottomrule
+\end{tabular}
+\caption{Data Fusion versus Dataflow decision matrix.}
+\label{tab:ch10-fusion-vs-dataflow}
+\end{table}
+
+\begin{tipbox}
+Whichever tool wins, keep one governance invariant: every pipeline---visual or coded---lands in version control, runs on a central schedule with idempotent sinks, and reports failures to the same on-call channel. Tool pluralism is fine; operational pluralism is not.
+\end{tipbox}
+
+\begin{pitfall}
+Data Fusion instance editions are billed continuously while running, even with zero pipelines executing. Development instances left running overnight are the classic budget leak---schedule instance shutdown or use smaller editions for development.
+\end{pitfall}
+
+\section{Interview Q\&A}
+\subsection{Concepts and Trade-offs}
+\begin{enumerate}
+    \item \textbf{Q: What underlying framework executes Data Fusion pipelines?}\\
+    A: CDAP applications compiled to Spark jobs running on ephemeral Dataproc clusters provisioned per run.
+
+    \item \textbf{Q: What is Wrangler's role before a pipeline runs at scale?}\\
+    A: It lets an analyst iteratively define and validate cleaning directives on a data sample; the directives then execute at full scale inside the pipeline.
+
+    \item \textbf{Q: When should you choose Data Fusion over Dataflow?}\\
+    A: When builders are analysts, sources and sinks are standard, and logic is row-level cleaning and joins rather than custom streaming or stateful processing.
+
+    \item \textbf{Q: Why use a private IP Data Fusion instance?}\\
+    A: To reach on-premises and internal data sources over private networking without exposing endpoints publicly---required in most regulated environments.
+
+    \item \textbf{Q: What do macros parameterize in a deployed pipeline?}\\
+    A: Runtime values such as the logical date, input/output paths, and environment-specific settings, enabling one definition to serve schedules, backfills, and reruns.
+\end{enumerate}
+
+\section{Further Reading}
+Read the Cloud Data Fusion documentation for instance setup, Wrangler directives, and plugin development \cite{googleclouddatafusiondocs}. Review Chapter~9's Dataproc documentation for the ephemeral clusters that execute pipelines \cite{googleclouddataprocdocs}, and the BigQuery documentation for sink schemas and write dispositions \cite{googlecloudbigquerydocs}. For the comparison discussion, the Dataflow documentation previews the streaming capabilities that justify a coded engine \cite{googleclouddataflowdocs}.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item Data Fusion is managed CDAP: visual pipelines compiled to Spark on ephemeral Dataproc clusters.
+    \item Wrangler's sample-first directive loop validates cleaning logic interactively before production scale.
+    \item Private instances plus VPC integration make visual ETL viable in regulated network topologies.
+    \item Macros and idempotent sinks turn one pipeline definition into safe schedules, backfills, and reruns.
+    \item The tool decision is a persona decision: analysts build in Data Fusion; engineers build streaming and custom logic in Dataflow.
+    \item Instance editions bill while running---govern development instances like any other always-on resource.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Explain how the ephemeral-Dataproc execution model aligns Data Fusion with the cost discipline of Chapter~9.
+    \item \textbf{(Conceptual)} A team proposes building a real-time fraud pipeline in Data Fusion. Explain why this strains the tool and what you would propose instead.
+    \item \textbf{(Hands-on)} Reproduce the Thursday lab, then add a Wrangler directive that hashes the email column with SHA-256 for privacy.
+    \item \textbf{(Hands-on)} Export the pipeline JSON, inspect where the email directive and sink schema live, and commit it with a README describing promotion across instances.
+    \item \textbf{(Design)} Draw the platform topology for the Friday retailer: instances per environment, plugin governance, network paths, and the central scheduling pattern.
+    \item \textbf{(Analysis)} A pipeline suddenly doubles its run time after a source change. List the four most likely causes and how you would isolate each in Data Fusion's run logs.
+\end{enumerate}

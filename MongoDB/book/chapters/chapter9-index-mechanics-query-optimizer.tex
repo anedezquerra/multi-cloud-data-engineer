@@ -1,0 +1,413 @@
+\chapter{Index Mechanics and the Query Optimizer}
+\index{indexes}\index{query planner}\index{query optimizer}\index{B+Tree}\index{ESR rule}\index{explain()}\index{covered query}\index{plan cache}\index{multikey index}%
+
+\begin{objectives}
+\begin{itemize}
+    \item Explain how MongoDB stores indexes as WiredTiger B+Tree structures and how the query planner selects among candidate plans.
+    \item Select single-field, compound, multikey, partial, sparse, and TTL index types for concrete access patterns.
+    \item Apply the Equality--Sort--Range (ESR) rule to design compound indexes that satisfy filters, sorts, and projections.
+    \item Prove index usage and coverage with \texttt{explain("executionStats")} and interpret \texttt{IXSCAN}, \texttt{COLLSCAN}, \texttt{FETCH}, and \texttt{SORT} stages.
+    \item Plan rolling index builds on large replica sets without degrading production writes.
+    \item Architect an enterprise search pipeline that eliminates CPU-burning collection scans over array fields.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+Every analytical and operational store in the sibling tracks has an equivalent of ``index design decides latency.'' MongoDB is unusual only in how explicitly the engineer owns that decision: there is no automatic indexing tier that silently fixes a missing compound index.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{2.9cm}p{3.0cm}p{3.0cm}p{3.0cm}@{}} 
+\toprule
+\textbf{Capability} & \textbf{AWS} & \textbf{Azure} & \textbf{GCP} \\
+\midrule
+Managed document DB & DocumentDB & Cosmos DB (Mongo API) & Firestore / Bigtable \\
+Index model & Manual indexes & Autopilot / manual policies & Composite indexes required \\
+Secondary indexes & B-tree indexes & Automatic indexing (default) & Automatic single-field \\
+Query plan insight & Profiler + explain & Diagnostic logs & Query explain stats \\
+Columnar analytics & Redshift sort/dist keys & Dedicated SQL pool indexes & BigQuery clustering \\
+Cloud data warehouse & Redshift distribution keys & Synapse distributions & BigQuery partitions \\
+\addlinespace
+Snowflake & \multicolumn{3}{l}{Micro-partition pruning, clustering keys, search optimization service} \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+The mental model transfers directly: Snowflake's micro-partition pruning, BigQuery's clustering, and Redshift's sort keys are all physical-data-layout decisions that replace per-query index lookup with zone-map elimination. MongoDB's compound B+Tree index is the operational-system counterpart: it is created deliberately, costs writes, and must be proven with \texttt{explain()} rather than assumed.
+\end{crosscloud}
+
+\section{Week 9 Roadmap: Indexes as Physical Design Decisions}
+Chapters 1--4 established how WiredTiger stores documents and how document models should follow access patterns. Part III now makes that access-pattern discipline mechanical: an index is a persistent, sorted structure that turns a predicate into a seek instead of a scan. The week's objective is not to memorize index types. It is to build the habit of deriving every index from a query shape, proving it with \texttt{explain()}, and deleting every index that no query justifies \cite{mongodbIndexesDocs,mongodbExplainDocs}.
+
+\begin{definitionbox}
+A \textbf{query plan} is the executable strategy the MongoDB query planner selects for a query shape: which index to scan, in what order, whether documents must be fetched, and whether results must be sorted in memory.
+\end{definitionbox}
+
+\begin{keyterms}
+\textbf{Selectivity}: the fraction of documents a predicate eliminates. \textbf{Compound index}: one index over multiple fields in a defined order. \textbf{Multikey index}: an index over array elements, with one entry per element. \textbf{Covered query}: a query answered entirely from index keys without fetching documents. \textbf{Plan cache}: the server's memory of which plan won for a query shape. \textbf{ESR rule}: order compound index fields Equality, then Sort, then Range.
+\end{keyterms}
+
+\section{Monday: Index Anatomy and the Query Planner}
+\subsection{Indexes Are WiredTiger Trees}
+Chapter 1 established that collections and indexes are separate WiredTiger B+Tree files. An index entry stores the key (one value per indexed field, in compound order) plus a record identifier pointing back to the document. Descending a B+Tree costs $O(\log n)$ page visits regardless of collection size \cite{bayer1972organization}, which is why a selective index turns a ten-million-document collection scan into a handful of page reads.
+
+Because indexes are trees, their cost model is symmetric: reads descend once, but every write must descend and update every affected index. A collection with seven secondary indexes performs eight tree updates per insert. The first performance question about any index is therefore not ``is it fast?'' but ``which query does it serve, and is that query frequent enough to pay the write tax?''
+
+\begin{notebox}
+The query planner can only choose among indexes that exist. Index design is a physical-schema decision made at design time, exactly like choosing a Snowflake clustering key or a Redshift distribution key---except MongoDB makes you do it explicitly per collection.
+\end{notebox}
+
+\subsection{How the Query Planner Chooses}
+For each distinct query shape (the set of predicate fields, sort, and projection), MongoDB generates candidate plans, races them on a sample of the data or evaluates them with cost heuristics, and caches the winner. When data distribution changes enough---a collection grows tenfold, an index is added, or statistics shift---the cached plan may be re-evaluated. Plan instability after a deployment is often a symptom of ambiguous indexes: two indexes that both marginally satisfy a shape, with the winner depending on which was evaluated first.
+
+\begin{pitfall}
+\textbf{Creating overlapping indexes.} \texttt{\{status: 1\}} and \texttt{\{status: 1, createdAt: -1\}} make the first index redundant: any query the single-field index serves is also served by the compound index's prefix. Redundant indexes still cost writes, cache, and checkpoint work.
+\end{pitfall}
+
+\subsection{Reading \texttt{explain()}}
+\texttt{db.collection.explain("executionStats")} returns the chosen plan tree plus measured execution statistics. The four counters that matter on day one are \texttt{totalDocsExamined}, \texttt{totalKeysExamined}, \texttt{nReturned}, and \texttt{executionTimeMillis}. A healthy selective query has \texttt{totalDocsExamined} close to \texttt{nReturned}; a ratio of thousands of documents examined per returned document signals a missing or mis-ordered index \cite{mongodbExplainDocs}.
+
+\begin{lstlisting}[language=JavaScript, caption={Proving index usage with execution statistics.}]
+db.orders.explain("executionStats").find(
+  { status: "shipped", orderDate: { $gte: ISODate("2026-07-01") } }
+).sort({ orderDate: -1 });
+
+// Healthy shape to look for in the output:
+//   stage: "IXSCAN" on the intended compound index
+//   totalKeysExamined ~= nReturned
+//   totalDocsExamined == nReturned   (no wasted FETCH work)
+//   no blocking SORT stage
+\end{lstlisting}
+
+The stage tree reads bottom-up: \texttt{IXSCAN} feeds \texttt{FETCH} (document retrieval), which may feed a \texttt{SORT} or \texttt{LIMIT}. A top-level \texttt{COLLSCAN} means no index was used at all; a \texttt{SORT} stage with a large \texttt{totalDataSizeSorted} means the index order did not match the requested sort.
+
+\section{Tuesday: The ESR Rule and Compound Index Design}
+\subsection{Equality, Sort, Range}
+The ESR rule orders compound index fields so the B+Tree does maximal work per key examined \cite{mongodbESRDocs}. Equality fields come first: they pin the scan to a single value per field, carving the narrowest possible key range. Sort fields come next: within the equality prefix, keys are already stored in sort order, so the plan streams results without a blocking sort. Range fields come last: a range predicate on an earlier field would break the contiguity that the sort stage depends on.
+
+\begin{definitionbox}
+The \textbf{ESR rule} states that compound index fields should be ordered Equality predicates first, then Sort fields, then Range predicates, so the index simultaneously minimizes keys examined and avoids an in-memory sort.
+\end{definitionbox}
+
+Consider the query from Monday: equality on \texttt{status}, range on \texttt{orderDate}, sort on \texttt{orderDate} descending. The range and sort share one field, so the ESR-compliant index is \texttt{\{ status: 1, orderDate: -1 \}}. Reversing the order to \texttt{\{ orderDate: -1, status: 1 \}} forces the planner to scan every order in the date range across all statuses and filter afterward---a \texttt{totalKeysExamined} blow-up that \texttt{explain()} makes visible immediately.
+
+\subsection{Worked ESR Examples}
+The rule composes cleanly with multiple equality and range fields:
+
+\begin{lstlisting}[language=JavaScript, caption={ESR design for three real query shapes.}]
+// Q1: find open tickets for an agent, newest first
+//     equality: assigneeId, status ; sort: openedAt
+db.tickets.createIndex({ assigneeId: 1, status: 1, openedAt: -1 });
+
+// Q2: price-range search inside one category, sorted by rating
+//     equality: category ; sort: rating ; range: price
+db.products.createIndex({ category: 1, rating: -1, price: 1 });
+
+// Q3: tenant time-series reads
+//     equality: tenantId, deviceId ; sort+range share: ts
+db.readings.createIndex({ tenantId: 1, deviceId: 1, ts: -1 });
+\end{lstlisting}
+
+When the sort field and the range field differ, sort wins the earlier position only if the range field is highly selective; otherwise accept the in-memory sort or reconsider the query. ESR is a heuristic with a physical justification, not a law---the justification is always visible in \texttt{totalKeysExamined}.
+
+\begin{tipbox}
+Design indexes from the query log, not from the schema. Export the slow-query log or \texttt{system.profile}, group by query shape, and design one compound index per high-frequency shape. A schema-first approach produces indexes nobody queries.
+\end{tipbox}
+
+\subsection{Sort Elimination and Index Direction}
+A single-field index can serve ascending and descending sorts equally because the B+Tree can be traversed in either direction. A compound index can serve a sort only when every field's direction matches (or every field is inverted): \texttt{\{a: 1, b: -1\}} serves \texttt{sort(\{a: 1, b: -1\})} and \texttt{sort(\{a: -1, b: 1\})}, but not \texttt{sort(\{a: 1, b: 1\})}. Getting direction right at design time eliminates the memory-hungry blocking \texttt{SORT} stage entirely.
+
+\section{Wednesday: Coverage, Multikey Behavior, and Selectivity}
+\subsection{Covered Queries}
+A query is \textbf{covered} when every field it filters, sorts, and projects exists in the index keys. The plan then consists of an \texttt{IXSCAN} alone---no \texttt{FETCH}---and \texttt{totalDocsExamined} is zero. Covered queries are the closest operational analogue of a columnar projection: the server never touches the document store.
+
+\begin{lstlisting}[language=JavaScript, caption={A covered query: projection must exclude \texttt{\_id} explicitly.}]
+db.orders.createIndex({ status: 1, orderDate: -1, total: 1 });
+
+db.orders.find(
+  { status: "shipped" },
+  { _id: 0, status: 1, orderDate: 1, total: 1 }   // no unindexed fields
+).sort({ orderDate: -1 });
+// explain() shows IXSCAN with totalDocsExamined: 0
+\end{lstlisting}
+
+\begin{pitfall}
+\textbf{Losing coverage by accident.} Projecting one unindexed field---or forgetting to exclude \texttt{\_id}---reintroduces \texttt{FETCH} for every returned document. Coverage is binary; verify it in \texttt{explain()} after every projection change.
+\end{pitfall}
+
+\subsection{Multikey Indexes and Array Bounds}
+Indexing an array field creates a multikey index: one entry per array element, all pointing to the same document. This is what makes queries such as \texttt{\{tags: "mongodb"\}} fast, but it carries two structural constraints. First, a compound index may index at most one array field; two arrays would require the Cartesian product of entries per document. Second, multikey indexes cannot cover queries in most cases, because the index entries do not record which array element matched.
+
+The enterprise-search failure mode in this week's Friday architecture is precisely a missing multikey index: a catalog query filtering on an unindexed array field (\texttt{attributes.values}) degrades into a \texttt{COLLSCAN} that decompresses and inspects every product document, saturating CPU while returning a handful of results.
+
+\subsection{Partial, Sparse, and TTL Indexes as Selectivity Tools}
+A \textbf{partial index} indexes only documents matching a filter expression, for example open orders: \texttt{partialFilterExpression: \{ status: "open" \}}. It is smaller, cheaper to maintain, and more cache-friendly than a full index, and the planner will use it only when the query predicate implies the partial filter. A \textbf{sparse index} omits documents missing the indexed field. A \textbf{TTL index} (Chapter 2) doubles as a lifecycle mechanism, deleting documents after a time threshold \cite{mongodbTTLDocs}.
+
+\begin{tipbox}
+When a query always includes the same filter---active records, a single tenant tier, non-deleted documents---ask whether the index should encode that filter partially instead of re-scanning it at query time.
+\end{tipbox}
+
+\subsection{Wildcard Indexes for Polymorphic Attributes}
+When a collection holds polymorphic attribute bags---electronics with \texttt{ram\_gb}, clothing with \texttt{size}, food with \texttt{allergens}---indexing every attribute path is impossible. The \textbf{wildcard index} projects an entire subtree into one index: \texttt{db.products.createIndex(\{ "attributes.\$**": 1 \})} serves equality and range queries on any path under \texttt{attributes}. Wildcard indexes accept inclusion/exclusion projections (\texttt{wildcardProjection}) to stay small, cannot combine multiple paths into compound keys, cannot encode specialized (text/geospatial) paths, and cannot cover queries---documents are always fetched. Use the wildcard as a safety net for the long tail of attributes, and graduate the top measured paths to plain compound indexes.
+
+\begin{lstlisting}[language=JavaScript, caption={Wildcard index over a polymorphic attribute subtree.}]
+db.products.createIndex({ "attributes.$**": 1 },
+  { wildcardProjection: { seo: 0 } });          // scope it, don't index everything
+
+db.products.explain("executionStats").find({ "attributes.ram_gb": { $gte: 16 } });
+db.products.explain("executionStats").find({ "attributes.color": "red" });
+// both resolve to IXSCAN on the wildcard index
+\end{lstlisting}
+
+\subsection{Hidden Indexes for Safe Experiments}
+A hidden index is maintained on writes but invisible to the planner. Hiding---rather than dropping---an index you suspect is unused lets you measure the impact instantly and unhide in seconds if a critical query regresses. Combined with \texttt{\$indexStats} (Chapter 12), hiding turns index deletion from a leap of faith into a reversible experiment.
+
+\begin{lstlisting}[language=JavaScript, caption={Hiding an index before deleting it.}]
+db.orders.hideIndex({ channel: 1 });          // planner stops using it
+// ... observe latency and $indexStats for one release cycle ...
+db.orders.dropIndex({ channel: 1 });          // safe deletion
+\end{lstlisting}
+
+\subsection{Specialized Types in Brief: Text and Geospatial}
+Two further types appear in index reviews. A \textbf{text index} tokenizes string fields (stop words, stemming, per-field weights) and serves \texttt{\$text} queries ranked by \texttt{textScore}; its limits---one text index per collection, no real typo tolerance, no facets or autocomplete---mean that search-as-a-feature belongs to Atlas Search's Lucene engine (Chapter 13). A \textbf{2dsphere index} encodes GeoJSON geometry as spherical geohash cells and serves \texttt{\$near}, \texttt{\$geoWithin}, and the \texttt{\$geoNear} aggregation stage; it degrades to errors, not scans, when missing. Both obey this chapter's laws: they are WiredTiger-maintained structures that tax every write and must justify themselves with a measured query shape.
+
+\section{Thursday Hands-On Project: Prove the ESR Rule on Five Million Documents}
+This lab generates a five-million-document orders collection, demonstrates ESR violations with measured execution statistics, and builds the optimal compound index. Run it against the local lab deployment from Chapter 0 or 1.
+
+\subsection{Data Generation}
+\begin{lstlisting}[language=JavaScript, caption={Generating a five-million-document orders collection.}]
+use indexLab;
+db.orders.drop();
+
+const statuses = ["pending", "paid", "shipped", "delivered", "returned"];
+const batch = 10000;
+for (let base = 0; base < 5000000; base += batch) {
+  const docs = [];
+  for (let i = 0; i < batch; i++) {
+    const n = base + i;
+    docs.push({
+      customerId: "cust-" + (n % 500000),
+      status: statuses[n % statuses.length],
+      orderDate: new Date(Date.now() - (n % 31536000000)),
+      total: NumberDecimal(((n % 100000) / 100).toFixed(2)),
+      channel: ["web", "mobile", "store"][n % 3]
+    });
+  }
+  db.orders.insertMany(docs, { ordered: false, writeConcern: { w: 1 } });
+}
+\end{lstlisting}
+
+\subsection{Measuring ESR Violations}
+Run the target query with no index, then with a deliberately mis-ordered index, and record \texttt{totalKeysExamined} and \texttt{totalDocsExamined} for each plan.
+
+\begin{lstlisting}[language=JavaScript, caption={Baseline, ESR violation, and corrected index.}]
+const q = () => db.orders.explain("executionStats").find(
+  { customerId: "cust-42", status: "shipped",
+    orderDate: { $gte: ISODate("2026-01-01") } }
+).sort({ orderDate: -1 });
+
+q();  // COLLSCAN: totalDocsExamined = 5000000
+
+// Deliberate violation: range field before equality fields.
+db.orders.createIndex({ orderDate: 1, customerId: 1, status: 1 });
+q();  // IXSCAN, but totalKeysExamined >> nReturned
+
+// ESR-compliant replacement.
+db.orders.dropIndex({ orderDate: 1, customerId: 1, status: 1 });
+db.orders.createIndex({ customerId: 1, status: 1, orderDate: -1 });
+q();  // IXSCAN, keysExamined ~= nReturned, no SORT stage
+\end{lstlisting}
+
+\subsection{Rolling Index Build Rehearsal}
+On a production replica set, building an index on the primary during peak traffic degrades writes and spikes WiredTiger cache pressure. Rehearse the rolling build: stop one secondary, restart it as a standalone on a different port, build the index there, rejoin the replica set, repeat per secondary, then step down the primary and build last. Automating this sequence is the exercise, not the individual commands.
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item The three \texttt{explain("executionStats")} outputs (baseline, violation, ESR) with \texttt{totalKeysExamined}, \texttt{totalDocsExamined}, and \texttt{executionTimeMillis} highlighted.
+    \item The final index list from \texttt{db.orders.getIndexes()} with a one-line justification per index.
+    \item A short paragraph explaining why the violation index still used \texttt{IXSCAN} yet remained slow.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item The final plan shows \texttt{IXSCAN} on \texttt{\{ customerId: 1, status: 1, orderDate: -1 \}} with no blocking \texttt{SORT} stage.
+    \item \texttt{totalKeysExamined} is within 10\% of \texttt{nReturned} on the final plan.
+    \item The redundant violation index is dropped, not merely unused.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Add a projection-only variant of the query and make it fully covered (\texttt{totalDocsExamined: 0}).
+    \item Repeat the experiment with a partial index on \texttt{status: "shipped"} and compare index size and build time.
+\end{itemize}
+
+\section{Friday Use Case and Architecture: Enterprise Search Without the CPU Fire}
+\subsection{Scenario and Requirements}
+An e-commerce platform's product-search service times out during promotional peaks. CPU on the primaries is pinned at 100\%, yet disk and network are idle. Profiling shows the dominant query filters products by array attributes---\texttt{\{attrs: \{ \$elemMatch: \{ name: "color", value: "red" \} \}\}}---against an unindexed field, forcing every request to decompress and inspect every catalog document.
+
+\subsection{Diagnosis and Redesign}
+The fix is architectural, not a bigger machine. Step one is proving the \texttt{COLLSCAN} with \texttt{explain("executionStats")} and quantifying waste: millions of documents examined per query, thousands of queries per minute. Step two is introducing a multikey index on \texttt{attrs.value} (and a compound variant for \texttt{\{attrs.name: 1, attrs.value: 1\}} where the pair is queried together), recognizing that only one array field may appear in a compound index. Step three is measuring the write-path cost: products average twelve attributes, so each insert now maintains twelve index entries, and the catalog bulk-load job must be re-benchmarked.
+
+\begin{pitfall}
+\textbf{Indexing the array without checking write amplification.} Multikey indexes multiply write cost by array cardinality. If the catalog team bulk-refreshes attributes nightly, schedule index builds and loads together, and watch checkpoint duration during the load window.
+\end{pitfall}
+
+\subsection{Architecture Guardrails}
+The mature design adds three guardrails. First, an index-review gate: every new query shape in the search service requires an \texttt{explain()} attachment in the pull request. Second, an index inventory job using \texttt{\$indexStats} (Chapter 12) that flags indexes with zero accesses for 30 days. Third, CPU and \texttt{totalDocsExamined} dashboards correlated per endpoint, so the next missing index is caught by a metric before it is caught by a page.
+
+\begin{figure}[H]
+    \centering
+    \resizebox{0.9\textwidth}{!}{%
+    \begin{tikzpicture}[
+        box/.style={rectangle, rounded corners, draw=primary, fill=primary!6, minimum width=3.0cm, minimum height=1cm, align=center, font=\small\bfseries},
+        tree/.style={rectangle, rounded corners, draw=green!45!black, fill=green!8, minimum width=3.0cm, minimum height=1cm, align=center, font=\small\bfseries},
+        bad/.style={rectangle, rounded corners, draw=red!60!black, fill=red!6, minimum width=3.0cm, minimum height=1cm, align=center, font=\small\bfseries},
+        arrow/.style={-{Stealth[length=2.5mm]}, draw=primary, thick}
+    ]
+        \node[box] (query) at (0,0) {Query shape\\(equality + sort + range)};
+        \node[tree] (planner) at (4.6,0) {Query planner\\candidate plans};
+        \node[tree] (ixscan) at (9.2,1.4) {IXSCAN\\ESR index};
+        \node[bad] (collscan) at (9.2,-1.4) {COLLSCAN\\no usable index};
+        \node[box] (stats) at (13.6,0) {\texttt{explain()}\\executionStats};
+        \draw[arrow] (query) -- (planner);
+        \draw[arrow] (planner) -- (ixscan);
+        \draw[arrow] (planner) -- (collscan);
+        \draw[arrow] (ixscan) -- (stats);
+        \draw[arrow] (collscan) -- (stats);
+    \end{tikzpicture}%
+    }
+    \caption{The query-plan feedback loop: every production query shape is proven against execution statistics, not assumed.}
+    \label{fig:ch5-plan-loop}
+\end{figure}
+
+\section{Interview Q\&A}
+\subsection{Index Design and Plans}
+\begin{enumerate}
+    \item \textbf{Q: Why does field order matter in a compound index?}\\
+    A: B+Tree keys are sorted lexicographically by field order. Equality fields first pin the scan range, sort fields next provide stored order, and range fields last cannot break that order. The ESR rule is the practical encoding of that physical fact.
+
+    \item \textbf{Q: What does \texttt{totalDocsExamined} much larger than \texttt{nReturned} mean?}\\
+    A: The plan fetched and discarded many documents---the index is missing, mis-ordered, or non-selective. It is the single clearest signal of wasted work.
+
+    \item \textbf{Q: Why can a compound index contain only one array field?}\\
+    A: Two array fields would require indexing the Cartesian product of their elements per document, exploding index size and update cost.
+
+    \item \textbf{Q: When is a partial index better than a full index?}\\
+    A: When queries always filter on the same predicate; the partial index is smaller, cheaper to write, and more cache-resident, at the cost of being usable only for queries implying the filter.
+
+    \item \textbf{Q: Why build indexes with a rolling procedure on large replica sets?}\\
+    A: A foreground build on the primary competes with production writes and spikes cache pressure. Building on secondaries first and stepping down the primary last keeps the write path available throughout.
+\end{enumerate}
+
+\section{Further Reading}
+MongoDB's index and explain documentation are the primary references \cite{mongodbIndexesDocs,mongodbExplainDocs}, with the ESR rule described in MongoDB's equality-sort-range tutorial \cite{mongodbESRDocs}. The B-tree foundations go back to Bayer and McCreight \cite{bayer1972organization}, and the storage cost of every additional index connects back to the WiredTiger behavior in Chapter 1 \cite{mongodbWiredTigerDocs}. For a cross-platform contrast, compare MongoDB's explicit index design with Snowflake's micro-partition pruning \cite{snowflakeSemiStructuredDocs} and Cosmos DB's automatic indexing policies \cite{cosmosPartitionDocs}.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item Indexes are persistent WiredTiger B+Trees: $O(\log n)$ reads, but every index taxes every write.
+    \item Design compound indexes with the ESR rule: Equality, Sort, Range, with range and sort sharing one field where possible.
+    \item Prove every index with \texttt{explain("executionStats")}: \texttt{totalKeysExamined} $\approx$ \texttt{nReturned} and \texttt{totalDocsExamined} $=$ \texttt{nReturned} are the healthy signatures.
+    \item Covered queries eliminate \texttt{FETCH} entirely, but one unindexed projected field silently destroys coverage.
+    \item Multikey indexes unlock array search at the cost of per-element write amplification and one-array-per-compound-index.
+    \item Partial, sparse, and TTL indexes encode selectivity and lifecycle directly into the index definition.
+    \item Rolling index builds and index-inventory audits are operational disciplines, not optional extras.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Given the query \texttt{find(\{tenant: t, status: "open", priority: \{\$gte: 3\}\}).sort(\{dueDate: 1\})}, design the ESR-compliant index and justify each field position.
+    \item \textbf{(Conceptual)} Explain why \texttt{\{a: 1, b: -1\}} serves \texttt{sort(\{a: -1, b: 1\})} but not \texttt{sort(\{a: 1, b: 1\})}.
+    \item \textbf{(Conceptual)} A covered query suddenly shows a \texttt{FETCH} stage after a code change. List two likely causes.
+    \item \textbf{(Hands-on)} Reproduce the Thursday lab with \texttt{channel} added as an equality field and design the new optimal index.
+    \item \textbf{(Hands-on)} Use \texttt{\$indexStats} on a lab collection, identify the index with the fewest accesses, and estimate its weekly write cost from the oplog.
+    \item \textbf{(Design)} Design the index set for the enterprise-search catalog: product text fields, attribute arrays, price ranges, and tenant isolation, with no more than four indexes.
+    \item \textbf{(Design)} Write an index-review checklist for a team, covering justification, ESR order, write cost, redundancy, and coverage.
+    \item \textbf{(Interview)} ``We added an index for every field and queries got slower.'' Diagnose and respond in five sentences.
+\end{enumerate}
+
+\section{Capstone Project: ESR-Compliant Index Architecture for a High-Traffic Order API}\label{sec:ch9-capstone}
+
+\begin{capstonebox}
+\textbf{Mission:} take a deliberately un-indexed five-million-document order workload from 100\% CPU collection scans to fully proven ESR-compliant plans, and deliver the index set as a reviewed, scripted migration with measured before-and-after execution statistics.
+
+\textbf{Estimated time:} 3--5 hours.
+
+\textbf{What you will practice:}
+\begin{itemize}
+    \item Deriving indexes from real query shapes rather than from the schema.
+    \item Applying the ESR rule and verifying sort elimination.
+    \item Achieving and proving covered queries.
+    \item Delivering index changes as scripted, reversible migrations.
+\end{itemize}
+\end{capstonebox}
+
+\subsection*{Scenario}
+You own the order-history API for a retail platform. Peak traffic is 4,000 reads per second across four query shapes: customer order history (filter customer, sort by date), tenant-level status dashboards (equality plus date range), a finance export (covered projection), and an operations queue (partial filter on open orders). The current collection has only the default \texttt{\_id} index. The database CPU saturates every evening and the team has proposed ``doubling the cluster.'' Your task is to prove that index architecture, not capacity, is the problem.
+
+\subsection*{Requirements}
+\begin{itemize}
+    \item Generate five million order documents with realistic cardinality (500k customers, five statuses, three channels, one-year date range).
+    \item Record a baseline \texttt{explain("executionStats")} and latency for each of the four query shapes.
+    \item Design at most four compound indexes covering all four shapes, applying ESR and using one partial index for the operations queue.
+    \item Make the finance export fully covered and prove \texttt{totalDocsExamined: 0}.
+    \item Deliver the index changes as an idempotent \texttt{mongosh} migration script that drops redundant indexes and builds the new set.
+    \item Produce a one-page before/after report: plans, keys examined, documents examined, latency, and estimated CPU reduction.
+\end{itemize}
+
+\subsection*{Reference Architecture}
+\begin{figure}[H]
+    \centering
+    \resizebox{0.85\textwidth}{!}{%
+    \begin{tikzpicture}[
+        qshape/.style={rectangle, rounded corners, draw=primary, fill=primary!6, minimum width=2.9cm, minimum height=1.5cm, align=center, font=\footnotesize\bfseries},
+        idx/.style={rectangle, rounded corners, draw=green!45!black, fill=green!8, minimum width=2.9cm, minimum height=1.0cm, align=center, font=\scriptsize},
+        arrow/.style={-{Stealth[length=2mm]}, draw=primary, thick}
+    ]
+        \node[qshape] (q1) at (0,3.2) {Order history\\cust + date sort};
+        \node[qshape] (q2) at (0,1.1) {Status dashboard\\tenant + range};
+        \node[qshape] (q3) at (0,-1.1) {Finance export\\covered projection};
+        \node[qshape] (q4) at (0,-3.2) {Ops queue\\open orders only};
+        \node[idx] (i1) at (5.4,3.2) {\texttt{\{cust:1, date:-1\}}};
+        \node[idx] (i2) at (5.4,1.1) {\texttt{\{tenant:1, status:1, date:-1\}}};
+        \node[idx] (i3) at (5.4,-1.1) {\texttt{\{status:1, date:1, total:1\}}};
+        \node[idx] (i4) at (5.4,-3.2) {partial: \texttt{\{status:1, prio:-1\}}};
+        \node[qshape] (prove) at (10.4,0) {\texttt{explain()}\\evidence pack};
+        \draw[arrow] (q1) -- (i1); \draw[arrow] (q2) -- (i2);
+        \draw[arrow] (q3) -- (i3); \draw[arrow] (q4) -- (i4);
+        \draw[arrow] (i1) -- (prove); \draw[arrow] (i2) -- (prove);
+        \draw[arrow] (i3) -- (prove); \draw[arrow] (i4) -- (prove);
+    \end{tikzpicture}%
+    }
+    \caption{Capstone mapping: each query shape gets exactly one justified index, and every index is proven in the evidence pack.}
+    \label{fig:ch5-capstone}
+\end{figure}
+
+\subsection*{Implementation Steps}
+\begin{enumerate}
+    \item \textbf{Baseline.} Script the data generator and the four query shapes so the baseline is reproducible. Store each \texttt{explain()} output as JSON.
+    \item \textbf{Design.} Write the ESR justification for each index in one sentence before creating it; if you cannot name the shape it serves, do not create it.
+    \item \textbf{Migrate.} Deliver the migration as \texttt{005\_order\_indexes.js} with \texttt{createIndex} calls, explicit drops of redundant indexes, and a rollback section.
+    \item \textbf{Prove.} Re-run all four shapes; confirm \texttt{IXSCAN}-only plans, sort elimination, and the covered finance query.
+    \item \textbf{Report.} Quantify the improvement and state the residual write-path cost of the four indexes.
+\end{enumerate}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item Data generator, query-shape scripts, and the idempotent index migration script.
+    \item The before/after \texttt{explain()} evidence pack and one-page report.
+    \item A rollback plan for the index migration.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item All four query shapes resolve to \texttt{IXSCAN} with \texttt{totalKeysExamined} within 10\% of \texttt{nReturned}.
+    \item The finance export is fully covered with zero documents examined.
+    \item No more than four secondary indexes exist, each justified by a measured query shape.
+    \item The migration script runs idempotently twice with no errors.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Rehearse the full rolling index build on a three-node replica set and measure write-latency impact per step.
+    \item Add a \texttt{\$indexStats} audit query to CI that fails the build if any index shows zero accesses after a soak test.
+\end{itemize}

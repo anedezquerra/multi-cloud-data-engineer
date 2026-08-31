@@ -1,0 +1,189 @@
+\chapter{CLI and API Quick Reference}
+\index{Azure CLI}\index{REST API}\index{quick reference}\index{T-SQL!reference}\index{KQL!reference}\index{PySpark!reference}%
+This appendix collects the commands, endpoints, and idioms the book's labs use repeatedly, in
+one lookup-friendly place. It is a reference, not a tutorial: each section points back to the
+chapter that teaches the concept.
+
+\section{Azure CLI Essentials}
+\index{az CLI!essentials}%
+\begin{lstlisting}[language=bash,caption={Azure CLI commands used across the labs.},label={lst:appendixb-az}]
+az login                                  # authenticate (Ch. 0, Appendix A)
+az account show                           # confirm subscription context
+az group create -n rg-fabric-de -l eastus # resource group for lab infra
+
+# Azure SQL free-tier source for the Week 9/11 labs
+az sql server create -g rg-fabric-de -n sql-fabric-de-<suffix> -l eastus `
+    -u sqladmin -p '<from-vault>'
+az sql db create -g rg-fabric-de -s sql-fabric-de-<suffix> -n sourcedb `
+    --edition GeneralPurpose --compute-model Serverless -f Gen5 -c 1
+
+# Key Vault for Chapters 11, 19, 22 (secrets never in code)
+az keyvault create -g rg-fabric-de -n kv-fabric-de-<suffix> -l eastus
+az keyvault secret set --vault-name kv-fabric-de-<suffix> `
+    -n eventstream-conn-str --value '<connection string>'
+az keyvault secret show --vault-name kv-fabric-de-<suffix> `
+    -n eventstream-conn-str --query value -o tsv
+
+# Capacity hygiene (Ch. 5, 23): pause dev/test capacities off-hours
+az fabric capacity resume -g rg-fabric-de -n fcapfabricde
+az fabric capacity suspend -g rg-fabric-de -n fcapfabricde
+\end{lstlisting}
+
+\section{OneLake Paths and Endpoints}
+\index{OneLake!paths}%
+Every Fabric item with storage is addressable through the DFS and Blob endpoints. The two forms
+appear throughout the book:
+
+\begin{lstlisting}[language=bash,caption={OneLake addressing patterns.},label={lst:appendixb-onelake}]
+# DFS endpoint (used by COPY INTO, ADLS-compatible tools)
+https://onelake.dfs.fabric.microsoft.com/<workspace>/<item>/Files/<path>
+https://onelake.dfs.fabric.microsoft.com/<workspace>/<item>/Tables/<table>
+
+# ABFS form (used by Spark and storage SDKs)
+abfss://<workspace>@onelake.dfs.fabric.microsoft.com/<item>.Lakehouse/Files/<path>
+\end{lstlisting}
+
+Right-click any folder in the lakehouse explorer to copy these paths exactly; a wrong segment is
+the most common cause of failed \texttt{COPY INTO} loads (Chapter~5).
+
+\section{Fabric REST API}
+\index{Fabric REST API}%
+The Fabric REST API automates workspace and item management---the operations plane beneath
+Week~23's CI/CD. Pattern: acquire a token, call the API, poll long-running operations.
+
+\begin{lstlisting}[language=bash,caption={Fabric REST API essentials.},label={lst:appendixb-rest}]
+# Token for the Fabric API (service principal or az CLI context)
+$token = az account get-access-token `
+    --resource https://api.fabric.microsoft.com --query accessToken -o tsv
+
+# List workspaces
+curl -H "Authorization: Bearer $token" `
+    https://api.fabric.microsoft.com/v1/workspaces
+
+# Create a lakehouse in a workspace
+curl -X POST -H "Authorization: Bearer $token" -H "Content-Type: application/json" `
+    -d '{"displayName":"lh_lab","description":"Appendix B example"}' `
+    https://api.fabric.microsoft.com/v1/workspaces/<workspace-id>/lakehouses
+
+# Run a notebook job (long-running; poll the returned Location header)
+curl -X POST -H "Authorization: Bearer $token" -H "Content-Type: application/json" `
+    -d '{}' `
+    "https://api.fabric.microsoft.com/v1/workspaces/<ws>/items/<notebook-id>/jobs/instances?jobType=RunNotebook"
+\end{lstlisting}
+
+\begin{pitfall}
+The REST API authenticates as \emph{someone}: a service principal with least-privilege workspace
+assignment, vaulted secret, and a rotation date. API tokens pasted into scripts reproduce
+Chapter~19's key-in-notebook failure at the platform layer.
+\end{pitfall}
+
+\section{T-SQL Quick Reference}
+\index{T-SQL!quick reference}%
+The statements the warehousing chapters rely on, in one block:
+
+\begin{lstlisting}[language=SQL,caption={T-SQL idioms used across Chapters 5--8 and 21.},label={lst:appendixb-tsql}]
+-- Bulk load (Ch. 5)
+COPY INTO dbo.stg_sales
+FROM 'https://onelake.dfs.fabric.microsoft.com/<ws>/<lh>/Files/stage/sales/'
+WITH ( FILE_TYPE = 'PARQUET' );
+
+-- Idempotent manifest recording (Ch. 5, 9)
+INSERT cfg.load_manifest (batch_path, rows_loaded, loaded_ts)
+VALUES ('2026-07', @@ROWCOUNT, CURRENT_TIMESTAMP);
+
+-- Cross-item query (Ch. 5-6): three-part name into a lakehouse endpoint
+SELECT TOP 10 * FROM lh_gold.dbo.fact_sales;
+
+-- Object security (Ch. 6, 21)
+GRANT SELECT ON gold.v_sales_enriched TO [analysts@contoso.com];
+DENY  SELECT ON gold.dim_customer (national_id) TO [analysts@contoso.com];
+
+-- Row-level security (Ch. 6, 21)
+CREATE SECURITY POLICY sec.sales_region_policy
+ADD FILTER PREDICATE sec.fn_region_predicate(region)
+ON gold.v_sales_enriched_base
+WITH (STATE = ON);
+
+-- Test as a restricted principal (Ch. 6, 21)
+EXECUTE AS USER = 'analyst-us@contoso.com';
+SELECT DISTINCT region FROM gold.v_sales_enriched;
+REVERT;
+\end{lstlisting}
+
+\section{KQL Quick Reference}
+\index{KQL!quick reference}%
+\begin{lstlisting}[language=SQL,caption={KQL idioms used across Chapters 13--16.},label={lst:appendixb-kql}]
+// Always bound by time (Ch. 14)
+IoTTelemetry | where Timestamp > ago(1h);
+
+// Dedup: latest arrival per producer-stamped id (Ch. 13-14)
+IoTTelemetry | summarize arg_max(ingestion_time(), *) by EventId;
+
+// Windowed aggregation (Ch. 14)
+IoTTelemetry
+| summarize avg(Temperature) by DeviceId, bin(Timestamp, 5m);
+
+// Rolling average + anomalies (Ch. 14)
+IoTTelemetry
+| where Timestamp > ago(6h)
+| make-series AvgTemp = avg(Temperature) default=0 on Timestamp step 5m by DeviceId
+| extend RollingAvg = series_fir(AvgTemp, repeat(1, 5))
+| extend Anomalies = series_decompose_anomalies(RollingAvg, 1.5);
+
+// Impossible travel (Ch. 16)
+Txn
+| summarize arg_max(ingestion_time(), *) by txn_id
+| order by card_id asc, ts asc
+| serialize
+| extend p_city = prev(city), p_ts = prev(ts)
+| where city != p_city and ts - p_ts <= 10m;
+\end{lstlisting}
+
+\section{PySpark and Delta Quick Reference}
+\index{PySpark!quick reference}\index{Delta Lake!quick reference}%
+\begin{lstlisting}[language=Python,caption={PySpark/Delta idioms used throughout.},label={lst:appendixb-pyspark}]
+# Read a managed table; stamp lineage columns (Ch. 3)
+df = (spark.read.table("bronze.orders")
+      .withColumn("ingested_at", F.current_timestamp()))
+
+# Idempotent partition-scoped write (Ch. 9, 17, 20)
+(df.write.format("delta").mode("overwrite")
+   .option("replaceWhere", "as_of_date = '2026-07-31'")
+   .saveAsTable("gold.features_store_daily"))
+
+# Delta maintenance (Ch. 4)
+spark.sql("OPTIMIZE silver_orders VORDER")
+spark.sql("DESCRIBE HISTORY silver_orders")
+
+# Time travel (Ch. 4, 22)
+prev = (spark.read.format("delta").option("versionAsOf", 12)
+        .table("silver_sales_orders_training"))
+
+# Schema evolution (Ch. 9): default enforcement rejects; opt in deliberately
+(df.write.format("delta").mode("append")
+   .option("mergeSchema", "true")
+   .saveAsTable("silver.orders"))
+
+# Registered model as UDF (Ch. 18, 20)
+predict = mlflow.pyfunc.spark_udf(spark, "models:/churn_model/Production",
+                                  result_type="double")
+\end{lstlisting}
+
+\section{DAX Quick Reference}
+\index{DAX!quick reference}%
+\begin{lstlisting}[language=SQL,caption={DAX idioms used across Chapters 7--8.},label={lst:appendixb-dax}]
+Total Revenue = SUM ( fact_sales[net_amount] )
+
+Order Count = DISTINCTCOUNT ( fact_sales[order_id] )
+
+Average Order Value = DIVIDE ( [Total Revenue], [Order Count] )
+
+Revenue YTD =
+CALCULATE ( [Total Revenue], DATESYTD ( dim_date[full_date] ) )
+\end{lstlisting}
+
+\begin{tipbox}
+Keep this appendix open during capstones. Every idiom here appears in at least one chapter's
+validation checklist; when an acceptance criterion says ``idempotent'' or ``dedup,'' these are the
+exact patterns it refers to.
+\end{tipbox}

@@ -1,0 +1,345 @@
+\chapter{Real-Time Dashboards}
+\index{Real-Time Dashboards}\index{KQL queryset}\index{automatic page refresh}\index{reverse ETL}\index{Dataverse}\index{identity resolution}\index{micro-batch}%
+
+\begin{objectives}
+\begin{itemize}
+    \item Distinguish KQL querysets from Real-Time Dashboards and choose correctly per audience.
+    \item Build auto-refreshing dashboards directly on KQL databases.
+    \item Configure Power BI automatic page refresh and weigh DirectQuery versus KQL-backed freshness.
+    \item Implement reverse ETL: upsert curated Gold data back to Dataverse on stable business keys.
+    \item Reason about sync frequency---near-real-time micro-batches versus nightly syncs---and its CU and API-throttling cost.
+    \item Design the sub-second BI access layer for a manufacturing floor monitoring machine health.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+Live operational dashboards and the reverse flow of curated data back into operational systems are cross-cloud patterns with different brand names per vendor.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{2.8cm}p{3.2cm}p{3.2cm}p{3.2cm}p{3.2cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{Fabric} & \textbf{AWS} & \textbf{GCP} & \textbf{Snowflake} \\
+\midrule
+Live dashboards & Real-Time Dashboards (KQL) & QuickSight / Grafana on Timestream & Looker / Grafana on BigQuery streaming & Snowsight / connected BI \\
+Auto-refresh BI & Power BI automatic page refresh & QuickSight refresh & Looker persistent derived tables & BI tool refresh \\
+Reverse ETL target & Dataverse / CRM via pipelines & AppFlow to SaaS & Workflows / AppSheet writes & Snowflake reverse-ETL partners \\
+Upsert semantics & Alternate-key upsert to Dataverse & API-level upsert per target & API-level per target & \texttt{MERGE} / external writes \\
+Sync cost driver & CUs + target API throttling & Lambda/AppFlow invocations & Function invocations + API quotas & Warehouse credits + API quotas \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+Databricks serves live BI from SQL warehouses; MongoDB has Charts and Atlas-native dashboards. The transferable insight of the week: \emph{dashboards close the loop from data to humans; reverse ETL closes it from data back to systems}---and both loops are billed.
+\end{crosscloud}
+
+\begin{keyterms}
+\textbf{KQL queryset}: an interactive, shareable collection of KQL queries for exploration. \quad
+\textbf{Real-Time Dashboard}: a Fabric item of auto-refreshing tiles, each bound to a KQL query. \quad
+\textbf{Automatic page refresh}: Power BI's scheduled re-query of live-connected visuals. \quad
+\textbf{Reverse ETL}: pushing curated analytical data back into operational systems (CRM, Dataverse). \quad
+\textbf{Identity resolution}: matching analytical records to operational records on stable business keys. \quad
+\textbf{Micro-batch sync}: small, frequent reverse-ETL runs trading freshness for throttling and cost pressure.
+\end{keyterms}
+
+\section{Week 16 Roadmap}
+Week~16 completes Part~IV. Monday contrasts KQL querysets with Real-Time Dashboards. Tuesday builds dashboards natively on KQL. Wednesday covers Power BI automatic page refresh and reverse ETL to Dataverse---identity resolution and sync-frequency economics. Thursday is the hands-on project: an auto-refreshing Real-Time Dashboard plus a reverse-ETL pipeline upserting a Gold customer-segment table into Dataverse. Friday designs the manufacturing-floor access layer with sub-second machine-health dashboards. The chapter closes with the Milestone~4 capstone: real-time fraud detection.
+
+This week is where Part~IV pays off visibly: the streams, queries, and rules of Weeks~13--15 become the live surfaces humans actually watch \cite{microsoftRealTimeDashboards}---and, through reverse ETL, the analytical work flows back into the operational systems where action happens.
+
+\begin{notebox}
+Two audiences, two tools: querysets are for engineers exploring; Real-Time Dashboards are for operators watching. Building a dashboard for exploration, or handing an operator a queryset, are symmetric category errors.
+\end{notebox}
+
+\section{Monday: KQL Querysets versus Real-Time Dashboards}
+\index{KQL queryset}\index{Real-Time Dashboards!versus querysets}
+A \textbf{queryset} is a working document: saved, shareable KQL queries with results, meant for iterative exploration and handoff between engineers. A \textbf{Real-Time Dashboard} is a production surface: tiles bound to queries, parameterized, auto-refreshing, permissioned, and meant to be glanced at for months without edits \cite{microsoftRealTimeDashboards,microsoftKQL}.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.8cm}p{5.0cm}p{5.0cm}@{}}
+\toprule
+\textbf{Aspect} & \textbf{KQL queryset} & \textbf{Real-Time Dashboard} \\
+\midrule
+Primary user & Engineer, analyst exploring & Operator, executive watching \\
+Content & Queries and result grids & Visual tiles over queries \\
+Refresh & On demand & Automatic, per tile/page \\
+Governance & Shared as code-like artifacts & Shared as monitored products \\
+Failure mode & Wrong analysis, caught by review & Wrong wall monitor, caught by nobody \\
+\bottomrule
+\end{tabular}
+\caption{Querysets explore; dashboards operate.}
+\label{tab:chapter16-queryset-vs-dashboard}
+\end{table}
+
+The engineering consequence: dashboards deserve production rigor---versioned source queries (exported from the queryset that bred them), bounded time windows, owners, and the lateness policy of Chapter~14 attached as a visible annotation.
+
+\section{Tuesday: Building Dashboards on KQL}
+\index{Real-Time Dashboards!building}
+Tiles bind KQL queries to visuals: time charts, bar charts, scorecards, tables. The practices that separate operable dashboards from demo screens \cite{microsoftRealTimeDashboards}:
+
+\begin{itemize}
+    \item \textbf{Every query is time-bounded.} A tile scanning all history on every refresh is a capacity leak with a UI.
+    \item \textbf{Parameters drive filtering.} A \texttt{\_device} or \texttt{\_site} parameter lets one dashboard serve many scopes; hardcoded filters fork dashboards per team.
+    \item \textbf{Read materialized views.} Tiles over Chapter~14's maintained state refresh in milliseconds; tiles over raw aggregation recompute the world every thirty seconds.
+    \item \textbf{Refresh cadence matches decision cadence.} A floor-safety tile refreshes in seconds; a daily-throughput tile refreshing every ten seconds burns capacity to tell nobody anything new.
+\end{itemize}
+
+\begin{tipbox}
+Set tile refresh to the slowest cadence the decision tolerates, not the fastest the platform allows. Freshness beyond the decision cadence is pure CU cost.
+\end{tipbox}
+
+\section{Wednesday: Automatic Page Refresh and Reverse ETL}
+\index{automatic page refresh}\index{reverse ETL}\index{Dataverse}\index{identity resolution}
+\subsection{Power BI Automatic Page Refresh}
+For Power BI reports over live connections (DirectQuery or KQL), automatic page refresh re-queries visuals on a schedule. The cost model is direct: every refresh is real query load on the capacity---a report open on forty wall monitors at ten-second refresh is four queries per second, forever. Set page refresh deliberately, per page, and prefer the KQL-native dashboard for second-level needs.
+
+\subsection{Reverse ETL}
+Analytics earns its keep when it changes operations. Reverse ETL pushes curated Gold data---customer segments, churn scores, recommended actions---back into the systems where people work: Dataverse, the CRM, the support console \cite{microsoftFabricPipelines}.
+
+\begin{definitionbox}
+\textbf{Reverse ETL} is the pipeline direction that writes curated analytical outputs from Gold tables back into operational systems, keyed by stable business identities, at a frequency chosen as an explicit cost--freshness trade-off.
+\end{definitionbox}
+
+Two disciplines define success. \textbf{Identity resolution}: match on stable business keys---Dataverse record IDs, CRM-native keys---never on names or emails, which change and collide. Upsert by alternate key, so reruns update rather than duplicate. \textbf{Sync-frequency economics}: near-real-time micro-batches (every 15 minutes) maximize freshness and multiply CU and target-API-throttling cost; nightly full syncs minimize both and serve many use cases perfectly well. Choose per entity, in writing, with the business owner.
+
+\begin{pitfall}
+Reverse ETL without idempotent upsert keys slowly forks reality: the CRM accumulates duplicate contacts, sales works phantom records, and the lakehouse's pristine Gold table gets blamed. Upsert on the stable key, reconcile counts both directions weekly, and alert on drift.
+\end{pitfall}
+
+\section{Thursday: Hands-on Project}
+\index{hands-on lab}\index{Real-Time Dashboards!hands-on}\index{reverse ETL!hands-on}
+The Week~16 lab has two halves: a Real-Time Dashboard natively in Fabric with auto-refreshing charts over the IoT KQL data, and a reverse-ETL pipeline upserting a Gold customer-segment table into Dataverse on a stable business key.
+
+\subsection{Goal and Architecture}
+Part one: dashboard \texttt{rtd\_fleet} over \texttt{kqldb\_iot} with tiles for active device count, current temperature trend per device, and anomaly count. Part two: pipeline \texttt{PL\_reverse\_etl\_segments} upserting \texttt{gold.customer\_segment} to a Dataverse table keyed on \texttt{customer\_id} as an alternate key. (A trial Dataverse environment or instructor mock suffices.)
+
+\subsection{Step-by-Step Actions}
+\begin{enumerate}
+    \item Create the dashboard; add the three tiles, each from a bounded query over the deduplicated view.
+    \item Set per-tile refresh cadences (10s for active devices, 60s for trends) and justify each in the tile description.
+    \item Add a \texttt{\_device} parameter and prove one dashboard serves all devices.
+    \item Build the reverse-ETL pipeline: read \texttt{gold.customer\_segment}, upsert to Dataverse by the \texttt{customer\_id} alternate key.
+    \item Run twice; verify the second run updates in place---record counts match, no duplicates.
+    \item Reconcile: Gold row count equals Dataverse segment count; log both to the ledger.
+    \item Estimate the CU and API-call cost of 15-minute versus nightly sync; write the recommendation.
+\end{enumerate}
+
+\begin{lstlisting}[language=SQL,caption={Dashboard tile queries: bounded, deduplicated, parameterized.},label={lst:chapter16-tiles}]
+// Tile 1: active devices (seen in the last 2 minutes)
+IoTTelemetry
+| where ingestion_time() > ago(2m)
+| summarize arg_max(ingestion_time(), *) by EventId
+| summarize ActiveDevices = dcount(DeviceId);
+
+// Tile 2: temperature trend per device (parameterized)
+IoTTelemetry
+| where Timestamp > ago(30m)
+| where DeviceId == _device or _device == "all"
+| summarize AvgTemp = avg(Temperature) by DeviceId, bin(Timestamp, 1m)
+| order by bin_Timestamp asc;
+\end{lstlisting}
+
+\subsection{Validation Checklist}
+\begin{itemize}
+    \item Every tile query is time-bounded and reads deduplicated or materialized data.
+    \item Refresh cadences are documented with a decision-cadence justification.
+    \item The dashboard parameter works; no per-device dashboard forks exist.
+    \item Reverse ETL upserts: a second run changes no record count, only updated fields.
+    \item Reconciliation counts match and are ledgered.
+    \item The sync-frequency recommendation cites CU and throttling arithmetic.
+\end{itemize}
+
+\section{Friday: Use Case and Architecture}
+\index{manufacturing dashboards}\index{sub-second latency}
+A manufacturing plant's operators monitor machine health---vibration and heat---on floor-mounted displays. Requirements: sub-second to few-second latency, per-line views, and graceful behavior when a sensor gateway drops.
+
+\subsection{The Design}
+Machine telemetry lands through eventstreams into the Eventhouse; per-line materialized views maintain rolling vibration and temperature state; Real-Time Dashboards render per-line tiles (parameterized, so one dashboard serves all lines) at a five-second refresh---the decision cadence of a floor operator watching for a hot spindle. Reflex rules (Chapter~15) handle reaction; the dashboards handle awareness. Sensor-gateway drops surface as a ``silence'' tile: machines whose last heartbeat exceeds a threshold, because on a plant floor \emph{no data is itself data}.
+
+\begin{pitfall}
+A wall dashboard that silently freezes looks exactly like a healthy plant. Every real-time surface needs a freshness indicator---last-event age, tile heartbeat---so operators can distinguish ``all quiet'' from ``all broken.'' This is the dashboard form of the lateness policy.
+\end{pitfall}
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{4.4cm}p{4.6cm}p{4.6cm}@{}}
+\toprule
+\textbf{Requirement} & \textbf{Design choice} & \textbf{Chapter discipline} \\
+\midrule
+Sub-second/few-second reads & Materialized views, not raw scans & Ch.~14 incremental state \\
+Per-line views & Dashboard parameters & Ch.~16 parameterization \\
+Sensor-drop detection & Silence/heartbeat tile & Ch.~13 ingestion monitoring \\
+Reaction on breach & Reflex rules, sustained & Ch.~15 noise discipline \\
+Cost control & Refresh = decision cadence & Capacity stewardship \\
+\bottomrule
+\end{tabular}
+\caption{Manufacturing-floor dashboard design, mapped to Part IV disciplines.}
+\label{tab:chapter16-manufacturing}
+\end{table}
+
+\section{Operational Guidance for Week 16}
+Dashboards and reverse ETL are the platform's most visible artifacts---and therefore where operational credibility is won or lost in front of the business.
+
+\subsection{Performance and Reliability}
+Audit tile queries monthly for unbounded scans. Track dashboard refresh cost in the Capacity Metrics app \cite{microsoftFabricMetricsApp}. Reconcile reverse-ETL counts both directions on a schedule. Treat freshness indicators as required tile furniture.
+
+\subsection{Security and Governance Checklist}
+\begin{itemize}
+    \item Dashboard permissions match the operational audience; telemetry detail can be sensitive.
+    \item Reverse ETL writes to operational systems are least-privilege and fully ledgered.
+    \item Dataverse upsert keys are documented stable business keys, never display fields.
+    \item Sync-frequency decisions are recorded with business-owner sign-off.
+    \item Personal data flowing into a CRM inherits its sensitivity classification (Chapter~22).
+    \item Every dashboard has a named owner and a freshness indicator.
+\end{itemize}
+
+\section{Interview Q\&A}
+\begin{enumerate}
+    \item \textbf{Q: When would you choose a Real-Time Dashboard over a KQL queryset?}\\
+    A: When the audience watches rather than explores---operators and executives need parameterized, auto-refreshing, governed tiles; querysets remain the engineers' working documents that breed the tiles' queries.
+    \item \textbf{Q: What does automatic page refresh cost in DirectQuery mode?}\\
+    A: Every refresh is real query load against the capacity, multiplied by every open report instance---forty wall monitors at ten seconds is four queries per second forever, which is why cadence follows decision cadence.
+    \item \textbf{Q: What is reverse ETL, and why push Gold data back to a CRM?}\\
+    A: Reverse ETL writes curated analytical outputs---segments, scores---into operational systems where people act. Analytics that never reaches the system of action is a report nobody operationalizes.
+    \item \textbf{Q: Which identity-resolution key would you sync Dataverse records on?}\\
+    A: A stable business key---the Dataverse record ID or a CRM-native identifier as an alternate key---never a mutable, collidable display field like name or email.
+    \item \textbf{Q: Trade-off between 15-minute and nightly reverse-ETL syncs?}\\
+    A: Fifteen-minute micro-batches buy freshness at multiplied CU consumption and target-API throttling pressure; nightly syncs are cheap and simple. The choice is per entity, in writing, with the business owner.
+    \item \textbf{Q: Why does every real-time dashboard need a freshness indicator?}\\
+    A: A frozen dashboard is indistinguishable from a healthy system; last-event age separates ``all quiet'' from ``all broken'' for the humans trusting the wall.
+\end{enumerate}
+
+\section{Further Reading}
+Review the Real-Time Dashboards documentation \cite{microsoftRealTimeDashboards}, the KQL reference behind every tile \cite{microsoftKQL}, and the pipeline mechanics that implement reverse ETL \cite{microsoftFabricPipelines}. Cost governance relies on the Capacity Metrics app \cite{microsoftFabricMetricsApp}; upstream stream correctness on Chapters~13--14 \cite{microsoftFabricEventstreams,microsoftFabricEventhouse}.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item Querysets explore; dashboards operate---different audiences, different rigor.
+    \item Every tile query is time-bounded, deduplicated or materialized, and refreshed at decision cadence.
+    \item Automatic page refresh multiplies query load by open viewers; wall monitors are a capacity design input.
+    \item Reverse ETL closes the analytics loop into operational systems, on stable keys, with ledgered reconciliation.
+    \item Sync frequency is an explicit per-entity business decision with CU and throttling arithmetic attached.
+    \item Freshness indicators are required: no-data is itself data, and frozen dashboards lie silently.
+    \item Part~IV's disciplines---dedup, windows, sustained conditions, cadence---compose into surfaces the business can trust.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Explain why decision cadence, not platform capability, sets refresh cadence.
+    \item \textbf{(Conceptual)} Why is a mutable field like email unacceptable as a reverse-ETL upsert key, even with deduplication?
+    \item \textbf{(Hands-on)} Add the heartbeat tile (machines silent beyond threshold) to the lab dashboard.
+    \item \textbf{(Hands-on)} Extend reverse ETL with a field-level change log: which Dataverse records changed, which field, old versus new.
+    \item \textbf{(Design)} Cost the wall-monitor estate: twenty displays, three refresh cadence options, one capacity. Show the arithmetic and recommend.
+    \item \textbf{(Design)} Design the reverse-ETL failure mode for a Dataverse API-throttling event: queue, backoff, and reconciliation behavior.
+    \item \textbf{(Interview)} In five sentences, explain how Part IV's four chapters compose into one trustworthy real-time platform.
+    \item \textbf{(Operational)} Write the runbook for ``dashboard shows stale data''---freshness check, view lag check, ingestion lag check, escalation.
+\end{enumerate}
+
+\section{Milestone 4 Capstone: Real-Time Fraud Detection}\label{sec:ch16-capstone}
+\index{Milestone 4 capstone}\index{capstone project!Part IV}\index{fraud detection}\index{impossible travel}
+
+\begin{capstonebox}
+\textbf{Mission.} Close Part~IV with the canonical real-time system: a Python producer simulating credit-card swipes into a Fabric Eventstream, routing to a KQL database, an impossible-travel fraud query (same card, two cities, ten minutes), a Data Activator rule alerting the security team on Teams, and a Real-Time Dashboard---all dedup-safe, replay-proven, and cost-estimated.
+
+\textbf{Estimated time.} 10--12 hours across the milestone's components.
+
+\textbf{What you'll practice.}
+\begin{itemize}
+    \item Producer discipline with unique transaction IDs and deliberate fraud scenarios.
+    \item Fan-out routing and dedup at the first queryable boundary.
+    \item Stateful pattern detection in KQL (\texttt{prev} over serialized partitions).
+    \item Sustained-condition Reflex rules that do not alert-storm.
+    \item The replay drill and the six rubric artifacts, including the capacity estimate and PII security review.
+\end{itemize}
+\end{capstonebox}
+
+\subsection*{Scenario}
+Contoso Bank's card division needs sub-minute fraud reaction. Swipes stream from the authorization network; the platform must detect impossible travel---a card used in two cities within ten minutes---and page the security team, while a live dashboard shows the fraud queue. Duplicates from redelivery must never double-fire an alert.
+
+\subsection*{Requirements}
+\begin{itemize}
+    \item Producer \texttt{card\_simulator.py} (faker-based) with unique \texttt{txn\_id} per swipe and a configurable impossible-travel injection mode.
+    \item Eventstream routing to the KQL database; dedup view on \texttt{txn\_id}.
+    \item The fraud query using \texttt{order by}/\texttt{serialize}/\texttt{prev} over the deduped stream.
+    \item Reflex rule with sustained/aggregated condition and cooldown, firing Teams to the security channel.
+    \item Real-Time Dashboard: fraud queue, swipe rate, freshness indicator.
+    \item The replay drill: simulated downstream outage, recovery, zero duplicate alerts.
+    \item Cost estimate (Eventhouse versus capacity CU burn) and security review (producer credentials in Key Vault, least-privilege KQL access, PII noted).
+\end{itemize}
+
+\subsection*{Reference Architecture}
+\begin{figure}[H]
+    \centering
+    \begin{tikzpicture}[node distance=8mm and 9mm]
+        \node[doc, minimum width=2.6cm, minimum height=1.0cm] (sim) at (0,0) {Card swipe\\simulator};
+        \node[stage] (es) at (4.0,0) {Eventstream};
+        \node[stage] (kql) at (8.0,0) {Eventhouse\\(KQL database)};
+        \node[stage] (dash) at (8.0,-2.4) {Real-Time\\Dashboard};
+        \node[stage, fill=orange!10] (reflex) at (12.2,0) {Data Activator\\(Reflex)};
+        \node[doc, minimum width=2.4cm, minimum height=1.0cm] (teams) at (15.8,0) {Teams\\security channel};
+
+        \draw[arrow] (sim) -- (es);
+        \draw[arrow] (es) -- (kql);
+        \draw[arrow] (kql) -- (dash);
+        \draw[arrow] (kql) -- (reflex);
+        \draw[arrow] (reflex) -- (teams);
+
+        \node[note, text width=12.5cm, align=center] at (7.8,-3.6) {Dedup before the rule; sustained conditions before the page; freshness indicators before trust.};
+    \end{tikzpicture}
+    \caption{Milestone 4 reference architecture: real-time fraud detection.}
+    \label{fig:chapter16-capstone-architecture}
+\end{figure}
+
+\subsection*{Implementation Steps}
+\begin{enumerate}
+    \item Build the simulator with unique IDs and the fraud-injection mode; vault the connection string.
+    \item Wire the eventstream to KQL; create the deduped view on \texttt{txn\_id}.
+    \item Implement and test the impossible-travel query against injected cases.
+    \item Build the Reflex rule (sustained condition, cooldown, full context payload).
+    \item Build the dashboard with the freshness indicator.
+    \item Run the replay drill; capture zero-duplicate-alert evidence.
+    \item Produce the cost estimate and PII security review; finalize the README.
+\end{enumerate}
+
+\begin{lstlisting}[language=SQL,caption={Milestone 4: impossible travel over the deduplicated stream.},label={lst:chapter16-capstone-fraud}]
+// Impossible travel: same card, different cities, <= 10 min apart
+Txn
+| summarize arg_max(ingestion_time(), *) by txn_id   -- dedup first
+| order by card_id asc, ts asc
+| serialize
+| extend p_card = prev(card_id), p_city = prev(city), p_ts = prev(ts)
+| where card_id == p_card and city != p_city and ts - p_ts <= 10m
+| project card_id, ts, city, p_city
+\end{lstlisting}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item Simulator source, item exports, and KQL artifacts in the repository.
+    \item Fraud-detection evidence: injected cases detected, benign travel ignored.
+    \item Teams alert capture from a simulated fraud event, plus replay-drill evidence.
+    \item Dashboard screenshot with the freshness indicator visible.
+    \item Cost estimate with two documented optimization decisions.
+    \item Security review: vaulted producer credentials, least-privilege KQL access, PII classification.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item[\(\square\)] The end-to-end stream runs from a clean environment: producer $\rightarrow$ Eventstream $\rightarrow$ KQL $\rightarrow$ alert.
+    \item[\(\square\)] Every swipe carries a unique \texttt{txn\_id}; the dedup view collapses injected duplicates.
+    \item[\(\square\)] Injected impossible-travel cases alert; same-city rapid swipes do not.
+    \item[\(\square\)] The replay drill produces zero duplicate alerts and zero lost transactions.
+    \item[\(\square\)] The dashboard's freshness indicator demonstrably distinguishes quiet from broken.
+    \item[\(\square\)] The cost estimate cites measured CU consumption; the security review names the PII handling.
+    \item[\(\square\)] No connection strings or secrets appear in source or evidence.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Add a second rule: velocity (more than five swipes per card per minute) with its own severity tier.
+    \item Add distance-aware impossible travel using real city coordinates and speed thresholds.
+    \item Feed fraud outcomes back to a case-management table via reverse ETL.
+    \item Load-test the pipeline at 10$\times$ volume and record where lag first appears.
+\end{itemize}

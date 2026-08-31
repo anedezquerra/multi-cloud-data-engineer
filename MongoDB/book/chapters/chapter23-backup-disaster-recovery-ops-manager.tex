@@ -1,0 +1,256 @@
+\chapter{Backup, Disaster Recovery, and Ops Manager}
+\index{disaster recovery}\index{chaos engineering}\index{runbook}\index{game day}\index{RPO}\index{RTO}\index{Ops Manager}\index{restore drill}\index{PITR}\index{alerting}%
+
+\begin{objectives}
+\begin{itemize}
+    \item Describe Ops Manager / Cloud Manager agent roles: monitoring, backup, and automation.
+    \item Explain continuous backup and Point-In-Time Recovery mechanics and the RPO/RTO contract.
+    \item Operate Atlas observability: metrics dashboards, alert configurations, and the Performance Advisor.
+    \item Write executable runbooks whose entries another engineer can follow at 3 a.m.
+    \item Execute a PITR restore drill against a measured objective in the Thursday project.
+    \item Architect disaster recovery with measured RPO/RTO and institutionalized game days.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+Disaster recovery is the least vendor-differentiated discipline in this book: every cloud sells regional redundancy, and every serious organization discovers that recovery is a practiced behavior, not a purchased feature.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{2.9cm}p{3.0cm}p{3.0cm}p{3.0cm}@{}} 
+\toprule
+\textbf{Capability} & \textbf{AWS} & \textbf{Azure} & \textbf{GCP} \\
+\midrule
+Cross-region DB & Aurora Global / DDB global tables & Cosmos DB multi-region & Spanner multi-region \\
+Backup service & AWS Backup & Azure Backup & Backup and DR Service \\
+Chaos tooling & Fault Injection Service & Azure Chaos Studio & Third-party / Gremlin \\
+Pilot-light DR & Warm standby patterns & Same & Same \\
+Runbook automation & Systems Manager runbooks & Automation runbooks & Cloud Workflows \\
+\addlinespace
+Snowflake / Fabric & \multicolumn{3}{l}{Failover groups / database replication; RTO dominated by re-pointing clients and re-warming caches} \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+MongoDB's distinctive position: replica sets and sharding (Part II) already give you most of DR's mechanics---the chapter's work is measuring them under real failure and writing the procedures humans execute when automation runs out \cite{mongodbOpsManagerDocs,sreBook}.
+\end{crosscloud}
+
+\section{Week 23 Roadmap: Backup, Observability, and the Bad Day}
+Chapter 20 designed the lifecycle; this week protects it in production. Monday covers the Ops Manager/Cloud Manager agent model; Tuesday the backup mechanics (continuous backup, PITR, the RPO/RTO contract); Wednesday the observability surface (metrics, alerts, Performance Advisor, SLOs, runbooks); Thursday is the restore drill; Friday is the full DR architecture with game-day discipline. The unifying claim: resilience is an operational practice renewed quarterly, not a property purchased once \cite{sreBook}.
+
+\begin{definitionbox}
+A \textbf{runbook} is a written, tested procedure for a specific alert or failure mode: symptom, impact, owner, triage steps with expected outputs, mitigations ordered by reversibility, and escalation. A \textbf{chaos drill} (game day) is a scheduled, controlled injection of a real failure to validate detection, response, and recovery.
+\end{definitionbox}
+
+\begin{keyterms}
+\textbf{RPO/RTO}: recovery point/time objectives per data class. \textbf{Continuous backup}: snapshots plus retained oplog enabling PITR granularity. \textbf{Performance Advisor}: Atlas's index and schema recommendation engine. \textbf{Burn-rate alert}: paging on error-budget consumption speed. \textbf{Game day}: scheduled organization-wide failure exercise. \textbf{Ops Manager}: MongoDB's self-hosted monitoring/backup/automation platform.
+\end{keyterms}
+
+\section{Monday: Ops Manager, Cloud Manager, and the Agent Model}
+\subsection{The Three Agents}
+Ops Manager (self-hosted) and Cloud Manager (MongoDB-hosted) run the same model: lightweight agents on each member provide \textbf{monitoring} (metrics up), \textbf{backup} (snapshots and oplog tailing to the backup store), and \textbf{automation} (the agent converges the local \texttt{mongod} toward the declared configuration---the pre-Kubernetes operator). The architecture review points: the backup agent's stream is a network path to protect (Chapter 19), the automation agent holds credentials that change your cluster (protect accordingly), and Ops Manager itself is a stateful application whose own backup is part of your DR plan \cite{mongodbOpsManagerDocs}.
+
+\subsection{Atlas versus Ops Manager Boundaries}
+Atlas folds this stack into the managed service; Ops Manager is the self-hosted answer for sovereign estates (Chapter 22's DBaaS). The decision matrix: Atlas when you may use public cloud and want the control plane operated for you; Ops Manager when sovereignty or existing investment mandates self-hosting; and in both cases, alert policies, backup schedules, and drills are your responsibility---the management plane operates machinery, it does not own your RPO.
+
+\section{Tuesday: Continuous Backups and Point-In-Time Recovery}
+\subsection{Snapshots Plus Oplog}
+Atlas continuous backup takes periodic snapshots and retains the oplog between them; a PITR request restores the snapshot preceding the target time and replays oplog entries forward. The RPO implication: with continuous backup, RPO approaches the oplog replication lag---seconds to minutes---rather than the snapshot interval. The RTO implication: restore time is dominated by snapshot size and transfer, so the RTO objective drives snapshot schedule and the ``restore to a new cluster'' topology choice, not the other way around. Snapshot management---retention schedules, per-data-class policies, and the cost of long retention---is configuration with a compliance signature (Chapter 20's lifecycle defines the classes).
+
+\subsection{The Recovery-Objective Contract}
+Every backup configuration traces to a written RPO/RTO pair per data class. Financial ledgers: RPO $< 1$ minute (continuous + PITR), RTO $< 15$ minutes (pre-provisioned restore target or rapid restore process). Analytics aggregates: RPO of 24 hours may be fine if aggregates are recomputable from sources---their ``backup'' is the regeneration pipeline (Chapter 11), not snapshots. The senior move is refusing to pay for RPO-seconds backup on recomputable data.
+
+\begin{pitfall}
+\textbf{A backup that has never been restored.} Untested backups fail in ways nobody predicts: wrong IAM on the restore target, insufficient disk, a corrupt snapshot chain, a 14-hour RTO against a 1-hour objective. Thursday's drill is the control; and alert on backup job failures themselves---a silently broken backup is the worst surprise in this book.
+\end{pitfall}
+
+\section{Wednesday: Atlas Observability, SLOs, and Runbooks}
+\subsection{Metrics, Alerts, and the Performance Advisor}
+Atlas surfaces per-node and per-namespace metrics, real-time performance panels, the integrated profiler (Chapter 12), alert configurations on dozens of conditions, and the Performance Advisor, which mines slow-query evidence to recommend indexes and schema changes. Advisor output is a hypothesis, not a fix: every recommendation still passes through Chapter 9's verification ritual---\texttt{explain()} before and after---because an index that fixes one shape taxes every write. Alerts are managed as code (Atlas API or Terraform, Chapter 21) so they are reviewable and environment-consistent.
+
+The syllabus's starter alert set, generalized: replication lag $>10$ s (page), connections $>80\%$ of maximum (ticket), disk usage $>85\%$ (ticket with forecast), oplog window below the consumer-downtime SLA (page for CDC-dependent platforms), backup job failure (page---silent backup decay is the worst surprise), and balancer migration-rate anomaly (ticket, per Chapters 6--7).
+
+\subsection{From Metrics to SLOs}
+Metrics become operations through Service Level Objectives: per-endpoint SLIs (availability, latency histograms) measured at the application boundary, plus platform SLIs the data team owns---replication lag, backup success, pipeline freshness, CDC lag. An SLO of 99.9\% monthly availability allows ${\approx}43$ minutes of failure; \textbf{burn-rate alerting} pages when consumption is fast enough to exhaust the budget early, and tickets on slow burns. Page on user-visible symptoms and lost controls; ticket on leading indicators (cache pressure trending, oplog window shrinking); never page on raw CPU alone---a hot CPU with healthy SLOs is a capacity note, not an incident \cite{sreBook}.
+
+\subsection{Runbooks That Survive Contact}
+Each paging alert links to an entry containing: the symptom as the alert states it; user impact in one sentence; triage as numbered commands with expected healthy/unhealthy outputs; mitigations ordered by reversibility (unhide an index before failing over; fail over before rebuilding); the escalation path with named roles; and the date the entry was last executed in a drill. The MongoDB runbook canon maps to this book: replication lag breach and election storms (Chapter 5), hot shards and migration storms (Chapters 6--7), ticket-queue saturation and cache-eviction pressure (Chapters 1, 12), oplog-window shrink (Chapters 5, 16), change-stream lag and dead tokens (Chapter 16), backup job failure (this chapter), audit-pipeline gaps (Chapter 19), residency-assertion failure (Chapter 8), disk-full (Chapter 20), certificate expiry (Chapters 17, 19, 22). Ten entries, each drilled, beats a hundred entries nobody has run.
+
+\begin{pitfall}
+\textbf{Runbooks written during incidents.} The 3 a.m.\ version of your teammate cannot improvise a safe mitigation. Runbooks are written in daylight, drilled quarterly, and updated by every postmortem that touches them---the drill date on the entry is the freshness guarantee.
+\end{pitfall}
+\section{Thursday Hands-On Project: The PITR Restore Drill}
+Execute the syllabus drill end-to-end: snapshot the counts, drop a collection ``accidentally,'' restore to one minute before the drop, and verify parity.
+
+\subsection{Drill Protocol}
+\begin{enumerate}
+    \item On a test Atlas cluster with continuous backup enabled, load a known dataset and record per-collection document counts and a checksum aggregate (e.g. sum of a numeric field) as the pre-drop evidence.
+    \item Drop the \texttt{ledger.entries} collection. Note the timestamp to the minute.
+    \item Initiate a PITR restore to one minute before the drop, into a new cluster (never overwrite the source of truth during a drill).
+    \item Verify restored counts and checksums match the pre-drop evidence exactly; measure wall-clock restore time against the 15-minute RTO.
+    \item Configure the two syllabus alerts---replication lag $>10$ s and connections $>80\%$ of maximum---plus a third: backup job failure.
+\end{enumerate}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item The pre-drop evidence capture script and the post-restore parity checker.
+    \item The drill report: drop time, restore target time, RTO measured, parity result.
+    \item The three alert configurations exported as code.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item Restored counts and checksums match the pre-drop snapshot exactly.
+    \item The restore meets (or the report honestly misses) the 15-minute RTO.
+    \item The backup-failure alert is demonstrated by a deliberately broken configuration.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Automate the drill as a quarterly scheduled job restoring to a scratch cluster and posting results to this chapter's monitoring stack.
+    \item Repeat the drill against a sharded cluster and document the coordination differences.
+\end{itemize}
+\section{Friday Use Case and Architecture: Enterprise DR with RPO $<$ 1 Minute, RTO $<$ 15 Minutes}
+\subsection{Scenario and Requirements}
+A multi-region enterprise platform must survive the loss of its primary region with RPO under one minute and RTO under fifteen minutes for the payments data class, with audited evidence for regulators.
+
+\subsection{Architecture}
+The DR design stacks this book's mechanisms rather than buying a new one. In-region: five-member replica sets per shard across three fault domains (Chapter 5), so node and zone loss are non-events. Cross-region: a warm standby---a second Atlas cluster in the DR region, continuously replicated via cluster-to-cluster sync, with applications pre-configured for the DR connection string behind DNS with a short TTL. RPO is met by sync lag ($\ll$ 1 minute, monitored per Wednesday's SLO discipline); RTO is met by the scripted promote-and-repoint procedure, drilled quarterly and currently measured at 11 minutes---under objective because the drill found and removed the two manual steps that used to eat four minutes. Cold data never fails over: Online Archive (Chapter 20) is already region-independent object storage. The regulator's evidence pack is the drill history: hypothesis, timeline, measured RPO/RTO, postmortems, and closed action items per quarter.
+
+\begin{figure}[H]
+    \centering
+    \resizebox{0.95\textwidth}{!}{%
+    \begin{tikzpicture}[
+        region/.style={rectangle, rounded corners, draw=primary, thick, fill=primary!6, minimum width=4.6cm, minimum height=2.6cm, align=center},
+        dr/.style={rectangle, rounded corners, draw=red!60!black, thick, fill=red!5, minimum width=4.6cm, minimum height=2.6cm, align=center},
+        box/.style={rectangle, rounded corners, draw=green!45!black, fill=green!8, minimum width=2.4cm, minimum height=0.9cm, align=center, font=\scriptsize\bfseries},
+        arrow/.style={-{Stealth[length=2.5mm]}, draw=primary, thick}
+    ]
+        \node[region, label={[font=\small\bfseries]above:Primary region}] (p) at (0,0) {};
+        \node[box] (prs) at (0,0.5) {Sharded cluster\\5-member RS/shard};
+        \node[box] (papp) at (0,-0.9) {App tier};
+        \node[dr, label={[font=\small\bfseries]above:DR region (warm standby)}] (d) at (8.6,0) {};
+        \node[box] (drs) at (8.6,0.5) {Synced cluster\\(C2C sync)};
+        \node[box] (dapp) at (8.6,-0.9) {App tier\\(idle, configured)};
+        \node[box] (dns) at (4.3,-2.9) {DNS (short TTL)\\repoint = RTO lever};
+        \draw[arrow] (prs) -- node[above,font=\scriptsize]{continuous sync ($<$ 1 min lag)} (drs);
+        \draw[arrow, dashed] (dns) -- (papp);
+        \draw[arrow, dashed] (dns) -- (dapp);
+    \end{tikzpicture}%
+    }
+    \caption{Warm-standby DR: continuous sync bounds RPO; scripted promote-and-repoint bounds RTO; drills keep both honest.}
+    \label{fig:ch23-dr}
+\end{figure}
+
+\subsection{Chaos Drills and Game Days}
+A drill states a hypothesis (``during a primary kill, \texttt{w:majority} writes gap $<$ 15 seconds and zero acknowledged writes are lost''), a blast-radius limit (staging first; production drills on a bounded slice during business hours with the on-call aware), the injection mechanism (process kill, firewall partition, pod deletion, disk fill), and an abort condition. The MongoDB drill catalog draws directly on this book's labs: primary kill and secondary loss (Chapter 5), network partitions, shard loss and balancer storms (Chapters 6--7), oplog expiry and consumer re-bootstrap (Chapter 16), certificate expiry (Chapters 17, 19), backup restore (Thursday), and operator pod loss (Chapter 22). The drill's product is the postmortem: timeline, hypothesis verdict, what detection fired and when, and owned action items tracked to closure. Time everything---detection-to-page, page-to-acknowledge, acknowledge-to-mitigate, mitigate-to-verify; the timeline is where runbook and alert quality become measurable.
+
+\subsection{What the Drills Changed}
+Three quarterly findings worth generalizing: the first drill's RTO was 23 minutes because DNS TTLs were set for caching friendliness, not failover (now 30 s with application retry tuned to match); the second revealed the sync-lag alert threshold was looser than the RPO (alert at 20 s, not 60); the third proved the DR region's cluster had silently under-provisioned IOPS relative to primary---a capacity drift the Chapter 12 capacity method now checks in both regions. Each finding is why the evidence requirement exists: DR plans degrade silently between drills.
+
+\section{Interview Q\&A}
+\subsection{Resilience Operations}
+\begin{enumerate}
+    \item \textbf{Q: RPO versus RTO?}\\
+    A: RPO bounds data loss (how much history may vanish); RTO bounds downtime (how long recovery may take). They are bought separately: sync lag buys RPO, automation and warm standbys buy RTO.
+
+    \item \textbf{Q: What does the Atlas Performance Advisor do?}\\
+    A: Mines slow-query evidence to recommend indexes and schema changes. Its output is a hypothesis: verify with \texttt{explain()} before adopting, because every index taxes every write.
+
+    \item \textbf{Q: Which two alert thresholds anchor the syllabus week, and why alert on backup job failures themselves?}\\
+    A: Replication lag $>10$ s and connections $>80\%$ of maximum. Backup failures page because backup decay is silent---nothing user-visible fails until the day you need the restore.
+
+    \item \textbf{Q: What do the three Ops Manager agents do?}\\
+    A: Monitoring (metrics up), backup (snapshots + oplog to the store), automation (converging local \texttt{mongod} to declared config). Each is a credential and a network path to protect.
+
+    \item \textbf{Q: What makes a runbook entry production-grade?}\\
+    A: Numbered triage with expected outputs, mitigations ordered by reversibility, named escalation, and a recent drill date from execution by someone other than the author.
+
+    \item \textbf{Q: Why are production drills run during business hours?}\\
+    A: Real failures arrive at peak load with full staffing value; a drill at 2 a.m.\ Sunday tests neither the traffic condition nor the human response that matters---and hiding drills from the on-call tests the wrong thing.
+
+    \item \textbf{Q: What belongs in a blameless postmortem?}\\
+    A: Timeline, hypothesis/detection analysis, contributing system conditions (not people), and owned, tracked action items whose closure is verified.
+\end{enumerate}
+
+\section{Further Reading}
+Ops Manager and Cloud Manager architecture are in MongoDB's documentation \cite{mongodbOpsManagerDocs}; Atlas backup/restore underpins the drill mechanics \cite{mongodbAtlasBackupDocs}. The SRE book's chapters on postmortems, game days, and managing load are the methodological core \cite{sreBook}. This chapter assumes Part II's failure mechanics \cite{mongodbReplicationDocs,mongodbShardingDocs} and the Atlas alerting surface \cite{mongodbAtlasMonitoringDocs}.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item Ops Manager's three agents---monitoring, backup, automation---are each a credential and a network path to protect.
+    \item PITR = snapshot + oplog replay; RPO and RTO objectives choose the configuration, not vice versa.
+    \item A backup that has never been restored is not a backup: drill quarterly, measure RTO, alert on backup job failures.
+    \item Advisor recommendations are hypotheses; verify with \texttt{explain()} before adopting.
+    \item Page on burn rate and lost controls; ticket on leading indicators; never page on raw CPU.
+    \item Runbooks are written in daylight, drilled quarterly, and freshness-stamped by execution.
+    \item Chaos drills test hypotheses with bounded blast radius and timed timelines; postmortems fix systems, not people.
+    \item Warm standby + scripted repoint + short DNS TTL is the pragmatic sub-15-minute RTO pattern.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Write the runbook entry for ``oplog window below 24 h'' including triage commands and the two mitigations ordered by reversibility.
+    \item \textbf{(Conceptual)} Why does restore-from-backup DR have a fundamentally different RTO profile than warm-standby promotion?
+    \item \textbf{(Conceptual)} Design the blast-radius policy for production chaos drills at a bank.
+    \item \textbf{(Hands-on)} Execute the region-loss drill on your Chapter 8 cluster and produce the evidence pack.
+    \item \textbf{(Hands-on)} Automate the backup-restore verification as a nightly job with alerting on failure.
+    \item \textbf{(Design)} Write the DR evidence pack table of contents for the regulator, mapped to drill artifacts.
+    \item \textbf{(Design)} Design the game-day calendar for a year: which drills, which quarters, which success criteria.
+    \item \textbf{(Interview)} ``Our DR failover worked in the drill but failed in the real event.'' List the five most common reasons.
+\end{enumerate}
+
+\section{Capstone Project: The Resilience Certification}\label{sec:ch23-capstone}
+
+\begin{capstonebox}
+\textbf{Mission:} produce a resilience certification for the book's reference platform: the complete runbook canon, a year of scheduled drills executed (compressed: four drills), measured RPO/RTO per data class, and the postmortem trail proving the organization learns.
+
+\textbf{Estimated time:} 6--8 hours across drill windows.
+
+\textbf{What you will practice:}
+\begin{itemize}
+    \item Writing and executing the ten-entry runbook canon.
+    \item Running hypothesis-driven drills with measured timelines.
+    \item Assembling regulatory-grade resilience evidence.
+\end{itemize}
+\end{capstonebox}
+
+\subsection*{Scenario}
+Before the platform may onboard its largest customer, the security-and-resilience review requires demonstrated---not documented---recovery capability across the platform's four highest-severity failure modes.
+
+\subsection*{Requirements}
+\begin{itemize}
+    \item The ten-entry runbook canon, each entry executed at least once by a second engineer.
+    \item Four executed drills: primary kill, region loss, oplog-expiry re-bootstrap, and PITR restore---each with hypothesis, timeline, and verdict.
+    \item Measured RPO/RTO per data class with the measurement method stated.
+    \item Postmortems for every drill with closed action items.
+    \item The resilience evidence pack: runbooks, drill artifacts, postmortems, and the improvement log showing what changed because of the drills.
+\end{itemize}
+
+\subsection*{Implementation Steps}
+\begin{enumerate}
+    \item \textbf{Canon.} Write the runbooks; have a teammate execute each with notes.
+    \item \textbf{Drill.} Schedule and execute the four drills; capture timelines.
+    \item \textbf{Measure.} Publish the RPO/RTO table with methods and current values.
+    \item \textbf{Learn.} Postmortem each drill; close action items; update runbooks.
+    \item \textbf{Certify.} Assemble the evidence pack and the improvement log.
+\end{enumerate}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item Runbook canon with execution stamps, drill artifacts, postmortems, and the RPO/RTO table.
+    \item The improvement log: what broke, what changed, and the re-drill evidence.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item Every drill verdict is backed by measured evidence, not narrative.
+    \item At least one drill produced a finding that changed the system, with re-drill proof.
+    \item A reviewer can trace any alert to its runbook to its last drill.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Automate two drills as recurring chaos jobs with result dashboards.
+    \item Extend certification to the Kubernetes staging platform (Chapter 22) with operator-failure drills.
+\end{itemize}

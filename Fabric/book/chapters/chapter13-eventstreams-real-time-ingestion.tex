@@ -1,0 +1,341 @@
+\chapter{Eventstreams and Real-Time Ingestion}
+\index{Real-Time Intelligence}\index{Eventstreams}\index{Event Hubs}\index{streaming ingestion}\index{at-least-once delivery}\index{idempotent consumer}\index{replay}\index{event\_id}%
+
+\begin{objectives}
+\begin{itemize}
+    \item Describe the Real-Time Intelligence architecture in Fabric and where Eventstreams sit within it.
+    \item Configure Eventstream sources: Azure Event Hubs, custom apps, and IoT-style producers.
+    \item Route Eventstream destinations to lakehouses, KQL databases, and Reflex items.
+    \item Send mock IoT telemetry from a Python producer to a custom app endpoint and land it in a KQL database.
+    \item Design idempotent, replay-safe consumers for at-least-once delivery.
+    \item Architect a global telemetry ingestion point for five million mobile games.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+Managed streaming ingestion---durable event buffers with fan-out to analytical and operational sinks---exists on every cloud. Fabric Eventstreams wraps Azure's eventing lineage in the SaaS workspace model.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{2.8cm}p{3.2cm}p{3.2cm}p{3.2cm}p{3.2cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{Fabric} & \textbf{AWS} & \textbf{GCP} & \textbf{Snowflake} \\
+\midrule
+Event ingestion & Eventstreams (Event Hubs lineage) & Kinesis / MSK (Kafka) & Pub/Sub & Snowpipe Streaming \\
+Custom producer endpoint & Custom app source & Kinesis PutRecords / Kafka producer & Pub/Sub publisher & Streaming ingest SDK \\
+Stream processing & Eventstream operators, KQL & Kinesis Data Analytics / Flink & Dataflow (Beam) & Streams + tasks / dynamic tables \\
+Analytical sink & KQL database (Eventhouse) & Redshift / Athena over S3 & BigQuery streaming & Snowflake tables \\
+Lake sink & Lakehouse Delta tables & S3 via Firehose & Cloud Storage & Managed staging \\
+Alerting sink & Data Activator (Reflex) & EventBridge / Lambda & Eventarc / Cloud Functions & Alerts / notifications \\
+Delivery semantics & At-least-once & At-least-once (Kinesis) & At-least-once (default) & Exactly-once ingest option \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+Databricks ingests streams with Structured Streaming and Delta Live Tables; MongoDB produces streams through change streams. The portable disciplines are this chapter's core: unique event IDs at the producer, dedup at the first queryable boundary, and knowing your source's replay window.
+\end{crosscloud}
+
+\begin{keyterms}
+\textbf{Eventstream}: a Fabric item that ingests, optionally transforms, and routes event streams to destinations. \quad
+\textbf{Custom app source}: an Event Hubs-compatible endpoint an Eventstream exposes for producer code. \quad
+\textbf{At-least-once delivery}: the guarantee that events arrive one or more times---never zero---which makes duplicates possible. \quad
+\textbf{Replay}: redelivery of events from the source's retention window after a downstream failure or reconfiguration. \quad
+\textbf{Idempotent consumer}: a consumer that processes the same event multiple times with the same final effect as processing it once. \quad
+\textbf{Eventhouse}: the Fabric item hosting KQL databases for streaming analytics (Chapter~14).
+\end{keyterms}
+
+\section{Week 13 Roadmap}
+Week~13 opens Part~IV, the real-time arc. Monday maps the Real-Time Intelligence architecture. Tuesday covers Eventstream sources. Wednesday covers destinations---lakehouse, KQL database, Reflex. Thursday is the hands-on project: a Python script sends mock IoT temperature data to a custom app endpoint, routed into a KQL database. Friday architects the global telemetry ingestion point for five million mobile games.
+
+Batch engineering asks ``how do we move last night's data?'' Streaming asks ``how do we reason about data that never stops arriving?'' The shift in mindset---unbounded input, event time versus processing time, at-least-once reality---is the real content of the week \cite{microsoftFabricEventstreams}.
+
+\begin{notebox}
+Production rule for the week: design Eventstream consumers for idempotency and replay. Events can be delivered more than once, so stamp every event with a unique ID and dedupe downstream (for example Delta \texttt{MERGE} on \texttt{event\_id}). Know the source's replay window (Event Hubs retention) so you can reprocess after a downstream failure without data loss or duplicates.
+\end{notebox}
+
+\section{Monday: Real-Time Intelligence Architecture}
+\index{Real-Time Intelligence!architecture}
+Fabric's Real-Time Intelligence experience organizes streaming work into a small set of cooperating items \cite{microsoftFabricEventstreams,microsoftFabricEventhouse}:
+
+\begin{itemize}
+    \item \textbf{Eventstreams} ingest from sources and route to destinations, with optional in-flight operators (filter, aggregate, union, expand).
+    \item \textbf{Eventhouses} host KQL databases---the analytical store for high-volume telemetry, covered in Chapter~14.
+    \item \textbf{Data Activator (Reflex)} items evaluate conditions over streams and Power BI visuals and fire actions, covered in Chapter~15.
+    \item \textbf{Real-Time Dashboards} visualize KQL over live data, covered in Chapter~16.
+\end{itemize}
+
+\begin{definitionbox}
+\textbf{Real-Time Intelligence} is Fabric's streaming workload family: ingestion (Eventstreams), analytical storage and query (Eventhouses/KQL), reaction (Reflex), and visualization (Real-Time Dashboards), all sharing OneLake and the workspace capacity model.
+\end{definitionbox}
+
+The architectural significance: streaming is no longer a separate platform. The same workspace that holds the batch lakehouse holds the eventstream; the same capacity meters both; the same governance applies. The data engineer's new obligations are the streaming-specific ones---delivery semantics, replay behavior, and event-time reasoning---not a new estate to learn.
+
+\section{Tuesday: Eventstream Sources}
+\index{Eventstreams!sources}\index{Event Hubs!source}\index{custom app endpoint}
+An eventstream begins at a source \cite{microsoftFabricEventstreams}:
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.6cm}p{5.2cm}p{5.0cm}@{}}
+\toprule
+\textbf{Source} & \textbf{Use} & \textbf{Notes} \\
+\midrule
+Azure Event Hubs & Existing event estates, high-throughput producers & Bring your own namespace; the classic enterprise bridge \\
+Custom app & Producer code you write (this week's lab) & Exposes an Event Hubs-compatible connection string \\
+IoT-style / device feeds & Telemetry at scale & Via IoT Hub or direct producer patterns \\
+Sample data & Learning and demos & Built-in generator for exploration \\
+CDC feeds & Database change capture & Operational tables become streams \\
+\bottomrule
+\end{tabular}
+\caption{Eventstream source types.}
+\label{tab:chapter13-sources}
+\end{table}
+
+The custom app source deserves emphasis: it gives any process that can open an AMQP/Kafka connection a managed landing point in Fabric. The lab's Python producer uses it; so does every home-grown telemetry emitter in the enterprise.
+
+\begin{tipbox}
+Treat the custom app connection string as a secret from the first lab: environment variable or Key Vault reference in the producer, never in source. The string is write access to your stream.
+\end{tipbox}
+
+\section{Wednesday: Eventstream Destinations}
+\index{Eventstreams!destinations}\index{KQL database!destination}\index{Lakehouse!destination}\index{Reflex!destination}
+Destinations determine what the stream becomes \cite{microsoftFabricEventstreams}:
+
+\begin{itemize}
+    \item \textbf{KQL database (Eventhouse)}: the analytical destination---indexed, compressed, queryable in KQL within seconds. Choose it for telemetry exploration, time-series analytics, dashboards, and anything Reflex or Real-Time Dashboards consume.
+    \item \textbf{Lakehouse}: the durable open destination---Delta tables in OneLake, joining the batch estate. Choose it when stream data must combine with batch history in Spark or feed the medallion layers.
+    \item \textbf{Reflex (Data Activator)}: the reactive destination---conditions evaluate per event or aggregate, actions fire (Chapter~15).
+    \item \textbf{Custom endpoints}: onward routing to systems outside Fabric.
+\end{itemize}
+
+Routing is fan-out: one stream, many destinations. The canonical topology sends raw events to both the KQL database (analytics) and the lakehouse (durability and batch integration), plus a filtered branch to Reflex (reaction).
+
+\subsection{Delivery Semantics and Idempotency}
+Every hop is at-least-once: Eventstream to KQL, Eventstream to lakehouse, replay from the Event Hubs retention window after failures. The consequence is absolute: \emph{downstream must dedupe}. Stamp a unique \texttt{event\_id} at the producer---before the first send, not at any hop---propagate it untouched, and enforce dedup at the first queryable boundary: a KQL materialized view with \texttt{arg\_max} (Chapter~14) or a Delta \texttt{MERGE} on \texttt{event\_id} for the lakehouse. Pair this with consumer checkpointing---recording the last processed offset or timestamp---so restarts resume instead of replaying.
+
+\begin{pitfall}
+Generating the event ID at a mid-pipeline hop is too late: the producer's retry already created two physical copies of the same logical event before any hop saw them. The unique ID must exist at the producer, in the payload, from birth.
+\end{pitfall}
+
+\section{Thursday: Hands-on Project}
+\index{hands-on lab}\index{Eventstreams!hands-on}\index{mock IoT producer}
+The Week~13 lab creates a Fabric Eventstream, writes a Python producer that sends mock IoT temperature readings to the custom app endpoint, and routes the stream to a KQL database.
+
+\subsection{Goal and Architecture}
+Create workspace \texttt{fabric-de-week13} with eventstream \texttt{es\_iot\_telemetry} and eventhouse \texttt{eh\_iot} containing KQL database \texttt{kqldb\_iot}. The producer simulates twenty devices emitting temperature readings every second, each event stamped with a unique \texttt{event\_id}.
+
+\subsection{Step-by-Step Actions}
+\begin{enumerate}
+    \item Create the eventstream; add a \emph{custom app} source; copy its connection string into an environment variable.
+    \item Add the KQL database destination; create the \texttt{IoTTelemetry} table.
+    \item Write the producer: batch sends, unique event IDs, graceful shutdown.
+    \item Run the producer for five minutes; verify events appear in KQL.
+    \item Query: events per device per minute, latest reading per device.
+    \item Kill and restart the producer; observe that replays or retries produce duplicate \texttt{event\_id}s if---and only if---the producer reuses IDs incorrectly; fix it if so.
+    \item Document the replay window of the underlying Event Hubs entity.
+\end{enumerate}
+
+\begin{lstlisting}[language=Python,caption={Mock IoT producer sending telemetry to the Eventstream custom app endpoint.},label={lst:chapter13-producer}]
+import os, json, time, uuid, random
+from azure.eventhub import EventHubProducerClient, EventData
+
+CONNECTION_STR = os.environ["EVENTSTREAM_CONN_STR"]  # from the custom app source
+
+producer = EventHubProducerClient.from_connection_string(CONNECTION_STR)
+devices = [f"device-{i:02d}" for i in range(20)]
+
+try:
+    while True:
+        batch = producer.create_batch()
+        for device in devices:
+            event = {
+                "event_id": str(uuid.uuid4()),      # stamped at the producer
+                "device_id": device,
+                "timestamp": time.time(),
+                "temperature": round(18 + 10 * random.random(), 2),
+                "humidity": round(30 + 40 * random.random(), 2),
+            }
+            batch.add(EventData(json.dumps(event)))
+        producer.send_batch(batch)
+        time.sleep(1)
+except KeyboardInterrupt:
+    producer.close()
+\end{lstlisting}
+
+\begin{lstlisting}[language=SQL,caption={First KQL verification queries over the landed stream.},label={lst:chapter13-verify}]
+-- Events per device per minute (dedup on event_id first)
+IoTTelemetry
+| summarize arg_max(ingestion_time(), *) by event_id
+| summarize events = count() by device_id, bin(todatetime(timestamp), 1m)
+| order by device_id, bin_todatetime_timestamp_ asc;
+
+-- Latest reading per device
+IoTTelemetry
+| summarize arg_max(todatetime(timestamp), *) by device_id
+| project device_id, timestamp, temperature, humidity;
+\end{lstlisting}
+
+\subsection{Validation Checklist}
+\begin{itemize}
+    \item The producer sends via the connection string from an environment variable, not source code.
+    \item Every event carries a unique \texttt{event\_id} generated before the first send.
+    \item Events are queryable in KQL within seconds of production.
+    \item The dedup query and the raw count differ after a replay test---and you can explain why.
+    \item The replay window of the source is recorded in the runbook.
+    \item Graceful shutdown leaves no partial batch unaccounted for.
+\end{itemize}
+
+\section{Friday: Use Case and Architecture}
+\index{telemetry ingestion!global}\index{mobile games}
+A games publisher operates titles played by five million concurrent mobile devices emitting session, performance, and crash telemetry. The requirement: one global ingestion point, high throughput, low-latency processing into Fabric.
+
+\subsection{The Architecture}
+Regional Event Hubs namespaces absorb producer traffic close to players; Eventstreams attach to them and fan out: the full stream to a lakehouse (durability, batch joins with purchase history), the full stream to an Eventhouse KQL database (live analytics), and a filtered branch---crashes and error events---to Reflex for immediate reaction. Producers stamp \texttt{event\_id} and session identifiers; the first queryable boundaries dedupe; consumer checkpoints make restarts safe.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{4.2cm}p{5.2cm}p{4.6cm}@{}}
+\toprule
+\textbf{Design decision} & \textbf{Choice} & \textbf{Reason} \\
+\midrule
+Regional Event Hubs front doors & Yes, per geography & Latency and blast-radius isolation \\
+One eventstream per region & Yes & Independent scaling and failure domains \\
+Lakehouse destination & Full stream & Durability + batch integration \\
+KQL destination & Full stream & Live analytics and dashboards \\
+Reflex branch & Crash/error filter only & Alert volume control \\
+Dedup boundary & KQL materialized view + Delta MERGE & First queryable points per path \\
+\bottomrule
+\end{tabular}
+\caption{Global telemetry architecture decisions.}
+\label{tab:chapter13-games}
+\end{table}
+
+\begin{pitfall}
+Five million producers will, at statistical certainty, produce every failure mode you did not design for: clock skew, retries after partial batch sends, duplicate SDK initializations. The dedup contract---unique ID at the producer, enforced at the first queryable boundary---is not a best practice here; it is the only thing standing between you and phantom double-counted revenue events.
+\end{pitfall}
+
+\section{Operational Guidance for Week 13}
+Streaming systems fail differently than batch: continuously, partially, and at inconvenient times. Design for restart, replay, and dedup from day one.
+
+\subsection{Performance and Reliability}
+Batch producer sends (amortize connection and per-event overhead). Monitor ingestion lag as a first-class signal---lag is the streaming equivalent of a failed batch. Size the replay window to your slowest realistic recovery. Keep eventstream operators simple; heavy transformation belongs in KQL or Spark where it is testable.
+
+\subsection{Security and Governance Checklist}
+\begin{itemize}
+    \item Connection strings in environment variables or Key Vault, rotated, never in source.
+    \item Producers identified per system; a leaked connection string must be attributable.
+    \item Telemetry containing personal data classified at the stream level, not discovered downstream.
+    \item Replay windows documented; reprocessing is an auditable operation.
+    \item Dedup keys specified in the data contract (Chapter~9) of every stream.
+    \item Destination access scoped: lakehouse and KQL permissions reflect who should see live operational data.
+\end{itemize}
+
+\section{Interview Q\&A}
+\begin{enumerate}
+    \item \textbf{Q: Name two Eventstream sources and one destination.}\\
+    A: Azure Event Hubs and custom app endpoints are sources; KQL databases, lakehouses, and Reflex items are destinations.
+    \item \textbf{Q: Why stamp every event with a unique ID?}\\
+    A: At-least-once delivery means every event may arrive multiple times; the producer-stamped ID is the only trustworthy dedup key, because IDs minted mid-pipeline cannot distinguish a producer retry from a new event.
+    \item \textbf{Q: What does the Event Hubs retention (replay) window control?}\\
+    A: How far back a consumer can reprocess after failure---recovery beyond the window loses data, so the window must exceed your slowest realistic recovery.
+    \item \textbf{Q: When route events to a KQL database versus a lakehouse?}\\
+    A: KQL for live analytics, dashboards, and Reflex consumption---indexed and queryable in seconds; lakehouse for durable open storage and batch integration with the medallion estate. Most architectures fan out to both.
+    \item \textbf{Q: What does at-least-once delivery imply for downstream consumers?}\\
+    A: Every consumer must be idempotent: dedupe on the producer-stamped ID at the first queryable boundary, and checkpoint progress so restarts resume instead of replay.
+    \item \textbf{Q: What is the canonical fan-out topology for a production stream?}\\
+    A: Full stream to KQL (analytics) and lakehouse (durability), plus a filtered branch to Reflex (reaction)---three different questions answered from one ingestion point.
+\end{enumerate}
+
+\section{Further Reading}
+Review the Eventstreams documentation \cite{microsoftFabricEventstreams} and the Eventhouse overview \cite{microsoftFabricEventhouse} that Chapter~14 develops. The reaction destination is introduced by the Data Activator documentation \cite{microsoftDataActivator} (Chapter~15). The lakehouse destination's table semantics come from Delta Lake \cite{deltaLakeDocs}; Kafka's design is the conceptual baseline for all of it \cite{apacheKafka}.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item Real-Time Intelligence = Eventstreams (ingest) + Eventhouses (analyze) + Reflex (react) + Real-Time Dashboards (visualize).
+    \item The custom app source turns any producer into a managed Fabric ingestion point via an Event Hubs-compatible endpoint.
+    \item Destinations define purpose: KQL for analytics, lakehouse for durability and batch joins, Reflex for reaction.
+    \item At-least-once delivery is not a defect to lament but a contract to honor: unique IDs at the producer, dedup at the first queryable boundary.
+    \item Replay windows bound your recovery; size them to your slowest realistic incident.
+    \item Streaming belongs in the same workspace, capacity, and governance as batch---the disciplines differ, the estate does not.
+    \item At global scale, the dedup contract is the difference between telemetry and fiction.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Explain event time versus processing time, and why the distinction matters for a daily aggregate computed over a stream.
+    \item \textbf{(Conceptual)} Why is ``exactly-once delivery'' the wrong goal and ``idempotent consumption'' the right one?
+    \item \textbf{(Hands-on)} Extend the producer with a deliberate 1\% duplicate-send rate; verify the dedup query stays correct and the raw count inflates.
+    \item \textbf{(Hands-on)} Add a lakehouse destination to the eventstream and implement the Delta \texttt{MERGE} dedup on \texttt{event\_id}.
+    \item \textbf{(Design)} Design the partitioning strategy for the games publisher: how many partitions, keyed by what, and why?
+    \item \textbf{(Design)} A device fleet goes offline for nine hours and backhauls. Which replay windows and late-arrival policies protect the daily aggregates? (Chapter~14 deepens this.)
+    \item \textbf{(Interview)} In five sentences, walk an interviewer through exactly what happens when a KQL destination fails for an hour and recovers.
+    \item \textbf{(Operational)} Write the runbook for ``ingestion lag exceeds five minutes''---detection, triage, replay safety check, escalation.
+\end{enumerate}
+
+\section{Capstone Project: Replay-Safe Telemetry Pipeline}\label{sec:ch13-capstone}
+\index{capstone project}\index{Eventstreams!capstone}\index{idempotent consumer!capstone}
+
+\begin{capstonebox}
+\textbf{Mission.} Build a production-shaped telemetry pipeline: a Python producer fleet simulator, an eventstream fanning out to a KQL database and a lakehouse, dedup enforced at both boundaries, a consumer checkpoint store, and---the proof---a documented replay drill in which a downstream ``outage'' is recovered without loss or duplicates.
+
+\textbf{Estimated time.} 5--7 hours.
+
+\textbf{What you'll practice.}
+\begin{itemize}
+    \item Producer discipline: unique IDs, batching, graceful shutdown, secret handling.
+    \item Fan-out routing to analytical and durable destinations.
+    \item Dedup at first queryable boundaries on two different engines.
+    \item Checkpointing and the end-to-end replay drill.
+\end{itemize}
+\end{capstonebox}
+
+\subsection*{Scenario}
+Contoso Devices ships a connected thermostat line. Telemetry must be live-queryable for support (KQL), durably stored for the data platform (lakehouse), and provably correct under the failure mode the field team fears most: the analytics path goes down for an hour while thermostats keep reporting.
+
+\subsection*{Requirements}
+\begin{itemize}
+    \item Producer simulator for 50 devices with unique \texttt{event\_id}s and a configurable duplicate-injection rate.
+    \item Eventstream \texttt{es\_thermostat} with KQL and lakehouse destinations.
+    \item Dedup: KQL-side \texttt{arg\_max} pattern and lakehouse-side Delta \texttt{MERGE} on \texttt{event\_id}.
+    \item A checkpoint table recording last-processed event time per consumer.
+    \item The replay drill: suspend the KQL destination for 30+ minutes, resume, and prove zero loss and zero duplicates with reconciliation queries.
+    \item A runbook documenting replay windows, dedup keys, and the drill procedure.
+\end{itemize}
+
+\subsection*{Implementation Steps}
+\begin{enumerate}
+    \item Build the producer with duplicate injection and graceful shutdown.
+    \item Wire the eventstream with both destinations; create tables.
+    \item Implement both dedup boundaries and the checkpoint store.
+    \item Run the pipeline for a baseline; record counts.
+    \item Execute the replay drill; capture before/during/after evidence.
+    \item Write reconciliation queries proving loss-free, duplicate-free recovery.
+\end{enumerate}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item Producer source, pipeline/eventstream exports, and table DDL in the repository.
+    \item Baseline and post-drill reconciliation query outputs.
+    \item The drill narrative: timeline, observed behavior, reconciliation proof.
+    \item The operational runbook.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item[\(\square\)] Every event carries a producer-stamped unique ID; duplicate injection measurably exercises the dedup path.
+    \item[\(\square\)] Both destinations dedupe correctly under injected duplicates.
+    \item[\(\square\)] The replay drill recovers with zero loss and zero duplicates, proven by queries.
+    \item[\(\square\)] Checkpoints allow a consumer restart without reprocessing.
+    \item[\(\square\)] The runbook records replay windows and dedup keys per stream.
+    \item[\(\square\)] No connection strings appear in source or screenshots.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Add a Reflex branch firing on temperature spikes (previews Chapter~15).
+    \item Add lag monitoring: emit a metric when ingestion lag exceeds a threshold.
+    \item Simulate a nine-hour device backhaul and document the late-arrival impact on aggregates.
+    \item Compare dedup cost: materialized view versus query-time \texttt{arg\_max}, at one day of volume.
+\end{itemize}

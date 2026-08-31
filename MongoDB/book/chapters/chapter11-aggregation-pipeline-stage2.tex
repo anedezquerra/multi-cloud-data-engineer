@@ -1,0 +1,313 @@
+\chapter{Aggregation Pipeline Mastery II: Window Functions and Materialized Views}
+\index{\$setWindowFields}\index{window functions}\index{moving average}\index{\$denseRank}\index{\$derivative}\index{materialized view}\index{\$merge}\index{on-demand materialized view}%
+
+\begin{objectives}
+\begin{itemize}
+    \item Compute running totals, rankings, derivatives, and moving averages with \texttt{\$setWindowFields} partitions and window bounds.
+    \item Distinguish accumulator behavior across \texttt{\$group}, \texttt{\$project}, and \texttt{\$setWindowFields} contexts.
+    \item Respect the 100 MB per-stage memory boundary and the sort requirements of windowed computation.
+    \item Build incrementally refreshed materialized views with \texttt{\$merge} and deterministic keys.
+    \item Deliver a 30-day moving-average financial analytics pipeline in the Thursday lab.
+    \item Architect a real-time leaderboard over fifty million gaming events.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+Window functions are the most portable analytical concept in this book: SQL \texttt{OVER (PARTITION BY ... ORDER BY ...)} exists verbatim in Redshift, Synapse, BigQuery, and Snowflake. MongoDB's \texttt{\$setWindowFields} is the same mathematics with document semantics.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{2.9cm}p{3.0cm}p{3.0cm}p{3.0cm}@{}} 
+\toprule
+\textbf{Concept} & \textbf{AWS (Redshift)} & \textbf{Azure (Synapse)} & \textbf{GCP (BigQuery)} \\
+\midrule
+Window stage & \texttt{OVER()} clause & \texttt{OVER()} clause & \texttt{OVER()} clause \\
+Rank & \texttt{RANK}/\texttt{DENSE\_RANK} & Same & Same \\
+Moving average & \texttt{AVG() OVER (ROWS)} & Same & Same \\
+Derivative & \texttt{LAG()} arithmetic & Same & Same \\
+Materialized view & Redshift MVs (auto-refresh) & Indexed views / Spark SQL & BigQuery MVs (auto-refresh) \\
+Incremental refresh & Automatic & Manual / pipeline & Automatic, partition-aware \\
+\addlinespace
+Snowflake & \multicolumn{3}{l}{Window functions identical; materialized views auto-maintained; streams + tasks for incremental pipelines} \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+MongoDB's distinction is the manual refresh path: \texttt{\$merge} into a results collection is a materialized view you maintain yourself, which means you also own its freshness, idempotency, and backfill story \cite{mongodbSetWindowFieldsDocs,kleppmann2017ddia}.
+\end{crosscloud}
+
+\section{Week 11 Roadmap: From Aggregates to Windows}
+Chapter 10's \texttt{\$group} collapses many documents into one summary row. Windows answer the complementary question: compute an aggregate \emph{for each} document from its neighbors---the running balance at every ledger entry, each player's rank within their region, the 30-day moving average beside every transaction. This week also closes the analytics loop: windowed results that dashboards recompute per request should become materialized views, refreshed incrementally and provably \cite{mongodbSetWindowFieldsDocs}.
+
+\begin{definitionbox}
+A \textbf{window function} computes a value for each document from a \emph{frame} of related documents defined by a partition key, a sort order, and window bounds, without collapsing the stream the way \texttt{\$group} does.
+\end{definitionbox}
+
+\begin{keyterms}
+\textbf{Partition}: the group of documents over which one window computes (e.g. one account). \textbf{Frame}: the subset of the partition feeding one document's computation (\texttt{range: [-30, 0], unit: "day"}). \textbf{\$denseRank}: rank without gaps. \textbf{\$derivative}: rate of change between frame endpoints. \textbf{Materialized view}: a collection holding precomputed pipeline output, refreshed by \texttt{\$merge}.
+\end{keyterms}
+
+\section{Monday: \texttt{\$setWindowFields} in Depth}
+\subsection{Partitions, Sort, and Frames}
+The stage takes three structural decisions. \texttt{partitionBy} groups the stream (one account, one player, one device). \texttt{sortBy} orders within the partition---mandatory for any frame-based operator, because a window without order is nondeterministic. The \texttt{window} bounds pick the frame: \texttt{documents: [-10, 0]} (last ten rows), \texttt{range: [-30, 0], unit: "day"} (last thirty days), or \texttt{documents: ["unbounded", "current"]} (running total).
+
+\begin{lstlisting}[language=JavaScript, caption={Running balance and 30-day moving average per account.}]
+db.ledger.aggregate([
+  { $match: { postedAt: { $gte: start } } },
+  { $setWindowFields: {
+      partitionBy: "$accountId",
+      sortBy: { postedAt: 1 },
+      output: {
+        runningBalance: { $sum: "$amount",
+          window: { documents: ["unbounded", "current"] } },
+        avg30d: { $avg: "$amount",
+          window: { range: [-30, 0], unit: "day" } }
+      } } }
+]);
+\end{lstlisting}
+
+\subsection{Ranking and Change Operators}
+\texttt{\$rank}, \texttt{\$denseRank}, and \texttt{\$documentNumber} order documents within partitions; \texttt{\$denseRank} leaves no gaps after ties, which is what leaderboards usually want. \texttt{\$derivative} computes the rate of change between the frame's endpoints---queue depth per minute, temperature drift per hour---and \texttt{\$expMovingAvg} variants weight recent values more heavily for smoothing noisy telemetry.
+
+\begin{pitfall}
+\textbf{Windows without deterministic sort.} If \texttt{sortBy} has ties and the frame is document-bounded, ties can fall on either side of a frame boundary between runs. Add a tiebreaker (\texttt{sortBy: \{ ts: 1, \_id: 1 \}}) whenever frame membership affects results.
+\end{pitfall}
+
+\subsection{Memory and the Sort Requirement}
+\texttt{\$setWindowFields} must materialize each partition in sorted order; it is a blocking stage subject to the 100 MB limit and \texttt{allowDiskUse}. Two design consequences follow. First, filter before the window: partitioning a hundred-million-document stream you will later discard is pure waste. Second, the stage can exploit an index whose order matches \texttt{partitionBy} + \texttt{sortBy}, avoiding the explicit sort---the window analogue of Chapter 9's sort elimination.
+
+\section{Tuesday: Accumulators Across Contexts}
+The same operator name behaves differently by context, and confusing them is the classic interview trap. In \texttt{\$group}, \texttt{\$sum: "\$amount"} accumulates across the group and outputs one value. In \texttt{\$project}, \texttt{\$sum} with an array argument reduces that array within one document. In \texttt{\$setWindowFields}, the accumulator computes over the frame and outputs one value \emph{per document}. A pipeline review should always ask: which context is this accumulator in, and what is its input stream?
+
+\begin{tipbox}
+When a pipeline needs both per-group totals and per-document windows, compute the window first (it preserves every document), then \texttt{\$group}. The reverse order loses the documents the window needed.
+\end{tipbox}
+
+\section{Wednesday: Materialized Views with \texttt{\$merge}}
+\subsection{The Pattern}
+MongoDB has no automatically maintained materialized view; the idiom is an aggregation pipeline ending in \texttt{\$merge}, which upserts pipeline output into a target collection \cite{mongodbMergeDocs}. Run on a schedule---or triggered by change streams (Chapter 16)---it produces a read-optimized results collection that dashboards query as plain documents. Because you own the refresh, the pattern's three non-negotiables are deterministic keys (so re-runs upsert rather than duplicate), a refresh watermark (so runs are incremental), and idempotency (so replays are safe).
+
+\begin{lstlisting}[language=JavaScript, caption={Incremental materialized view refresh with a watermark.}]
+const wm = db.mv_state.findOne({ _id: "acct_metrics" })?.watermark
+         ?? ISODate("2000-01-01");
+const now = new Date();
+
+db.ledger.aggregate([
+  { $match: { postedAt: { $gte: wm, $lt: now } } },       // delta window
+  { $setWindowFields: {
+      partitionBy: "$accountId", sortBy: { postedAt: 1, _id: 1 },
+      output: { avg30d: { $avg: "$amount",
+        window: { range: [-30, 0], unit: "day" } } } } },
+  { $merge: { into: "acct_metrics", on: "_id",
+              whenMatched: "replace", whenNotMatched: "insert" } }
+]);
+
+db.mv_state.updateOne({ _id: "acct_metrics" },
+  { $set: { watermark: now } }, { upsert: true });
+\end{lstlisting}
+
+\begin{notebox}
+Windows look backwards, so a naive watermark misses late-arriving rows that change old frames. Production refreshes re-compute a lookback window (e.g. watermark minus 31 days for a 30-day window) so stragglers are absorbed by the next run.
+\end{notebox}
+
+\subsection{Correctness Contract}
+The contract mirrors Chapter 10's: a reference implementation (pandas or SQL) validates a sampled window, the merge key is deterministic, and a reconcile job periodically recomputes a full partition and diffs it against the materialized collection. A materialized view without a reconcile job is a rumor with a schema.
+
+\section{Thursday Hands-On Project: Financial Moving-Average Pipeline}
+Build the transaction-log analytics lab: two million ledger entries, a 30-day moving average and exponential smoothing per account, and an incremental \texttt{\$merge} refresh.
+
+\subsection{Data and Window Pipeline}
+\begin{lstlisting}[language=JavaScript, caption={Ledger generator and windowed analytics.}]
+use windowLab;
+db.ledger.drop();
+const batch = [];
+for (let i = 0; i < 2000000; i++) {
+  batch.push({ _id: i, accountId: "acct-" + (i % 50000),
+    postedAt: new Date(Date.now() - (i % 90) * 86400000 - (i % 86400) * 1000),
+    amount: ((i % 20000) / 100 - 100) });
+  if (batch.length === 10000) {
+    db.ledger.insertMany(batch, { ordered: false }); batch.length = 0;
+  }
+}
+db.ledger.createIndex({ accountId: 1, postedAt: 1 });
+
+db.ledger.aggregate([
+  { $match: { accountId: { $in: ["acct-1", "acct-2"] } } },
+  { $setWindowFields: {
+      partitionBy: "$accountId", sortBy: { postedAt: 1, _id: 1 },
+      output: {
+        avg30d: { $avg: "$amount",
+          window: { range: [-30, 0], unit: "day" } },
+        ema: { $expMovingAvg: { input: "$amount", alpha: 0.1 } }
+      } } }
+]);
+\end{lstlisting}
+
+\subsection{Exercises Within the Lab}
+Verify determinism by running the pipeline twice and diffing outputs; then remove the \texttt{\_id} tiebreaker, re-run, and observe which frames changed. Finish by wiring the incremental \texttt{\$merge} refresh from Wednesday and re-running it after inserting a late-arriving transaction dated 10 days back---the lookback window must absorb it.
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item The generator, window pipeline, and incremental refresh script.
+    \item The determinism experiment (with and without the sort tiebreaker).
+    \item The late-arrival test showing the lookback window correcting the materialized view.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item Moving-average values match a pandas reference within floating tolerance on a sampled account.
+    \item The refresh is idempotent: three consecutive runs produce identical \texttt{acct\_metrics} content.
+    \item No stage spills with \texttt{allowDiskUse} disabled on the filtered stream.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Re-implement the same metrics with Spark or DuckDB and compare runtime, memory, and operational complexity.
+    \item Trigger the refresh from a change stream on \texttt{ledger} instead of a cron schedule.
+\end{itemize}
+
+\section{Friday Use Case and Architecture: Real-Time Gaming Leaderboard}
+\subsection{Scenario and Requirements}
+A gaming platform streams fifty million match events daily and must serve per-player global and regional leaderboards with sub-second reads, plus per-player rolling statistics (win rate over the last 20 matches, score trend). Event volume rules out computing windows at read time; the leaderboard must be materialized and incrementally maintained.
+
+\subsection{Architecture}
+The design separates the hot write path from the analytical refresh. Match events land in a sharded \texttt{events} collection (Chapter 10). A scheduled micro-batch pipeline---every minute---computes \texttt{\$setWindowFields} over new events partitioned by player, merges rank and rolling-stat documents into \texttt{leaderboard} and \texttt{player\_stats} collections keyed by player and window, and serves reads from those precomputed collections with plain indexed lookups. Regional boards are one \texttt{partitionBy} change, not a second system. Chapter 15 replaces the cron with a change-stream trigger once CDC is in the toolkit.
+
+\begin{pitfall}
+\textbf{Ranking fifty million players in one window.} Global rank is a single partition---one giant sort. Compute ranks per region (bounded partitions) and derive the global board by merging ranked regional streams, or accept an approximate global board updated less frequently.
+\end{pitfall}
+
+\section{Interview Q\&A}
+\subsection{Windows and Views}
+\begin{enumerate}
+    \item \textbf{Q: \texttt{\$rank} versus \texttt{\$denseRank}?}\\
+    A: After a tie, \texttt{\$rank} skips positions (1, 2, 2, 4); \texttt{\$denseRank} does not (1, 2, 2, 3). Leaderboards usually want dense ranks.
+
+    \item \textbf{Q: Why does \texttt{\$setWindowFields} require \texttt{sortBy}?}\\
+    A: Frame membership is defined by order; without a sort, ``the last 30 days per row'' is meaningless and results are nondeterministic.
+
+    \item \textbf{Q: How does a MongoDB materialized view differ from Snowflake's?}\\
+    A: Snowflake maintains the view automatically on base-table change. MongoDB's \texttt{\$merge} pattern is maintained by your refresh job, so you own freshness, idempotency, and reconciliation.
+
+    \item \textbf{Q: Why the lookback window in incremental refresh?}\\
+    A: Frames reach backwards in time; a late event changes old frames. Refreshing watermark-minus-window-length re-computes every frame the late data could touch.
+
+    \item \textbf{Q: What does \texttt{\$derivative} actually compute?}\\
+    A: The slope between the first and last points of the frame, per unit time---a rate of change, not a point-to-point diff.
+\end{enumerate}
+
+\section{Further Reading}
+The \texttt{\$setWindowFields} reference defines partition, frame, and operator semantics \cite{mongodbSetWindowFieldsDocs}; \texttt{\$merge} output behavior is in the aggregation stage documentation \cite{mongodbMergeDocs,mongodbAggregationDocs}. Kleppmann's chapters on batch and stream processing frame the materialization trade-offs \cite{kleppmann2017ddia}, and the Apache Spark project provides the batch-window comparison point used in the stretch goals \cite{apacheSparkRepo}.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item Windows compute per-document aggregates over ordered frames; \texttt{\$group} collapses; choose per question, not per habit.
+    \item Deterministic sort keys make windows reproducible; ties without tiebreakers make them flaky.
+    \item Accumulator semantics depend on context: \texttt{\$group}, \texttt{\$project}, and \texttt{\$setWindowFields} are three different contracts.
+    \item \texttt{\$setWindowFields} is a blocking stage: filter first, exploit matching index order, respect the 100 MB limit.
+    \item \texttt{\$merge} + watermark + deterministic keys is the materialized-view idiom; add lookback for late data.
+    \item Every materialized view needs a reconcile job; freshness you cannot prove is freshness you do not have.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Write the frame specification for ``previous 5 transactions plus current'' and for ``previous calendar week.''
+    \item \textbf{(Conceptual)} Explain why a global leaderboard rank cannot be partitioned by region, and sketch the two-level alternative.
+    \item \textbf{(Conceptual)} When is \texttt{\$expMovingAvg} preferable to a simple moving average over a range frame?
+    \item \textbf{(Hands-on)} Add a \texttt{\$derivative} of queue depth per minute to the lab dataset and chart the result.
+    \item \textbf{(Hands-on)} Break the materialized view by merging with a non-deterministic key, observe duplicates, then fix and prove idempotency.
+    \item \textbf{(Design)} Design the refresh architecture for a tenant-isolated SaaS metrics product: watermarks per tenant, late data, backfill after an outage.
+    \item \textbf{(Design)} Decide, with justification, whether a 30-day moving-average dashboard should be a live pipeline, a materialized view, or a cached API response at 1k, 100k, and 10M daily requests.
+    \item \textbf{(Interview)} ``The materialized view drifted from the base data over a month.'' Enumerate the likely causes and your diagnostic order.
+\end{enumerate}
+
+\section{Capstone Project: Windowed Analytics with Incremental Materialization}\label{sec:ch11-capstone}
+
+\begin{capstonebox}
+\textbf{Mission:} build the windowed analytics platform for the orders domain: a 100-million-document workload served by ESR-compliant compound indexes (Chapter 9), faceted one-scan dashboards (Chapter 10), and windowed rolling metrics materialized with \texttt{\$merge} (this chapter)---with every plan proven covered and every refresh provably idempotent.
+
+\textbf{Estimated time:} 6--8 hours, dominated by data generation and index builds.
+
+\textbf{What you will practice:}
+\begin{itemize}
+    \item Integrating index architecture, pipeline design, and windowed analytics into one system.
+    \item Proving zero \texttt{FETCH}/\texttt{COLLSCAN} and zero disk spills under realistic scale.
+    \item Operating incremental materialization with lookback, reconciliation, and data-quality tests.
+\end{itemize}
+\end{capstonebox}
+
+\subsection*{Scenario}
+The payments platform from earlier capstones must now serve a finance analytics product: rolling 30-day customer spend metrics, multi-faceted revenue dashboards, and an organizational rollup of teams to regions via \texttt{\$graphLookup}. The workload is one hundred million ledger documents. Constraints: all dashboard queries fully covered, no disk spilling in steady state, and the analytics workload must not touch the OLTP primary---run it on a dedicated analytics replica set member or a hidden analytics node.
+
+\subsection*{Requirements}
+\begin{itemize}
+    \item Generate 100M ledger documents (or a documented, proportionally scaled subset) with account, region, timestamp, and amount fields.
+    \item Design one ESR compound index per dominant pipeline entry shape; validate coverage with \texttt{explain("executionStats")} on every pipeline.
+    \item Implement the full pipeline chain: early \texttt{\$match} $\to$ \texttt{\$lookup} $\to$ \texttt{\$facet} $\to$ \texttt{\$setWindowFields} $\to$ \texttt{\$merge}.
+    \item Implement incremental refresh with watermark plus 31-day lookback, deterministic merge keys, and a nightly reconcile job comparing one full partition against a reference computation.
+    \item Provide at least three automated data-quality tests (aggregation parity vs. reference SQL, cardinality checks, empty-input edge case) with a failing-case demonstration.
+    \item Provide a monthly cost estimate for the analytics replica set and storage footprint, with two optimization decisions documented.
+\end{itemize}
+
+\subsection*{Reference Architecture}
+\begin{figure}[H]
+    \centering
+    \resizebox{0.95\textwidth}{!}{%
+    \begin{tikzpicture}[
+        st/.style={stage, minimum width=2.05cm, font=\scriptsize\bfseries},
+        store/.style={cylinder, shape aspect=0.25, draw=primary, thick, fill=primary!8, shape border rotate=90, align=center, minimum width=1.5cm, minimum height=1.15cm, font=\scriptsize\bfseries},
+        ops/.style={rectangle, rounded corners, draw=orange!85!black, fill=orange!10, minimum width=2.3cm, minimum height=0.9cm, align=center, font=\scriptsize\bfseries},
+        arrow/.style={-{Stealth[length=2.5mm]}, draw=primary, thick}
+    ]
+        \node[store] (ledger) at (0,0) {ledger\\(100M)};
+        \node[st] (match) at (2.6,0) {\$match\\ESR index};
+        \node[st] (lookup) at (5.1,0) {\$lookup};
+        \node[st] (facet) at (7.4,0) {\$facet};
+        \node[st] (win) at (9.8,0) {\$setWindow-\\Fields};
+        \node[st] (merge) at (12.3,0) {\$merge};
+        \node[store] (mv) at (14.6,0) {metrics\\views};
+        \node[ops] (wm) at (5.1,-1.7) {watermark +\\lookback 31d};
+        \node[ops] (rec) at (12.3,-1.7) {nightly\\reconcile};
+        \draw[arrow] (ledger) -- (match);
+        \draw[arrow] (match) -- (lookup);
+        \draw[arrow] (lookup) -- (facet);
+        \draw[arrow] (facet) -- (win);
+        \draw[arrow] (win) -- (merge);
+        \draw[arrow] (merge) -- (mv);
+        \draw[arrow, dashed] (wm) -- (match);
+        \draw[arrow, dashed] (rec) -- (mv);
+    \end{tikzpicture}%
+    }
+    \caption{Windowed analytics engine: one indexed scan feeds faceted windowed computation into reconciled materialized views.}
+    \label{fig:ch8-capstone}
+\end{figure}
+
+\subsection*{Implementation Steps}
+\begin{enumerate}
+    \item \textbf{Baseline.} Generate data; run the naive pipeline; record the \texttt{COLLSCAN} baseline for the report.
+    \item \textbf{Indexes.} Build ESR indexes per entry shape; prove \texttt{IXSCAN}-only plans and zero \texttt{FETCH} on covered projections.
+    \item \textbf{Pipeline.} Assemble the full stage chain; verify determinism with the sort tiebreaker; confirm no spills with \texttt{allowDiskUse} disabled in steady state.
+    \item \textbf{Materialize.} Add watermark, lookback, deterministic keys, and \texttt{\$merge}; demonstrate a late-arrival correction.
+    \item \textbf{Verify.} Run the three data-quality tests, the reconcile job, and the failing-case demonstrations; write the cost estimate.
+\end{enumerate}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item Generator, index migration, pipeline scripts, refresh job, and reconcile job.
+    \item Explain evidence pack: IXSCAN-only, zero spills, covered projections.
+    \item Data-quality test suite with failing-case output, plus the cost-estimate document.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item Every production pipeline starts with an index-backed \texttt{\$match}; no \texttt{COLLSCAN} appears in any explain output.
+    \item Windowed results match the reference implementation on sampled partitions.
+    \item Incremental refresh is idempotent and absorbs late arrivals within the lookback window.
+    \item The reconcile job detects an injected drift in a test run.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Replace the scheduled refresh with change-stream-triggered incremental updates (previewing Chapter 16).
+    \item Benchmark the same rolling metrics in DuckDB or Spark and write a one-page build-vs-buy analysis.
+\end{itemize}

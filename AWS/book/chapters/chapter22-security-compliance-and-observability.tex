@@ -1,0 +1,326 @@
+% NOTE: Filename is fixed by the book outline; content teaches Week 22
+% (Data Governance & Quality) of the syllabus.
+\chapter{Data Governance and Data Quality at Scale}
+\index{data governance}\index{data quality}\index{Glue Data Quality}\index{data lineage}\index{data mesh}\index{cross-account sharing}\index{schema drift}%
+\begin{objectives}
+\begin{itemize}
+    \item Share catalog data across accounts with Lake Formation and manage access with LF-Tags.
+    \item Author AWS Glue Data Quality rulesets (DQDL) with thresholds, and route failures to alerts.
+    \item Use lineage---SageMaker ML Lineage and open standards---to trace quality failures to their upstream source.
+    \item Implement a quality gate that halts a pipeline when a required column exceeds 5\% nulls.
+    \item Distinguish rules that catch schema drift from rules that catch content degradation.
+    \item Architect a five-domain data mesh with centralized governance and decentralized data engineering.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+Quality rules, lineage, and mesh organization are the governance layer every platform now ships; the vocabulary converged faster here than anywhere else in the stack.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{2.8cm}p{3.0cm}p{3.0cm}p{3.0cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{AWS} & \textbf{Azure} & \textbf{GCP} \\
+\midrule
+Quality rules engine & Glue Data Quality (DQDL) & Fabric/Purview data quality & Dataplex data quality \\
+Cross-account sharing & Lake Formation + RAM & Purview + Fabric sharing & Analytics Hub / Dataplex \\
+Tag-based governance & LF-Tags & Purview classifications & Policy tags \\
+Lineage & SageMaker Lineage, OpenLineage & Purview lineage & Dataplex lineage \\
+Catalog of record & Glue Data Catalog & Microsoft Purview & Dataplex \\
+\addlinespace
+Open-source alternative & Great Expectations, DataHub & Same (cloud-agnostic) & Same \\
+Quality gate pattern & In-job evaluation + SNS & Pipeline gates & Dataflow/Dataplex gates \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+\textbf{Snowflake} implements quality as data metric functions and governance as Horizon Catalog. \textbf{MongoDB} enforces shape at write time with schema validation---the closest operational-store analog to a DQ ruleset. \textbf{Fabric} ties quality and lineage into OneLake's unified governance story.
+\end{crosscloud}
+
+\section{Week 22 Roadmap and Mental Model}
+Weeks 5--20 built a platform that moves and computes data correctly when everything works. Week~22 asks the harder questions: how do you \emph{know} the data is right, and who is accountable when it is not? Governance at scale has two technical pillars---a catalog with fine-grained, tag-based access (Chapter~8 extended across accounts) and automated data quality (rules as code, evaluated in pipelines)---and one organizational pillar: ownership that scales, which leads to the data mesh.
+
+The connecting idea: \emph{quality and access are properties of data products, enforced in pipelines, traceable through lineage} \cite{awsGlueDataQualityDocs,openLineage}. A dashboard that silently consumed a half-null feed is a governance failure before it is an engineering one.
+
+\begin{definitionbox}
+\textbf{Data quality engineering} is the practice of expressing expectations about data (completeness, uniqueness, validity, freshness) as versioned, executable rules evaluated inside pipelines---with failures that halt, alert, and trace to root cause.
+\end{definitionbox}
+
+\begin{keyterms}
+\textbf{DQDL}: Data Quality Definition Language---Glue's rule syntax (\texttt{IsComplete}, \texttt{ColumnValues}, \ldots). \textbf{Ruleset}: a named, versioned set of rules evaluated against a dataset or frame. \textbf{Threshold}: a soft-fail level allowing observed-versus-expected comparison. \textbf{Lineage}: the recorded graph of what produced what. \textbf{Data mesh}: domain-owned data products with federated governance. \textbf{Data product}: a dataset with an owner, a contract, quality SLAs, and discoverability.
+\end{keyterms}
+
+\section{Monday: Cross-Account Sharing and Tag-Based Access}
+\subsection{Sharing the Catalog, Not the Data}
+Chapter~8 governed one account; the enterprise reality is many. Lake Formation shares catalog databases and tables across accounts (via AWS RAM invitations), and the receiving account sees shared objects in its own catalog with its own grant structure on top \cite{awsLakeFormationDocs}. The data stays in the producer's S3; the consumer's engines read it under Lake Formation credential vending. Column masks and row filters apply across the boundary---a shared table with a masked \texttt{pii\_email} arrives masked.
+\index{cross-account sharing}\index{AWS RAM}
+
+\subsection{Why Tags Win at Scale}
+In a multi-account estate, named-resource grants multiply into an unmaintainable matrix. LF-Tags invert the work: producers tag resources (\texttt{domain=finance}, \texttt{sensitivity=confidential}), consumers' roles hold grants on tag expressions, and new datasets inherit correct policy by being tagged correctly at creation. The tag taxonomy---its keys, allowed values, and who may assign them---becomes the governance contract reviewed by the data council, with tag assignment enforced in the pipeline code that registers tables.
+\index{LF-Tags}
+
+\begin{pitfall}
+\textbf{Tag taxonomy by convention instead of control.} LF-Tag matching is exact and case-sensitive: \texttt{PII} and \texttt{pii} are different worlds, and a mistyped tag silently changes who can read the table. Constrain tag values at assignment time (CI validation on the registration code) and audit tag coverage monthly---untagged tables are ungoverned tables.
+\end{pitfall}
+
+\section{Tuesday: AWS Glue Data Quality}
+\subsection{RULES as Code}
+Glue Data Quality evaluates rulesets written in DQDL against catalog tables or in-flight DynamicFrames, publishing results to CloudWatch and---in ETL jobs---letting you branch on the outcome \cite{awsGlueDataQualityDocs}:
+
+\begin{lstlisting}[caption={A DQDL ruleset for the orders feed.},label={lst:ch22-dqdl}]
+Rules = [
+    IsComplete "order_id",
+    IsUnique "order_id",
+    ColumnValues "order_amount" >= 0,
+    ColumnLength "email" between 5 and 254,
+    Completeness "email" >= 0.95 with threshold 0.9
+]
+\end{lstlisting}
+
+Each rule is a falsifiable claim about the data: \texttt{IsComplete} catches nulls, \texttt{IsUnique} catches key duplication, \texttt{ColumnValues} catches out-of-domain values, \texttt{ColumnExists} catches schema drift (a renamed or dropped source column), and \texttt{Completeness} with a threshold distinguishes ``some nulls'' from ``the feed is degrading.'' Rules live in version control next to the pipeline that enforces them; a rule change is a pull request, reviewed like the contract change it is.
+\index{DQDL}\index{ruleset}
+
+\subsection{Rule Selection: Drift Versus Degradation}
+Two failure families need different instruments. \emph{Schema drift}---structure changed---is caught by \texttt{ColumnExists}, \texttt{ColumnCount}, and type assertions (and prevented upstream by Chapter~11's schema registry). \emph{Content degradation}---structure intact, values rotting---is caught by completeness, uniqueness, distribution, and freshness rules. A ruleset covering only one family leaves the other invisible.
+
+\section{Wednesday: Lineage---Tracing Failures Upstream}
+\subsection{Why Lineage Is an Operational Tool}
+When Tuesday's \texttt{Completeness "email"} rule fails, the questions arrive instantly: which downstream tables and dashboards consumed the bad batch, and which upstream change introduced it? Lineage answers both. SageMaker ML Lineage tracks artifacts and their relationships across the ML estate; OpenLineage emits a portable event standard from Airflow, Spark, and dbt that platforms like DataHub render as the full graph \cite{openLineage,dataHubProject}. For the data engineer, the discipline is emission: every job you write should record its inputs, outputs, and run identity.
+\index{lineage}\index{OpenLineage}\index{DataHub}
+
+\begin{tipbox}
+Combine DQ rule results with lineage: publish the failing rule, the run ID, and the dataset version into the lineage graph so a quality failure can be traced to the exact upstream table that introduced it. A red dashboard with a one-click path to the offending upstream commit is the difference between a ten-minute and a two-day incident.
+\end{tipbox}
+
+\section{Thursday Hands-on Project: A Quality Gate That Halts the Pipeline}
+\index{hands-on project!Glue Data Quality gate}
+Implement a Glue Data Quality ruleset inside an ETL job that fails the pipeline if a required column is more than 5\% null, routing failure alerts to SNS.
+
+\subsection*{Lab Objectives}
+\begin{itemize}
+    \item Attach a DQDL ruleset to an existing Glue job's DynamicFrame.
+    \item Branch on the evaluation outcome: pass writes; fail publishes and raises.
+    \item Inject a violating batch and observe the halt and the alert.
+    \item Record rule outcomes to CloudWatch for trending.
+\end{itemize}
+
+\subsection*{Procedure}
+The evaluation lives inside the job, between transform and sink:
+
+\begin{lstlisting}[language=Python,caption={In-job data-quality evaluation with an SNS-routed hard gate.},label={lst:ch22-dq-gate}]
+import boto3
+from awsglue.context import GlueContext
+from awsglue.dynamicframe import DynamicFrame
+from awsgluedq.transforms import EvaluateDataQuality
+
+RULESET = """
+Rules = [
+    IsComplete "order_id",
+    IsUnique "order_id",
+    ColumnValues "order_amount" >= 0,
+    ColumnLength "email" between 5 and 254,
+    Completeness "email" >= 0.95 with threshold 0.9
+]
+"""
+
+ALERTS_TOPIC = "arn:aws:sns:us-east-1:123456789012:data-quality-alerts"
+
+# ... earlier: build `frame` (a DynamicFrame) from catalog sources ...
+dq_results = EvaluateDataQuality().process_rows(
+    frame=frame,
+    ruleset=RULESET,
+    publishing_options={
+        "cloudwatch_metrics_enabled": True,
+        "results_s3_prefix": "s3://acme-analytics-raw-123456789012/dq-results/",
+    },
+    additional_options={"performanceTuning.caching": "CACHE_NOTHING"},
+)
+
+outcome = dq_results[EvaluateDataQuality.DATA_QUALITY_RULES_OUTCOME]
+overall = outcome.toDF().agg({"DataQualityEvaluationResult": "max"}) \
+                       .first()[0]
+
+if overall == "Failed":
+    sns = boto3.client("sns")
+    sns.publish(
+        TopicArn=ALERTS_TOPIC,
+        Subject="DQ gate failed: orders feed",
+        Message=f"Quality gate failed for run. "
+                f"Results: s3://...dq-results/ (see rule outcomes).",
+    )
+    raise RuntimeError("DQ gate failed - load halted")
+
+# gate passed: proceed to the Redshift/lake sink
+\end{lstlisting}
+
+\subsection*{Verification}
+\begin{itemize}
+    \item A clean batch passes the gate and lands in the target.
+    \item A batch with 8\% null \texttt{email} halts the job before any write; the SNS message arrives; rule outcomes are in S3 and CloudWatch.
+    \item The threshold rule reports ``observed 0.92 vs.\ required 0.95'' granularity, not a bare pass/fail.
+    \item A rerun with a fixed batch succeeds without manual target cleanup (idempotency from Chapter~10).
+\end{itemize}
+
+\begin{pitfall}
+\textbf{Warning-only quality checks in production pipelines.} A rule that logs and loads anyway trains the organization that quality is advisory. Decide per rule: hard gates (halt the load) for contract-level guarantees, soft monitors (alert and load) for informational trends---and never confuse the two in the same list without labels.
+\end{pitfall}
+
+\section{Friday Use Case: A Five-Domain Data Mesh}
+\index{use case!data mesh}
+A global conglomerate has five independent business domains---retail, logistics, finance, marketing, manufacturing---each with its own data engineers, its own AWS account, and its own release cadence. The CDO wants decentralized delivery with centralized governance: one policy language, enforced everywhere, without a central bottleneck team. Architect the mesh.
+
+\subsection{Operating Model}
+\textbf{Domains own data products.} Each domain publishes datasets as products: an owner, a schema contract (Chapter~11), a DQ ruleset (this week), an SLO (freshness, completeness), and catalog registration with the standard tag set. ``Who owns the quality of a data product?'' has one answer: the domain that publishes it.
+
+\textbf{The center owns the platform and the policy.} A central governance account defines the LF-Tag taxonomy, the cross-account sharing patterns, the DQ rule libraries, and the audit aggregation (CloudTrail, DQ outcomes). It grants by tag expression---\texttt{domain=finance AND sensitivity<=internal}---so policy scales without a ticket queue.
+
+\subsection{Architecture}
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[
+        dombox/.style={rectangle, rounded corners, draw=primary, thick, fill=primary!6, align=center, minimum width=2.7cm, minimum height=1.5cm, font=\footnotesize\bfseries},
+        hubbox/.style={rectangle, rounded corners, draw=red!60!black, thick, fill=red!5, align=center, minimum width=4.4cm, minimum height=1.5cm, font=\footnotesize\bfseries},
+        arr/.style={-{Stealth[length=2.5mm]}, draw=primary, thick}
+    ]
+        \node[dombox] (d1) at (0,2.4) {Retail account\\data products};
+        \node[dombox] (d2) at (0,0.6) {Logistics account\\data products};
+        \node[dombox] (d3) at (0,-1.2) {Finance account\\data products};
+        \node[hubbox] (gov) at (5.6,0.6) {Governance account\\tag taxonomy, audit\\policy by expression};
+        \node[dombox] (c1) at (11.2,2.4) {BI account\\consuming analysts};
+        \node[dombox] (c2) at (11.2,-1.2) {ML account\\consuming scientists};
+        \draw[arr] (d1) -- node[above,font=\scriptsize]{share via LF + RAM} (c1);
+        \draw[arr] (d2) -- (c1);
+        \draw[arr] (d3) -- (c2);
+        \draw[arr, dashed] (gov) -- (d1);
+        \draw[arr, dashed] (gov) -- (d2);
+        \draw[arr, dashed] (gov) -- (d3);
+        \draw[arr, dashed] (gov) -- (c1);
+        \draw[arr, dashed] (gov) -- (c2);
+    \end{tikzpicture}%
+    }
+    \caption{Data mesh on AWS: domains publish governed products from their own accounts; the center owns taxonomy and audit; consumers read through tag-expression grants.}
+    \label{fig:ch22-mesh}
+\end{figure}
+
+\subsection{Failure Modes the Design Anticipates}
+\textbf{Ungoverned product drift.} A domain stops tagging or stops running its DQ ruleset. Countermeasure: the governance account aggregates per-domain compliance signals (tag coverage, DQ pass rates, contract freshness) into a published scorecard---governance by transparency.
+
+\textbf{Central bottleneck relapse.} If every share needs central approval, the mesh dies. Countermeasure: grants on tag expressions are pre-authorized policy; shares matching policy need no ticket.
+
+\textbf{Semantic divergence.} Five domains define ``customer'' five ways. Countermeasure: the conformed-dimension practice of Chapter~5 survives the mesh---shared dimensions are themselves data products with named owners.
+
+\begin{pitfall}
+\textbf{A mesh of pipelines instead of products.} Sharing raw tables with no owner, contract, or SLO recreates the swamp with extra accounts. The unit of the mesh is the data product---owned, contracted, quality-gated, discoverable---not the table.
+\end{pitfall}
+
+\section{Interview Q\&A}
+\subsection{Concepts and Trade-offs}
+\begin{enumerate}
+    \item \textbf{Q: How do LF-Tags simplify cross-account data sharing?}\\
+    A: Grants bind to tag expressions instead of resource names, so any correctly tagged shared table inherits policy in every account automatically---policy scales with data classes, not table count.
+    \item \textbf{Q: Why consult lineage when a data-quality check fails?}\\
+    A: Lineage answers the incident's two questions instantly: what consumed the bad batch downstream, and which upstream change introduced it---turning a two-day hunt into a directed fix.
+    \item \textbf{Q: \texttt{ColumnExists} versus \texttt{Completeness}: which catches schema drift?}\\
+    A: \texttt{ColumnExists}---structure. \texttt{Completeness} catches content degradation within an intact schema. A production ruleset needs both families.
+    \item \textbf{Q: In a data mesh, who owns the quality of a data product?}\\
+    A: The publishing domain. The center provides the platform, taxonomy, and audit---accountability for the product's contract and SLO stays with its owner.
+    \item \textbf{Q: What does the threshold clause on a DQ rule buy you?}\\
+    A: Nuance: \texttt{Completeness >= 0.95 with threshold 0.9} distinguishes a mild dip (report) from a cliff (fail), so rules can monitor without halting on noise.
+    \item \textbf{Q: Why enforce schema contracts at registration time, not query time?}\\
+    A: Registration is where the producer's intent is declared; query time is where violations have already become durable bad data---and possibly replicated downstream.
+\end{enumerate}
+
+\section{Further Reading}
+The Glue Data Quality documentation covers DQDL, in-job evaluation, and CloudWatch publication \cite{awsGlueDataQualityDocs}; the Lake Formation guide covers cross-account sharing and LF-Tags \cite{awsLakeFormationDocs}. Great Expectations and DataHub are the open-source anchors for rules and metadata respectively \cite{greatExpectations,dataHubProject}, and OpenLineage is the lineage event standard \cite{openLineage}.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item Cross-account governance shares catalogs, not copies; masks and filters survive the boundary.
+    \item Tags are the scaling mechanism for policy; the taxonomy is a controlled artifact, validated in CI.
+    \item DQDL rules are falsifiable, versioned claims about data, evaluated inside pipelines.
+    \item Cover both failure families: schema drift (\texttt{ColumnExists}) and content degradation (\texttt{Completeness} and friends).
+    \item Lineage makes quality failures traceable; emission is a discipline every job must practice.
+    \item The mesh unit is the data product: owner, contract, SLO, discoverability---governance by transparency, not by ticket queue.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Explain why named-resource grants fail operationally past a few hundred tables, and how tag expressions fix it.
+    \item \textbf{(Conceptual)} Distinguish hard gates from soft monitors and give one rule that belongs in each category.
+    \item \textbf{(Hands-on)} Run the Thursday lab; add a \texttt{ColumnExists "email"} rule and demonstrate it catching a renamed source column.
+    \item \textbf{(Hands-on)} Share a catalog table to a second sandbox account via Lake Formation and RAM; verify the column mask survives.
+    \item \textbf{(Hands-on)} Emit OpenLineage events from the DQ gate job and visualize one failure path in DataHub.
+    \item \textbf{(Design)} Write the tag taxonomy (keys, values, assignment owners) for the five-domain mesh.
+    \item \textbf{(Design)} Design the governance scorecard: which signals, which cadence, who acts on it.
+    \item \textbf{(Architecture)} A domain must leave the mesh (divestiture). Design the un-sharing and data-custody process.
+\end{enumerate}
+
+\section{Capstone Project: A Governed Two-Domain Mesh Slice}\label{sec:ch22-capstone}
+\index{capstone project}\index{data mesh!capstone}
+
+\begin{capstonebox}
+\textbf{Mission.} Prove the mesh pattern at small scale: two domain accounts publishing quality-gated, tag-governed data products, one governance account owning taxonomy and audit, and one consumer account reading through expression-based grants---with a deliberately broken feed demonstrating the full failure path.
+
+\textbf{Estimated time.} 6--8 hours across three sandbox accounts.
+
+\textbf{What you\textquotesingle{}ll practice.}
+\begin{itemize}
+    \item Cross-account Lake Formation sharing with tag-expression grants.
+    \item Pipeline-embedded DQ gates with SNS alerting and S3 result evidence.
+    \item Tag taxonomy enforcement in registration code.
+    \item Governance telemetry: tag coverage and DQ pass rates per domain.
+\end{itemize}
+\end{capstonebox}
+
+\subsection*{Scenario}
+Retail and logistics publish; analytics consumes; governance oversees. The pilot's success criterion: a consumer gains correct access to a new product with zero tickets, and a bad feed is halted, alerted, and traced without human intervention.
+
+\subsection*{Requirements}
+\textbf{Functional requirements.}
+\begin{itemize}
+    \item Each domain publishes one product: cataloged, tagged per taxonomy, quality-gated in its pipeline.
+    \item The consumer account reads via LF-Tag expression grants; PII columns arrive masked.
+    \item The governance account aggregates tag coverage and DQ outcomes into a scorecard.
+    \item The broken-feed drill: halt, alert, and trace to the upstream change.
+\end{itemize}
+
+\textbf{Non-functional requirements.}
+\begin{itemize}
+    \item New-product onboarding requires no grant ticket---only correct tags, enforced in CI.
+    \item Every DQ failure leaves durable evidence (S3 results, CloudWatch metrics, SNS alert).
+    \item Lineage connects each product to its source pipeline run.
+\end{itemize}
+
+\subsection*{Implementation Steps}
+\begin{enumerate}
+    \item Stand up the taxonomy in the governance account; codify allowed values.
+    \item Build each domain's pipeline with the DQ gate and tagged registration.
+    \item Share the products; grant the consumer by tag expression; verify masks.
+    \item Build the scorecard from CloudWatch and \texttt{list-permissions} exports.
+    \item Run the broken-feed drill and the zero-ticket onboarding drill; document both.
+\end{enumerate}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item Taxonomy definition, pipeline code, and grant configuration as code.
+    \item Scorecard output for both domains.
+    \item Drill evidence: halted pipeline, alert, lineage trace, and the ticketless onboarding record.
+    \item The operating memo: what the center owns, what domains own, what breaks next.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item A mistyped tag value fails CI; an untagged table fails the scorecard.
+    \item The consumer cannot reach an untagged or out-of-policy product, demonstrated.
+    \item The broken feed never reaches the consumer; the evidence chain is complete.
+    \item Onboarding a third (synthetic) product takes under an hour using only the documented path.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Add Great Expectations in one domain and reconcile its results with DQDL reporting.
+    \item Add a data contract (Chapter~11 registry) to one product and show the two layers cooperating.
+    \item Publish the scorecard to QuickSight with per-domain drill-down.
+    \item Simulate the divestiture exercise: un-share a domain and produce its custody report.
+\end{itemize}

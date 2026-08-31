@@ -1,0 +1,248 @@
+\chapter{Security, IAM, and Networking for Data Platforms}
+\index{VPC Service Controls}\index{IAM}\index{Workload Identity}\index{Cloud KMS}\index{CMEK}\index{Private Service Connect}
+
+\begin{objectives}
+\begin{itemize}
+    \item Configure VPC Service Controls perimeters and access levels that block exfiltration even with stolen credentials.
+    \item Apply least-privilege custom roles, service accounts per workload, and Workload Identity over service-account keys.
+    \item Choose between Google-managed encryption, CMEK, and CSEK for BigQuery and Cloud Storage.
+    \item Validate a perimeter with a negative test and wire audit-log alerting on violations.
+    \item Connect privately to Google APIs with Private Google Access and Private Service Connect.
+    \item Design a healthcare data perimeter that contains compromise blast radius.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+Perimeter-based exfiltration defense and key management have direct counterparts on every cloud; the GCP names are the ones to memorize for this book's exam.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{2.8cm}p{3.0cm}p{3.0cm}p{3.0cm}@{}} \\
+\toprule
+\textbf{Capability} & \textbf{GCP} & \textbf{AWS} & \textbf{Azure} \\
+\midrule
+Service perimeter & VPC Service Controls & SCPs + endpoint policies & (Private Link + policy; Purview for data) \\
+Private API access & Private Google Access / PSC & VPC endpoints (PrivateLink) & Private Link / private endpoints \\
+Key management & Cloud KMS (CMEK/CSEK) & KMS (CMK/BYOK) & Key Vault (CMK/BYOK) \\
+Identity federation & Workload Identity Federation & IAM Roles Anywhere / IRSA & Workload identity federation \\
+Audit trail & Cloud Audit Logs & CloudTrail & Azure Monitor / Activity Log \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+\textbf{Snowflake} implements perimeter control with network policies and Tri-Secret Secure (BYOK); \textbf{MongoDB Atlas} with private endpoints, customer key management, and field-level encryption. The shared mental model: IAM answers \emph{who may}, perimeters answer \emph{from where and to where}, and keys answer \emph{who can read it at all}.
+\end{crosscloud}
+
+\begin{keyterms}
+\textbf{VPC Service Controls (VPC SC)}: organization-level perimeters around GCP services that restrict API access by network origin and identity, independent of IAM grants.
+\textbf{Access level}: a named set of request attributes (IP range, device, identity) permitted to cross a perimeter.
+\textbf{Workload Identity Federation}: keyless authentication letting external or CI workloads impersonate service accounts via short-lived tokens.
+\textbf{CMEK}: customer-managed encryption keys in Cloud KMS protecting service data, with rotation and revocation under your control.
+\textbf{CSEK}: customer-supplied encryption keys, where key material never persists in Google systems.
+\textbf{Private Service Connect}: private, IP-based connectivity to Google APIs or producer services from a VPC.
+\end{keyterms}
+
+\section{Week 21 Roadmap}
+Week~21 opens Part~VI by hardening everything the book has built. Monday covers VPC Service Controls and private connectivity. Tuesday is the IAM deep dive: custom roles, service accounts, Workload Identity. Wednesday covers Cloud KMS and the CMEK/CSEK decision. Thursday builds and negative-tests a BigQuery perimeter. Friday designs the healthcare anti-exfiltration architecture.
+
+\begin{definitionbox}
+\textbf{VPC Service Controls} create a service perimeter: API calls to protected services (BigQuery, Cloud Storage, and dozens more) succeed only from authorized networks and identities, regardless of how permissive IAM is \cite{googlecloudvpcscdocs}. IAM controls \emph{who}; the perimeter controls \emph{where from, where to}---and it is the control that survives credential theft.
+\end{definitionbox}
+
+\section{Monday: VPC Service Controls and Private Connectivity}
+\index{VPC SC!perimeters}\index{ingress and egress rules}\index{Private Service Connect!endpoints}
+
+\subsection{Perimeter Semantics}
+A perimeter lists projects and protected services. Inside-to-inside calls flow freely; crossing the boundary---reading a BigQuery dataset from outside, copying a bucket's objects to an outside project---is denied unless an \textbf{access level} (IP, device, identity conditions) or an explicit \textbf{ingress/egress rule} permits it. The security property that matters: an attacker holding a perfectly valid service-account key, operating from an unauthorized network, gets \texttt{PERMISSION\_DENIED} from the perimeter. IAM alone cannot say that.
+
+\subsection{Perimeters and Data Engineering}
+Data pipelines cross boundaries constantly: Composer calls BigQuery; Dataflow writes Cloud Storage; Cloud Build deploys Dataform. Each crossing needs to be inside the perimeter or explicitly ruled in---the classic production incident is deploying a perimeter and breaking every CI/CD job that runs outside it. Design in layers: one perimeter for the data platform's projects, ingress rules for CI identities and specific methods, and dry-run mode (log-only) before enforcement.
+
+\subsection{Private Connectivity}
+\textbf{Private Google Access} lets VPC resources reach Google APIs over internal IPs without public addresses; \textbf{Private Service Connect} publishes Google APIs (or producer services) as private endpoints with DNS control. Both remove the public-internet path for data-plane traffic---complementary to VPC SC, which governs the API plane regardless of network path.
+
+\begin{pitfall}
+Dry-run first, always. An enforced perimeter with a forgotten service---Composer's GKE autoscaling APIs, a Cloud Build trigger, a Dataproc job's staging bucket---takes down production data movement while looking, from IAM's perspective, perfectly configured. Run dry-run for two weeks and triage every violation log before enforcing.
+\end{pitfall}
+
+\section{Tuesday: IAM Deep Dive---Custom Roles, Service Accounts, Workload Identity}
+\index{IAM!custom roles}\index{service accounts!least privilege}\index{Workload Identity!federation}
+
+\subsection{Roles and the Least-Privilege Discipline}
+GCP IAM binds principals to roles on resources. Predefined roles (e.g., \texttt{roles/bigquery.dataEditor}) are the everyday tool; \textbf{custom roles} package exactly the permissions a workload needs when predefined roles are too broad---a Dataflow runner that must write one dataset and read one topic, nothing else. Basic roles (Owner, Editor, Viewer) grant sweeping access across services and have no place on production resources; Chapter~1's storage lab and every chapter since have assumed this discipline.
+
+\subsection{Service Accounts as Workload Identity}
+Every pipeline identity is a service account: one per workload (not per project), named for its function, granted at the narrowest resource scope. The cardinal sin is the \textbf{downloaded service-account key}: a bearer credential that never expires, exfiltrates with a single copy, and audits poorly. \textbf{Workload Identity} replaces keys with short-lived tokens---GKE workloads via Workload Identity for GKE, external CI (GitHub Actions, on-premises runners) via Workload Identity Federation---so there is no key file to steal, rotate, or accidentally commit.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{4.0cm}p{4.2cm}p{4.2cm}@{}} \\
+\toprule
+\textbf{Pattern} & \textbf{Risk} & \textbf{Preferred alternative} \\
+\midrule
+Downloaded SA key in CI secret store & Never expires; exfiltrates silently & Workload Identity Federation \\
+One shared SA for all jobs & Blast radius of every workload & One SA per workload \\
+Basic roles on data resources & Cross-service sweep & Predefined/custom roles at resource scope \\
+Keys committed to git & Permanent, public compromise & Secret Manager + keyless auth; rotate and investigate if it happens \\
+\bottomrule
+\end{tabular}
+\caption{Identity anti-patterns and their least-privilege alternatives \cite{googlecloudiamoverview}.}
+\label{tab:ch21-identity-antipatterns}
+\end{table}
+
+\begin{tipbox}
+Use IAM Policy Analyzer and the \texttt{lastUsed} insights to hunt over-granted permissions quarterly: a role whose unused permissions exceed its used ones is a custom-role candidate. Least privilege is a maintenance activity, not a launch-day configuration.
+\end{tipbox}
+
+\section{Wednesday: Cloud KMS---CMEK versus CSEK in BigQuery and Cloud Storage}
+\index{CMEK!vs CSEK}\index{key rotation}\index{key destruction}
+
+\subsection{The Encryption Ladder}
+All GCP data is encrypted at rest by default with Google-managed keys. \textbf{CMEK} upgrades control: keys live in your Cloud KMS key rings, services access them through a per-service-agent grant, rotation and revocation are yours, and every use is audit-logged. \textbf{CSEK} (customer-supplied keys) goes further: you present key material per request and Google never persists it---maximal control, maximal operational burden (lose the key, lose the data, permanently). Regulatory drivers usually land on CMEK; CSEK serves narrow, high-sensitivity enclaves.
+
+\subsection{CMEK in Practice}
+Location binds: a CMEK key's location must be compatible with the protected resource (a \texttt{US} multi-region bucket wants a \texttt{us} key ring). Key \textbf{rotation} is non-disruptive (new versions encrypt new writes; old versions decrypt old data). Key \textbf{disablement} is the kill switch: disable the key and protected data becomes unreadable within the propagation window---powerful for crypto-shredding (Chapter~23) and terrifying as an accident. Guard keys with separation of duties: the team administering data should not administer the keys protecting it.
+
+\begin{pitfall}
+Disabling a CMEK key is a data outage, not a permission change: BigQuery tables, buckets, and disks protected by it fail reads broadly. Test the disable/restore procedure in a sandbox before you ever need it under incident pressure, and restrict key-admin roles to a small, monitored group.
+\end{pitfall}
+
+\begin{notebox}
+Cloud KMS destruction has a mandatory 24-hour scheduled-destruction delay---a deliberate safety net against accidental or coerced deletion. Chapter~23 uses this property as the foundation of GDPR crypto-shredding.
+\end{notebox}
+
+\section{Thursday Hands-On Project: Perimeter Around a BigQuery Dataset}
+\index{hands-on project}\index{negative test}\index{access levels}
+This lab creates a VPC Service Controls perimeter protecting BigQuery in a lab project, proves the block with a negative test from an unauthorized context, then adds an access level permitting a specific IP.
+
+\subsection{Create the Perimeter}
+\begin{lstlisting}[language=bash,caption={Creating an access policy, access level, and dry-run perimeter.}]
+$env:ORG_ID = "123456789012"
+$env:PROJECT_ID = "my-gcp-vpcsc-lab"
+$env:PROJECT_NUMBER = "999999999999"
+
+gcloud access-context-manager policies create `
+  --organization=$env:ORG_ID --title="data-platform-policy"
+
+gcloud access-context-manager levels create lab_analyst_ip `
+  --policy=<POLICY_ID> --title="Lab analyst IP" `
+  --ip-based-access-levels=<YOUR_IP>/32
+
+gcloud access-context-manager perimeters create data_perimeter `
+  --policy=<POLICY_ID> --title="Data platform perimeter" `
+  --resources=projects/$env:PROJECT_NUMBER `
+  --restricted-services=bigquery.googleapis.com,storage.googleapis.com `
+  --access-levels=lab_analyst_ip `
+  --enable-dry-run
+\end{lstlisting}
+
+\subsection{Negative Test and Enforcement}
+\begin{enumerate}
+    \item Query a BigQuery dataset in the project from an IP \emph{outside} the access level (a Cloud Shell session or a different network). In dry-run, the violation appears in audit logs with \texttt{dryRun: true}.
+    \item Query again from the permitted IP: success. The contrast is the evidence.
+    \item Review dry-run violation logs for a period, triage each (CI identities? Composer? scheduled queries?), add justified ingress rules.
+    \item Remove \texttt{--enable-dry-run} (update the perimeter to enforced), re-run the negative test, and capture the \texttt{PERMISSION\_DENIED} response.
+\end{enumerate}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item The perimeter and access-level configuration commands or Terraform.
+    \item Negative-test evidence from both dry-run (logged violation) and enforced (denied query) phases.
+    \item A triage log of dry-run violations with the ingress rules they justified.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item The perimeter restricts BigQuery and Cloud Storage for the lab project.
+    \item An external query is verifiably blocked while the access-level IP succeeds.
+    \item No legitimate workload broke during enforcement---the triage log explains why.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Add an ingress rule scoped to a CI service account and specific BigQuery methods only.
+    \item Create a Cloud Monitoring alert on perimeter-violation audit logs.
+    \item Extend the perimeter to protect a Vertex AI training path (Chapter~18's Friday design).
+\end{itemize}
+
+\section{Friday Use Case and Architecture: The Healthcare Anti-Exfiltration Perimeter}
+\index{healthcare security}\index{exfiltration prevention}\index{defense in depth}
+
+\subsection{Scenario}
+A healthcare analytics platform holds PHI in BigQuery and Cloud Storage. The threat model includes a stolen service-account key and a compromised analyst credential. Requirement: even with valid credentials, no data may leave the governed environment.
+
+\subsection{Layered Design}
+\textbf{Perimeter}: one VPC SC perimeter encloses the data projects and the CI/orchestration project; restricted services include BigQuery, Storage, Pub/Sub, Dataflow, and Vertex AI. \textbf{Access levels}: analyst access only from corporate device IP ranges with verified device context; service accounts only from inside the perimeter. \textbf{Identity}: Workload Identity everywhere---no keys exist to steal; analyst access uses short-lived federated sessions. \textbf{Encryption}: CMEK on all stores with key administration separated from data administration. \textbf{Observation}: audit logs stream to a locked logging project (its own perimeter), with alerts on perimeter violations, mass exports, and policy changes. \textbf{Negative testing}: a monthly game day runs the stolen-credential scenario from an external network and files the denial evidence.
+
+\begin{figure}[H]
+    \centering
+    \resizebox{0.95\textwidth}{!}{%
+    \begin{tikzpicture}[
+        svc/.style={rectangle, rounded corners, draw=primary, thick, fill=primary!6, text width=3.1cm, minimum height=1.0cm, align=center, font=\small\bfseries},
+        sec/.style={rectangle, rounded corners, draw=magenta, thick, fill=magenta!8, text width=3.1cm, minimum height=0.9cm, align=center, font=\footnotesize\bfseries},
+        atk/.style={rectangle, rounded corners, draw=red!60!black, thick, fill=red!6, text width=3.1cm, minimum height=1.0cm, align=center, font=\small\bfseries},
+        arrow/.style={-{Stealth[length=2.5mm]}, draw=primary, thick},
+        blocked/.style={{Stealth[length=2.5mm]}-, draw=red!60!black, thick}
+    ]
+        \node[svc] (data) at (0,0) {Data projects\\BigQuery + GCS\\CMEK};
+        \node[svc] (ci) at (4.6,0) {CI / orchestration\\Composer + Build\\inside perimeter};
+        \node[sec] (logs) at (9.4,0) {Logging project\\audit + violation\\alerts};
+        \node[atk] (attacker) at (4.6,-2.4) {Stolen credential\\external network};
+        \node[sec] (level) at (0,-2.4) {Access levels\\corp IP + device};
+
+        \draw[arrow] (ci) -- (data);
+        \draw[arrow] (data) -- (logs);
+        \draw[arrow] (level) -- (data);
+        \draw[blocked] (attacker) -- node[right, font=\footnotesize]{denied} (data);
+    \end{tikzpicture}%
+    }
+    \caption{Healthcare perimeter: valid credentials from an unauthorized network are denied by VPC SC.}
+    \label{fig:ch21-healthcare-perimeter}
+\end{figure}
+
+\begin{tipbox}
+The design review question that matters: ``enumerate every path bytes can leave the perimeter''---exports, public shares, signed URLs, CI artifacts, support bundles. Each path needs a rule or a documented acceptance. Exfiltration defense fails through the path nobody enumerated.
+\end{tipbox}
+
+\section{Interview Q\&A}
+\subsection{Concepts and Trade-offs}
+\begin{enumerate}
+    \item \textbf{Q: What does a VPC SC perimeter block that IAM cannot?}\\
+    A: Requests from unauthorized networks or to unauthorized destinations---even with perfectly valid, fully-authorized IAM credentials. IAM authenticates; the perimeter constrains context.
+
+    \item \textbf{Q: Why prefer Workload Identity over service-account keys?}\\
+    A: Keys are long-lived bearer files that exfiltrate and audit poorly; Workload Identity issues short-lived tokens with no key material to steal, rotate, or commit.
+
+    \item \textbf{Q: CMEK versus CSEK: who holds the key material in each?}\\
+    A: CMEK keys live in your Cloud KMS, used by services under grant and audit; CSEK material is supplied per request and never persisted by Google---with total-loss risk if you lose it.
+
+    \item \textbf{Q: How do access levels modify perimeter behavior?}\\
+    A: They carve conditional entry (IP ranges, device state, identity) into the perimeter boundary for requests that would otherwise be denied.
+
+    \item \textbf{Q: Why test a perimeter with a negative (denied) query?}\\
+    A: Security controls fail silently toward openness; only a denied-request test proves the control exists and works, and only repeated tests prove it keeps working.
+\end{enumerate}
+
+\section{Further Reading}
+Read the VPC Service Controls documentation for perimeter design, dry-run, and ingress/egress rules \cite{googlecloudvpcscdocs}, the IAM documentation for roles, service accounts, and federation \cite{googlecloudiamoverview}, and Cloud KMS for key lifecycle and CMEK integration \cite{googlecloudkmsdocs}. The Architecture Framework's security pillar ties these controls into reviewable posture \cite{googlecloudarchitectureframework}, and Chapter~23 builds the DLP and erasure layer on top \cite{googleclouddlpdocs}.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item IAM controls who; VPC SC controls where-from and where-to; KMS controls readability. Defense requires all three.
+    \item Perimeters are deployed dry-run-first, with every violation triaged before enforcement.
+    \item No downloaded keys, ever: Workload Identity Federation covers CI and external workloads.
+    \item Custom roles and per-workload service accounts keep blast radius proportional to function.
+    \item CMEK key disablement is a kill switch and an outage mechanism---test it deliberately, guard it with separation of duties.
+    \item Security controls are proven by negative tests and audit evidence, not by configuration screenshots.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Explain to a skeptical engineer why ``we already have least-privilege IAM'' does not cover the stolen-key scenario.
+    \item \textbf{(Conceptual)} Compare CMEK rotation, disablement, and destruction: effect, reversibility, and appropriate use of each.
+    \item \textbf{(Hands-on)} Reproduce the Thursday lab, then add an ingress rule for a specific service account and one BigQuery method; verify other methods still deny.
+    \item \textbf{(Hands-on)} Create a custom role for the Chapter~14 Dataflow runner (read one subscription, write one dataset) and diff it against the predefined roles it replaces.
+    \item \textbf{(Design)} Enumerate the exfiltration paths for the healthcare platform and assign each a control or documented acceptance.
+    \item \textbf{(Architecture)} Design the monthly stolen-credential game day end to end: scenario, execution, evidence collection, and review ritual.
+\end{enumerate}

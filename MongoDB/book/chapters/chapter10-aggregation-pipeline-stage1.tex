@@ -1,0 +1,321 @@
+\chapter{Aggregation Pipeline Mastery I: Core Stages, Reshaping, and Joins}
+\index{aggregation pipeline}\index{\$match}\index{\$group}\index{\$lookup}\index{\$unwind}\index{\$facet}\index{\$graphLookup}\index{allowDiskUse}\index{pipeline optimization}%
+
+\begin{objectives}
+\begin{itemize}
+    \item Compose the core stages---\texttt{\$match}, \texttt{\$project}, \texttt{\$group}, \texttt{\$sort}, \texttt{\$limit}---into readable, index-aware pipelines.
+    \item Reshape documents with \texttt{\$unwind}, \texttt{\$arrayToObject}, \texttt{\$objectToArray}, and \texttt{\$facet}.
+    \item Implement relational-style joins with \texttt{\$lookup} (equality, correlated subqueries) and recursive traversal with \texttt{\$graphLookup}.
+    \item Order stages so indexes, projections, and limits eliminate work early, and use \texttt{allowDiskUse} deliberately.
+    \item Replace a suite of SQL JOIN queries with one optimized \texttt{\$lookup} + \texttt{\$facet} pipeline.
+    \item Compute deep reporting hierarchies and recursive team rollups in the Thursday lab.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+The aggregation pipeline is MongoDB's in-database analytics engine. Its siblings are the SQL engines of the cloud warehouses; the conceptual mapping is direct, and the design skill---push filters down, join small, aggregate late---is identical.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{2.9cm}p{3.0cm}p{3.0cm}p{3.0cm}@{}} 
+\toprule
+\textbf{Pipeline concept} & \textbf{AWS (Redshift)} & \textbf{Azure (Synapse/Fabric)} & \textbf{GCP (BigQuery)} \\
+\midrule
+\texttt{\$match} & \texttt{WHERE} & \texttt{WHERE} & \texttt{WHERE} \\
+\texttt{\$group} & \texttt{GROUP BY} & \texttt{GROUP BY} & \texttt{GROUP BY} \\
+\texttt{\$lookup} & \texttt{LEFT JOIN} & \texttt{LEFT JOIN} & \texttt{LEFT JOIN} \\
+\texttt{\$facet} & Multiple CTEs in one scan & \texttt{UNION} of CTEs & Multi-branch subqueries \\
+\texttt{\$graphLookup} & Recursive CTE & Recursive CTE & Recursive CTE / \texttt{WITH RECURSIVE} \\
+\texttt{\$merge}/\texttt{\$out} & \texttt{INSERT INTO SELECT} & CTAS / \texttt{INSERT} & \texttt{CREATE TABLE AS} \\
+\texttt{allowDiskUse} & Disk-based spill & Spill to tempdb & Spill to disk (slots) \\
+\addlinespace
+Snowflake & \multicolumn{3}{l}{One SQL engine covers all of the above; pruning replaces the early-\texttt{\$match} discipline automatically} \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+The key difference is ownership: Snowflake and BigQuery optimize the physical plan for you, while MongoDB executes stages largely in written order. Stage order \emph{is} the physical plan, which makes pipeline literacy a first-class engineering skill \cite{mongodbAggregationDocs,snowflakeSemiStructuredDocs}.
+\end{crosscloud}
+
+\section{Week 10 Roadmap: Thinking in Stages}
+An aggregation pipeline is a sequence of document transformations, each stage consuming the previous stage's output stream. This week moves from reading pipelines to designing them: which stage order exploits indexes, where reshaping belongs, when a join is cheaper than an embed, and how to prove a pipeline is efficient rather than hoping. The running example is the order-analytics workload from Chapter 9, extended with customers, products, and an organizational hierarchy \cite{mongodbAggregationDocs,mongodbLookupDocs}.
+
+\begin{definitionbox}
+An \textbf{aggregation pipeline} is an ordered array of stages \texttt{[\{ \$match: ... \}, \{ \$group: ... \}, ...]} where each stage transforms a stream of documents and the server executes stages largely in written order, with a documented set of optimizer rewrites.
+\end{definitionbox}
+
+\begin{keyterms}
+\textbf{Stage}: one transformation step. \textbf{Accumulator}: an aggregation operator (\texttt{\$sum}, \texttt{\$avg}) inside \texttt{\$group} or a window. \textbf{Blocking stage}: a stage (\texttt{\$sort}, \texttt{\$group}) that must buffer its input before producing output. \textbf{Predicate pushdown}: the optimizer moving \texttt{\$match} earlier when semantics allow. \textbf{Correlated \texttt{\$lookup}}: a join whose pipeline references the outer document.
+\end{keyterms}
+
+\section{Monday: Core Stages and Index-Aware Ordering}
+\subsection{The Core Five}
+\texttt{\$match} filters, \texttt{\$project} reshapes, \texttt{\$group} aggregates, \texttt{\$sort} orders, \texttt{\$limit} truncates. Mastery is less about each stage than about their interaction: a leading \texttt{\$match} on an indexed field is executed as an index scan before the pipeline starts; a \texttt{\$sort} immediately following a compatible \texttt{\$match} uses index order; a \texttt{\$limit} after a \texttt{\$sort} caps the sort buffer. The same three stages in the wrong order can differ by a factor of one hundred in measured work.
+
+\begin{lstlisting}[language=JavaScript, caption={Index-aware ordering: match on the ESR index, sort in index order, limit early.}]
+db.orders.aggregate([
+  { $match: { customerId: "cust-42",                       // hits {customerId:1, orderDate:-1}
+              orderDate: { $gte: ISODate("2026-01-01") } } },
+  { $sort: { orderDate: -1 } },                            // served by index order
+  { $limit: 50 },                                          // caps everything downstream
+  { $project: { _id: 0, orderDate: 1, total: 1, status: 1 } }
+]);
+\end{lstlisting}
+
+\subsection{Blocking Stages and the 100 MB Boundary}
+\texttt{\$sort} and \texttt{\$group} are blocking: they cannot emit a document until they have consumed their entire input. By default a blocking stage may use at most 100 MB of RAM; beyond that the pipeline fails unless \texttt{allowDiskUse: true} permits spilling to temporary files \cite{mongodbLimitsDocs}. Spilling is 10--100$\times$ slower, so the senior pattern is to shrink the stream before the blocking stage: selective \texttt{\$match} first, tight \texttt{\$project} second, block last.
+
+\begin{pitfall}
+\textbf{\texttt{allowDiskUse} as a default.} Teams that enable it globally stop seeing their memory bugs. Enable it per pipeline after a deliberate review, and alert on pipelines that spill in production slow logs.
+\end{pitfall}
+
+\subsection{What the Optimizer Rewrites}
+MongoDB's pipeline optimizer performs documented rewrites: it coalesces adjacent \texttt{\$match} stages, pushes \texttt{\$match} before \texttt{\$lookup} when the predicate is independent, and merges \texttt{\$sort}+\texttt{\$limit} into a bounded top-$k$ sort. It does \emph{not} reorder \texttt{\$project} freely or convert a late \texttt{\$match} into an index scan once a reshaping stage intervenes. Write the pipeline you want executed; treat the optimizer as cleanup, not rescue.
+
+\section{Tuesday: Reshaping Documents}
+\subsection{\texttt{\$unwind}: Arrays to Streams}
+\texttt{\$unwind} expands one document per array element: an order with three items becomes three order-item documents. It is the bridge between the document model's embedded arrays and the row-oriented world of \texttt{\$group}. The cost is multiplicative stream growth---unwinding two arrays compounds---and the semantic trap is empty arrays: \texttt{preserveNullAndEmptyArrays: true} keeps documents whose array is empty or missing, which is usually what analytics wants.
+
+\subsection{\texttt{\$facet}: Many Answers from One Scan}
+\texttt{\$facet} runs multiple independent sub-pipelines over the same input stream in a single pass. A customer-360 endpoint that needs revenue by region, top products, and a summary total issues one scan and three branches instead of three collection scans:
+
+\begin{lstlisting}[language=JavaScript, caption={One scan, three answers: the \texttt{\$facet} pattern.}]
+db.orders.aggregate([
+  { $match: { orderDate: { $gte: start, $lt: end } } },
+  { $facet: {
+      revenue_by_region: [
+        { $group: { _id: "$region", revenue: { $sum: "$total" },
+                    orders: { $count: {} } } },
+        { $sort: { revenue: -1 } } ],
+      top_products: [
+        { $unwind: "$items" },
+        { $group: { _id: "$items.sku", units: { $sum: "$items.qty" } } },
+        { $sort: { units: -1 } }, { $limit: 10 } ],
+      summary: [
+        { $group: { _id: null, total_revenue: { $sum: "$total" } } } ]
+  } }
+], { allowDiskUse: true });
+\end{lstlisting}
+
+Each facet branch gets its own 100 MB memory budget. \texttt{\$facet} output is a single document, so its total result is subject to the 16 MB document limit---branch results must be aggregated or limited, never raw streams \cite{mongodbLimitsDocs}.
+
+\subsection{\texttt{\$arrayToObject} and \texttt{\$objectToArray}}
+These two operators convert between arrays of \texttt{\{k, v\}} pairs and subdocuments with dynamic keys. Their classic use is normalizing attribute bags (the polymorphic \texttt{attributes} from Chapter 9) so a \texttt{\$group} can pivot attributes into columns---or unpivot columns into rows---without application code.
+
+\section{Wednesday: Joins in a Document Database}
+\subsection{\texttt{\$lookup}: Equality Joins}
+The simple form joins on field equality: \texttt{from}, \texttt{localField}, \texttt{foreignField}, \texttt{as}. It behaves as a left outer join producing an array, conventionally followed by \texttt{\$unwind} or \texttt{\$set: \{ c: \{ \$first: "\$customer" \} \}}. Two rules make it production-safe: the foreign field must be indexed, and the join should follow the selective \texttt{\$match} so the join runs per surviving document, not per collection row \cite{mongodbLookupDocs}.
+
+\begin{pitfall}
+\textbf{\texttt{\$lookup} before \texttt{\$match}.} Joining a hundred million orders to customers and only then filtering by date joins rows you will discard. Filter first; the optimizer only rewrites the cases it can prove safe.
+\end{pitfall}
+
+\subsection{Correlated Subqueries}
+The \texttt{let}/\texttt{pipeline} form of \texttt{\$lookup} runs an arbitrary sub-pipeline per outer document, with outer fields bound as variables. This powers ``customer plus their three most recent invoices'' shapes that a flat equality join cannot express. Correlation is powerful and expensive: the sub-pipeline executes once per outer document, so the outer stream must be small and the inner collection indexed on the join key.
+
+\subsection{\texttt{\$graphLookup}: Recursive Traversal}
+\texttt{\$graphLookup} traverses a self-referencing relationship---employees to managers, categories to parents---to a specified depth, emitting one array element per reachable node. The essential controls are \texttt{maxDepth} (unbounded traversal on a cyclic graph is an outage, not a query) and \texttt{restrictSearchWithMatch} (prune branches early). The Thursday lab uses it to compute reporting chains and recursive headcount.
+
+\begin{lstlisting}[language=JavaScript, caption={Recursive reporting chain with bounded depth.}]
+db.employees.aggregate([
+  { $match: { _id: managerId } },
+  { $graphLookup: {
+      from: "employees",
+      startWith: "$_id",
+      connectFromField: "_id",
+      connectToField: "manager_id",
+      as: "reports",
+      maxDepth: 10,
+      depthField: "level",
+      restrictSearchWithMatch: { active: true }
+  } },
+  { $project: { name: 1, headcount: { $size: "$reports" } } }
+]);
+\end{lstlisting}
+
+\section{Thursday Hands-On Project: Organizational Hierarchy Analytics}
+Build the hierarchy lab: a synthetic company tree, recursive headcount via \texttt{\$graphLookup}, and a \texttt{\$facet} dashboard joining departments to budgets via \texttt{\$lookup}.
+
+\subsection{Data Generation and the Recursive Rollup}
+\begin{lstlisting}[language=JavaScript, caption={Synthetic hierarchy and recursive headcount rollup.}]
+use aggLab;
+db.employees.drop();
+const docs = [{ _id: 1, name: "CEO", manager_id: null, dept: "exec" }];
+for (let i = 2; i <= 20000; i++) {
+  docs.push({ _id: i, name: "emp-" + i,
+              manager_id: Math.max(1, Math.floor(i / 7)),   // ~7-ary tree
+              dept: ["eng", "sales", "ops"][i % 3] });
+}
+db.employees.insertMany(docs, { ordered: false });
+db.employees.createIndex({ manager_id: 1 });
+
+// Headcount under every director-level manager:
+db.employees.aggregate([
+  { $match: { manager_id: { $in: [2, 3, 4] } } },
+  { $graphLookup: {
+      from: "employees", startWith: "$_id",
+      connectFromField: "_id", connectToField: "manager_id",
+      as: "tree", maxDepth: 8, depthField: "level" } },
+  { $project: { name: 1, headcount: { $size: "$tree" },
+                deepest: { $max: "$tree.level" } } }
+]);
+\end{lstlisting}
+
+\subsection{Joining Hierarchy to Budgets}
+Create a \texttt{budgets} collection keyed by \texttt{dept}, indexed, then a correlated \texttt{\$lookup} that attaches budget and computes per-capita spend under each manager. Verify with \texttt{explain("executionStats")} on the pipeline that the foreign-side lookup uses the index (\texttt{IXSCAN} in the \texttt{\$lookup} sub-plan).
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item The hierarchy generator, the \texttt{\$graphLookup} rollup, and the \texttt{\$lookup} budget join.
+    \item \texttt{explain()} output proving indexed foreign-side access.
+    \item A paragraph analyzing how result size changes if \texttt{maxDepth} moves from 8 to unbounded on this dataset.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item The rollup returns correct headcounts verified against a Python-side recursive reference implementation.
+    \item The \texttt{\$lookup} sub-plan shows \texttt{IXSCAN} on \texttt{budgets.dept}.
+    \item No stage spills to disk with \texttt{allowDiskUse} disabled at this data size.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Introduce a deliberate cycle into the hierarchy and show how \texttt{maxDepth} bounds the blast radius.
+    \item Re-implement the dashboard as one \texttt{\$facet} pipeline and compare total execution time with three separate queries.
+\end{itemize}
+
+\section{Friday Use Case and Architecture: Ten SQL JOINs Become One Pipeline}
+\subsection{Scenario and Requirements}
+A retail BI team maintains ten SQL queries---daily revenue by region, top products, new-customer counts, return rates, channel mix---each independently scanning the orders tables. Nightly runtime is ninety minutes and growing. The migration to MongoDB (Chapter 4) is complete; the task is to replace the ten queries with one pipeline per dashboard, each scanning the orders collection once.
+
+\subsection{Design}
+The replacement architecture is a \textbf{read-optimized pipeline layer}: each dashboard maps to a \texttt{\$match} (date window on the ESR index) $\to$ \texttt{\$lookup} (customers, products, both indexed) $\to$ \texttt{\$facet} (one branch per legacy report) pipeline. Results are written to a \texttt{dashboard\_daily} collection with \texttt{\$merge} (Chapter 11) so the BI tool reads precomputed documents instead of re-running pipelines. The ten queries collapse to one scan per night; runtime drops from ninety minutes to the cost of one indexed range scan plus aggregation.
+
+\begin{figure}[H]
+    \centering
+    \resizebox{0.95\textwidth}{!}{%
+    \begin{tikzpicture}[
+        stageN/.style={stage, minimum width=2.2cm},
+        store/.style={cylinder, shape aspect=0.25, draw=primary, thick, fill=primary!8, shape border rotate=90, align=center, minimum width=1.7cm, minimum height=1.2cm, font=\footnotesize\bfseries},
+        arrow/.style={-{Stealth[length=2.5mm]}, draw=primary, thick}
+    ]
+        \node[store] (orders) at (0,0) {orders};
+        \node[stageN] (match) at (2.9,0) {\$match\\(date, ESR)};
+        \node[stageN] (lookup) at (5.8,0) {\$lookup\\customers};
+        \node[stageN] (facet) at (8.7,0) {\$facet\\3 branches};
+        \node[stageN] (merge) at (11.6,0) {\$merge};
+        \node[store] (dash) at (14.2,0) {dashboard};
+        \draw[arrow] (orders) -- (match);
+        \draw[arrow] (match) -- (lookup);
+        \draw[arrow] (lookup) -- (facet);
+        \draw[arrow] (facet) -- (merge);
+        \draw[arrow] (merge) -- (dash);
+    \end{tikzpicture}%
+    }
+    \caption{One-scan dashboard pipeline: early match, indexed join, faceted branches, merged precomputed results.}
+    \label{fig:ch7-dashboard}
+\end{figure}
+
+\subsection{Guardrails}
+Three rules keep the pipeline layer healthy: every pipeline starts with an indexed \texttt{\$match} (a pipeline without one is a code-review rejection), \texttt{allowDiskUse} is opt-in per pipeline with a comment justifying it, and each \texttt{\$facet} branch ends in \texttt{\$limit} or \texttt{\$group} so the 16 MB facet ceiling can never be hit by accident.
+
+\section{Interview Q\&A}
+\subsection{Pipeline Design}
+\begin{enumerate}
+    \item \textbf{Q: Why put \texttt{\$match} first even when the optimizer can push it down?}\\
+    A: Because pushdown only applies to provably safe cases; any reshaping stage in between defeats it. Written order is the reliable contract.
+
+    \item \textbf{Q: What makes \texttt{\$facet} different from running three pipelines?}\\
+    A: One input scan feeds all branches. The trade-off is that all branches share one pass and the combined output must fit in a single 16 MB document.
+
+    \item \textbf{Q: When does \texttt{\$lookup} become a performance problem?}\\
+    A: When the foreign field is unindexed (per-document collection scan) or when the outer stream is huge (correlated cost per outer document).
+
+    \item \textbf{Q: What can go wrong with an unbounded \texttt{\$graphLookup}?}\\
+    A: Cycles or deep hierarchies explode the traversal; every node re-scans the collection by \texttt{connectToField}. Bound with \texttt{maxDepth} and prune with \texttt{restrictSearchWithMatch}.
+
+    \item \textbf{Q: Why is \texttt{allowDiskUse: true} not a free lunch?}\\
+    A: Spilled sorts and groups run on disk, typically 10--100$\times$ slower, and the spill I/O competes with the storage engine. It is a safety valve, not a strategy.
+\end{enumerate}
+
+\section{Further Reading}
+The aggregation pipeline reference and stage catalog are the canonical sources \cite{mongodbAggregationDocs}, with \texttt{\$lookup} semantics detailed separately \cite{mongodbLookupDocs} and the 100 MB stage limit documented among the limits and thresholds \cite{mongodbLimitsDocs}. Kleppmann's treatment of dataflow and joins provides the vendor-neutral theory \cite{kleppmann2017ddia}. The migration context for replacing SQL joins comes from Chapter 4's references \cite{mongodbRelationalMigratorDocs}.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item Stage order is the physical plan: filter early, project tight, block late, limit aggressively.
+    \item \texttt{\$sort} and \texttt{\$group} block at 100 MB unless \texttt{allowDiskUse} permits slow disk spilling.
+    \item \texttt{\$facet} replaces many scans with one, but its output must fit a single document.
+    \item \texttt{\$lookup} needs an indexed foreign field and a small outer stream; correlation multiplies cost per outer document.
+    \item \texttt{\$graphLookup} traverses hierarchies safely only with \texttt{maxDepth} and branch pruning.
+    \item The mature pattern is pipelines that write precomputed results with \texttt{\$merge}, read cheaply by dashboards.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Reorder \texttt{\$project}, \texttt{\$match}, \texttt{\$group}, \texttt{\$sort}, \texttt{\$limit} for minimal work on an indexed date-range query, and justify each position.
+    \item \textbf{(Conceptual)} Explain why \texttt{\$facet} output is limited to 16 MB and design a branch that can never hit the limit.
+    \item \textbf{(Conceptual)} When would you prefer application-side joins over \texttt{\$lookup}?
+    \item \textbf{(Hands-on)} Extend the hierarchy lab with a \texttt{restrictSearchWithMatch} that excludes inactive employees and measure the traversal-size change.
+    \item \textbf{(Hands-on)} Rewrite the top-products facet branch using \texttt{\$arrayToObject} after pivoting items, and compare readability and latency.
+    \item \textbf{(Design)} Design the pipeline layer for a multi-tenant SaaS dashboard: five reports, one scan, tenant isolation, and precomputed output.
+    \item \textbf{(Design)} Specify the code-review checklist for aggregation pipelines in your organization.
+    \item \textbf{(Interview)} ``Our pipeline is correct but takes 40 minutes.'' Give the five most likely structural causes and the evidence you would check for each.
+\end{enumerate}
+
+\section{Capstone Project: One-Scan Analytics Pipeline for the Orders Domain}\label{sec:ch10-capstone}
+
+\begin{capstonebox}
+\textbf{Mission:} consolidate ten legacy report queries over the orders domain into a single index-aware, faceted aggregation pipeline with indexed joins, recursive hierarchy rollups, and merged precomputed output---proven with execution statistics and a correctness check against a Python reference implementation.
+
+\textbf{Estimated time:} 4--6 hours.
+
+\textbf{What you will practice:}
+\begin{itemize}
+    \item Designing stage order around indexes and blocking-stage memory.
+    \item Composing \texttt{\$lookup}, \texttt{\$facet}, and \texttt{\$graphLookup} in one pipeline.
+    \item Validating pipeline correctness against an independent implementation.
+\end{itemize}
+\end{capstonebox}
+
+\subsection*{Scenario}
+Your migrated e-commerce platform (Chapter 4 capstone) now serves the BI team from MongoDB. The ten legacy SQL reports were translated one-to-one into ten aggregation pipelines; the analytics secondary saturates nightly and the reports window is slipping. You must consolidate to one scan per dataset and prove the consolidation is correct, not just fast.
+
+\subsection*{Requirements}
+\begin{itemize}
+    \item Seed orders, customers, products, and employees collections with at least two million orders.
+    \item Implement the consolidated pipeline: indexed date \texttt{\$match}, indexed \texttt{\$lookup} joins, one \texttt{\$facet} with at least three branches, and a \texttt{\$graphLookup} branch computing per-region management rollups.
+    \item Write results to \texttt{dashboard\_daily} via \texttt{\$merge} with a deterministic key.
+    \item Prove correctness: a Python reference implementation must produce identical branch results on a sampled window.
+    \item Capture \texttt{explain("executionStats")} showing the leading index scan and no unindexed foreign-side lookups.
+\end{itemize}
+
+\subsection*{Implementation Steps}
+\begin{enumerate}
+    \item \textbf{Baseline.} Script the ten legacy pipelines; record total runtime and per-pipeline documents examined.
+    \item \textbf{Consolidate.} Build the single pipeline; keep each facet branch independently testable.
+    \item \textbf{Verify.} Implement the Python reference for a one-day sample; assert equality on every branch.
+    \item \textbf{Prove.} Attach the explain evidence and a memory report demonstrating no spills with \texttt{allowDiskUse} disabled.
+    \item \textbf{Merge.} Add the \texttt{\$merge} sink and demonstrate idempotent re-runs over the same window.
+\end{enumerate}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item The consolidated pipeline script, the Python correctness harness, and the explain evidence pack.
+    \item A before/after report: runtime, documents examined, and secondary CPU profile.
+    \item A runbook entry for extending the pipeline with a new report branch.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item One collection scan feeds all report branches; the leading \texttt{\$match} uses the ESR index.
+    \item The Python reference matches every facet branch on the sampled window.
+    \item The \texttt{\$merge} sink is idempotent: re-running the same window changes nothing.
+    \item Total pipeline runtime is at least 5$\times$ faster than the sum of the ten legacy pipelines on the same data.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Add a change-data-capture trigger (Chapter 16) that invalidates affected dashboard documents on order corrections.
+    \item Parameterize the pipeline by tenant and demonstrate that the facet design holds under fifty concurrent tenant runs.
+\end{itemize}

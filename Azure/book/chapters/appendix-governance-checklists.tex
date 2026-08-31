@@ -1,0 +1,106 @@
+\chapter{Governance and Production-Readiness Checklists}
+\index{governance!checklist}\index{production readiness}\index{checklist}%
+This appendix collects the book's operating discipline into printable checklists.
+Use them as go-live gates for new data products, as audit preparation, and as the
+skeleton of your platform's monthly review (Chapter 22). Each item cites the
+chapter that teaches it.
+
+\begin{notebox}
+A checklist is a minimum bar, not a ceiling. When a product handles regulated
+data, extend the privacy section with your compliance team's requirements before
+first load, not after first incident.
+\end{notebox}
+
+\section{New Data Product Go-Live}
+\index{data product!go-live}
+
+\subsection*{Storage and Layout}
+\begin{itemize}
+    \item[$\square$] Storage account, container, and zone follow the naming convention (Ch.~1).
+    \item[$\square$] Redundancy (LRS/ZRS/GZRS) chosen against an RPO/RTO statement (Ch.~1).
+    \item[$\square$] Lifecycle policy defined per prefix with tested prefixes (Ch.~1).
+    \item[$\square$] Formats are columnar (Delta/Parquet) in curated zones; file sizes managed with OPTIMIZE/VACUUM (Ch.~7, 9).
+    \item[$\square$] Grain declared for every fact table; distribution keys chosen with skew evidence (Ch.~5, 6).
+\end{itemize}
+
+\subsection*{Pipelines and Quality}
+\begin{itemize}
+    \item[$\square$] Pipeline is parameterized for dev/test/prod from one artifact set (Ch.~10).
+    \item[$\square$] Sinks are idempotent; a demonstrated rerun changes nothing (Ch.~10, 12).
+    \item[$\square$] At least three data-quality tests gate the load; poisoned-batch path demonstrated (Ch.~22).
+    \item[$\square$] Failure path notifies a human; audit table records every run (Ch.~10, 12).
+    \item[$\square$] Contract version recorded per source; quarantine and reprocessing runbook exists (Ch.~11).
+\end{itemize}
+
+\subsection*{Security and Privacy}
+\begin{itemize}
+    \item[$\square$] All service-to-service access uses managed identities; zero secrets in code (Ch.~21).
+    \item[$\square$] Private endpoints plus private DNS; public access disabled; outside-fails proof captured (Ch.~21).
+    \item[$\square$] PII classified in Purview \emph{before} any serving view exposes it (Ch.~8, 22).
+    \item[$\square$] Masking/encryption/tokenization chosen per threat model (Ch.~23).
+    \item[$\square$] Erasure path designed (crypto-shredding or per-store purge) with hold interaction (Ch.~23).
+\end{itemize}
+
+\subsection*{Observability and Cost}
+\begin{itemize}
+    \item[$\square$] Diagnostic settings route to Log Analytics; failure, drift, and silence alerts armed (Ch.~22).
+    \item[$\square$] Freshness/completeness/correctness SLOs published with measurement queries (Ch.~22).
+    \item[$\square$] Resources tagged (\texttt{product}, \texttt{environment}, \texttt{domain}); budget alert set (Ch.~22).
+    \item[$\square$] Monthly cost estimate documented with at least two optimization decisions (all capstones).
+    \item[$\square$] Idle-cost discipline verified: pools paused, clusters terminate, compute scales to zero (Ch.~5, 9, 18).
+\end{itemize}
+
+\section{Schema Change (Expand--Contract) Gate}
+\index{expand--contract!checklist}
+\begin{itemize}
+    \item[$\square$] Expand: new column/shape added alongside the old; nothing removed (Ch.~24).
+    \item[$\square$] Migrate: dual-write active; backfill completed and reconciled (Ch.~24).
+    \item[$\square$] Switch: view shim presents one stable interface to consumers (Ch.~24).
+    \item[$\square$] Contract: Purview lineage plus dbt \texttt{ref()} graph show zero readers of the old shape (Ch.~22, 24).
+    \item[$\square$] Each step shipped as a separate reviewed release; rollback path stated (Ch.~24).
+\end{itemize}
+
+\section{Streaming Job Production Gate}
+\index{streaming!checklist}
+\begin{itemize}
+    \item[$\square$] Partition key and count justified with ordering/parallelism arithmetic (Ch.~13).
+    \item[$\square$] Producers attach unique event IDs; consumers are idempotent and checkpointed (Ch.~13).
+    \item[$\square$] Event time declared (\texttt{TIMESTAMP BY} / watermarks); late/out-of-order policy documented (Ch.~14, 15).
+    \item[$\square$] State bounded by watermarks; state-store provider chosen with size evidence (Ch.~15).
+    \item[$\square$] Checkpoint paths versioned per deployment; change procedure documented (Ch.~15).
+    \item[$\square$] Watermark-delay and input-stall alerts distinguish silence from zero traffic (Ch.~14).
+    \item[$\square$] Capture or replay path exists for reconciliation and backfill (Ch.~13, 14).
+\end{itemize}
+
+\section{ML Model Promotion Gate}
+\index{model promotion!checklist}
+\begin{itemize}
+    \item[$\square$] Model registered with lineage: data asset, environment, code, metrics (Ch.~18).
+    \item[$\square$] Feature schema alignment validated; training and serving share one definition (Ch.~17).
+    \item[$\square$] Metric gate passed on fresh holdout; AutoML baseline comparison recorded (Ch.~18).
+    \item[$\square$] Shadow/canary evaluation on live traffic completed (Ch.~19).
+    \item[$\square$] Human approval recorded; rollback is a traffic shift, not a redeploy (Ch.~19).
+    \item[$\square$] Drift monitor armed with the retraining runbook attached (Ch.~19).
+\end{itemize}
+
+\section{Monthly Platform Review Agenda}
+\index{platform review!agenda}
+\begin{enumerate}
+    \item \textbf{Reliability:} SLO attainment per product; top three incidents with root causes (Ch.~22).
+    \item \textbf{Quality:} gate failure rate; quarantine backlog age; tests added this month (Ch.~22).
+    \item \textbf{Governance:} unclassified assets; unscanned sources; stale access reviews (Ch.~8, 22).
+    \item \textbf{Cost:} top ten movers; budget variance; optimizations executed and planned (Ch.~22).
+    \item \textbf{Security:} posture report---public access, shared keys, purge protection, role breadth (Ch.~21).
+    \item \textbf{Privacy:} erasure SLA performance; hold register reconciled with legal (Ch.~23).
+\end{enumerate}
+
+\section{Quarterly Drills}
+\index{drills}
+\begin{itemize}
+    \item[$\square$] Erasure drill on a synthetic subject with certificate (Ch.~23).
+    \item[$\square$] Restore drill: recover one deleted table and one deleted container (Ch.~1).
+    \item[$\square$] Region-failure tabletop for RA-GRS/GZRS estates with the runbook (Ch.~1).
+    \item[$\square$] Chaos drill: kill a streaming consumer mid-batch; measure recovery against the SLO (Ch.~15).
+    \item[$\square$] Gate fire drill: poisoned batch through every gated pipeline (Ch.~22).
+    \item[$\square$] Rebuild drill: \texttt{terraform destroy}/\texttt{apply} one non-production estate (Ch.~24).
+\end{itemize}

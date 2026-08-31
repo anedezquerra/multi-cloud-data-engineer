@@ -1,0 +1,279 @@
+\chapter{Change Data Capture with Streams}
+\index{streams}\index{change data capture}\index{MERGE}\index{Week 7}%
+\begin{objectives}
+\begin{itemize}
+    \item Create standard, append-only, and insert-only streams and explain each type's offset semantics.
+    \item Interpret \texttt{METADATA\$ACTION}, \texttt{METADATA\$ISUPDATE}, and \texttt{METADATA\$ROW\_ID} in stream queries.
+    \item Consume stream offsets transactionally with idempotent \texttt{MERGE} statements and dedup keys.
+    \item Join stream deltas to dimensions in near-real-time and absorb late-arriving dimension members.
+    \item Detect, explain, and recover from stale streams, including the 14-day change-retention limit.
+    \item Design an incremental CDC pipeline synchronizing an operational MySQL database into Snowflake via AWS DMS and streams.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+Change data capture is one of the most portable ideas in data engineering: read the database's change journal once, replay it everywhere. Each ecosystem names the journal differently.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{2.8cm}p{3.0cm}p{3.0cm}p{3.0cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{AWS} & \textbf{Azure} & \textbf{GCP} \\
+\midrule
+Managed CDC replication & AWS DMS & Azure Data Factory CDC / SQL CDC & Datastream \\
+Change log (source) & MySQL binlog / RDS & SQL Server CDC / Cosmos change feed & MySQL/PostgreSQL logs via Datastream \\
+In-warehouse CDC & Redshift streams (limited) / staging + merge & Synapse/ADF incremental copy & BigQuery CDC via Datastream + merge \\
+Stream object & Kinesis Data Streams & Event Hubs & Pub/Sub \\
+Offset / checkpoint & Kinesis sequence numbers & Event Hubs checkpoints & Pub/Sub subscriptions \\
+\addlinespace
+Snowflake equivalent & \multicolumn{3}{l}{Standard / append-only / insert-only streams with transactional offsets} \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+\textbf{Microsoft Fabric} offers mirroring and event-driven pipelines; \textbf{MongoDB} provides change streams on the oplog, the closest conceptual sibling to a Snowflake stream. Snowflake's distinctive contribution is that the CDC journal is a \emph{queryable SQL object with a transactional offset}: consuming a stream and merging its deltas commit or roll back as one unit.
+\end{crosscloud}
+
+\section{Week 7 Roadmap}
+Bulk loads answer ``what is the full state?'' Streams answer the harder production question: ``what changed since last time, and can I apply exactly those changes exactly once?'' This chapter turns Snowflake streams into a disciplined CDC engine \cite{snowflakeStreamsDocs}.
+
+Monday introduces the three stream types and the offset as consumption state. Tuesday dissects the metadata columns that make updates interpretable. Wednesday builds the idempotent \texttt{MERGE} consumer and handles the near-real-time dimension-join problem. Thursday is the hands-on CDC lab. Friday designs the classic operational-database-to-Snowflake synchronization pipeline.
+
+\begin{keyterms}
+\textbf{Stream}: a Snowflake object that records row-level changes (inserts, updates, deletes) on a source table since an offset.\quad
+\textbf{Offset}: the stream's consumption state---the point up to which changes have been committed downstream.\quad
+\textbf{Append-only stream}: a stream tracking inserts only, cheaper on update-heavy sources.\quad
+\textbf{METADATA\$ACTION}: per-change indicator of \texttt{INSERT} or \texttt{DELETE} (updates appear as pairs).\quad
+\textbf{Stale stream}: a stream whose change data has aged past retention; it must be recreated and its consumers re-bootstrapped.
+\end{keyterms}
+
+\section{Monday: Stream Types and Offset State}
+\index{stream!standard}\index{stream!append-only}\index{stream!insert-only}\index{offset}
+A standard \textbf{stream} on a table captures every insert, update, and delete as change records. An \textbf{append-only} stream captures inserts only---ideal for event and log tables where updates and deletes do not occur, and more efficient because Snowflake need not track update pairs. An \textbf{insert-only} stream (on external tables) similarly tracks new rows only. Choosing the narrowest sufficient type reduces change-tracking overhead.
+
+\begin{definitionbox}
+A stream's \textbf{offset} is its consumption state: a bookmark recording exactly which change records have been committed downstream. The offset advances only when a transaction that reads the stream commits; a failed transaction leaves the offset untouched, so a re-run sees the same changes again.
+\end{definitionbox}
+
+That single property---transactional offset advance---is what separates a stream from a hand-rolled \texttt{WHERE updated\_ts > :last\_run} watermark. Watermarks drift, collide with late commits, and double-apply on retry; a stream offset moves atomically with the work it triggered.
+
+\subsection{Streams Versus Dynamic Tables}
+\index{dynamic tables!vs. streams}
+Week 11's dynamic tables solve the same freshness problem differently. A stream holds \emph{delta state} and requires a consumer (usually a task running \texttt{MERGE}); the engineer owns the consumption logic. A dynamic table holds \emph{incremental-refresh state internally}---changed micro-partitions plus dependency versions---and Snowflake owns the refresh. Dynamic tables degrade to a full refresh when the defining query uses constructs incremental refresh cannot track or after certain base-table DDL; a full refresh reprocesses the entire base. The rule of thumb: keep frequently-changing layers incrementally refreshable, and reach for streams when you need explicit, transactional control over how deltas apply.
+
+\begin{notebox}
+A stream contains no separate copy of table data in the row-store sense---it records change metadata against the source table's micro-partitions, leveraging the same versioning machinery as Time Travel. Storage cost of a stream is modest; the operational cost is the consumer you must run.
+\end{notebox}
+
+\section{Tuesday: Stream Metadata Columns}
+\index{METADATA\textdollar ACTION}\index{METADATA\textdollar ISUPDATE}\index{METADATA\textdollar ROW\_ID}
+Querying a stream returns the source table's columns plus three metadata columns:
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{4.2cm}p{9.2cm}@{}}
+\toprule
+\textbf{Column} & \textbf{Meaning} \\
+\midrule
+\texttt{METADATA\$ACTION} & \texttt{INSERT} or \texttt{DELETE}. An update appears as a DELETE+INSERT pair. \\
+\texttt{METADATA\$ISUPDATE} & \texttt{TRUE} when the record is half of an update pair; lets consumers collapse pairs into updates. \\
+\texttt{METADATA\$ROW\_ID} & Immutable row identifier, useful for tracing a physical row through its change history. \\
+\bottomrule
+\end{tabular}
+\caption{The three metadata columns every stream query exposes.}
+\label{tab:chapter7-stream-metadata}
+\end{table}
+
+The update-as-pair representation surprises everyone once. If a row is updated twice before consumption, the stream may show DELETE(old value), INSERT(newest value)---the intermediate state is collapsed. Consumers must therefore treat stream rows as ``the net change since the offset,'' not as a replayable event log of every individual statement. Event-sourced replay requires landing raw change events explicitly (for example from a binlog reader such as AWS DMS), not from a Snowflake stream.
+
+\begin{pitfall}
+\textbf{Do not filter a stream, consume the filtered subset, and assume the rest is preserved.} Any committed transaction that reads the stream---even a \texttt{SELECT ... WHERE}---can advance the offset for \emph{all} changes it saw, including rows your filter discarded. Gate consumers with \texttt{SYSTEM\$STREAM\_HAS\_DATA} and consume the full delta.
+\end{pitfall}
+
+\section{Wednesday: Idempotent MERGE Consumers and Near-Real-Time Enrichment}
+\index{MERGE!idempotent}\index{dedup key}\index{late-arriving dimensions}
+The canonical consumer applies deltas to a curated target with \texttt{MERGE}. Two properties make it production-grade: the stream offset advances only on commit (retry-safety), and the \texttt{MERGE} itself is written idempotently so a re-run over the same deltas is a no-op.
+
+\begin{lstlisting}[language=SQL, caption={Stream + MERGE CDC pattern}]
+CREATE OR REPLACE STREAM raw.customer_stream
+  ON TABLE raw.customer_landing
+  APPEND_ONLY = FALSE;
+
+MERGE INTO gold.customers AS tgt
+USING raw.customer_stream AS src
+  ON tgt.customer_id = src.customer_id
+WHEN MATCHED AND src.METADATA$ACTION = 'DELETE'
+  THEN DELETE
+WHEN MATCHED AND src.METADATA$ACTION = 'INSERT'
+  THEN UPDATE SET name = src.name,
+                  email = src.email,
+                  updated_ts = CURRENT_TIMESTAMP()
+WHEN NOT MATCHED AND src.METADATA$ACTION = 'INSERT'
+  THEN INSERT (customer_id, name, email, updated_ts)
+       VALUES (src.customer_id, src.name, src.email,
+               CURRENT_TIMESTAMP());
+\end{lstlisting}
+
+\subsection{Dedup Keys Make Re-Runs No-Ops}
+\index{dedup key}
+When the change feed carries a stable event identifier, matching on that key makes the merge intrinsically idempotent even outside transactional guarantees:
+
+\begin{lstlisting}[language=SQL, caption={Idempotent stream MERGE with a dedup key}]
+-- gold.order_events carries the dedup key event_id
+MERGE INTO gold.order_events AS tgt
+USING (
+  SELECT event_id, order_id, status, event_ts
+  FROM raw.order_stream
+  WHERE METADATA$ACTION = 'INSERT'
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY event_id ORDER BY event_ts DESC) = 1
+) AS src
+ON tgt.event_id = src.event_id      -- dedup key match
+WHEN NOT MATCHED THEN
+  INSERT (event_id, order_id, status, event_ts)
+  VALUES (src.event_id, src.order_id, src.status, src.event_ts);
+-- The stream offset advances only if this transaction
+-- commits; a failed run leaves the offset untouched, and
+-- a re-run matches on event_id and applies nothing.
+\end{lstlisting}
+
+\subsection{Stream-to-Dimension Joins and SCD Staleness}
+\index{SCD staleness}
+Enriching deltas in near-real-time usually means joining the stream to a dimension inside the \texttt{MERGE} source subquery (or inside a dynamic table). The failure mode is \emph{SCD staleness}: if the dimension layer refreshes more slowly than the fact stream, new facts join to a missing or outdated dimension row. The disciplined response is not to drop unmatched rows---it is to loosen the dimension layer's target lag, re-run the idempotent \texttt{MERGE} so late members reconcile, and (for hard SLAs) insert inferred placeholder dimension members that later enrich.
+
+\begin{tipbox}
+Unmatched-row telemetry is a data-quality signal, not noise. Log the count of deltas that failed the dimension join per run; a rising trend predicts a widening freshness gap before users notice wrong reports.
+\end{tipbox}
+
+\subsection{Detecting and Recovering Stale Streams}
+\index{stale stream}\index{SYSTEM\textdollar STREAM\_HAS\_DATA}
+A stream goes \textbf{stale} when its source table's Time Travel retention expires beneath unconsumed change data (1 day default, up to 90 days on Enterprise Edition) or when change data exceeds the 14-day hard limit. \texttt{SHOW STREAMS} exposes a \texttt{STALE} column; \texttt{SYSTEM\$STREAM\_HAS\_DATA} tells consumers whether work exists. Staleness forces a re-bootstrap: drop and recreate the stream to re-anchor the offset, then truncate-and-reload (or \texttt{INSERT OVERWRITE}) the downstream target from the source, reconciling the gap window with a key-based anti-join audit. Budget that full-reload credit cost and downstream downtime into the pipeline's RTO---frequent staleness means the consumer cadence is slower than retention, not that the stream design is wrong.
+
+\section{Thursday Hands-On Project: Stream-to-Target CDC}
+\index{hands-on project!streams}
+This project builds the complete delta loop: mutate a landing table, observe the stream, and sync a target with \texttt{MERGE}.
+
+\subsection*{Scenario}
+An operational system upserts customer rows into \texttt{raw.customer\_landing} via micro-batch. The curated \texttt{gold.customers} table must reflect inserts, updates, and deletes within minutes, with provable idempotency.
+
+\subsection*{Procedure}
+\begin{enumerate}
+    \item Create \texttt{raw.customer\_landing} and \texttt{gold.customers} with identical business columns plus \texttt{updated\_ts}.
+    \item Create the standard stream \texttt{raw.customer\_stream} on the landing table.
+    \item Insert three customers; query the stream and confirm three \texttt{INSERT} actions.
+    \item Run the Wednesday \texttt{MERGE}; verify the target and confirm the stream now reads empty (offset advanced).
+    \item Update one row and delete another in the landing table; inspect the stream's DELETE+INSERT pair with \texttt{METADATA\$ISUPDATE}.
+    \item Re-run the \texttt{MERGE}; verify update and delete propagated.
+    \item Re-run the identical \texttt{MERGE} a third time and confirm zero rows changed---idempotency evidence.
+    \item Wrap consumption in \texttt{SYSTEM\$STREAM\_HAS\_DATA} gating and simulate a failure between runs.
+\end{enumerate}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item \textbf{SQL script:} DDL, mutation sequence, \texttt{MERGE}, and verification queries.
+    \item \textbf{Offset evidence:} stream contents before and after each consumption, showing transactional advance.
+    \item \textbf{Idempotency proof:} the repeated-run output showing zero applied changes.
+    \item \textbf{Staleness plan:} the alert query on \texttt{SHOW STREAMS STALE} and the re-bootstrap runbook steps.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item Inserts, updates, and deletes each propagate to the target through one code path.
+    \item The stream offset advances only on committed consumption, demonstrated by an induced rollback.
+    \item A repeated consumer run changes nothing, and the reason (offset semantics plus merge keys) is explained in writing.
+    \item The update pair (DELETE + INSERT with \texttt{ISUPDATE = TRUE}) is correctly interpreted, not double-counted.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Add an \texttt{event\_id} dedup key to the landing feed and convert the merge to the dedup-key pattern.
+    \item Join the stream to a slowly changing dimension in the \texttt{MERGE} source; inject a late dimension member and absorb it via re-run.
+    \item Force staleness on a throwaway table (minimum retention plus unconsumed changes) and execute the full re-bootstrap.
+\end{itemize}
+
+\section{Friday Real-World Architecture: MySQL to Snowflake CDC}
+\index{Real-World Architecture!MySQL CDC}\index{AWS DMS}
+A retailer's order management system runs on MySQL. Analytics in Snowflake must lag the operational database by minutes, not nightly batches. The canonical composition pairs AWS DMS for cross-engine replication with Snowflake streams for in-platform delta application \cite{awsDmsDocs}.
+
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[
+        src/.style={rectangle, rounded corners, draw=orange!70!black, thick, fill=orange!10, align=center, minimum width=2.7cm, minimum height=1.0cm, font=\small\bfseries},
+        sf/.style={rectangle, rounded corners, draw=primary, thick, fill=primary!6, align=center, minimum width=2.7cm, minimum height=1.0cm, font=\small\bfseries},
+        tbl/.style={rectangle, rounded corners, draw=codegreen!60!black, thick, fill=green!8, align=center, minimum width=2.7cm, minimum height=1.0cm, font=\small\bfseries},
+        arrow/.style={-{Stealth[length=2.5mm]}, draw=primary, thick},
+        lbl/.style={font=\scriptsize\itshape, text=codegray}
+    ]
+        \node[src] (mysql) at (0, 0) {MySQL OMS\\binlog};
+        \node[src] (dms) at (3.4, 0) {AWS DMS\\CDC task};
+        \node[src] (s3) at (6.8, 0) {S3 change files\\(CSV/Parquet)};
+        \node[sf] (pipe) at (10.0, 0) {Snowpipe\\auto-ingest};
+        \node[tbl] (land) at (6.8, -2.2) {raw landing\\(op + PK + ts)};
+        \node[sf] (stream) at (10.0, -2.2) {standard\\stream};
+        \node[tbl] (gold) at (13.2, -2.2) {gold.orders\\MERGE};
+        \draw[arrow] (mysql) -- node[lbl, above]{read log} (dms);
+        \draw[arrow] (dms) -- node[lbl, above]{write deltas} (s3);
+        \draw[arrow] (s3) -- node[lbl, above]{SQS event} (pipe);
+        \draw[arrow] (pipe) |- (land);
+        \draw[arrow] (land) -- (stream);
+        \draw[arrow] (stream) -- node[lbl, above]{idempotent MERGE} (gold);
+    \end{tikzpicture}%
+    }
+    \caption{Operational CDC: DMS reads the MySQL binlog into S3 change files; Snowpipe lands them; a stream plus MERGE applies deltas to curated tables.}
+    \label{fig:chapter7-mysql-cdc}
+\end{figure}
+
+\subsection{Design Decisions}
+\begin{enumerate}
+    \item \textbf{DMS emits change files with operation codes.} Land them raw with \texttt{op}, primary key, commit timestamp, and payload columns. The landing table is the replayable event log the stream alone cannot be.
+    \item \textbf{The stream gates and the MERGE applies.} A task (Chapter 8) runs only when \texttt{SYSTEM\$STREAM\_HAS\_DATA} is true, then executes the idempotent merge ordered by commit timestamp.
+    \item \textbf{Deletes are first-class.} Operational deletes must propagate; the merge's \texttt{WHEN MATCHED ... DELETE} branch is what keeps gold from silently accumulating ghosts.
+    \item \textbf{Reconciliation closes the loop.} A daily key-count and checksum comparison between MySQL and gold catches drift that any single hop missed.
+\end{enumerate}
+
+\begin{pitfall}
+\textbf{Out-of-order application corrupts state.} DMS files for one table can interleave across tasks. Order deltas by commit timestamp (and sequence where available) inside the merge source, or partition consumption per table so ordering is preserved per key.
+\end{pitfall}
+
+\section{Interview Q\&A}
+\begin{enumerate}
+    \item \textbf{Q: What does \texttt{METADATA\$ISUPDATE} indicate?}\\
+    A: That the change record is one half of an update represented as a DELETE+INSERT pair, so consumers can collapse pairs into true updates.
+    \item \textbf{Q: What serves as a stream's consumption state, and when does it advance?}\\
+    A: Its offset---a bookmark of committed changes. It advances only when a transaction that read the stream commits; failed runs leave it untouched.
+    \item \textbf{Q: How does a dedup key make a stream-consuming MERGE idempotent?}\\
+    A: Matching on a stable event identifier means re-applying the same delta matches an existing row and changes nothing; only genuinely new events insert.
+    \item \textbf{Q: When does a dynamic table degrade from incremental to full refresh?}\\
+    A: When the defining query uses constructs incremental refresh cannot track, or after certain base-table DDL; full refresh reprocesses the entire base.
+    \item \textbf{Q: How do you absorb late-arriving dimension members in a stream-to-dimension join?}\\
+    A: Loosen the dimension layer's lag, keep the merge idempotent, and re-run so unmatched facts reconcile instead of dropping them.
+\end{enumerate}
+
+\section{Further Reading}
+Snowflake's streams documentation defines stream types, offsets, and staleness behavior \cite{snowflakeStreamsDocs}. The AWS DMS documentation covers binlog-based replication into S3 \cite{awsDmsDocs}. Debezium's architecture is the open-source reference for log-based CDC thinking \cite{debeziumDocs}, and Kimball's dimensional techniques inform the SCD consumers built in Chapter 12 \cite{kimball2013toolkit}.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item Streams are queryable CDC journals with a transactional offset---consumption commits or the delta waits.
+    \item Updates surface as DELETE+INSERT pairs flagged by \texttt{METADATA\$ISUPDATE}; streams show net change, not statement replay.
+    \item Production consumers are gated (\texttt{SYSTEM\$STREAM\_HAS\_DATA}), transactional, and idempotent via merge or dedup keys.
+    \item Late-arriving dimensions are absorbed by lag tuning and idempotent re-runs, never by dropping unmatched facts.
+    \item Stale streams demand re-bootstrap: recreate the stream, reload the target, and audit the gap with an anti-join.
+    \item Cross-engine CDC (DMS to S3 to Snowpipe to stream to MERGE) layers delivery guarantees; reconcile end to end.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Explain why a watermark (\texttt{updated\_ts > :last\_run}) consumer is weaker than a stream offset.
+    \item \textbf{(Conceptual)} A row is inserted and updated twice between consumptions. Describe the stream contents.
+    \item \textbf{(Conceptual)} Why can a filtered stream read silently discard changes?
+    \item \textbf{(Hands-on)} Build the append-only variant of the Thursday lab on an event table and contrast storage/metadata behavior.
+    \item \textbf{(Hands-on)} Add a dimension join to the merge, inject a late member, and reconcile it with an idempotent re-run.
+    \item \textbf{(Design)} Design CDC for a source that hard-deletes rows without tombstones. Where do deletes get detected?
+    \item \textbf{(Design)} Write the staleness re-bootstrap runbook: detection query, reload steps, anti-join audit, and RTO estimate.
+    \item \textbf{(Operations)} Write a monitor that alerts when any stream's \texttt{STALE} flag flips or when \texttt{HAS\_DATA} stays true across three consumer intervals.
+    \item \textbf{(Cost)} Compare the credit cost of a per-minute stream consumer versus a dynamic table at 1-minute lag for the same delta volume.
+    \item \textbf{(Interview)} Explain to an application DBA why Snowflake still needs their binlog even though streams exist in-platform.
+\end{enumerate}

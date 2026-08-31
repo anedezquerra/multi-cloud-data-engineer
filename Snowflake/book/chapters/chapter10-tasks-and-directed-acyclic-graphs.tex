@@ -1,0 +1,228 @@
+\chapter{Query Tuning, Performance, and Profiling}
+\index{query profile}\index{performance tuning}\index{spilling}\index{Week 10}%
+\begin{objectives}
+\begin{itemize}
+    \item Read the Snowflake Query Profile in Snowsight: operator tree, pruning, scan, and spill metrics.
+    \item Distinguish spilling to local storage from spilling to remote storage and choose the right remedy for each.
+    \item Diagnose join problems: accidental Cartesian products, build-versus-probe side selection, and exploding joins.
+    \item Refactor slow queries with early filters, pre-aggregation, and CTE structuring, validating every change in the profile.
+    \item Execute a hands-on tuning lab that takes one slow query from diagnosis to measured speedup.
+    \item Perform an enterprise cost and performance audit on a workload burning \$20{,}000 per month.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+The physics of analytical performance---scan less, spill never, join carefully---is identical everywhere; each platform exposes it through a different explain plan.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{2.8cm}p{3.0cm}p{3.0cm}p{3.0cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{AWS (Redshift)} & \textbf{Azure (Synapse/Fabric)} & \textbf{GCP (BigQuery)} \\
+\midrule
+Plan inspection & EXPLAIN + query monitoring & DMVs + query store & Query plan explanation + slot timeline \\
+Partition skipping & Zone maps on sort keys & Partition elimination / distribution & Partition pruning + clustering \\
+Spill signal & Disk-based query steps & TempDB spill DMVs & Bytes shuffled / spilled \\
+Compute remedy & Resize / concurrency scaling & Scale DWUs / resource class & More slots / reservations \\
+Result caching & Result cache & Result-set caching & Cached query results \\
+\addlinespace
+Snowflake equivalent & \multicolumn{3}{l}{Query Profile operators, partitions scanned/total, local vs.\ remote spill, warehouse resize} \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+\textbf{MongoDB} answers the same questions through \texttt{explain('executionStats')} and index design---a different storage model, identical discipline. Snowflake's twist is that there are no indexes to build: the levers are pruning, warehouse size, caching, and SQL shape.
+\end{crosscloud}
+
+\section{Week 10 Roadmap}
+Chapters 5--9 built pipelines that move and shape data. This chapter asks the economic question: is the SQL \emph{efficient}? In a consumption-priced platform, a badly written query is not just slow---it is a recurring invoice \cite{snowflakeQueryProfileDocs}.
+
+Monday teaches the Query Profile as the primary diagnostic instrument. Tuesday dissects spilling. Wednesday covers join pathology. Thursday runs the full tuning loop on one slow query. Friday scales the discipline into an enterprise cost audit.
+
+\begin{keyterms}
+\textbf{Query Profile}: Snowsight's operator-level execution graph with per-operator timing, rows, and bytes.\quad
+\textbf{Pruning efficiency}: partitions scanned versus partitions total---the fraction of storage a query avoided reading.\quad
+\textbf{Spilling}: intermediate results overflowing memory to local disk (moderate cost) or remote storage (severe cost).\quad
+\textbf{Cartesian join}: a join with no effective predicate, producing the cross product of both sides.\quad
+\textbf{Build side}: the smaller join input Snowflake uses to construct the in-memory hash table.
+\end{keyterms}
+
+\section{Monday: Reading the Query Profile}
+\index{Query Profile}\index{partitions scanned}
+The Query Profile renders execution as a tree of operators---TableScan, Filter, Join, Aggregate, Sort---each annotated with rows processed, bytes, and percentage of total query time. Reading a profile is a skill with a reliable order of operations:
+
+\begin{enumerate}
+    \item \textbf{Find the dominant operator.} The operator holding most of the execution time defines the problem class: scans mean pruning or warehouse size; joins mean join pathology; aggregations and sorts often mean spilling.
+    \item \textbf{Check pruning.} On TableScan, \emph{partitions scanned} versus \emph{partitions total} is the pruning ratio. Scanning 40{,}000 of 40{,}000 partitions for a query about yesterday means the predicate, the data order, or the clustering is broken.
+    \item \textbf{Follow row-count inflation.} If a join emits 50 million rows from 1-million-row inputs, suspect fan-out before blaming hardware.
+    \item \textbf{Check spill bytes} on the heavy operators (Tuesday's topic).
+    \item \textbf{Check the warehouse.} A profile that is uniformly slow with high queuing may be a sizing or concurrency problem, not a SQL problem.
+\end{enumerate}
+
+\begin{definitionbox}
+\textbf{Pruning efficiency} is the share of a table's micro-partitions that metadata eliminates before scanning. It is the single highest-leverage metric in Snowflake tuning because it multiplies through everything downstream: fewer partitions means fewer bytes decompressed, joined, and aggregated.
+\end{definitionbox}
+
+\begin{notebox}
+Three caches can hide a slow query during testing: the result cache (same query, same data, instant replay), the warehouse's local SSD cache, and Cloud Services metadata. Benchmark with \texttt{USE CACHED\_RESULTS = FALSE}, a resumed warehouse state you document, or intentionally varied predicates---and always disclose cache state in measurements.
+\end{notebox}
+
+\section{Tuesday: Spilling to Local and Remote Storage}
+\index{spilling}\index{remote spill}
+An operator that cannot hold its working set in memory spills. \textbf{Local spill} overflows to the warehouse node's SSD---a performance drag measured in modest multiples. \textbf{Remote spill} overflows to cloud object storage---an order-of-magnitude cliff, because intermediate data now crosses the network, persists to S3-class storage, and reads back.
+
+\begin{pitfall}
+\textbf{Bytes spilled to remote storage is the strongest single signal to upsize the warehouse.} Refactoring SQL can shrink the working set, but when the workload genuinely needs more memory per node, an XL warehouse often ends the incident in minutes. Tune SQL first when spill comes from accidental row inflation; resize when the honest working set exceeds memory.
+\end{pitfall}
+
+Spill reduction follows a short playbook:
+\begin{itemize}
+    \item \textbf{Filter early.} Push selective predicates before wide joins so the join's working set is small.
+    \item \textbf{Pre-aggregate.} \texttt{GROUP BY} to the needed grain before joining, not after.
+    \item \textbf{Project narrowly.} \texttt{SELECT *} on a 300-column fact table drags every column through every operator; columnar storage only helps if you let it.
+    \item \textbf{Split monster queries.} A multi-CTE chain that spills can become two steps landing an intermediate table, trading a small storage write for a bounded working set.
+\end{itemize}
+
+\section{Wednesday: Join Optimization}
+\index{join optimization}\index{Cartesian join}\index{exploding join}
+Snowflake's joins are distributed hash joins: the smaller input becomes the \emph{build side} of an in-memory hash table, the larger streams past as the \emph{probe side}. The optimizer chooses sides from statistics, which is why row-count estimates in the profile matter.
+
+\subsection{The Three Join Disasters}
+\begin{enumerate}
+    \item \textbf{Accidental Cartesian.} A missing or non-equijoin predicate produces the cross product. The profile shows it unmistakably: output rows equal the product of inputs. The fix is the join condition---but the \emph{cause} is usually a schema where the natural key was never documented, which is why Chapter 12's dimensional discipline matters.
+    \item \textbf{Exploding join.} A join on a non-unique key (say, \texttt{customer\_id} against a table with duplicate rows per customer) silently multiplies rows. Detect with a uniqueness check on the join key; fix by deduplicating the build side (\texttt{QUALIFY ROW\_NUMBER() ... = 1}) or fixing the upstream duplication bug.
+    \item \textbf{Skewed build side.} When one key value dominates (a sentinel \texttt{customer\_id = 0} holding 40\% of rows), one node does the work. Remedies: filter the sentinel into its own branch, salt the key, or handle the sentinel population in a separate \texttt{UNION ALL} leg.
+\end{enumerate}
+
+\begin{lstlisting}[language=SQL, caption={Detecting a non-unique join key before it explodes}]
+SELECT customer_id, COUNT(*) AS rows_per_key
+FROM gold.dim_customers
+GROUP BY customer_id
+HAVING COUNT(*) > 1
+ORDER BY rows_per_key DESC
+LIMIT 20;
+-- Any row here means a join on customer_id fans out.
+\end{lstlisting}
+
+\begin{tipbox}
+Functions on join or filter keys defeat metadata pruning and statistics: \texttt{WHERE DATE(event\_ts) = '2026-08-31'} prunes worse than \texttt{WHERE event\_ts >= '2026-08-31' AND event\_ts < '2026-09-01'}. Write sargable predicates on the raw column whenever possible.
+\end{tipbox}
+
+\section{Thursday Hands-On Project: One Slow Query, Diagnosed and Fixed}
+\index{hands-on project!query tuning}
+This lab runs the full tuning loop: capture a baseline, read the profile, refactor, resize, and prove the speedup.
+
+\subsection*{Scenario}
+A nightly revenue report joining a 100-million-row fact table to dimensions now takes 22 minutes and spills to remote storage. Finance notices; the bill confirms it.
+
+\subsection*{Procedure}
+\begin{enumerate}
+    \item Generate a skewed dataset: a fact table with a sentinel \texttt{customer\_id = 0} holding 30\% of rows, plus a dimension with accidental duplicates.
+    \item Run the deliberately naive report query (\texttt{SELECT *}, functions on filter keys, join on the duplicated key). Capture the profile: dominant operator, partitions scanned/total, spill bytes, elapsed time.
+    \item Diagnose in writing before changing anything: name each pathology and its profile evidence.
+    \item Refactor: sargable date predicate, early filter, pre-aggregation to the report grain, explicit column list, deduplicated dimension.
+    \item Re-run with \texttt{USE\_CACHED\_RESULTS = FALSE}; capture the new profile.
+    \item If remote spill persists, resize the warehouse one step and measure again.
+    \item Record before/after: elapsed time, bytes scanned, partitions scanned/total, spill bytes, credits consumed.
+\end{enumerate}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item \textbf{Baseline and final SQL} with the refactor rationale inline.
+    \item \textbf{Two profiles} (screenshots or exported metrics) with the dominant operators annotated.
+    \item \textbf{Metrics table:} elapsed, bytes scanned, pruning ratio, local/remote spill, credits---before, after refactor, after resize.
+    \item \textbf{One-page diagnosis memo} a reviewer could use to reproduce every conclusion from the profiles.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item Every change is justified by a specific profile metric, not folklore.
+    \item Result-cache effects are controlled and disclosed.
+    \item The final query is measurably cheaper in bytes scanned, not only faster on a warm cache.
+    \item The resize decision (taken or rejected) is argued from spill bytes.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Re-run against a clustered copy of the fact table and quantify the pruning delta (linking back to Chapter 1).
+    \item Introduce an accidental Cartesian in a branch query and identify it from the profile alone.
+    \item Compare the tuned query on SMALL versus LARGE warehouses and plot the price-performance knee.
+\end{itemize}
+
+\section{Friday Real-World Architecture: The \$20k/Month Workload Audit}
+\index{Real-World Architecture!cost audit}\index{cost optimization}
+An enterprise data platform team inherits a pipeline estate costing \$20{,}000 per month in warehouse credits. Leadership asks: which of this is waste?
+
+\subsection{Audit Method}
+\begin{enumerate}
+    \item \textbf{Attribute spend.} \texttt{SNOWFLAKE.ACCOUNT\_USAGE.WAREHOUSE\_METERING\_HISTORY} allocates credits by warehouse and hour; \texttt{QUERY\_HISTORY} joins queries to warehouses, users, and bytes scanned. The first chart---credits by warehouse by week---usually finds the suspect immediately.
+    \item \textbf{Rank queries by cost, not duration.} \texttt{QUERY\_HISTORY} bytes scanned times warehouse rate approximates per-query cost. The top ten queries typically hold half the spend.
+    \item \textbf{Classify each offender.} Pruning failure (scan ratio near 100\%), remote spill (resize or refactor), scheduling waste (a dashboard refreshing at 1-minute against hourly data), or idle compute (warehouse running with no queries---auto-suspend misconfiguration).
+    \item \textbf{Fix in order of effort-adjusted value.} A predicate fix deployed today beats a reclustering program deployed next quarter.
+\end{enumerate}
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{4.2cm}p{4.6cm}p{4.6cm}@{}}
+\toprule
+\textbf{Finding} & \textbf{Profile / history evidence} & \textbf{Typical fix} \\
+\midrule
+Full-table scans for recent data & Partitions scanned $\approx$ total & Sargable date predicates; load order; clustering \\
+Remote spill & Spill bytes to remote $>$ 0 & Refactor working set; resize warehouse \\
+Idle warehouses & Metering without queries & Auto-suspend at 60--300 s \\
+Over-frequent refresh & Query text repeated per minute & Align schedule to data freshness SLA \\
+Duplicate work & Same logical query from N dashboards & Shared aggregate / dynamic table \\
+\bottomrule
+\end{tabular}
+\caption{Recurring findings in a Snowflake cost audit and their evidence.}
+\label{tab:chapter10-cost-audit}
+\end{table}
+
+\subsection{Governance After the Audit}
+An audit that ends with a slide deck repeats annually. One that ends with controls does not: resource monitors capping warehouse budgets (Chapter 22), query tags attributing spend to teams and products, and a standing monthly report built on \texttt{QUERY\_HISTORY} so the next regression is found in days. Cost engineering is an operations discipline, not a project.
+
+\begin{pitfall}
+\textbf{Do not let the audit become a blame report.} The goal is a ranked list of structural fixes with owners and savings estimates. Teams optimize what they are shown; publish per-product cost attribution as information, not punishment.
+\end{pitfall}
+
+\section{Interview Q\&A}
+\begin{enumerate}
+    \item \textbf{Q: Which Query Profile metric signals poor micro-partition pruning?}\\
+    A: Partitions scanned close to partitions total on the TableScan operator, usually alongside high bytes scanned.
+    \item \textbf{Q: What does spilling to remote storage tell you to do first?}\\
+    A: Check whether the working set is honestly that large---if refactor candidates (early filters, pre-aggregation) are exhausted, upsize the warehouse; remote spill is the clearest resize signal.
+    \item \textbf{Q: How do you eliminate an accidental Cartesian join?}\\
+    A: Restore the missing equijoin predicate; in the profile, the giveaway is output rows equal to the product of input rows.
+    \item \textbf{Q: When is upsizing the warehouse better than rewriting SQL?}\\
+    A: When the working set genuinely exceeds memory (remote spill with clean SQL) or when the query is CPU-bound and well-pruned already.
+    \item \textbf{Q: Why does SELECT * hurt on wide columnar tables?}\\
+    A: Columnar engines read only referenced columns; \texttt{SELECT *} forces every column through decompression, memory, and spill---removing the format's core advantage.
+\end{enumerate}
+
+\section{Further Reading}
+Snowflake's Query Profile documentation is the reference for operator metrics \cite{snowflakeQueryProfileDocs}. The warehouse-considerations guide connects sizing decisions to credit economics \cite{snowflakeWarehouseConsiderationsDocs}, and the original Snowflake paper explains the execution engine these profiles expose \cite{dageville2016snowflake}. Chapter 22 extends the audit patterns into a full FinOps practice.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item The Query Profile is the diagnostic instrument: dominant operator, pruning ratio, row inflation, spill bytes---in that order.
+    \item Remote spill is the resize signal; local spill is a refactor prompt.
+    \item Cartesian and exploding joins announce themselves through row-count multiplication; verify key uniqueness.
+    \item Filter early, pre-aggregate, project narrowly, and write sargable predicates.
+    \item Control the three caches in every benchmark and disclose cache state.
+    \item Cost auditing ranks queries by bytes-times-credits, fixes structurally, then institutionalizes monitors and attribution.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Order the five profile-reading steps and explain why pruning precedes spill analysis.
+    \item \textbf{(Conceptual)} A query is fast in testing and slow in production. List three cache-related explanations.
+    \item \textbf{(Hands-on)} Reproduce an exploding join, detect it via the profile and a uniqueness query, and fix it two different ways.
+    \item \textbf{(Hands-on)} Force remote spill with a large sort, then eliminate it by pre-aggregation; record spill bytes both ways.
+    \item \textbf{(Hands-on)} Rewrite three non-sargable predicates into sargable form and measure the pruning change.
+    \item \textbf{(Design)} Write the audit's top-N query report: SQL over \texttt{QUERY\_HISTORY} joining warehouse rates.
+    \item \textbf{(Design)} Define query tags for cost attribution across teams, products, and environments.
+    \item \textbf{(Operations)} Build the weekly ``new expensive query'' detector comparing this week's top spenders to last week's.
+    \item \textbf{(Cost)} A query scans 2 TB nightly on a LARGE warehouse. Estimate monthly credits and model the savings of 90\% pruning.
+    \item \textbf{(Interview)} Explain to a CFO why ``the warehouse was idle'' appears on the bill and which setting fixes it.
+\end{enumerate}

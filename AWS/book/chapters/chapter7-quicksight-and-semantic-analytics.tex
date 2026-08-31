@@ -1,0 +1,354 @@
+% NOTE: Filename is fixed by the book outline; content teaches Week 7
+% (Data Lakehouse & Amazon Athena) of the syllabus.
+\chapter{Data Lakehouse and Amazon Athena}
+\index{Amazon Athena}\index{data lakehouse}\index{AWS Glue Data Catalog}\index{crawlers}\index{Redshift Spectrum}\index{Apache Parquet}\index{Apache Iceberg}\index{partition pruning}%
+\begin{objectives}
+\begin{itemize}
+    \item Explain how Amazon Athena runs serverless SQL directly against S3 and how its per-byte-scanned pricing shapes table design.
+    \item Catalog S3 data with AWS Glue crawlers, databases, and tables, and recognize where schema inference fails.
+    \item Query the same catalog from Redshift Spectrum and decide when Spectrum is preferable to Athena.
+    \item Convert raw CSV to partitioned Parquet and quantify the scan-cost reduction from columnar layout and partition pruning.
+    \item Describe what Apache Iceberg adds beyond plain Parquet files: schema evolution, partition evolution, and ACID tables.
+    \item Design a hybrid lakehouse architecture that queries 50 PB of S3 logs alongside core business data in Redshift.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+The lakehouse pattern---open files on object storage, a shared catalog, multiple query engines---now exists on every cloud, and the week's services map cleanly onto their counterparts.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{2.8cm}p{3.0cm}p{3.0cm}p{3.0cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{AWS} & \textbf{Azure} & \textbf{GCP} \\
+\midrule
+Serverless SQL on the lake & Athena & Synapse/Fabric serverless SQL & BigQuery external tables \\
+Shared metastore & Glue Data Catalog & Microsoft Purview / OneLake catalog & Dataplex / BigLake metastore \\
+Schema inference & Glue crawlers & Synapse auto-discovery & BigQuery autodetect \\
+Warehouse-to-lake query & Redshift Spectrum & Synapse/Fabric lakehouse shortcuts & BigLake tables \\
+Table format & Iceberg / Hudi / Delta on S3 & Delta (OneLake native) & BigLake Iceberg \\
+\addlinespace
+Pricing lever & Per TB scanned & Capacity units & Bytes scanned / slots \\
+Cost control & Partitioning + Parquet & Partitioning + Delta & Partitioning + clustering \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+\textbf{Fabric} is the most opinionated implementation: OneLake plus Delta--Parquet with \emph{shortcuts} makes the warehouse and lake the same physical data. \textbf{Snowflake} reads external Iceberg tables while its native tables remain the managed counterpart of the same idea. \textbf{MongoDB} plays the source-system role here---Atlas Data Federation queries S3, but the document model itself stays operational.
+\end{crosscloud}
+
+\section{Week 7 Roadmap and Mental Model}
+Chapters 5 and 6 kept data inside the warehouse. This week opens the warehouse to the lake: the same SQL questions, asked against open files on S3, governed by a shared catalog, from whichever engine fits the query. The lakehouse thesis \cite{armbrust2021lakehouse} is that object storage plus open table formats plus a metastore can deliver warehouse-grade management at lake economics.
+
+Three services implement the pattern on AWS. \textbf{Athena} is serverless SQL (Trino/Presto heritage) over S3, billed per byte scanned. The \textbf{Glue Data Catalog} is the shared metastore that tells every engine what tables exist, where their files live, and what schema to apply. \textbf{Redshift Spectrum} lets a Redshift cluster read the same catalog and S3 files, so lake data and warehouse data join in one query. The engineering craft of the week is cost: on a per-byte-scanned engine, \emph{table layout is the price list}.
+\index{lakehouse}\index{metastore}
+
+\begin{definitionbox}
+\textbf{Amazon Athena} is a serverless, interactive query service that runs standard SQL against data in S3 using schemas from the Glue Data Catalog. There is no infrastructure to manage; you pay per terabyte of data scanned per query.
+\end{definitionbox}
+
+\begin{keyterms}
+\textbf{Crawler}: a Glue job that scans S3 paths, infers schemas, and registers or updates catalog tables. \textbf{External table}: a catalog entry whose data lives as files in S3 rather than inside the engine. \textbf{Partition projection}: declaring partition rules in table properties instead of storing every partition in the catalog. \textbf{Spectrum}: Redshift's ability to query catalog-registered S3 data via an external schema. \textbf{Table format} (Iceberg/Hudi/Delta): a metadata layer over Parquet files providing ACID transactions, schema evolution, and time travel.
+\end{keyterms}
+
+\section{Monday: Amazon Athena---Serverless SQL on S3}
+\subsection{How Athena Executes}
+Athena needs no cluster. A query references catalog tables; Athena's engine reads the relevant S3 objects, applies the table's schema and SerDe, and executes the plan on transient compute. Results land in a query-results bucket you configure per workgroup. Because the unit of billing is bytes scanned---with a per-query minimum---the entire discipline of Athena cost control is making queries read fewer bytes: columnar formats, compression, partitioning, and projection of only needed columns \cite{awsAthenaDocs}.
+\index{Athena workgroup}\index{bytes scanned}
+
+\begin{pitfall}
+\textbf{SELECT * on raw CSV.} An unpartitioned CSV table forces Athena to read every byte of every column of every file. On a 10~TB dataset that is a \$50 query run repeatedly by accident. Workgroup data-usage limits exist precisely to abort such scans; set them on day one.
+\end{pitfall}
+
+\subsection{Workgroups and Cost Guardrails}
+Workgroups isolate teams and enforce policy: per-query and per-period data-scanned limits, enforced encryption of results, and CloudWatch metrics per workgroup. In practice every production Athena deployment has at least an analyst workgroup with tight limits and an ETL workgroup with a higher ceiling and separate results bucket.
+\index{workgroup limits}
+
+\section{Tuesday: The Glue Data Catalog and Crawlers}
+\subsection{A Shared Metastore}
+The Glue Data Catalog is a Hive-metastore-compatible service holding databases, tables, partitions, and schema versions \cite{awsGlueCatalogDocs}. Athena, Redshift Spectrum, EMR, and Glue ETL all resolve table names against it. This single-catalog design is what makes the lakehouse more than a pile of files: a table defined once is queryable from every engine with the same name, schema, and partition layout.
+\index{Glue Data Catalog}\index{Hive metastore}
+
+\subsection{Crawlers: Inference and Its Limits}
+A crawler walks an S3 prefix, samples files, infers columns and types, detects partitions from \texttt{key=value} path segments, and creates or updates catalog tables \cite{awsGlueCatalogDocs}. Inference is a convenience, not a contract. Crawlers merge schemas when files in one prefix disagree, misclassify types from unlucky samples, and can create thousands of tiny tables if pointed at a prefix that mixes datasets. Production practice: crawl the \emph{curated} zone where layout is uniform, define raw-zone tables by hand with explicit DDL, and version the catalog with schema-registry discipline (Chapter~11).
+\index{crawler}\index{schema inference}
+
+\begin{tipbox}
+Prefer partition projection on tables with thousands of partitions (for example, \texttt{year=/month=/day=} over many years). It stores partition \emph{rules} in table properties instead of millions of partition entries in the catalog, eliminating both catalog bloat and the \texttt{MSCK REPAIR TABLE} maintenance chore.
+\end{tipbox}
+
+\section{Wednesday: Redshift Spectrum and the Open Table Layer}
+\subsection{Querying the Lake from the Warehouse}
+Redshift Spectrum lets Redshift SQL read catalog-registered S3 tables through an external schema, so a query can join \texttt{fact\_sales} in the warehouse with \texttt{clickstream} in the lake in one statement \cite{awsRedshiftSpectrumDocs}. Spectrum spins up an independent fleet to scan S3, billed per byte scanned; the Redshift cluster does the joins and aggregation.
+
+\begin{lstlisting}[language=SQL,caption={Creating a Spectrum external schema over the Glue catalog.},label={lst:ch7-external-schema}]
+CREATE EXTERNAL SCHEMA lakehouse FROM DATA CATALOG
+  DATABASE 'retail_lake'
+  IAM_ROLE 'arn:aws:iam::123456789012:role/SpectrumRole'
+  CREATE EXTERNAL DATABASE IF NOT EXISTS;
+
+SELECT d.year, p.category, SUM(l.event_count) AS events
+FROM lakehouse.clickstream_daily l
+JOIN dim_date d     ON l.date_key = d.date_key
+JOIN dim_product p  ON l.product_key = p.product_key
+GROUP BY 1, 2;
+\end{lstlisting}
+
+\textbf{Spectrum or Athena?} Both read the same catalog and charge per byte scanned. Choose Spectrum when the query must join lake data with warehouse-resident tables in one statement, or when the organization already operates a Redshift cluster. Choose Athena when there is no cluster running, the query is lake-only, or the team wants zero infrastructure. The catalog makes this an execution-time decision, not a data-modeling decision.
+\index{Spectrum versus Athena}
+
+\subsection{From Files to Tables: Parquet and Iceberg}
+Plain Parquet gives columnar, compressed, splittable files---the foundation of lake economics. \textbf{Apache Iceberg} adds the table semantics files lack: atomic commits so concurrent writers never corrupt a table, schema evolution without rewriting data, partition evolution without rewriting data, hidden partitioning, and time travel over snapshots \cite{apacheIceberg}. Athena, Glue, and EMR all read and write Iceberg tables registered in the Glue catalog, which is what turns an S3 prefix into a governed, mutable table.
+\index{Apache Iceberg}\index{table format}\index{time travel}
+
+\begin{notebox}
+The catalog entry records the table format, not just the schema. An Iceberg table queried as if it were plain Parquet will silently read stale or duplicate file versions. Always register and query Iceberg tables through a format-aware engine.
+\end{notebox}
+
+\section{Thursday Hands-on Project: Crawl, Query, and Federate the Same Data}
+\index{hands-on project!Glue crawler, Athena, and Spectrum}
+One dataset, three access paths: catalog an S3 bucket of raw CSVs with a Glue crawler, aggregate it in Athena, then query the same catalog table from Redshift Spectrum---and finally measure what Parquet conversion buys.
+
+\subsection*{Lab Objectives}
+\begin{itemize}
+    \item Run a Glue crawler over a raw CSV prefix and inspect the inferred schema.
+    \item Write an Athena aggregation over the raw table and record bytes scanned.
+    \item Convert the CSVs to partitioned Parquet, catalog the result, and rerun the aggregation.
+    \item Create a Spectrum external schema and join the lake table to a Redshift dimension.
+\end{itemize}
+
+\subsection*{Procedure}
+Stage a CSV dataset (the Chapter~5 synthetic sales data exported as CSV works well) under \texttt{s3://<bucket>/raw/sales\_csv/}. Create the crawler with the CLI:
+
+\begin{lstlisting}[language=bash,caption={Creating and running a Glue crawler over raw CSVs.},label={lst:ch7-crawler}]
+$Region = "us-east-1"
+$Bucket = "acme-analytics-raw-123456789012"
+$Role   = "GlueCrawlerRole"   # trust: glue.amazonaws.com; policy: read $Bucket
+
+aws glue create-database --database-input "{`"Name`":`"week7_lake`"}"
+
+aws glue create-crawler `
+  --name week7-sales-crawler `
+  --role $Role `
+  --database-name week7_lake `
+  --targets "{`"S3Targets`":[{`"Path`":`"s3://$Bucket/raw/sales_csv/`"}]}"
+
+aws glue start-crawler --name week7-sales-crawler
+aws glue get-crawler --name week7-sales-crawler   # poll until State = READY
+aws glue get-tables --database-name week7_lake
+\end{lstlisting}
+
+Query the raw table in Athena and note the bytes scanned from the query statistics. Then convert to Parquet with a one-shot Athena CTAS (Create Table As Select)---Athena itself is the easiest converter:
+
+\begin{lstlisting}[language=SQL,caption={CTAS conversion from CSV to partitioned Parquet, then the same aggregation on both.},label={lst:ch7-ctas}]
+-- Convert once: CTAS writes partitioned Parquet and registers a new table
+CREATE TABLE week7_lake.sales_parquet
+WITH (
+  format = 'PARQUET',
+  parquet_compression = 'SNAPPY',
+  external_location = 's3://acme-analytics-raw-123456789012/curated/sales_parquet/',
+  partitioned_by = ARRAY['order_year', 'order_month']
+) AS
+SELECT order_line_id, customer_id, product_id, store_id, qty, amount,
+       YEAR(order_date)  AS order_year,
+       MONTH(order_date) AS order_month
+FROM week7_lake.sales_csv;
+
+-- Aggregation over raw CSV (record "Data scanned"):
+SELECT customer_id, SUM(amount) FROM week7_lake.sales_csv
+GROUP BY 1 ORDER BY 2 DESC LIMIT 100;
+
+-- The same aggregation over Parquet (compare "Data scanned"):
+SELECT customer_id, SUM(amount) FROM week7_lake.sales_parquet
+WHERE order_year = 2026 AND order_month = 8
+GROUP BY 1 ORDER BY 2 DESC LIMIT 100;
+\end{lstlisting}
+
+Finally, point Spectrum at the same catalog database from the Chapter~5 workgroup and join lake data to the warehouse dimension:
+
+\begin{lstlisting}[language=SQL,caption={Spectrum external schema joining the lake table to a Redshift dimension.},label={lst:ch7-spectrum}]
+CREATE EXTERNAL SCHEMA week7 FROM DATA CATALOG
+  DATABASE 'week7_lake'
+  IAM_ROLE 'arn:aws:iam::123456789012:role/SpectrumRole'
+  CREATE EXTERNAL DATABASE IF NOT EXISTS;
+
+SELECT c.segment, SUM(s.amount) AS revenue
+FROM week7.sales_parquet s
+JOIN dim_customer c ON s.customer_id = c.customer_id
+WHERE s.order_year = 2026 AND c.is_current
+GROUP BY 1;
+\end{lstlisting}
+
+\subsection*{Verification}
+\begin{itemize}
+    \item The crawler creates one table with the expected columns; any schema merge surprises are documented.
+    \item Athena query statistics show the Parquet aggregation scanning one to two orders of magnitude fewer bytes than the CSV equivalent; the date-filtered query prunes to one partition.
+    \item The Spectrum query returns identical aggregates to the Athena query over the same table.
+    \item A cost line computes the price of both Athena runs at \$5/TB and states the annualized saving for a daily-run query.
+\end{itemize}
+
+\begin{pitfall}
+\textbf{Crawler-created tables pointing at mixed prefixes.} If the raw prefix contains more than one dataset shape, the crawler either creates several tables with cryptic names or merges incompatible schemas. Point crawlers at single-dataset prefixes and set a table-level configuration to enforce one table per prefix.
+\end{pitfall}
+
+\section{Friday Use Case: A 50 PB Media Log Lakehouse}
+\index{use case!media log lakehouse}
+A media company accumulates CDN, player, and ad-server logs at roughly 30~TB per day---about 50~PB retained---while its subscriber, content, and billing systems of record live in a provisioned Redshift cluster. Leadership wants analysts to query logs alongside business data without paying warehouse storage prices for 50~PB.
+
+\subsection{Architecture}
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[
+        box/.style={rectangle, rounded corners, draw=primary, thick, fill=primary!6, align=center, minimum width=2.9cm, minimum height=1.0cm, font=\small\bfseries},
+        storebox/.style={cylinder, shape aspect=0.25, draw=primary, thick, fill=blue!6, shape border rotate=90, align=center, text width=2.6cm, minimum height=1.3cm, font=\small\bfseries},
+        gov/.style={rectangle, rounded corners, draw=red!60!black, thick, fill=red!5, align=center, minimum width=2.6cm, minimum height=0.9cm, font=\footnotesize\bfseries},
+        arr/.style={-{Stealth[length=2.5mm]}, draw=primary, thick}
+    ]
+        \node[box] (logs) at (0,0) {Log ingestion\\(Firehose, Ch.~14)};
+        \node[storebox] (raw) at (3.3,0) {S3 raw zone\\JSON logs};
+        \node[box] (etl) at (6.6,0) {Glue ETL\\compaction};
+        \node[storebox] (cur) at (9.9,0) {S3 curated\\Parquet/Iceberg};
+        \node[box] (cat) at (9.9,2.2) {Glue Catalog\\+ crawlers};
+        \node[box] (ath) at (13.2,1.1) {Athena\\ad-hoc};
+        \node[box] (rs) at (13.2,-1.3) {Redshift + Spectrum\\business joins};
+        \node[gov] (lf) at (6.6,2.2) {Lake Formation\\(Ch.~8)};
+        \draw[arr] (logs) -- (raw);
+        \draw[arr] (raw) -- (etl);
+        \draw[arr] (etl) -- (cur);
+        \draw[arr] (cur) -- (cat);
+        \draw[arr] (cat) -- (ath);
+        \draw[arr] (cat) -- (rs);
+        \draw[arr] (cur) -- (rs);
+        \draw[arr, dashed] (lf) -- (cat);
+    \end{tikzpicture}%
+    }
+    \caption{Media lakehouse: logs land raw, are compacted to partitioned Parquet/Iceberg, and are served through one catalog to Athena (ad-hoc) and Spectrum (joins with warehouse data).}
+    \label{fig:ch7-media-lakehouse}
+\end{figure}
+
+\subsection{Design Decisions}
+\textbf{Layout is the budget.} At \$5 per TB scanned, a full scan of 50~PB is a \$250{,}000 query. The curated zone is therefore partitioned by \texttt{day} and \texttt{log\_source}, stored as Snappy-compressed Parquet, and compacted by a Glue job into $\sim$1~GB files so engines do not drown in small-file overhead. Column projection (selecting five of eighty columns) and partition pruning (querying seven days, not five years) bring a typical analyst query down to low gigabytes---pennies.
+
+\textbf{Right engine per question.} Ad-hoc log exploration runs in Athena with tight workgroup limits. Questions joining logs to subscribers and billing run through Spectrum inside Redshift, where warehouse dimensions already live. Hot aggregates that dashboards hit repeatedly are promoted into Redshift as materialized views over the external schema, so Spectrum pays the scan once per refresh, not once per dashboard load.
+
+\textbf{Cold history stays cold.} Logs older than thirteen months transition to Glacier storage classes (Chapter~1) with an Iceberg snapshot retained for audit reproducibility; compliance retrieval is a restore operation, not a query.
+
+\textbf{Governance.} All access flows through the Glue catalog with Lake Formation permissions (Chapter~8), so the same column masks apply whether the analyst arrives via Athena or Spectrum.
+
+\begin{pitfall}
+\textbf{Letting the raw zone become the query surface.} Raw JSON logs scanned interactively are the most expensive way imaginable to answer questions. The raw zone exists for durability and reprocessing; only compacted, partitioned, columnar curated data should be exposed to analysts.
+\end{pitfall}
+
+\section{Interview Q\&A}
+\subsection{Concepts and Trade-offs}
+\begin{enumerate}
+    \item \textbf{Q: Why does Parquet lower Athena cost compared with CSV?}\\
+    A: Athena bills per byte scanned. Parquet is columnar and compressed, so a query reads only the blocks of the columns it references---often one to two orders of magnitude fewer bytes than row-oriented, uncompressed CSV.
+    \item \textbf{Q: What does a Glue crawler infer, and when does it infer wrong?}\\
+    A: It infers columns, types, and partitions by sampling files. It fails when files in one prefix disagree in schema, when samples are unrepresentative, or when a prefix mixes datasets.
+    \item \textbf{Q: When is Redshift Spectrum preferable to Athena for the same S3 data?}\\
+    A: When the query must join lake data with warehouse-resident tables in one statement, or a Redshift cluster is already running and the team wants one SQL surface. For lake-only ad-hoc work with no cluster, Athena is simpler.
+    \item \textbf{Q: How does partition pruning cut bytes scanned?}\\
+    A: The engine reads partition metadata and skips every file outside the query's partition filter---a date-filtered query opens seven day-partitions instead of five years of files.
+    \item \textbf{Q: What makes Apache Iceberg a lakehouse format beyond plain Parquet files?}\\
+    A: A metadata layer providing atomic commits, schema and partition evolution, hidden partitioning, and snapshot time travel---table semantics that raw files on object storage lack.
+    \item \textbf{Q: Why run crawlers against the curated zone rather than the raw zone?}\\
+    A: Inference assumes uniform layout. The curated zone is compacted, typed, and partitioned, so inference succeeds; the raw zone is heterogeneous by design and deserves hand-written DDL.
+\end{enumerate}
+
+\section{Further Reading}
+The Athena User Guide covers workgroups, cost controls, CTAS, and partition projection \cite{awsAthenaDocs}; the Glue documentation covers the Data Catalog and crawler configuration \cite{awsGlueCatalogDocs}; and the Spectrum documentation covers external schemas and the IAM role trust model \cite{awsRedshiftSpectrumDocs}. For table formats, the Apache Iceberg site and specification explain snapshots, manifest files, and partition evolution \cite{apacheIceberg}. Armbrust et al.\ provide the academic framing of the lakehouse itself \cite{armbrust2021lakehouse}.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item Athena turns S3 into a SQL database with no infrastructure; per-byte-scanned pricing makes table layout the cost model.
+    \item The Glue Data Catalog is the shared metastore that lets Athena, Spectrum, EMR, and Glue ETL see one set of tables.
+    \item Crawlers are inference conveniences: trust them in uniform curated zones, hand-write DDL for raw zones, and prefer partition projection at scale.
+    \item Spectrum and Athena read the same catalog; choose per query by join needs and running infrastructure, not by data modeling.
+    \item Parquet plus partitioning plus column projection is the cost-control trinity; Iceberg adds ACID, evolution, and time travel on top.
+    \item In a 50 PB lakehouse, raw zones are for durability, curated zones are for queries, and warehouse materialization is for repeated questions.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Explain why ``bytes scanned'' and ``bytes stored'' diverge more for Parquet than for CSV.
+    \item \textbf{(Conceptual)} Why does a Spectrum query require an active Redshift cluster while an Athena query does not?
+    \item \textbf{(Hands-on)} Run the Thursday lab and produce a scanned-bytes table for CSV versus Parquet, with and without the date filter.
+    \item \textbf{(Hands-on)} Enable partition projection on \texttt{sales\_parquet} and drop the catalog partitions; verify the same queries still prune correctly.
+    \item \textbf{(Hands-on)} Create an Athena workgroup with a 1~GB per-query limit and demonstrate it aborting a full-table CSV scan.
+    \item \textbf{(Design)} Design the S3 prefix scheme, partitioning, and crawler schedule for three log sources with different volumes and retention rules.
+    \item \textbf{(Design)} Decide, with reasons, which tables in the media lakehouse should be Iceberg and which can remain plain Parquet.
+    \item \textbf{(Architecture)} Extend \cref{fig:ch7-media-lakehouse} with a third engine (EMR Spark, Chapter~9) reading the same catalog, and state what governs concurrent writes to an Iceberg table.
+\end{enumerate}
+
+\section{Capstone Project: A Cost-Measured Lakehouse Tier for Web Analytics}\label{sec:ch7-capstone}
+\index{capstone project}\index{lakehouse!capstone}\index{Athena!capstone}
+
+\begin{capstonebox}
+\textbf{Mission.} Build a queryable lakehouse tier over raw web-analytics exports: catalog the raw data, convert it to partitioned Parquet, serve it through Athena and Spectrum, and prove the cost model with measured bytes scanned.
+
+\textbf{Estimated time.} 3--5 hours in a sandbox AWS account.
+
+\textbf{What you\textquotesingle{}ll practice.}
+\begin{itemize}
+    \item Crawler configuration, schema validation, and partition projection on the Glue catalog.
+    \item CTAS conversion from CSV to partitioned, compressed Parquet.
+    \item Serving one catalog through two engines and reconciling results.
+    \item Building a scanned-bytes cost model with workgroup guardrails.
+\end{itemize}
+\end{capstonebox}
+
+\subsection*{Scenario}
+A publisher's web-analytics vendor drops hourly CSV exports into S3---about 2~GB per day, two years retained. Analysts currently download files locally; the data team wants governed SQL access, a predictable cost ceiling, and joins against the subscriber dimension already in Redshift.
+
+\subsection*{Requirements}
+\textbf{Functional requirements.}
+\begin{itemize}
+    \item Crawl the raw hourly exports into a \texttt{web\_lake} database; validate the inferred schema against a hand-written contract and document discrepancies.
+    \item Convert history to Snappy Parquet partitioned by \texttt{year/month/day}; register the curated table with partition projection.
+    \item Serve a five-query analyst workload in Athena and the join-with-subscribers query through Spectrum.
+    \item Set an analyst workgroup with a per-query scanned limit and an alarm on daily bytes scanned.
+\end{itemize}
+
+\textbf{Non-functional requirements.}
+\begin{itemize}
+    \item All access resolves through the Glue catalog; no direct S3 paths in analyst queries.
+    \item The cost model states price per query, per analyst-day, and per month at measured volumes.
+    \item Raw and curated zones have distinct lifecycle policies consistent with Chapter~1.
+\end{itemize}
+
+\subsection*{Implementation Steps}
+\begin{enumerate}
+    \item Stage two years of synthetic hourly exports (adapt \cref{lst:ch5-generate} to page-view events).
+    \item Create the database, crawler, and curated table per \cref{lst:ch7-crawler,lst:ch7-ctas}.
+    \item Run the analyst workload in Athena; record bytes scanned per query from the query statistics API.
+    \item Create the Spectrum external schema and run the subscriber-join query; reconcile results with Athena.
+    \item Configure the workgroup limit, trip it deliberately with a raw CSV scan, and capture the event.
+    \item Write the cost model and the one-paragraph engine-selection policy.
+\end{enumerate}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item Catalog inventory: databases, tables, partition counts, and the schema-validation report.
+    \item Bytes-scanned measurements for CSV versus Parquet, with and without partition filters.
+    \item The five-query workload, the Spectrum join, and reconciled results.
+    \item The cost model and guardrail configuration with the tripped-alarm evidence.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item The curated table is partitioned, Parquet, Snappy, and uses partition projection.
+    \item Parquet conversion reduces scanned bytes by at least 5$\times$ on the workload, documented per query.
+    \item Athena and Spectrum return identical results on the shared table.
+    \item The workgroup limit demonstrably aborts an unbounded query.
+    \item The cost model is reproducible from the recorded measurements.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Convert the curated table to Iceberg and demonstrate schema evolution (add a column) and time travel.
+    \item Add a Glue ETL compaction job that merges small files nightly and measure its effect on query planning time.
+    \item Materialize the two heaviest dashboard queries into Redshift and report the monthly Spectrum saving.
+    \item Compare Athena engine v3 function coverage with the functions your workload actually uses; document any rewrites.
+\end{itemize}

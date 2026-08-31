@@ -1,0 +1,293 @@
+\chapter{Unstructured Data and Generative AI Data Products}
+\index{Document Intelligence}\index{Azure Cognitive Search}\index{Azure OpenAI}\index{OCR}\index{Azure Functions}\index{retrieval-augmented generation}%
+\begin{objectives}
+\begin{itemize}
+    \item Extract key-value pairs and tables from scanned documents with Azure AI Document Intelligence.
+    \item Apply Azure AI Language (NER, key phrases, PII detection) and Translator inside data pipelines.
+    \item Trigger document processing with an Azure Function on ADLS Gen2 upload and persist structured JSON to the lake.
+    \item Index extracted metadata in Azure AI Search so unstructured content becomes queryable.
+    \item Design retrieval-augmented generation (RAG) data products over enterprise content with Azure OpenAI.
+    \item Govern PII exposed by OCR and embeddings, and evaluate hallucination risk in generated outputs.
+    \item Complete the Part V milestone: an end-to-end MLOps pipeline from feature extraction to nightly batch scoring.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+Document AI, search, and managed foundation models exist on every cloud; the pipeline pattern---ingest, extract, index, retrieve, generate---is identical across vendors.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{3.0cm}p{2.9cm}p{3.1cm}p{3.2cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{AWS} & \textbf{Azure} & \textbf{GCP} \\
+\midrule
+Document extraction & Textract & AI Document Intelligence & Document AI \\
+NLP / PII detection & Comprehend & AI Language & Cloud Natural Language \\
+Translation & Amazon Translate & Azure Translator & Cloud Translation \\
+Search / vectors & OpenSearch / Kendra & AI Search (vector + hybrid) & Vertex AI Search \\
+Foundation models & Bedrock & Azure OpenAI Service & Vertex AI (Gemini) \\
+Event-driven processing & Lambda & Azure Functions & Cloud Functions \\
+\addlinespace
+\multicolumn{4}{@{}l@{}}{\textbf{Fabric}: AI skills over OneLake; \textbf{Snowflake}: Cortex (LLM functions in SQL); \textbf{MongoDB}: Atlas Vector Search.} \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+The RAG pattern taught here---chunk, embed, index, retrieve, ground the model---is the same architecture whether the vector store is AI Search, OpenSearch, pgvector, or Atlas Vector Search.
+\end{crosscloud}
+
+\begin{keyterms}
+\textbf{Document Intelligence}: Azure's document extraction service---layout, tables, key-value pairs, and prebuilt invoice/receipt/ID models.\quad
+\textbf{AI Search}: Azure's search service with keyword, vector, and hybrid (semantic) retrieval over indexed content.\quad
+\textbf{RAG}: retrieval-augmented generation---grounding a language model's answers in retrieved enterprise documents.\quad
+\textbf{Embedding}: a vector representation of text enabling semantic similarity search.\quad
+\textbf{Skillset}: AI Search's enrichment pipeline applied at indexing time (OCR, entity extraction, translation).
+\end{keyterms}
+
+\section{Week 20 Overview: The Other 80\% of Enterprise Data}
+Everything so far assumed data arrives as rows. Enterprise reality is messier: invoices are scanned PDFs, contracts are Word documents, support tickets are prose, product catalogs are images. Week 20 brings unstructured content into the platform with Azure's AI services \cite{microsoft2025docIntelligence}, then goes one step further: once content is extracted, embedded, and indexed, it can \emph{ground generative models}---the retrieval-augmented generation pattern that turned search indexes into the data layer of the generative AI wave \cite{microsoft2025azureOpenAI}. The data engineer's job is unchanged in kind: move content reliably, extract faithfully, govern what is sensitive, and make it findable.
+
+\section{Monday: Document Intelligence and Vision}
+\index{Document Intelligence}\index{OCR}
+
+\subsection{Layout, Prebuilt, and Custom Models}
+Document Intelligence offers three depths. \textbf{Read/Layout} extracts text, tables, and structure from any document. \textbf{Prebuilt models}---invoices, receipts, IDs, business cards---return typed fields (\texttt{VendorName}, \texttt{InvoiceTotal}, line items) with confidence scores, no training required. \textbf{Custom models} learn your forms from a handful of labeled samples. Choose the shallowest model that meets the field-level accuracy bar; prebuilt invoice extraction beats a custom model you have to maintain, until your invoices' layouts defeat it.
+
+\subsection{Confidence Is Part of the Schema}
+Extraction is probabilistic. Every extracted field carries a confidence; the pipeline design must decide what happens below the threshold---route to human review, flag in the output schema, or quarantine like a contract violation (Chapter 11). Treating OCR output as deterministic text is the unstructured-data version of trusting external input.
+
+\begin{pitfall}
+\textbf{OCR-exposed PII.} Scanning user-uploaded documents surfaces names, addresses, account numbers, and health data that never appeared in your structured schemas. Classify extracted output with the same Purview rules (Chapter 22) as any other zone, and run AI Language's PII detection over extracted text before it reaches searchable indexes.
+\end{pitfall}
+
+\section{Tuesday: Language, Translator, and Enrichment}
+\index{Azure AI Language}\index{Translator}
+
+\subsection{Language Understanding as a Transform}
+AI Language provides named-entity recognition, key-phrase extraction, sentiment, summarization, and PII detection as callable transforms. In a data pipeline they are just another hop: support tickets land in bronze, a Function or Databricks job calls the Language endpoint, and the silver table gains \texttt{entities}, \texttt{key\_phrases}, \texttt{sentiment}, and \texttt{pii\_redacted\_text} columns. Translator plays the same role for multilingual estates---translate at ingestion so downstream search and analytics operate on one language, preserving originals in bronze.
+
+\subsection{Batching and Cost}
+Cognitive services bill per text record or page; the cost lever is batching (submit documents in batches, cache by content hash so reprocessed files do not rebill) and selectivity (extract only the fields the data product needs). A pipeline that re-OCRs a 50~PB corpus on every retry has a retry-shaped cost bug.
+
+\section{Wednesday: Event-Driven Document Processing and Search}
+\index{Azure Functions}\index{Azure AI Search}
+
+\subsection{The Function-on-Upload Pattern}
+The canonical unstructured pipeline: upload to ADLS Gen2 $\rightarrow$ Event Grid \texttt{BlobCreated} $\rightarrow$ Azure Function $\rightarrow$ Document Intelligence $\rightarrow$ structured JSON to the silver zone. This is Chapter 12's event-driven orchestration applied to documents; the Function is the right-sized compute because extraction latency is dominated by the service call, not by local work.
+
+\begin{lstlisting}[language=Python,caption={Event Grid-triggered Function extracting an invoice and landing JSON in the lake.},label={lst:ch20-function}]
+import azure.functions as func
+from azure.ai.documentintelligence import DocumentIntelligenceClient
+from azure.identity import DefaultAzureCredential
+import json, os
+
+client = DocumentIntelligenceClient(
+    endpoint=os.environ["DOCINTEL_ENDPOINT"],
+    credential=DefaultAzureCredential())
+
+def main(event: func.EventGridEvent, outputBlob: func.Out[str]):
+    blob_url = event.get_json()["url"]
+    poller = client.begin_analyze_document_from_url(
+        "prebuilt-invoice", blob_url)
+    result = poller.result()
+    fields = {k: {"value": v.content, "confidence": v.confidence}
+              for doc in result.documents
+              for k, v in doc.fields.items()}
+    outputBlob.set(json.dumps({
+        "source": blob_url,
+        "model": "prebuilt-invoice",
+        "fields": fields}))
+\end{lstlisting}
+
+\subsection{Making It Searchable}
+Azure AI Search indexes the extracted JSON---full-text over content, vector indexes over embeddings, hybrid queries combining both, with semantic ranking on top \cite{microsoft2025cognitiveSearch}. Indexers can crawl the lake directly with a skillset that applies OCR and entity extraction \emph{at index time}, which suits content that needs search but not a curated silver schema. The design decision: extract-then-index when the structured fields are themselves a data product (downstream SQL, BI); index-time enrichment when search \emph{is} the product.
+
+\section{Thursday Hands-on Project: Invoice Extraction Function}
+\index{hands-on lab}\index{Document Intelligence!project}
+Build the Function from Listing~\ref{lst:ch20-function}: a scanned-PDF invoice uploaded to the lake is extracted to key-value JSON within seconds, with low-confidence fields flagged.
+
+\subsection{Provision}
+\begin{lstlisting}[language=bash,caption={Document Intelligence and a Function App with a managed identity.},label={lst:ch20-provision}]
+$rg = "rg-de-azure-book-week20"
+az group create --name $rg --location eastus
+
+az cognitiveservices account create --name docintel-wk20 `
+  --resource-group $rg --kind FormRecognizer --sku S0 `
+  --location eastus --custom-domain docintel-wk20
+
+az functionapp create --name func-wk20-doc --resource-group $rg `
+  --consumption-plan-location eastus --runtime python --runtime-version 3.11 `
+  --functions-version 4 --storage-account <stfunc> --os-type Linux `
+  --assign-identity "[system]"
+\end{lstlisting}
+
+Grant the Function's managed identity \texttt{Cognitive Services User} on the Document Intelligence account and blob access to the lake; wire the Event Grid subscription on \texttt{BlobCreated} for the \texttt{incoming/invoices/} prefix.
+
+\subsection{Test the Confidence Path}
+Upload a clean invoice (fields extracted, confidences high, JSON lands in silver) and a deliberately degraded scan---crumpled, low DPI. Verify low-confidence fields carry their scores and route to the review queue; verify the Function is idempotent against duplicate Event Grid deliveries by keying the output blob name on the source blob's content hash.
+
+\section{Friday Use Case: Terabytes of User Images, Searchable}
+\index{use case}\index{Azure AI Search!at scale}
+A marketplace ingests terabytes of seller-uploaded images. Requirements: OCR any text in images, tag objects and scenes, detect policy-violating content, and make all of it searchable by support and trust-and-safety teams.
+
+\subsection{Architecture}
+Upload $\rightarrow$ Event Grid $\rightarrow$ Function fan-out $\rightarrow$ Vision (captioning, tags, OCR) and Content Moderator $\rightarrow$ extracted metadata JSON to silver $\rightarrow$ AI Search index (keyword over tags/text, vector over image-caption embeddings) $\rightarrow$ an internal search app. PII detection runs over OCR text before indexing; moderation verdicts gate public visibility. The Chapter 13 principles apply at the ingestion edge; the Chapter 22 governance applies to what OCR reveals.
+
+\subsection{From Search to RAG}
+The same index grounds a generative assistant: a trust-and-safety analyst asks ``show me listings that look like counterfeit handbags from new sellers,'' the query embeds and retrieves matching content from AI Search, and Azure OpenAI synthesizes an answer with citations to the retrieved listings \cite{microsoft2025azureOpenAI}. The data product discipline is what makes the AI safe: grounded answers, citations, access control enforced at retrieval (security filters per user), and evaluation of groundedness before the assistant ships.
+
+\begin{pitfall}
+\textbf{Ungrounded generation over enterprise data.} A language model answering from parametric memory will invent plausible policy numbers and listing IDs. RAG exists to make answers checkable: if the assistant cannot cite the retrieved document, it does not answer. Enforce citation requirements in the system prompt and in evaluation.
+\end{pitfall}
+
+\section{Architectural Decision Record Template}
+\index{architectural decision record}
+Per unstructured pipeline record: extraction model choice (read/prebuilt/custom) with the accuracy evidence, confidence thresholds and the human-review route, PII handling of extracted text, index schema (keyword/vector/hybrid) with the query patterns it serves, and---for generative surfaces---the grounding, citation, and evaluation policy.
+
+\section{Operational Deep Dive: Evaluation as Pipeline Testing}
+\index{evaluation!generative AI}
+Generative data products need evaluation pipelines the way ETL needs data-quality tests. Maintain a golden set of analyst questions with known-correct answers; run the assistant against it on every index or prompt change; measure groundedness and citation accuracy, not vibes. A model or prompt change that regresses the golden set blocks deployment---the Chapter 19 promotion gate, applied to prompts and indexes.
+
+\section{Troubleshooting Patterns}
+\index{troubleshooting!AI services}
+Extraction quality collapsed after a vendor redesign $\rightarrow$ prebuilt model drift; evaluate a custom model on the new layout. Function timeouts on large PDFs $\rightarrow$ extraction is slow for hundred-page scans; switch to asynchronous pattern with a completion queue. Search results stale $\rightarrow$ indexer cadence or change detection policy on the lake datasource. Assistant answers ungrounded $\rightarrow$ retrieval returning irrelevant chunks; fix chunking and top-$k$ before touching the prompt.
+
+\section{Week 20 Lab Rubric}
+\index{rubric}
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.2cm}p{5.0cm}p{5.0cm}@{}}
+\toprule
+\textbf{Criterion} & \textbf{Meets expectation} & \textbf{Needs improvement} \\
+\midrule
+Extraction & Confidence-aware output with a review route for low scores & OCR text trusted blindly \\
+Eventing & Idempotent Function keyed on content hash & Duplicate processing per Event Grid retry \\
+PII & Extracted text classified/redacted before indexing & PII searchable in the index \\
+Generative & Grounded answers with citations and golden-set evaluation & Ungrounded answers, untested prompts \\
+\bottomrule
+\end{tabular}
+\caption{Week 20 rubric for the unstructured-data deliverables.}
+\label{tab:ch20-rubric}
+\end{table}
+
+\section{Interview Q\&A}
+\subsection{Concepts and Trade-offs}
+\begin{enumerate}
+    \item \textbf{Q: Which service extracts key-value pairs from scanned invoices?}\\
+    A: Azure AI Document Intelligence---the prebuilt invoice model returns typed fields with confidence scores, no training needed.
+    \item \textbf{Q: Why trigger document processing with a Function on blob upload?}\\
+    A: Event-driven processing removes polling; the Function is right-sized because extraction latency lives in the service call, not local compute.
+    \item \textbf{Q: How do you make extracted document metadata searchable?}\\
+    A: Land structured JSON in the lake and index it in AI Search---keyword, vector, or hybrid depending on query patterns.
+    \item \textbf{Q: What PII risks arise when OCR-ing user-uploaded documents?}\\
+    A: OCR surfaces PII that structured schemas never declared; extracted text must be classified and redacted before it reaches searchable indexes.
+\end{enumerate}
+
+\section{Further Reading}
+The Document Intelligence \cite{microsoft2025docIntelligence}, AI Search \cite{microsoft2025cognitiveSearch}, and Azure OpenAI \cite{microsoft2025azureOpenAI} documentations are the primary sources. The ADF documentation \cite{microsoft2025adf} covers calling cognitive services from pipelines, and Chapter 22's Purview material governs what extraction exposes.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item Choose the shallowest extraction model that meets the accuracy bar: read, then prebuilt, then custom.
+    \item Confidence scores are part of the output schema; low-confidence fields need a human-review route.
+    \item Event Grid plus Functions makes document processing event-driven; content-hash keys make it idempotent.
+    \item Extract-then-index when fields are a data product; index-time enrichment when search is the product.
+    \item OCR and embeddings expose PII---classify and redact before indexing.
+    \item RAG makes generative answers checkable; golden-set evaluation gates every prompt or index change.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} When does a custom Document Intelligence model beat the prebuilt invoice model?
+    \item \textbf{(Conceptual)} Explain why extraction output must be treated as probabilistic, and what that implies for schema design.
+    \item \textbf{(Conceptual)} Compare keyword, vector, and hybrid retrieval for the trust-and-safety search app.
+    \item \textbf{(Hands-on)} Complete the Thursday project with both the clean and degraded invoices.
+    \item \textbf{(Hands-on)} Add AI Language PII detection as a second hop and verify redaction before indexing.
+    \item \textbf{(Hands-on)} Build the golden-set evaluation harness and demonstrate a blocked regression.
+    \item \textbf{(Design)} Design the security-trimmed RAG index: per-user document visibility enforced at retrieval.
+    \item \textbf{(Design)} Write the ADR for extract-then-index versus index-time enrichment for the marketplace.
+    \item \textbf{(Design)} Specify the moderation gate: which verdicts block visibility, and how do appeals reprocess?
+    \item \textbf{(Interview)} Prepare a two-minute answer to ``why did the assistant quote a policy that does not exist?''
+\end{enumerate}
+
+\section{Milestone 5 Capstone: End-to-End MLOps Pipeline}\label{sec:ch20-capstone}
+\index{capstone project}\index{MLOps!capstone}
+
+\begin{capstonebox}
+\textbf{Mission:} Assemble Part V: ADF orchestrates Synapse feature extraction $\rightarrow$ Azure ML pipeline (preprocess, train, evaluate) $\rightarrow$ metric-gated registration $\rightarrow$ a batch endpoint scoring new data nightly, with drift-triggered retraining and full lineage.
+
+\textbf{Estimated time:} 8--10 hours.
+
+\textbf{What you will practice:}
+\begin{itemize}
+    \item Cross-service orchestration (ADF driving Synapse and AML).
+    \item Versioned pipeline components with pinned environments (Chapter 18).
+    \item Metric-gated registration and batch serving (Chapters 18--19).
+    \item Drift detection wired to automated retraining (Chapter 19).
+\end{itemize}
+\end{capstonebox}
+
+\subsection*{Scenario}
+The retailer's data science team ships a churn model that scores the full customer base nightly. Requirements: no manual steps from feature refresh to scored output, a metric gate before any registration, and a drift alert that retrains without human detection---while every model remains traceable to its training data.
+
+\subsection*{Requirements}
+\begin{itemize}
+    \item \textbf{Orchestration:} ADF pipeline runs Synapse feature extraction, then invokes the AML pipeline; failure paths notify.
+    \item \textbf{Training:} AML components with pinned environments; datastore access via managed identity only.
+    \item \textbf{Gating:} registration requires $\text{AUC} \ge 0.80$ plus recorded approval; batch endpoint created from the registered model.
+    \item \textbf{Monitoring:} drift monitor on production inputs; endpoint/job metrics in Azure Monitor; one tested alert.
+    \item \textbf{Tests:} at least three automated checks---metric threshold, feature-schema validation, batch-output sanity---with a failing case.
+\end{itemize}
+
+\subsection*{Reference Architecture}
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[node distance=1.1cm]
+        \node[stage] (adf) {ADF\\orchestrator};
+        \node[stage, right=1.2cm of adf] (syn) {Synapse\\feature extract};
+        \node[stage, right=1.2cm of syn] (aml) {AML pipeline\\train + evaluate};
+        \node[store, right=1.2cm of aml] (reg) {Model\\Registry};
+        \node[stage, below=1.0cm of aml] (batch) {Batch endpoint\\nightly scoring};
+        \node[doc, above=0.9cm of aml] (drift) {Drift monitor\\Event Grid retrain};
+        \draw[arrow] (adf) -- (syn);
+        \draw[arrow] (syn) -- (aml);
+        \draw[arrow] (aml) -- (reg);
+        \draw[arrow] (reg) -- (batch);
+        \draw[arrow, dashed] (drift) -- (aml);
+    \end{tikzpicture}%
+    }
+    \caption{Milestone 5 architecture: ADF-orchestrated feature extraction, gated AML training, nightly batch scoring, drift-triggered retraining.}
+    \label{fig:ch20-capstone-arch}
+\end{figure}
+
+\subsection*{Implementation Steps}
+\begin{enumerate}
+    \item Register the ADLS datastore with the workspace managed identity; version the feature asset.
+    \item Build the AML pipeline with the metric gate (Chapter 18).
+    \item Create the batch endpoint from a registered model; schedule nightly scoring from ADF.
+    \item Configure the drift monitor and the Event Grid retraining path; fire it with the synthetic drift experiment.
+    \item Produce the cost estimate (AML compute, storage, ADF) with two optimizations.
+\end{enumerate}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item All pipeline definitions, component code, and orchestration JSON in the repo.
+    \item Evidence pack: gate pass/fail, drift alert, batch output sanity checks, lineage query results.
+    \item README that runs the system end-to-end from a clean workspace.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item A clean-environment run executes train $\rightarrow$ register $\rightarrow$ nightly batch scoring with no manual steps.
+    \item A degraded training run is blocked by the gate; a drift event triggers retraining automatically.
+    \item Every scored batch traces to a model version, a data asset version, and a pipeline run.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Add this chapter's document pipeline as a feature source (extracted invoice fields as churn features).
+    \item Replace nightly batch with an online endpoint behind blue-green for a real-time consumer.
+    \item Add a champion/challenger evaluation on joined outcomes before promotion.
+\end{itemize}

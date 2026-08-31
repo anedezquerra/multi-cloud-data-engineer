@@ -1,0 +1,284 @@
+\chapter{Performance Profiling and Query Tuning}
+\index{database profiler}\index{system.profile}\index{explain()}\index{IXSCAN}\index{COLLSCAN}\index{\$indexStats}\index{slow query log}\index{performance tuning}\index{WiredTiger tickets}%
+
+\begin{objectives}
+\begin{itemize}
+    \item Enable and mine the database profiler and \texttt{system.profile} collection without harming production.
+    \item Read \texttt{explain()} plans stage by stage: \texttt{COLLSCAN}, \texttt{IXSCAN}, \texttt{FETCH}, \texttt{SORT\_KEY\_GENERATOR}, and their cost signatures.
+    \item Diagnose systemic bottlenecks: WiredTiger ticket saturation, slow-log patterns, and index waste via \texttt{\$indexStats}.
+    \item Distinguish the three cache failure modes and apply the tuning order: workload, cache size, eviction, compression, then hardware.
+    \item Build a capacity model from working-set measurements and write amplification, with headroom as a re-measurable policy.
+    \item Apply a repeatable performance methodology: measure, rank by total cost, fix the plan, verify, regression-guard.
+    \item Profile an un-optimized database in the Thursday lab and remove redundant indexes safely.
+    \item Conduct a queued-ticket (\texttt{qr/qw}) architectural audit as the Friday engagement.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+Performance diagnosis is the most transferable skill in this book: every platform exposes the same four instruments---a query plan, a slow log, wait/queue metrics, and per-object usage statistics---with different names.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{2.9cm}p{3.0cm}p{3.0cm}p{3.0cm}@{}} 
+\toprule
+\textbf{Instrument} & \textbf{AWS (RDS/Redshift)} & \textbf{Azure (SQL/Cosmos)} & \textbf{GCP (SQL/BigQuery)} \\
+\midrule
+Query plan & EXPLAIN / Redshift plan & Query Store plans & EXPLAIN / dry-run slots \\
+Slow log & RDS slow query log & Azure SQL diagnostics & Cloud SQL insights \\
+Wait/queue metrics & Performance Insights waits & DMVs / wait stats & Query Insights \\
+Object usage stats & pg\_stat\_user\_indexes & sys.dm\_db\_index\_usage\_stats & INFORMATION\_SCHEMA \\
+\addlinespace
+Snowflake / Fabric & \multicolumn{3}{l}{\texttt{QUERY\_HISTORY}, query profile operator timings, warehouse load metrics replace per-index statistics} \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+MongoDB's distinctive contribution is that all four instruments are queryable data inside the database itself---\texttt{system.profile}, \texttt{explain()}, \texttt{serverStatus}, \texttt{\$indexStats}---so diagnosis is a scripting exercise, not a console scavenger hunt \cite{mongodbProfilerDocs,mongodbExplainDocs}.
+\end{crosscloud}
+
+\section{Week 12 Roadmap: From Guessing to Evidence}
+Chapters 9--11 taught you to design fast systems; this week teaches you to fix slow ones. The methodology is deliberately boring: capture what actually ran, rank shapes by total cost (frequency $\times$ latency), read the plan for the worst offender, change one thing, re-measure, and leave a regression guard. Everything this week---the profiler, \texttt{explain()}, ticket metrics, \texttt{\$indexStats}---exists to serve that loop \cite{mongodbProfilerDocs}.
+
+\begin{definitionbox}
+The \textbf{database profiler} records per-operation execution detail (duration, plan summary, keys/documents examined, namespace) into the capped \texttt{system.profile} collection at a configurable sampling threshold.
+\end{definitionbox}
+
+\begin{keyterms}
+\textbf{Query shape}: a query's structure with literal values abstracted away. \textbf{Plan summary}: the profiler's compact plan description (e.g. \texttt{IXSCAN \{status: 1\}}). \textbf{Queued tickets} (\texttt{qr/qw}): operations waiting for WiredTiger read/write concurrency slots. \textbf{\$indexStats}: per-index usage counters. \textbf{ms/-slowms}: the profiler's sampling threshold in milliseconds.
+\end{keyterms}
+
+\section{Monday: The Database Profiler}
+\subsection{Levels and the Cost of Watching}
+\texttt{db.setProfilingLevel()} accepts 0 (off), 1 (sample slow operations), and 2 (everything). Level 2 on a busy system is a self-inflicted incident: every operation writes a profile document through the same storage engine you are trying to measure. The production posture is level 1 with a \texttt{slowms} threshold matched to your latency SLO (typically 50--100 ms), or level 2 for bounded diagnostic windows measured in minutes.
+
+\begin{lstlisting}[language=JavaScript, caption={Profiling posture: level 1 with a 100 ms threshold.}]
+db.setProfilingLevel(1, { slowms: 100 });
+
+// Mine the profile collection like any other data:
+db.system.profile.aggregate([
+  { $match: { ts: { $gte: new Date(Date.now() - 3600e3) },
+              ns: "shop.orders", op: "query" } },
+  { $group: { _id: { shape: "$queryHash", plan: "$planSummary" },
+              count: { $sum: 1 },
+              totalMs: { $sum: "$millis" },
+              avgDocsExamined: { $avg: "$docsExamined" } } },
+  { $sort: { totalMs: -1 } }, { $limit: 10 }
+]);
+\end{lstlisting}
+
+\subsection{Mining by Total Cost, Not Worst Case}
+The aggregation above embodies the week's central discipline: group by \texttt{queryHash} (the shape), rank by \texttt{totalMs} (frequency $\times$ latency), not by the single slowest execution. A 2-second query that runs nightly matters less than a 300 ms query running 50 times per second. \texttt{avgDocsExamined} versus returned counts inside each group tells you whether the fix is an index, a projection, or a reshaped query.
+
+\begin{tipbox}
+\texttt{system.profile} is a capped collection per database and is not replicated; on replica sets, profile the primary and secondaries separately---an analytical query hammering a secondary never appears in the primary's profile.
+\end{tipbox}
+
+\section{Tuesday: Reading Explain Plans}
+\subsection{The Stage Zoo}
+\texttt{explain("executionStats")} renders the plan as a tree of stages; each stage's \texttt{executionTimeMillisEstimate} and examined/returned counters localize the cost. The recurring cast:
+
+\begin{itemize}
+    \item \textbf{COLLSCAN}: full collection scan. Acceptable for tiny collections and one-off migrations; a red flag on any hot path.
+    \item \textbf{IXSCAN}: index scan. Check \texttt{indexBounds}: a selective range examines few keys; \texttt{[MinKey, MaxKey]} means the index was used for sort or traversal, not filtering.
+    \item \textbf{FETCH}: document retrieval after an index scan. Large \texttt{docsExamined} here means the index filters poorly (non-covered, low selectivity).
+    \item \textbf{SORT\_KEY\_GENERATOR} + \textbf{SORT}: an in-memory blocking sort---the index order did not match the requested sort (Chapter 9's direction rules).
+    \item \textbf{COUNT\_SCAN / DISTINCT\_SCAN / TEXT\_OR}: specialized fast paths; recognize them as good news.
+    \item \textbf{SHARDING\_FILTER} and per-shard sub-plans on sharded clusters: count the shards.
+\end{itemize}
+
+\subsection{The Three Diagnostic Ratios}
+Experienced review compresses a plan into three ratios: \texttt{keysExamined/nReturned} (index selectivity; want $\approx 1$), \texttt{docsExamined/nReturned} (fetch efficiency; want $=1$, i.e. covered or tight), and \texttt{executionTimeMillis} per returned document versus the endpoint's budget. A plan can use an index and still be terrible---the ratios, not the stage names, are the verdict.
+
+\begin{pitfall}
+\textbf{Celebrating IXSCAN.} An \texttt{IXSCAN} over \texttt{[MinKey, MaxKey]} bounds is a collection scan wearing an index costume---it reads every index entry, then fetches every document, doing strictly more work than a plain COLLSCAN. Always read the bounds.
+\end{pitfall}
+
+\section{Wednesday: Systemic Bottlenecks}
+\subsection{WiredTiger Tickets and the qr/qw Queue}
+WiredTiger admits a bounded number of concurrent read and write operations (tickets, default 128 each in modern versions). When all tickets are in use, further operations queue---visible in \texttt{serverStatus} as \texttt{globalLock.currentQueue.readers/writers} (the \texttt{qr/qw} of legacy \texttt{mongostat}) and in ticket-availability counters. Sustained queueing means the storage engine, not the query layer, is the bottleneck: causes include cache pressure forcing eviction work per operation, slow disks stretching each operation's ticket hold time, and sheer concurrency beyond the engine's capacity \cite{mongodbServerStatusDocs}.
+
+\subsection{\texttt{\$indexStats}: The Index Inventory Audit}
+\texttt{\{\$indexStats: \{\}\}} reports per-index access counts since server start. The operational use is an inventory audit: indexes with zero or near-zero accesses over a full business cycle are pure write-tax. The audit discipline: collect stats across a representative period (indexes used only by the month-end report look dead mid-month), hide before dropping (Chapter 9), and record the decision.
+
+\subsection{Slow Logs as a Product}
+The structured slow-operation log lines (\texttt{"SLOW QUERY"} components) are a stream you can ship, parse, and dashboard. A mature team treats slow-log volume as a product metric: a weekly budget of slow operations per service, with new shapes triaged like bugs. The alternative---discovering regressions from user complaints---is an observability failure, not a performance one.
+
+\begin{notebox}
+Memory-spill warnings in slow logs (\texttt{usedDisk: true} on sorts and groups) are Chapter 10's 100 MB boundary surfacing in production. Treat every spill in a hot pipeline as a capacity-planning red flag, not an \texttt{allowDiskUse} success story.
+\end{notebox}
+
+\subsection{Cache Failure Modes: Too Small, Too Large, Disk-Bound}
+Chapter 1 explained WiredTiger's cache machinery; profiling tells you which failure mode you are in. \textbf{Cache too small}: the working set does not fit; every request faults pages in, eviction threads churn, and latency follows disk latency---the signature is high \texttt{pages read into cache}, rising application-thread eviction, and latency correlated with disk wait. \textbf{Cache too large}: the OS page cache starves and dirty data accumulates into bursty checkpoints; p99 spikes arrive on the checkpoint rhythm. \textbf{Disk-bound}: the cache is fine but the checkpoint's dirty-page flush exceeds storage bandwidth---queueing with moderate CPU, as in Friday's audit.
+
+\subsection{The Tuning Order and Container-Aware Sizing}
+Tune in order of preference: fix the workload first (indexes, projections, report offload---cheapest and largest effect); then size the cache to the measured working set via \texttt{cacheSizeGB}, leaving OS and process headroom; then adjust eviction targets and triggers to start background eviction earlier under write bursts; then choose compression per collection (Snappy for CPU-bound, Zstandard for I/O-bound); and only then buy IOPS, provisioned for peak checkpoint bandwidth rather than average. On Kubernetes (Chapter 22) or any container runtime, set \texttt{cacheSizeGB} explicitly and align it with the pod's memory limit: WiredTiger sizes from visible memory, and a container that sees host RAM gets OOM-killed while believing it has headroom.
+
+\begin{pitfall}
+\textbf{Tuning eviction knobs before fixing the workload.} Eviction tuning redistributes pain among symptoms; it cannot create cache capacity. Every eviction-tuning change in a design review must cite the workload fix that was ruled out first.
+\end{pitfall}
+
+\subsection{Working Sets, Write Amplification, and the Sizing Model}
+The \textbf{working set}---hot data plus hot index bytes over a representative window---is measured three ways that must roughly agree: hot-slice plus index sizes from \texttt{db.collection.stats()}, cache-fault rate under steady-state traffic, and the cold-cache fill asymptote after a restart under replayed traffic. \textbf{Write amplification}---collection page, one page per affected index, journal record, and checkpoint re-write per logical write---runs 5--20$\times$ on indexed write-heavy workloads, so physical IOPS demand is logical rate times measured amplification, and every secondary index is an IOPS budget line. The sizing document tabulates current sizes, growth, the working-set measurement and its growth rule, peak physical IOPS, and a recommendation with headroom; headroom is a policy with a re-measurement trigger (``2$\times$ measured peak, re-measured quarterly''), not a fixed cushion. For time-bounded access patterns, RAM tracks the hot window---ingest rate times retention---not total data size; prove the access distribution by document age before adopting that plan.
+
+\begin{tipbox}
+Indexes are usually the surprise in working-set estimates. A write-heavy collection's index pages churn through cache continuously; measure data and index working sets separately before proposing \texttt{cacheSizeGB}.
+\end{tipbox}
+
+\section{Thursday Hands-On Project: The Un-Optimized Database Audit}
+You receive a deliberately neglected database: missing indexes, redundant indexes, a spilling pipeline, and one query shape dominating total cost. Produce a measured audit and a fix migration.
+
+\subsection{Lab Generation}
+\begin{lstlisting}[language=JavaScript, caption={A neglected database: redundancy, waste, and a spilling report.}]
+use auditLab;
+db.events.drop();
+for (let i = 1; i <= 1000000; i++) {
+  db.events.insertOne({
+    userId: "u" + (i % 50000), type: ["click","view","buy"][i % 3],
+    ts: new Date(Date.now() - (i % 30) * 86400000),
+    amount: i % 500, tags: ["t" + (i % 100)]
+  });
+}
+// Legacy index inventory: redundant and unused entries.
+db.events.createIndex({ userId: 1 });
+db.events.createIndex({ userId: 1, ts: -1 });
+db.events.createIndex({ type: 1 });            // low cardinality, unused shape
+db.events.createIndex({ amount: 1 });          // never queried
+\end{lstlisting}
+
+\subsection{The Audit Sequence}
+Drive the workload script (a mix of per-user history queries and the spilling daily report), then: (1) mine \texttt{system.profile} for the top shapes by total cost; (2) \texttt{explain("executionStats")} each top shape and record the three ratios; (3) run \texttt{\$indexStats} and classify every index as used/redundant/unused; (4) write the fix migration---new compound index for the dominant shape, hide-then-drop for dead indexes, pipeline rewrite for the spill---and re-measure everything.
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item The profile-mining aggregation, the per-shape explain evidence, and the \texttt{\$indexStats} classification table.
+    \item The fix migration script with rollback, and the before/after measurement table.
+    \item A one-page audit report ranking findings by measured total cost.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item The dominant shape's \texttt{docsExamined/nReturned} ratio drops to ${\approx}1$.
+    \item The spilling pipeline runs with \texttt{usedDisk: false} after the rewrite.
+    \item Every dropped index was hidden first and its drop justified by \texttt{\$indexStats} evidence.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Script the entire audit as a re-runnable tool that outputs the findings table for any database.
+    \item Simulate ticket saturation (a concurrency-500 workload) and capture the queue metrics before/after the fixes.
+\end{itemize}
+
+\section{Friday Use Case and Architecture: The qr/qw Architectural Audit}
+\subsection{Engagement Brief}
+A logistics platform's cluster shows sustained queued reads and writes (\texttt{qr/qw} $> 50$) every afternoon; p99 latency triples while CPU sits at 40\%. The vendor recommendation was ``scale up.'' Your audit must find the structural cause.
+
+\subsection{Findings and Resolution}
+The evidence chain: queued tickets with moderate CPU means operations hold tickets while waiting on I/O; WiredTiger cache metrics show application-thread eviction climbing each afternoon; the profile shows a daily 14:00 report---a \texttt{COLLSCAN} over the events collection---flooding the cache and evicting the OLTP working set. The fix is threefold: the report moves to a tagged analytics secondary (Chapter 8), its pipeline gets an index-backed \texttt{\$match} and early \texttt{\$limit}, and ticket queues get an alert at sustained $>10$. Scaling up would have hidden the report problem for one quarter of data growth and doubled the bill.
+
+\begin{pitfall}
+\textbf{Scaling up a queueing system.} Ticket saturation is usually a workload-shape problem---one greedy operation starving everyone. Bigger hardware raises the ceiling without fixing the shape; the audit must always identify \emph{which} operations hold the tickets.
+\end{pitfall}
+
+\section{Interview Q\&A}
+\subsection{Diagnosis}
+\begin{enumerate}
+    \item \textbf{Q: Why rank slow queries by total cost instead of worst latency?}\\
+    A: Total cost (frequency $\times$ latency) ranks by business impact; a frequent 300 ms query usually costs more than a nightly 2 s query, and fixing it buys back the most capacity.
+
+    \item \textbf{Q: What does \texttt{SORT\_KEY\_GENERATOR} tell you?}\\
+    A: The plan must extract sort keys and sort in memory---the index did not provide order. It is the signal to revisit ESR field order or direction.
+
+    \item \textbf{Q: What do high \texttt{qr/qw} values mean?}\\
+    A: Operations are queueing for WiredTiger read/write tickets: the storage layer is saturated. Causes are cache pressure, slow I/O, or excessive concurrency---rarely the query planner.
+
+    \item \textbf{Q: Why profile secondaries separately?}\\
+    A: \texttt{system.profile} is local and unreplicated; analytical load on secondaries is invisible in the primary's profile.
+
+    \item \textbf{Q: When is dropping a ``zero-usage'' index wrong?}\\
+    A: When the observation window missed its business cycle (month-end, quarterly). Collect across representative periods and hide before dropping.
+\end{enumerate}
+
+\section{Further Reading}
+The profiler and explain references are the primary instruments \cite{mongodbProfilerDocs,mongodbExplainDocs}, with \texttt{serverStatus} for ticket and queue counters \cite{mongodbServerStatusDocs} and the index documentation for \texttt{\$indexStats} context \cite{mongodbIndexesDocs}. The methodology framing---measure, rank, fix, verify---is the SRE approach to latency \cite{sreBook}. The storage-engine tuning sections later in this chapter pick up where these symptoms point \cite{mongodbWiredTigerDocs}.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item The profiler at level 1 with a tuned \texttt{slowms} is a safe production instrument; level 2 is a diagnostic window, not a posture.
+    \item Rank shapes by total cost; fix the dominant shape first; verify with the three ratios.
+    \item Read index bounds, not stage names: an unbounded IXSCAN is worse than a COLLSCAN.
+    \item Queued tickets mean storage saturation; find the greedy operation before buying hardware.
+    \item \texttt{\$indexStats} plus hide-before-drop turns index cleanup into a reversible discipline.
+    \item Cache too small faults pages; cache too large bursts checkpoints; disk-bound queues tickets---three different fixes.
+    \item Capacity models need four measured inputs: working set, write amplification, latency objectives, and growth---with headroom as a re-measurable policy.
+    \item Every fix ships with a regression guard: an alert, a test, or an audit query.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Why is \texttt{system.profile} capped, and what does that imply for long-window analysis?
+    \item \textbf{(Conceptual)} A plan shows \texttt{IXSCAN} with \texttt{docsExamined} $= 10^6$, \texttt{nReturned} $= 50$. Diagnose and propose two fixes.
+    \item \textbf{(Conceptual)} Explain how a single report query can raise \texttt{qr/qw} for the whole cluster.
+    \item \textbf{(Hands-on)} Write the profile-mining pipeline for your own project database and identify its dominant shape.
+    \item \textbf{(Hands-on)} Force a spill (\texttt{allowDiskUse} off, oversized sort), capture the error, then fix the pipeline to eliminate it.
+    \item \textbf{(Design)} Design the slow-log budget policy for a platform team: thresholds, triage SLA, ownership.
+    \item \textbf{(Design)} Write the regression guard for this week's fix: the exact alert or test that fires if the dominant shape regresses.
+    \item \textbf{(Interview)} ``CPU is low but everything is slow.'' Walk your first five diagnostic commands.
+\end{enumerate}
+
+\section{Milestone 3 Capstone: Real-Time Analytical Engine over 100 Million Documents}\label{sec:ch12-capstone}
+
+\begin{capstonebox}
+\textbf{Mission:} integrate Weeks 9--12 into one analytical engine: a 100-million-document workload served by ESR-compliant compound indexes (Chapter 9), faceted one-scan pipelines and windowed rolling metrics materialized with \texttt{\$merge} (Chapters 10--11), and a full profiling pass (this chapter) proving IXSCAN-only plans, zero disk spills, and no redundant indexes.
+
+\textbf{Estimated time:} 6--8 hours, dominated by data generation and index builds.
+
+\textbf{What you will practice:}
+\begin{itemize}
+    \item Deriving indexes from query shapes and proving them with execution statistics.
+    \item Composing faceted, windowed pipelines that respect the 100 MB stage boundary.
+    \item Profiling a whole workload and shipping fixes as reviewed migrations.
+\end{itemize}
+\end{capstonebox}
+
+\subsection*{Scenario}
+A finance analytics product must serve rolling 30-day customer spend metrics, multi-faceted revenue dashboards, and organizational rollups over 100 million ledger documents. Constraints: all dashboard queries fully covered, no disk spilling in steady state, and the analytical workload isolated from the OLTP primary on a dedicated analytics replica set member.
+
+\subsection*{Requirements}
+\begin{itemize}
+    \item Generate 100M ledger documents (or a documented, proportionally scaled subset) with account, region, timestamp, and amount fields.
+    \item Design one ESR compound index per dominant pipeline entry shape; validate coverage with \texttt{explain(`executionStats'')} on every pipeline.
+    \item Implement the pipeline chain: early \texttt{\$match} $\to$ \texttt{\$lookup} $\to$ \texttt{\$facet} $\to$ \texttt{\$setWindowFields} $\to$ \texttt{\$merge} with deterministic keys and watermark plus lookback refresh.
+    \item Run the full profiler audit: mine \texttt{system.profile} for top shapes by total cost, classify all indexes with \texttt{\$indexStats}, and eliminate every redundant or unused index found.
+    \item Provide at least three automated data-quality tests (aggregation parity vs.\ reference SQL, cardinality checks, empty-input edge case) with a failing-case demonstration.
+    \item Provide a monthly cost estimate for the analytics replica set and storage footprint, with two optimization decisions documented.
+\end{itemize}
+
+\subsection*{Implementation Steps}
+\begin{enumerate}
+    \item \textbf{Baseline.} Generate data; run the naive pipeline; record the COLLSCAN baseline and the profiler evidence.
+    \item \textbf{Indexes.} Build ESR indexes per entry shape; prove IXSCAN-only plans and zero FETCH on covered projections.
+    \item \textbf{Pipeline.} Assemble the full stage chain; verify determinism with sort tiebreakers; confirm no spills with \texttt{allowDiskUse} disabled.
+    \item \textbf{Materialize.} Add watermark, lookback, deterministic keys, and \texttt{\$merge}; demonstrate a late-arrival correction.
+    \item \textbf{Audit.} Profile the steady-state workload; remove dead indexes; attach the before/after evidence pack and cost estimate.
+\end{enumerate}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item Generator, index migration, pipeline scripts, refresh job, and the profiler audit report.
+    \item Explain evidence pack: IXSCAN-only, zero spills, covered projections.
+    \item Data-quality test suite with failing-case output, plus the cost-estimate document.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item Every production pipeline starts with an index-backed \texttt{\$match}; no COLLSCAN appears in any explain output.
+    \item Windowed results match the reference implementation on sampled partitions.
+    \item The profiler audit shows zero unused indexes and no memory-spill warnings in steady state.
+    \item Incremental refresh is idempotent and absorbs late arrivals within the lookback window.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Package the audit as a reusable toolkit: one command profiles any database and emits a ranked findings report.
+    \item Replace the scheduled refresh with change-stream-triggered incremental updates (previewing Chapter 16).
+\end{itemize}

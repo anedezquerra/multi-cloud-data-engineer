@@ -1,0 +1,332 @@
+% NOTE: Filename is fixed by the book outline; content teaches Week 23
+% (Compliance & Data Privacy with Amazon Macie) of the syllabus.
+\chapter{Compliance and Data Privacy with Amazon Macie}
+\index{Amazon Macie}\index{PII discovery}\index{data classification}\index{tokenization}\index{right to erasure}\index{crypto-shredding}\index{AWS CloudTrail}\index{AWS Config}%
+\begin{objectives}
+\begin{itemize}
+    \item Discover and classify PII in S3 with Amazon Macie, including custom data identifiers.
+    \item Build non-destructive, auditable quarantine workflows for suspect files.
+    \item Choose among masking, tokenization, and cryptographic hashing in pipelines.
+    \item Propagate GDPR-style erasure requests across lake zones, warehouses, streams, caches, and backups---or render them moot with crypto-shredding.
+    \item Audit data access with CloudTrail data events and configuration posture with AWS Config.
+    \item Architect a third-party data onboarding pipeline that identifies, tokenizes, and safely warehouses PII.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+Sensitive-data discovery, de-identification, and erasure are regulatory constants; each cloud ships a discovery engine and the same architectural answers.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{2.8cm}p{3.0cm}p{3.0cm}p{3.0cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{AWS} & \textbf{Azure} & \textbf{GCP} \\
+\midrule
+PII discovery at rest & Amazon Macie & Microsoft Purview scanning & Sensitive Data Protection (DLP) \\
+Custom identifiers & Macie custom data identifiers & Custom classifiers & Custom infoTypes \\
+Audit trail & CloudTrail (incl.\ data events) & Azure Monitor / audit logs & Cloud Audit Logs \\
+Config posture & AWS Config rules & Azure Policy & Security Command Center \\
+Crypto-shredding & Per-subject KMS keys, then delete key & Per-subject KEKs in Key Vault & Per-subject keys in Cloud KMS \\
+Quarantine pattern & Object Lock bucket + Lambda & Immutability policies + Functions & Bucket lock + functions \\
+\addlinespace
+Erasure across copies & Enumerate zones/snapshots/streams & Same problem, same pattern & Same problem, same pattern \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+\textbf{Snowflake} offers object-tagging-driven masking and supports erasure via row deletion within its retention windows---with Time Travel/Fail-safe explicitly in scope. \textbf{MongoDB} supports client-side field-level encryption, which makes per-subject crypto-shredding natural. \textbf{Fabric} centralizes discovery in Purview over OneLake.
+\end{crosscloud}
+
+\section{Week 23 Roadmap and Mental Model}
+The platform is built; now it must answer to regulators, customers, and counsel. Week~23's three disciplines are \emph{discovery} (you cannot protect PII you have not found---Macie), \emph{de-identification} (masking, tokenization, hashing---and knowing which is reversible), and \emph{erasure} (the right to be forgotten against an architecture that was designed, all book long, to never forget anything: versioning, replication, snapshots, streams, backups) \cite{awsMacieDocs}.
+
+The week's uncomfortable thesis: \textbf{deletion is an architecture, not an API call}. Every durability feature from Chapters 1--16 is an erasure obstacle, and the designs that survive audit are the ones that planned for forgetting at the same time they planned for durability---per-subject encryption keys being the standout pattern.
+
+\begin{definitionbox}
+\textbf{Amazon Macie} is a managed sensitive-data discovery service for S3: it inventories buckets, samples and scans objects with managed and custom data identifiers, and produces findings---typed, located, and severity-scored---that drive quarantine and remediation workflows.
+\end{definitionbox}
+
+\begin{keyterms}
+\textbf{Managed data identifier}: Macie's built-in detectors (credit cards, national IDs, names, credentials). \textbf{Custom data identifier}: your regex-plus-context detector for domain-specific identifiers. \textbf{Finding}: a located, typed, severity-scored discovery. \textbf{Masking}: irreversible redaction for display. \textbf{Tokenization}: reversible substitution via a mapping under control. \textbf{Crypto-shredding}: deleting a subject's encryption key to render all copies unrecoverable. \textbf{Data events}: CloudTrail's per-object API logging.
+\end{keyterms}
+
+\section{Monday: Amazon Macie---Automated PII Discovery}
+\subsection{What Macie Actually Does}
+Macie maintains a continuous inventory of your S3 estate and runs discovery jobs (or automated discovery) that sample objects, apply managed data identifiers (credit cards with Luhn validation, national identifiers, credentials, contact data), evaluate your custom data identifiers, and emit findings: which object, which identifiers, how many occurrences, how severe \cite{awsMacieDocs}. Findings route to EventBridge---which is what turns discovery into workflow.
+\index{Macie}\index{managed data identifier}
+
+Beyond regex, Macie's detectors use proximity keywords, checksums, and format validation to suppress false positives---a 16-digit number that fails Luhn is not a credit-card finding. That is why managed identifiers outperform hand-rolled regex scanning on both noise and recall.
+
+\subsection{Custom Data Identifiers and the Noise Budget}
+Custom identifiers (order numbers with a known prefix, employee IDs, claim numbers) extend discovery to your domain. Their engineering constraint is the \emph{noise budget}: an over-broad regex generates thousands of findings and trains the team to ignore real PII alerts. Tune custom identifiers against a representative sample before rollout---set proximity keywords, match thresholds, and exclusions---and review finding precision monthly.
+\index{custom data identifier}
+
+\begin{pitfall}
+\textbf{Enabling Macie without a findings workflow.} Discovery without response is liability documentation: you now have written proof that PII sat unprotected and nobody acted. Wire findings to triage (EventBridge $\rightarrow$ SNS/Lambda) before the first job runs, and define severity SLAs.
+\end{pitfall}
+
+\section{Tuesday: De-Identification and the Erasure Problem}
+\subsection{Masking, Tokenization, Hashing}
+Three transformations, three different guarantees. \textbf{Masking} (\texttt{****-****-****-1234}) is irreversible display redaction---right for analyst-facing columns. \textbf{Tokenization} substitutes a value with a token whose mapping lives in a controlled store---reversible under authorization, so the same customer links across systems while raw values stay in the vault. \textbf{Cryptographic hashing} (salted, e.g., HMAC) is one-way: good for join keys and dedup, useless for re-identification---which is the point---but remember that low-entropy identifiers hash to a dictionary-attackable space.
+\index{masking}\index{tokenization}\index{hashing}
+
+\subsection{Right to Erasure Against a Durable Architecture}
+A GDPR-style erasure request must reach every copy: raw S3 lake zones (all \emph{versions}---versioning retains deleted objects), curated zones, Redshift tables (and their snapshots and automated backups until expiry), Kinesis streams (records persist for the full 24-hour-to-365-day retention window), downstream derived tables and aggregates, caches, and cross-region replicas \cite{awsS3ObjectLock,awsS3Replication}.
+
+\textbf{Pattern A: crypto-shredding.} Encrypt each data subject's records under a subject-specific KMS data key at ingestion. Erasure deletes the key; every copy---backups, replicas, Glacier archives, warehouse snapshots---becomes permanently unrecoverable in one auditable operation \cite{awsKMSDocs}. The cost is key-management cardinality (one key per subject) and ingestion-time discipline.
+
+\textbf{Pattern B: enumerated deletion.} Maintain a per-subject copy register; on erasure, delete versioned objects, issue warehouse deletes (with CDC replay downstream), wait out stream retention, and schedule snapshot expiry---then \emph{verify} with a Macie re-scan that no residual PII remains. The cost is a long, testable runbook.
+
+\textbf{The legal-hold exception.} An S3 Object Lock legal hold overrides retention and blocks deletion until released. Erasure jobs must check hold status and route held records to an exception queue---failing or silently skipping them both violate the process.
+\index{right to erasure}\index{crypto-shredding}\index{legal hold}
+
+\begin{pitfall}
+\textbf{The naive DELETE.} On AWS, \texttt{DELETE} does not erase: S3 versioning retains prior versions, Redshift snapshots keep deleted rows until expiry, Kinesis records persist for the retention window, and Glacier archives are immutable until retention ends. Erasure runbooks must enumerate every copy location---then crypto-shred the subject key or schedule versioned deletion plus snapshot expiry, and verify with a Macie re-scan.
+\end{pitfall}
+
+\section{Wednesday: CloudTrail and Config---Auditing Access and Posture}
+\subsection{CloudTrail: The Access Ledger}
+CloudTrail records API activity. Management events (who created the bucket) are on by default; \emph{data events} (who read which S3 object, who invoked which Lambda) are opt-in per bucket/function and are exactly what ``audit data access'' means for a lake \cite{awsCloudTrailDocs}. Deliver trails to a dedicated log-archive account with Object Lock, so the audit trail survives compromise of the account being audited. CloudTrail Lake turns the ledger queryable: ``show every \texttt{GetObject} by this role against the PII prefix in March.''
+\index{CloudTrail}\index{data events}
+
+\subsection{Config: Posture as Code}
+AWS Config records resource configuration over time and evaluates rules: bucket public access disabled, KMS rotation enabled, CloudTrail logging on, endpoint policies present \cite{awsConfigDocs}. For the privacy program, Config is the continuous control: not ``we configured it right in March,'' but ``it is configured correctly right now, and here is the evidence trail of every change since March.''
+\index{AWS Config}
+
+\section{Thursday Hands-on Project: Macie Discovery and Automated Quarantine}
+\index{hands-on project!Macie quarantine}
+Enable Macie on a bucket, upload a CSV containing mock credit card numbers, review the findings, and trigger a Lambda that quarantines the file.
+
+\subsection*{Lab Objectives}
+\begin{itemize}
+    \item Enable Macie and run a one-time discovery job against a test prefix.
+    \item Upload a synthetic CSV with mock card numbers and observe the finding.
+    \item Implement the quarantine path: EventBridge rule $\rightarrow$ Lambda $\rightarrow$ move to an Object-Locked quarantine bucket.
+    \item Produce the audit record linking the finding ID to the quarantine action.
+\end{itemize}
+
+\subsection*{Procedure}
+\begin{lstlisting}[language=bash,caption={Enabling Macie and running a discovery job.},label={lst:ch23-macie}]
+aws macie2 enable-macie
+
+$Job = @"
+{
+  "name": "week23-discovery",
+  "jobType": "ONE_TIME",
+  "s3JobDefinition": {
+    "bucketDefinitions": [{
+      "accountId": "123456789012",
+      "buckets": ["week23-ingest-123456789012"]
+    }],
+    "sampling": { "samplingType": "NONE" }
+  }
+}
+"@
+$Job | Set-Content -Path macie-job.json -Encoding ascii
+aws macie2 create-classification-job --cli-input-json file://macie-job.json
+
+# Synthetic test data (never real PANs):
+Set-Content cards.csv "name,card`nAlice,4111111111111111`nBob,5500005555555559"
+aws s3 cp cards.csv s3://week23-ingest-123456789012/incoming/cards.csv
+aws macie2 list-findings --finding-criteria file://severity-high.json
+\end{lstlisting}
+
+\begin{lstlisting}[language=Python,caption={Quarantine Lambda: non-destructive, audited.},label={lst:ch23-quarantine}]
+import json
+import os
+
+import boto3
+
+s3 = boto3.client("s3")
+QUARANTINE = os.environ["QUARANTINE_BUCKET"]  # Object Lock enabled
+
+def lambda_handler(event, context):
+    detail = event["detail"]
+    finding_id = detail["id"]
+    res = detail["resourcesAffected"]["s3Object"]
+    bucket, key = res["bucketName"], res["key"]
+
+    # Move, do not delete: quarantine preserves evidence under Object Lock.
+    dest_key = f"quarantined/{finding_id}/{key.split('/')[-1]}"
+    s3.copy_object(
+        Bucket=QUARANTINE, Key=dest_key,
+        CopySource={"Bucket": bucket, "Key": key},
+        MetadataDirective="REPLACE",
+        Metadata={"macie-finding-id": finding_id, "source-bucket": bucket},
+    )
+    s3.delete_object(Bucket=bucket, Key=key)
+
+    # The action itself is CloudTrail-logged; the finding ID in metadata
+    # and this log line are the audit linkage.
+    print(json.dumps({"action": "quarantine", "finding": finding_id,
+                      "from": f"{bucket}/{key}", "to": dest_key}))
+\end{lstlisting}
+
+\subsection*{Verification}
+\begin{itemize}
+    \item The discovery job reports findings on the test file with the credit-card identifier type and occurrence locations.
+    \item The EventBridge rule fires on the finding; the object moves to the quarantine bucket with the finding ID in its metadata.
+    \item The quarantine bucket's Object Lock prevents deletion of the quarantined object; CloudTrail shows the copy, the delete, and the finding publication.
+    \item A clean control file produces no finding and remains in place---the false-positive check.
+\end{itemize}
+
+\begin{pitfall}
+\textbf{Quarantining by deletion.} Deleting the suspect file destroys the evidence and makes the incident unanswerable. Move to an Object-Locked quarantine bucket, log the Macie finding ID with every action to CloudTrail, and let retention policy---not panic---govern final disposal.
+\end{pitfall}
+
+\section{Friday Use Case: Tokenizing Third-Party Customer Data Onboarding}
+\index{use case!third-party PII onboarding}
+A retailer buys third-party customer datasets monthly: CSVs with names, emails, phone numbers, and purchase histories. The warehouse needs the analytics value; compliance requires that raw PII never persists in the analytical estate. Design the onboarding pipeline.
+
+\subsection{Architecture}
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[
+        box/.style={rectangle, rounded corners, draw=primary, thick, fill=primary!6, align=center, minimum width=2.9cm, minimum height=1.0cm, font=\small\bfseries},
+        storebox/.style={cylinder, shape aspect=0.25, draw=primary, thick, fill=blue!6, shape border rotate=90, align=center, text width=2.5cm, minimum height=1.25cm, font=\footnotesize\bfseries},
+        guard/.style={rectangle, rounded corners, draw=red!60!black, thick, fill=red!5, align=center, minimum width=2.6cm, minimum height=0.9cm, font=\footnotesize\bfseries},
+        arr/.style={-{Stealth[length=2.5mm]}, draw=primary, thick}
+    ]
+        \node[storebox] (drop) at (0,0) {Vendor drop\\S3 (locked)};
+        \node[guard] (macie) at (3.1,0) {Macie scan\\+ classify};
+        \node[box] (glue) at (6.3,0) {Glue job\\tokenize via KMS};
+        \node[storebox] (safe) at (9.5,0) {Sanitized zone\\(tokenized)};
+        \node[box] (rs) at (12.6,0) {Redshift\\warehouse};
+        \node[guard] (vault) at (6.3,2.1) {Token vault\\(separate account)};
+        \node[guard] (rescan) at (9.5,-2.1) {Macie re-scan\\verification};
+        \draw[arr] (drop) -- (macie);
+        \draw[arr] (macie) -- (glue);
+        \draw[arr] (glue) -- (safe);
+        \draw[arr] (safe) -- (rs);
+        \draw[arr, dashed] (vault) -- (glue);
+        \draw[arr, dashed] (rescan) -- (safe);
+    \end{tikzpicture}%
+    }
+    \caption{Third-party PII onboarding: discovery, KMS-anchored tokenization, a sanitized zone, warehouse load, and verification by re-scan.}
+    \label{fig:ch23-onboarding}
+\end{figure}
+
+\subsection{Design Decisions}
+\textbf{Discovery before processing.} Every drop is Macie-scanned on arrival: the scan both classifies the file (which identifier types are present---driving which columns get tokenized) and catches schema surprises (a vendor silently adding a national-ID column produces a new finding type, not a silent warehouse column).
+
+\textbf{Tokenization with KMS anchoring.} The Glue job tokenizes PII columns through a vault in a separate account, with the vault's keys in KMS and access via a tightly scoped role. The token is deterministic per subject, so customer linkage works in the warehouse; the mapping never leaves the vault account. The choice of tokenization over hashing is deliberate: fraud investigations need authorized re-identification, which hashing forbids.
+
+\textbf{The raw drop's lifecycle.} The vendor prefix is Object-Locked, access-restricted, and short-retained: long enough to reprocess on pipeline failure, then expired by lifecycle rule. The sanitized zone is the system of record for analytics; the raw zone is a processing stage, not an asset.
+
+\textbf{Verification as a pipeline stage.} After the load, a Macie re-scan of the sanitized zone must find zero PII before the batch is marked complete; a finding halts publication and pages. Trust, then verify, then scan.
+
+\begin{pitfall}
+\textbf{Tokenizing the warehouse but not the pipeline.} Staging files, Glue temporary directories, error outputs, and logs all held the raw values on the way through. The PII posture must cover the whole path: encrypted staging with short lifecycles, no PII in job logs (log field names, never values), and the re-scan covering intermediate prefixes too.
+\end{pitfall}
+
+\section{Interview Q\&A}
+\subsection{Concepts and Trade-offs}
+\begin{enumerate}
+    \item \textbf{Q: What does Macie detect beyond regex-matched patterns?}\\
+    A: Managed identifiers use checksums (Luhn for cards), proximity keywords, and format validation; Macie also inventories bucket posture (public, unencrypted, shared) alongside content findings.
+    \item \textbf{Q: Why quarantine suspect files with Object Lock instead of deleting them?}\\
+    A: Quarantine preserves evidence immutably for investigation and audit; deletion destroys the artifact the finding refers to and can itself violate retention obligations.
+    \item \textbf{Q: Tokenization versus hashing: which transformation is reversible?}\\
+    A: Tokenization---via the controlled mapping vault. Hashing is one-way; and for low-entropy identifiers, hash dictionaries make it effectively reversible to attackers anyway, so choose tokenization with a real vault when re-identification is a requirement.
+    \item \textbf{Q: What do CloudTrail data events record for S3?}\\
+    A: Object-level API activity---\texttt{GetObject}, \texttt{PutObject}, \texttt{DeleteObject}---per principal, per object: the access ledger for the lake, delivered to an independent log-archive account.
+    \item \textbf{Q: Why tune Macie custom data identifiers before rollout?}\\
+    A: False-positive economics: an over-broad identifier floods findings, and teams trained to ignore alerts miss real PII. Tune on representative samples and review precision monthly.
+    \item \textbf{Q: What makes crypto-shredding superior to enumerated deletion for erasure?}\\
+    A: One key deletion renders every copy---versions, replicas, snapshots, archives---unrecoverable in a single auditable act, instead of a long runbook that must find and delete every copy and then prove it did.
+\end{enumerate}
+
+\section{Further Reading}
+The Macie User Guide covers managed and custom identifiers, jobs, and finding structure \cite{awsMacieDocs}; the KMS guide covers per-subject key patterns for crypto-shredding \cite{awsKMSDocs}; CloudTrail and Config documentation cover the audit and posture layers \cite{awsCloudTrailDocs,awsConfigDocs}. The Object Lock and replication references ground the erasure analysis \cite{awsS3ObjectLock,awsS3Replication}.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item Discovery precedes protection: Macie finds the PII your architecture forgot it had.
+    \item Findings without a workflow are liability documentation; wire triage before the first scan.
+    \item Masking hides, hashing deduplicates, tokenization links under control---choose by reversibility requirement.
+    \item Erasure is architecture: enumerate every copy, or crypto-shred and let copies become ciphertext.
+    \item Legal holds are first-class erasure exceptions; route them, never silently skip them.
+    \item Verify the posture continuously: Config rules for configuration, CloudTrail data events for access, Macie re-scans for content.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Explain why a hash of an email address is not anonymization.
+    \item \textbf{(Conceptual)} Walk the erasure checklist for a subject whose data lives in a versioned bucket, a Redshift table with snapshots, and a Kinesis stream with 7-day retention.
+    \item \textbf{(Hands-on)} Run the Thursday project; add a custom data identifier for your synthetic employee-ID format and tune it to zero false positives on a control set.
+    \item \textbf{(Hands-on)} Implement per-subject KMS data keys on a small dataset and demonstrate crypto-shredding one subject.
+    \item \textbf{(Hands-on)} Write the CloudTrail Lake query reconstructing all access to a quarantined object.
+    \item \textbf{(Design)} Design the exception queue for erasure requests blocked by legal holds: states, owners, SLAs, and audit records.
+    \item \textbf{(Design)} Choose masking, tokenization, or hashing for: analyst dashboards, cross-system join keys, fraud investigation, and marketing audiences. Justify each.
+    \item \textbf{(Architecture)} Extend the Friday architecture for weekly deltas from the same vendor: what changes in discovery, tokenization, and verification?
+\end{enumerate}
+
+\section{Capstone Project: An Auditable PII Onboarding and Erasure Service}\label{sec:ch23-capstone}
+\index{capstone project}\index{PII!capstone}\index{erasure!capstone}
+
+\begin{capstonebox}
+\textbf{Mission.} Productize the Friday pipeline: third-party datasets are discovered, classified, tokenized, and warehoused---with a working erasure service that handles a deletion request end to end, including the legal-hold exception and the verification re-scan.
+
+\textbf{Estimated time.} 8--10 hours in sandbox accounts.
+
+\textbf{What you\textquotesingle{}ll practice.}
+\begin{itemize}
+    \item Macie-driven classification as a pipeline stage, not a report.
+    \item Vault-backed tokenization with KMS anchoring and separate-account custody.
+    \item Erasure runbooks (enumerated) and crypto-shredding (key-based), compared in practice.
+    \item Continuous verification: Config, CloudTrail data events, and re-scans.
+\end{itemize}
+\end{capstonebox}
+
+\subsection*{Scenario}
+The retailer's privacy office requires evidence, not assurances: the onboarding service must pass a quarterly audit in which auditors pick a subject and a batch and ask you to prove the subject's PII exists nowhere it should not---and, for one exercised request, nowhere at all.
+
+\subsection*{Requirements}
+\textbf{Functional requirements.}
+\begin{itemize}
+    \item Onboarding per \cref{fig:ch23-onboarding}, with classification-driven tokenization mapping.
+    \item An erasure runbook covering versions, snapshots, streams, and replicas, executed end to end on a test subject.
+    \item The legal-hold exception path: held records queued, not deleted, with audit records.
+    \item Post-erasure Macie re-scan evidence attached to the request record.
+\end{itemize}
+
+\textbf{Non-functional requirements.}
+\begin{itemize}
+    \item The token vault lives in a separate account; re-identification is possible, logged, and alarming.
+    \item Raw staging prefixes expire by lifecycle; pipeline logs contain no PII values.
+    \item CloudTrail data events cover all PII prefixes; Config rules cover the posture controls.
+\end{itemize}
+
+\subsection*{Implementation Steps}
+\begin{enumerate}
+    \item Build the onboarding pipeline with the scan-classify-tokenize-load stages.
+    \item Implement the vault integration and the re-identification procedure with its alarm.
+    \item Author the erasure runbook; implement crypto-shredding for one domain as the comparison.
+    \item Run the full erasure drill including the held-record exception.
+    \item Produce the audit packet: findings, actions, re-scan evidence, access ledger extracts.
+\end{enumerate}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item Pipeline code, vault policies, and the classification-to-tokenization mapping.
+    \item The erasure runbook and its drill evidence, including the exception queue.
+    \item The crypto-shredding proof (key deletion, unreadable copies) and the comparison memo.
+    \item The quarterly-audit packet, produced end to end.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item The auditor's sample subject is provably absent from every location post-erasure, with the re-scan attached.
+    \item A held record survives the drill in the exception queue with its audit trail, not in a failed job.
+    \item Re-identification is possible for an authorized role and alarms on use.
+    \item No PII value appears in any pipeline log---verified by scan of the log groups.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Extend crypto-shredding across all domains and retire the enumerated runbook.
+    \item Automate the audit packet as a scheduled report.
+    \item Add DSAR intake (EventBridge + Step Functions workflow) with SLA tracking.
+    \item Build the data-minimization review: which collected fields earn their privacy cost?
+\end{itemize}

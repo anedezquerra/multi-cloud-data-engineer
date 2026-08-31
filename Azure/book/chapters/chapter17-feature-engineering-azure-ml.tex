@@ -1,0 +1,314 @@
+\chapter{Feature Engineering and In-Database Machine Learning}
+\index{feature engineering}\index{PREDICT}\index{ONNX}\index{Synapse Spark}\index{training-serving skew}\index{in-database scoring}%
+\begin{objectives}
+\begin{itemize}
+    \item Explain where feature engineering belongs in a data platform and why feature definitions must be shared between training and scoring.
+    \item Train a classification model with Synapse Spark (or SynapseML) on warehouse data and export it in ONNX format.
+    \item Score live rows natively in a dedicated SQL pool with the T-SQL PREDICT function.
+    \item Eliminate data movement from the scoring path and reason about when in-database scoring beats a real-time endpoint.
+    \item Keep training and scoring feature schemas aligned and detect skew before it degrades a model silently.
+    \item Build the Thursday churn model end-to-end: Spark training, ONNX export, SQL scoring.
+    \item Architect a SQL-only daily inventory forecasting system for 1{,}000 retail stores.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+In-database scoring---pushing the model to the data rather than shipping data to a model server---exists in every analytical engine, typically via ONNX or a native PREDICT-style function.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{3.0cm}p{2.9cm}p{3.1cm}p{3.2cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{AWS} & \textbf{Azure} & \textbf{GCP} \\
+\midrule
+In-database scoring & Redshift ML (SageMaker) & Synapse T-SQL PREDICT (ONNX) & BigQuery ML \\
+Spark training & EMR + SageMaker & Synapse Spark / SynapseML & Dataproc + Vertex AI \\
+Feature store & SageMaker Feature Store & AML managed feature store & Vertex AI Feature Store \\
+Model format for SQL & (Auto via SageMaker) & ONNX & Native BQML models \\
+Batch scoring & Redshift batch transform & PREDICT over pool tables & ML.PREDICT \\
+\addlinespace
+\multicolumn{4}{@{}l@{}}{\textbf{Fabric}: SynapseML + MLflow in Fabric notebooks; \textbf{Snowflake}: Snowpark ML + SQL inference; \textbf{MongoDB}: Atlas Vector Search + aggregation scoring.} \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+ONNX is the portable artifact: train in Spark (or scikit-learn, PyTorch, TensorFlow), export once, score in SQL, in an AML endpoint (Chapter 18), or at the edge---one model, many runtimes.
+\end{crosscloud}
+
+\begin{keyterms}
+\textbf{Feature}: a measurable model input derived from raw data.\quad
+\textbf{ONNX}: Open Neural Network Exchange, the portable model format PREDICT requires.\quad
+\textbf{PREDICT}: the T-SQL function that scores rows against a stored ONNX model inside the database engine.\quad
+\textbf{Training-serving skew}: divergence between feature computation at training time and at scoring time.\quad
+\textbf{SynapseML}: Microsoft's distributed ML library for Spark on Synapse and Databricks.
+\end{keyterms}
+
+\section{Week 17 Overview: Models Where the Data Lives}
+Part V embeds machine learning into the data platform rather than bolting it on. The shortest path from warehouse data to a scored row does not leave the warehouse: train where compute is rich (Spark), export the model as a portable artifact (ONNX), and score where the data sits (T-SQL PREDICT in the dedicated pool) \cite{microsoft2025synapsePredict}. Every hop you remove---export jobs, feature APIs, network round-trips---is a failure mode deleted and a latency budget returned.
+
+The week's conceptual weight sits in \textbf{feature engineering}: the features are the model's interface to reality, and their definitions must be identical at training and scoring time. In-database scoring makes this discipline vivid: the scoring features come from SQL, so the training features had better be derivable by the same SQL.
+
+\section{Monday: Feature Engineering as Platform Discipline}
+\index{feature engineering!discipline}
+
+\subsection{Features Are Contracts}
+A feature---\texttt{orders\_last\_30d}, \texttt{avg\_basket\_90d}, \texttt{days\_since\_last\_login}---is a versioned, testable data transformation with an owner and a consumer (the model). Treating features as ad-hoc SQL inside training notebooks guarantees the central ML production failure: the model trains on one definition and scores on another. The platform answer is to compute features once, store them in governed feature tables (the gold zone's feature schema, or Chapter 18's managed feature store), and have both training and scoring read from that single definition.
+
+\subsection{Point-in-Time Correctness}
+The subtlest feature bug is \textbf{leakage}: features computed with information that would not have existed at prediction time. A churn feature \texttt{total\_refunds} computed over all history includes refunds that happened \emph{after} the prediction date. The defense is point-in-time joins: every feature row carries an \texttt{as\_of} timestamp, and training sets are assembled with temporal discipline---the same event-time thinking as Chapter 14, applied to ML.
+
+\begin{pitfall}
+\textbf{Notebook-local features.} When the training notebook computes features inline and the scoring path recomputes them in SQL, the two will drift---not if, but when. Persist feature tables; train and score from the same columns.
+\end{pitfall}
+
+\section{Tuesday: T-SQL PREDICT---Scoring Without a Server}
+\index{PREDICT}\index{ONNX}
+
+\subsection{The Mechanism}
+PREDICT scores rows inside the dedicated SQL pool \cite{microsoft2025synapsePredict}: the ONNX model is stored in a table (as a hex-encoded varbinary), and the function joins it against feature columns:
+
+\begin{lstlisting}[language=SQL,caption={Storing an ONNX model and scoring live rows with PREDICT.},label={lst:ch17-predict}]
+-- model bytes land here once, from the Spark export step
+CREATE TABLE ml_models (
+    model_id INT IDENTITY PRIMARY KEY,
+    model_name VARCHAR(100),
+    model_bytes VARBINARY(MAX),
+    created_at DATETIME2 DEFAULT GETDATE()
+);
+
+SELECT c.customer_id,
+       p.score AS churn_probability
+FROM dbo.customer_features c
+CROSS APPLY (
+    SELECT score FROM PREDICT(
+        MODEL = (SELECT TOP 1 model_bytes FROM ml_models
+                 WHERE model_name = 'churn_v3' ORDER BY model_id DESC),
+        DATA = c AS d,
+        RUNTIME = ONNX
+    ) WITH (score REAL)
+) p;
+\end{lstlisting}
+
+Scoring happens where the data already lives: no export, no endpoint, no network. For batch scoring over millions of warehouse rows---nightly churn scores, monthly risk ratings---this is structurally the cheapest and most operationally boring design, which is a compliment.
+
+\subsection{When In-Database Scoring Wins and Loses}
+Wins: batch or interactive scoring over warehouse-resident features; SQL-native teams; governance-sensitive data that must not leave the database perimeter. Loses: sub-100-millisecond scoring of single records from applications (that is Chapter 19's managed online endpoint), features that need live computation (the warehouse only knows what ETL told it), and models too large or exotic for the ONNX runtime inside SQL.
+
+\section{Wednesday: Training with Synapse Spark and Exporting ONNX}
+\index{Synapse Spark}\index{SynapseML}
+
+\subsection{The Training Path}
+Synapse Spark pools (or Databricks, Chapter 9) read warehouse or lake features, train with Spark MLlib or SynapseML \cite{microsoft2025synapseml}, evaluate against a holdout, and export ONNX:
+
+\begin{lstlisting}[language=Python,caption={Train logistic regression churn model in Synapse Spark and export ONNX.},label={lst:ch17-train}]
+from pyspark.ml import Pipeline
+from pyspark.ml.feature import VectorAssembler
+from pyspark.ml.classification import LogisticRegression
+import onnxmltools
+
+features = ["orders_30d", "avg_basket_90d", "days_since_login",
+            "support_tickets_30d"]
+df = spark.table("gold.churn_training")   # point-in-time-correct features
+
+train, test = df.randomSplit([0.8, 0.2], seed=42)
+pipe = Pipeline(stages=[
+    VectorAssembler(inputCols=features, outputCol="features"),
+    LogisticRegression(labelCol="churned", featuresCol="features"),
+])
+model = pipe.fit(train)
+
+auc = BinaryClassificationEvaluator(labelCol="churned") \
+        .evaluate(model.transform(test))
+print(f"holdout AUC = {auc:.3f}")
+
+onnx_model = onnxmltools.convert_sparkml(
+    model, "churn_v3",
+    [(f, FloatTensorType([1])) for f in features])  # illustrative signature
+with open("churn_v3.onnx", "wb") as f:
+    f.write(onnx_model.SerializeToString())
+\end{lstlisting}
+
+\subsection{The Schema Alignment Contract}
+PREDICT binds model inputs to table columns \emph{by name and type}. The training feature list and the scoring view's columns must match exactly---order, names, types. Encode the contract as the \texttt{dbo.customer\_features} view used by both paths, version it with the model (\texttt{churn\_v3} expects view version 3), and test the pairing in CI: a model registered against the wrong feature view is a silent wrong-answer generator.
+
+\begin{tipbox}
+Store the model's expected feature list and types as metadata beside the model bytes, and write a validation query that diffs it against \texttt{sys.columns} of the scoring view. Run it in the deployment pipeline before promoting a model.
+\end{tipbox}
+
+\section{Thursday Hands-on Project: Churn Model from Spark to SQL}
+\index{hands-on lab}\index{churn model}
+Train a logistic-regression churn model on customer features in Synapse Spark, export ONNX, load it into the dedicated pool, and score live customers with PREDICT.
+
+\subsection{Steps}
+\begin{enumerate}
+    \item Build \texttt{gold.churn\_training} (point-in-time features + label) and \texttt{dbo.customer\_features} (the scoring view)---same column definitions, enforced.
+    \item Train and export with Listing~\ref{lst:ch17-train}; record holdout AUC.
+    \item Load the model bytes into \texttt{ml\_models} (OPENROWSET BULK from the lake).
+    \item Score with Listing~\ref{lst:ch17-predict}; verify score distributions between Spark-side evaluation and SQL-side scoring match on the same rows.
+    \item Induce a schema mismatch (rename one feature in the view) and capture the failure---this is the regression test for the alignment contract.
+\end{enumerate}
+
+\section{Friday Use Case: SQL-Only Inventory Forecasting for 1{,}000 Stores}
+\index{use case}\index{forecasting}
+A retailer needs daily per-store demand forecasts. Constraint from the platform team: the entire pipeline must be SQL-operable---no model servers, no Python on the scoring path---because the operations team that owns it is a SQL team.
+
+\subsection{Architecture}
+Nightly: Synapse Spark trains a global forecasting model (store, product features plus calendar features) and exports ONNX weekly. The pool stores the model; a scheduled stored procedure computes tomorrow's features from the silver zone and scores all store-product pairs with PREDICT into \texttt{gold.inventory\_forecast}. Chapter 7's serverless views expose the forecast to Power BI; Chapter 16's reverse ETL pushes reorder alerts to the operations tool. Every component is already in this book; the design work is the schema contract and the retraining cadence.
+
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[node distance=1.3cm]
+        \node[store] (silver) {Silver zone\\sales history};
+        \node[stage, right=1.4cm of silver] (train) {Synapse Spark\\train + export ONNX};
+        \node[store, right=1.4cm of train] (models) {ml\_models\\(pool table)};
+        \node[stage, below=1.1cm of models] (predict) {T-SQL PREDICT\\nightly scoring};
+        \node[store, right=1.4cm of predict] (fcst) {gold.forecast\\table};
+        \node[stage, right=1.4cm of fcst] (pbi) {Power BI +\\reverse ETL alerts};
+        \draw[arrow] (silver) -- (train);
+        \draw[arrow] (train) -- (models);
+        \draw[arrow] (models) -- (predict);
+        \draw[arrow] (silver) |- (predict);
+        \draw[arrow] (predict) -- (fcst);
+        \draw[arrow] (fcst) -- (pbi);
+    \end{tikzpicture}%
+    }
+    \caption{SQL-only forecasting: Spark trains weekly, PREDICT scores nightly, and the whole serving path is operable by a SQL team.}
+    \label{fig:ch17-inventory}
+\end{figure}
+
+\begin{pitfall}
+\textbf{Letting ``SQL-only'' degrade into ``never retrained.''} The operability constraint covers the \emph{scoring} path, not the \emph{learning} path. Schedule retraining, gate promotion on a metric (Chapter 19), and monitor drift---an unmaintained model is a slow-motion incident.
+\end{pitfall}
+
+\section{Architectural Decision Record Template}
+\index{architectural decision record}
+Per model record: feature table of record with its point-in-time discipline, the training environment and cadence, the ONNX export verification step, the scoring path (in-database versus endpoint) with the latency and data-residency justification, and the schema-alignment test that pairs model version to feature view version.
+
+\section{Operational Deep Dive: Scoring SLAs and Model Inventory}
+\index{model inventory}
+Treat scored tables like any data product: a freshness SLA (scores land by 06:30), a volume check (row count matches the eligible population), and a distribution check (today's score histogram versus the trailing band---a shift with no upstream change is a model or feature problem). Keep a model inventory---model, version, feature view version, trained-on window, holdout metric, promoted-by---queryable from the \texttt{ml\_models} table itself.
+
+\section{Troubleshooting Patterns}
+\index{troubleshooting!PREDICT}
+PREDICT binding errors $\rightarrow$ feature name/type mismatch between the view and the ONNX signature; run the alignment validator. Scores shifted after a pool maintenance window $\rightarrow$ the model table was repopulated from the wrong artifact; the model inventory query settles it. Spark and SQL disagree on the same rows $\rightarrow$ preprocessing (scaling, encoding) done in training but omitted in SQL features---preprocessing must live upstream of both paths, in the feature view.
+
+\section{Week 17 Lab Rubric}
+\index{rubric}
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.2cm}p{5.0cm}p{5.0cm}@{}}
+\toprule
+\textbf{Criterion} & \textbf{Meets expectation} & \textbf{Needs improvement} \\
+\midrule
+Feature discipline & One feature definition feeds training and scoring; point-in-time correct & Inline notebook features; leakage unexamined \\
+Model lifecycle & ONNX export verified; model + view versioned together & Model file passed around without metadata \\
+Scoring & PREDICT scores reconcile with Spark-side evaluation & Scores accepted unverified \\
+Operability & SQL-operable scoring path with freshness and distribution checks & Manual notebook scoring \\
+\bottomrule
+\end{tabular}
+\caption{Week 17 rubric for the feature-engineering deliverables.}
+\label{tab:ch17-rubric}
+\end{table}
+
+\section{Interview Q\&A}
+\subsection{Concepts and Trade-offs}
+\begin{enumerate}
+    \item \textbf{Q: What does T-SQL PREDICT eliminate from the scoring path?}\\
+    A: Data movement---no export jobs, no endpoints, no network round-trips; rows are scored where they already live.
+    \item \textbf{Q: When is in-database scoring preferable to a real-time endpoint?}\\
+    A: For batch/interactive scoring over warehouse-resident features, SQL-native operations teams, and data that must not leave the database perimeter.
+    \item \textbf{Q: In what format must a model be stored for Synapse PREDICT?}\\
+    A: ONNX, stored as varbinary in a table and referenced by the PREDICT function at scoring time.
+    \item \textbf{Q: What must be true of training and scoring feature schemas?}\\
+    A: They must match by name, type, and semantics---enforced by one shared feature view versioned with the model.
+\end{enumerate}
+
+\section{Further Reading}
+The PREDICT tutorial \cite{microsoft2025synapsePredict} and the SynapseML documentation \cite{microsoft2025synapseml} are the primary sources. The ONNX ecosystem and the Azure Machine Learning documentation \cite{microsoft2025azureml} connect this chapter to Chapters 18--19, where the same models get endpoints, pipelines, and monitoring.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item Features are versioned contracts; one feature table feeds both training and scoring.
+    \item Point-in-time correctness prevents leakage---the silent way models lie.
+    \item PREDICT plus ONNX scores rows in-place; batch scoring never needs a server.
+    \item In-database scoring wins on operability and data gravity; endpoints win on latency and live features.
+    \item Model version and feature-view version are one deployment unit; test the pairing.
+    \item SQL-only scoring is legitimate architecture when retraining and monitoring are still engineered in.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Explain training-serving skew with a concrete feature example and its silent failure mode.
+    \item \textbf{(Conceptual)} Why does leakage survive model validation, and how do point-in-time joins catch it?
+    \item \textbf{(Conceptual)} When would you keep preprocessing out of the ONNX graph, and where must it then live?
+    \item \textbf{(Hands-on)} Complete the Thursday project, including the induced schema-mismatch test.
+    \item \textbf{(Hands-on)} Add a calibration step to the training pipeline and compare SQL-side score distributions before/after.
+    \item \textbf{(Hands-on)} Write the model/feature alignment validator query and wire it into a deployment script.
+    \item \textbf{(Design)} Design the \texttt{ml\_models} inventory schema and the freshness/distribution checks for scored tables.
+    \item \textbf{(Design)} Write the ADR choosing PREDICT over an AML endpoint for the inventory forecaster.
+    \item \textbf{(Design)} Extend the Friday design with a drift trigger that queues retraining (preview Chapter 19).
+    \item \textbf{(Interview)} Prepare a two-minute answer to ``the model was 91\% accurate in training and useless in production---what happened?''
+\end{enumerate}
+
+\section{Capstone Project: In-Database Churn Scoring with a Schema Contract}\label{sec:ch17-capstone}
+\index{capstone project}\index{churn model!capstone}
+
+\begin{capstonebox}
+\textbf{Mission:} Ship a governed in-database scoring loop: point-in-time feature tables, Spark training with ONNX export, PREDICT scoring in the dedicated pool, a versioned model/feature contract with an automated alignment test, and scoring SLAs an operations team can run.
+
+\textbf{Estimated time:} 4--6 hours.
+
+\textbf{What you will practice:}
+\begin{itemize}
+    \item Point-in-time feature assembly and leakage discipline.
+    \item ONNX export, registration, and in-pool scoring.
+    \item Model/feature version pairing with automated validation.
+    \item Score freshness, volume, and distribution monitoring.
+\end{itemize}
+\end{capstonebox}
+
+\subsection*{Scenario}
+A subscription business with a churn-risk reverse-ETL loop (Chapter 16) wants nightly churn scores for every active customer, consumed by the retention team's SQL tooling. The platform team owns training; the SQL team owns scoring; the contract between them must be machine-checked, not meeting-checked.
+
+\subsection*{Requirements}
+\begin{itemize}
+    \item \textbf{Features:} one governed feature view, point-in-time correct, used by both training and scoring.
+    \item \textbf{Model:} logistic regression or better, holdout AUC recorded, ONNX artifact registered with metadata.
+    \item \textbf{Contract:} automated alignment validation gating promotion; induced-mismatch regression test.
+    \item \textbf{Operations:} scoring completes by 06:30 with freshness, volume, and distribution checks on the output.
+\end{itemize}
+
+\subsection*{Reference Architecture}
+Figure~\ref{fig:ch17-inventory} with the subscription schema: silver interactions $\rightarrow$ Spark training $\rightarrow$ \texttt{ml\_models} $\rightarrow$ PREDICT $\rightarrow$ \texttt{gold.churn\_scores} $\rightarrow$ reverse ETL to Dynamics 365.
+
+\subsection*{Implementation Steps}
+\begin{enumerate}
+    \item Assemble the point-in-time training set and the scoring view from one definition.
+    \item Train, evaluate, and export ONNX (Listing~\ref{lst:ch17-train}).
+    \item Register the model with metadata; score with PREDICT (Listing~\ref{lst:ch17-predict}).
+    \item Build the alignment validator; pass it, then prove it catches a mismatch.
+    \item Add the three output checks; document the operations runbook.
+\end{enumerate}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item Training notebook, ONNX artifact, registration script, and scoring procedure.
+    \item The alignment validator and its regression test.
+    \item The scoring SLA runbook with the three checks.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item SQL-side scores reconcile with Spark-side evaluation on identical rows.
+    \item The alignment test blocks a mismatched model/view pairing in the deployment path.
+    \item The scoring table meets its freshness and volume checks for three consecutive nights.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Add a challenger model and an automated champion/challenger comparison on holdout AUC.
+    \item Compute a simple drift metric on one feature and chart it for two weeks.
+    \item Port the scoring to a serverless SQL pool over Delta features and compare operability.
+\end{itemize}

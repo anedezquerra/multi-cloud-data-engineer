@@ -1,0 +1,344 @@
+\chapter{Power BI Direct Lake Mode}
+\index{Direct Lake}\index{Power BI}\index{DirectQuery}\index{Import mode}\index{fallback}\index{framing}\index{V-Order!Direct Lake}\index{semantic model!Direct Lake}%
+
+\begin{objectives}
+\begin{itemize}
+    \item Explain how Direct Lake reads Delta-Parquet directly into memory, and how it differs from Import and DirectQuery.
+    \item Describe framing and what triggers a Direct Lake fallback to DirectQuery.
+    \item Optimize lakehouse tables for Direct Lake, including the specific role of V-Order.
+    \item Build a Direct Lake report against a Gold lakehouse and benchmark it against DirectQuery.
+    \item Detect and diagnose fallback events with the Capacity Metrics app and model telemetry.
+    \item Architect an executive dashboard with sub-second response over a 100-million-row dataset without nightly refreshes.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+Direct Lake is Fabric's distinctive contribution to BI serving: the semantic engine reads the same open Delta-Parquet files that Spark and SQL use, instead of importing copies or delegating queries. Other platforms approximate the goal differently.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{2.8cm}p{3.2cm}p{3.2cm}p{3.2cm}p{3.2cm}@{}}
+\toprule
+\textbf{Serving pattern} & \textbf{Fabric} & \textbf{AWS} & \textbf{GCP} & \textbf{Snowflake} \\
+\midrule
+BI reads open lake files & Direct Lake over OneLake Delta & QuickSight over Athena/Spectrum & Looker/Looker Studio over BigLake & External/Iceberg tables to BI tools \\
+In-memory BI copy & Power BI Import & QuickSight SPICE & Looker in-memory caches & Cached results / extracts in BI tool \\
+Live query to source & DirectQuery (warehouse/endpoint) & QuickSight direct query & Looker live connection & Live connection to Snowflake \\
+Cache/update control & Framing (auto/on-demand) & SPICE refresh schedule & Cache policies & Result cache (24h) + BI caching \\
+Performance lever & V-Order + column pruning & Sort keys + Spectrum tuning & Partition/cluster pruning & Clustering + result cache \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+Databricks serves BI through SQL warehouses and partner extracts; MongoDB through the Atlas SQL Interface or charts. The shared insight: \emph{copy for speed versus query for freshness} is the universal BI trade-off---Direct Lake is Fabric's bid to dissolve it by making the lake itself fast enough to serve.
+\end{crosscloud}
+
+\begin{keyterms}
+\textbf{Direct Lake}: a Power BI storage mode that loads Delta-Parquet columns from OneLake into memory on demand---no import copy, no per-query round trip. \quad
+\textbf{Framing}: the process by which a Direct Lake model binds to the current version of its Delta tables. \quad
+\textbf{Fallback}: Direct Lake's automatic switch to DirectQuery when a query exceeds guardrails or hits unsupported shapes. \quad
+\textbf{V-Order}: Fabric's write-time Parquet layout optimization that accelerates the column loads Direct Lake performs. \quad
+\textbf{DirectQuery}: a storage mode that translates visual interactions into live SQL against the source.
+\end{keyterms}
+
+\section{Week 8 Roadmap}
+Week~8 completes the Part~II serving stack. Monday explains Direct Lake conceptually: reading Delta-Parquet directly into memory. Tuesday covers the fallback behavior that silently degrades unprepared models to DirectQuery. Wednesday turns to optimization---V-Order, column pruning, and model hygiene. Thursday is the hands-on project: a Direct Lake report over the Gold lakehouse, benchmarked against a DirectQuery twin. Friday architects the executive dashboard: sub-second response on 100 million rows without nightly refresh delays. The chapter closes Part~II with the Milestone~2 capstone.
+
+Direct Lake is the payoff of everything since Week~1. OneLake's open Delta storage, Part~I's physical optimization, Week~6's governed SQL surface, and Week~7's star schema converge here into reports that are simultaneously fresh and fast \cite{microsoftDirectLake}.
+
+\begin{notebox}
+``No import, no DirectQuery'' is the slogan; the engineering reality is \emph{transcoding}: the semantic engine memory-maps and loads Parquet columns from OneLake as queries demand them, so the first query on a cold column pays a load cost and subsequent queries are in-memory fast.
+\end{notebox}
+
+\section{Monday: The Direct Lake Concept}
+\index{Direct Lake!concept}\index{transcoding}
+Import mode copies data into the semantic model on a schedule: fast queries, stale data, duplicated storage. DirectQuery sends every visual interaction to the source as SQL: fresh data, source-dependent latency, query load on the warehouse. Direct Lake threads the needle by reading the Delta-Parquet files in OneLake directly into the engine's memory on demand \cite{microsoftDirectLake}.
+
+\begin{definitionbox}
+\textbf{Direct Lake} is a Power BI storage mode in which the semantic model loads columns from OneLake Delta-Parquet files into memory as queries require them, keeping data as fresh as the last table commit without maintaining a separate imported copy.
+\end{definitionbox}
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.0cm}p{3.6cm}p{3.6cm}p{3.6cm}@{}}
+\toprule
+\textbf{Property} & \textbf{Import} & \textbf{DirectQuery} & \textbf{Direct Lake} \\
+\midrule
+Data freshness & As of last refresh & Live & As of last Delta commit + framing \\
+Query latency & In-memory fast & Source-dependent & In-memory after column load \\
+Storage duplication & Yes (model copy) & No & No (reads OneLake) \\
+Refresh needed & Yes (scheduled) & No & Framing only (lightweight) \\
+Load on source & Refresh-time bursts & Every interaction & Column reads from OneLake \\
+Row guardrails & Capacity memory & Source limits & Fallback thresholds \\
+\bottomrule
+\end{tabular}
+\caption{The three Power BI storage modes compared.}
+\label{tab:chapter8-modes}
+\end{table}
+
+\subsection{When Import Still Wins}
+Import remains the right choice when the source is slow or expensive to query live, when the model needs full DAX query features without fallback risk on enormous tables, or when data arrives from outside OneLake entirely. Direct Lake is the default for OneLake-resident star schemas; it is not a universal replacement.
+
+\section{Tuesday: Framing and Fallback}
+\index{framing}\index{fallback}
+Two mechanisms define Direct Lake operations. \emph{Framing} is how the model points at a table version: when Delta tables commit new data, the model re-frames---a metadata operation far cheaper than an import refresh---so visuals see the new files. \emph{Fallback} is the escape hatch: when a query cannot be served from the lake---because a table exceeds row guardrails for the capacity, a column type is unsupported, or a query shape is incompatible---the engine silently routes it to the SQL analytics endpoint as DirectQuery \cite{microsoftDirectLake,microsoftFabricDirectLakeFallback}.
+
+\begin{definitionbox}
+\textbf{Fallback} is Direct Lake's automatic degradation to DirectQuery for a query or table that cannot be served from OneLake. It preserves correctness but sacrifices Direct Lake latency, and it is silent unless you measure it.
+\end{definitionbox}
+
+\subsection{What Triggers Fallback}
+\begin{itemize}
+    \item A table exceeding the capacity's Direct Lake row-count guardrail.
+    \item Unsupported column types or certain calculated-column and RLS shapes.
+    \item Queries against SQL views rather than physical Delta tables.
+    \item Memory pressure forcing eviction beyond what re-loading can serve.
+\end{itemize}
+
+\begin{pitfall}
+Fallback is silent and per-query: a report can serve 95\% of interactions from the lake and fall back only on the executive's favorite drill path. Monitor fallback events with the Capacity Metrics app and semantic model telemetry---a slow ``Direct Lake'' report is often a fallback problem or missing V-Order, not a capacity problem \cite{microsoftFabricMetricsApp}.
+\end{pitfall}
+
+\section{Wednesday: Optimizing Models for Direct Lake}
+\index{V-Order!Direct Lake}\index{column pruning}
+Direct Lake performance is the compound interest of Part~I's physical discipline. V-Order applies Fabric's optimized Parquet layout at write time, which directly accelerates the column loads Direct Lake performs \cite{microsoftFabricVOrder,microsoftFabricOptimize}. Beyond V-Order:
+
+\begin{itemize}
+    \item \textbf{Prune columns.} Direct Lake loads columns, not rows; a 200-column fact costs column-load time for every column the model includes. Model only what reports use.
+    \item \textbf{Compact small files.} Chapter~4's \texttt{OPTIMIZE} work pays off again: many small files multiply the file-open cost of column reads.
+    \item \textbf{Prefer integer keys.} Relationship columns load and join fastest as compact integers.
+    \item \textbf{Frame deliberately.} Automatic framing keeps models fresh; for tables updated in bursts, on-demand framing after the batch commit avoids mid-load version flapping.
+\end{itemize}
+
+\begin{tipbox}
+Run \texttt{OPTIMIZE ... VORDER} on Gold tables as the final step of the pipeline that produces them, so every framing binds to already-optimized files. Re-optimizing after reports exist means the next frame picks up the improvement without any report change.
+\end{tipbox}
+
+\section{Thursday: Hands-on Project}
+\index{hands-on lab}\index{Direct Lake!benchmark}
+The Week~8 lab creates a Power BI report in Direct Lake mode against the Gold lakehouse and benchmarks it against an identical DirectQuery model, producing evidence rather than slogans.
+
+\subsection{Goal and Architecture}
+Use a workspace \texttt{fabric-de-week08} with a Gold lakehouse containing a star schema---ideally \texttt{fact\_sales} at several million rows with conformed dimensions from Chapter~7. Build two semantic models over identical tables: \texttt{sm\_directlake} (Direct Lake) and \texttt{sm\_directquery} (DirectQuery). Build one report page per model with identical visuals.
+
+\subsection{Step-by-Step Actions}
+\begin{enumerate}
+    \item Verify Gold tables are compacted and V-Ordered; record file counts.
+    \item Create \texttt{sm\_directlake} and \texttt{sm\_directquery} over the same tables with identical relationships and measures.
+    \item Build the benchmark report page: a card (total revenue), a bar chart (revenue by region), and a matrix (revenue by region and month).
+    \item Time each visual's first render and repeated interactions in both models; record results.
+    \item Trigger a Delta commit (append one batch), then measure how quickly each model reflects it.
+    \item Open the Capacity Metrics app and capture CU consumption and any fallback events for both models.
+    \item Force a fallback scenario (query a view instead of a table, or exceed a guardrail on a test table) and capture the telemetry signature.
+\end{enumerate}
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{4.6cm}p{3.6cm}p{3.6cm}@{}}
+\toprule
+\textbf{Measurement} & \textbf{Direct Lake} & \textbf{DirectQuery} \\
+\midrule
+First render (cold) & \emph{record} & \emph{record} \\
+Repeat interaction (warm) & \emph{record} & \emph{record} \\
+Freshness after commit & \emph{record} & \emph{record} \\
+CU-seconds per session & \emph{record} & \emph{record} \\
+Fallback events observed & \emph{record} & n/a \\
+\bottomrule
+\end{tabular}
+\caption{Benchmark evidence template: fill with your measured values.}
+\label{tab:chapter8-benchmark}
+\end{table}
+
+\subsection{Validation Checklist}
+\begin{itemize}
+    \item Both models expose identical measures and produce identical totals.
+    \item The benchmark table is complete with real measured values.
+    \item Direct Lake reflects a new commit after framing without an import refresh.
+    \item At least one fallback event was deliberately produced and identified in telemetry.
+    \item V-Order status and file counts of the Gold tables are recorded.
+    \item You can state, with numbers, when DirectQuery would still be the right choice.
+\end{itemize}
+
+\section{Friday: Use Case and Architecture}
+\index{Direct Lake!executive dashboard}\index{real-time BI}
+The executive team wants a live revenue dashboard: sub-second interactions over a 100-million-row fact, updated within minutes of a sale---no nightly refresh window. This is the scenario Direct Lake was built for, and it succeeds or fails on engineering discipline.
+
+\subsection{The Architecture}
+Sales land in Bronze, conform through Silver, and publish to a Gold star schema whose \texttt{fact\_sales} exceeds 100 million rows. Every Gold table is compacted and V-Ordered at the end of its producing pipeline. A Direct Lake semantic model with automatic framing sits on top; reports query the model. The result: a sale committed to Gold appears in the dashboard after the next frame---seconds to minutes---with in-memory interaction speed.
+
+\subsection{The Guardrail Conversation}
+A 100-million-row fact sits near capacity-dependent Direct Lake guardrails. The architecture therefore includes: an F SKU sized so the fact stays within guardrails; column pruning so only reported columns load; monitoring of fallback events with alerting (a sustained fallback rate is a page-the-engineer event, not a shrug); and a rehearsed degradation plan---if the fact outgrows guardrails, the options are aggregation tables, capacity scale-up, or targeted DirectQuery for the largest slice.
+
+\begin{pitfall}
+Designing to exactly the guardrail is designing to fail next quarter. Row guardrails are capacity-dependent and change over releases; leave 30--50\% headroom and monitor growth rate, because ``it fell back'' is discovered by executives as ``the dashboard is slow.''
+\end{pitfall}
+
+\begin{tipbox}
+Pair the Direct Lake dashboard with a Data Activator alert (Chapter~15) on capacity and fallback events. The same real-time muscle that watches IoT temperatures can watch your own platform.
+\end{tipbox}
+
+\section{Operational Guidance for Week 8}
+Treat fallback as a first-class production signal. The Capacity Metrics app, queried regularly, tells you what users experience before they report it.
+
+\subsection{Performance and Reliability}
+Optimize Gold physically before tuning the model. Keep models narrow, keys integer, relationships single-direction. Frame after batch commits rather than mid-pipeline. Benchmark on a schedule---row growth silently changes the performance envelope.
+
+\subsection{Security and Governance Checklist}
+\begin{itemize}
+    \item Certify Direct Lake models before executives depend on them; mark exploratory models clearly.
+    \item Apply RLS (Chapters~6 and 21) knowing that some RLS shapes influence fallback behavior---test the combination.
+    \item Restrict who can repoint or re-frame production models.
+    \item Monitor capacity so interactive BI and batch loads do not starve each other.
+    \item Document the degradation plan for guardrail overflow.
+\end{itemize}
+
+\section{Interview Q\&A}
+\begin{enumerate}
+    \item \textbf{Q: What triggers a Direct Lake fallback to DirectQuery?}\\
+    A: Row-count guardrails exceeded for the capacity, unsupported column types or query shapes, queries against views instead of physical tables, or memory pressure---each routes that query to the SQL endpoint silently.
+    \item \textbf{Q: Why does V-Order matter specifically for Direct Lake?}\\
+    A: Direct Lake loads Parquet columns from OneLake at query time; V-Order's write-time layout optimization makes exactly those column reads faster, so cold-query latency drops without any model change.
+    \item \textbf{Q: What does framing do in a Direct Lake model?}\\
+    A: Framing binds the model to the current Delta table versions---a metadata operation that replaces the import refresh, making newly committed data visible without copying it.
+    \item \textbf{Q: Which telemetry reveals fallback events in production?}\\
+    A: The Capacity Metrics app and semantic model telemetry: fallback appears as DirectQuery-mode query load where you expected lake reads.
+    \item \textbf{Q: When is Import mode still preferable to Direct Lake?}\\
+    A: When the source lives outside OneLake, when the source is too slow to serve live column reads, or when the model needs Import-only DAX features without fallback risk on very large tables.
+    \item \textbf{Q: How does Direct Lake achieve freshness without refresh?}\\
+    A: It reads the same Delta files the pipelines write; framing re-points the model at new versions, so a committed sale appears after the next frame rather than the next import window.
+\end{enumerate}
+
+\section{Further Reading}
+Start with the Direct Lake overview \cite{microsoftDirectLake} and fallback behavior documentation \cite{microsoftFabricDirectLakeFallback}. The physical prerequisites are V-Order \cite{microsoftFabricVOrder} and Delta optimization \cite{microsoftFabricOptimize}. Operations rely on the Capacity Metrics app \cite{microsoftFabricMetricsApp} and semantic model fundamentals \cite{microsoftFabricSemanticModels}. The storage foundation remains Delta Lake \cite{deltaLakeDocs,armbrust2020delta}.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item Direct Lake loads Delta-Parquet columns from OneLake into memory on demand---Import's speed trajectory with DirectQuery's freshness.
+    \item Framing is the lightweight metadata operation that replaces the import refresh.
+    \item Fallback to DirectQuery is silent, per-query, and correct-but-slow; it is the top silent killer of ``Direct Lake'' performance.
+    \item V-Order, compaction, and column pruning are Direct Lake optimizations applied at the storage layer, before the model exists.
+    \item Benchmark with evidence: identical models, identical visuals, measured latencies, captured telemetry.
+    \item Guardrails are capacity-dependent; design with headroom and a rehearsed degradation plan.
+    \item Import and DirectQuery remain legitimate choices---Direct Lake is the default for OneLake star schemas, not a religion.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Explain transcoding to a BI developer who has only ever used Import mode.
+    \item \textbf{(Conceptual)} Why is fallback worse than simply choosing DirectQuery for a table? Consider user experience and diagnostics.
+    \item \textbf{(Hands-on)} Complete the benchmark table with your own measured values and write three sentences of interpretation.
+    \item \textbf{(Hands-on)} Deliberately trigger fallback three different ways (view, oversized table, unsupported shape) and capture each telemetry signature.
+    \item \textbf{(Design)} Size the capacity and model design for a fact growing from 100M to 200M rows over 18 months; include the trigger points for your degradation plan.
+    \item \textbf{(Design)} An acquisition lands: the new subsidiary's data lives in an on-premises SQL Server with no path to OneLake this quarter. Choose and defend storage modes for a combined report.
+    \item \textbf{(Interview)} In five sentences, explain why Direct Lake dissolves the freshness-versus-speed trade-off, and where it reappears anyway.
+    \item \textbf{(Operational)} Write the alert rule and runbook for a sustained fallback rate on the executive dashboard.
+\end{enumerate}
+
+\section{Milestone 2 Capstone: End-to-End Analytics Workflow}\label{sec:ch8-capstone}
+\index{Milestone 2 capstone}\index{capstone project!Part II}\index{star schema!capstone}\index{Direct Lake!capstone}\index{COPY INTO!capstone}
+
+\begin{capstonebox}
+\textbf{Mission.} Close Part~II by building the complete warehousing and BI serving stack: a Synapse Data Warehouse loaded by idempotent \texttt{COPY INTO} batches, T-SQL stored procedures that build a star schema from raw OneLake data, a custom semantic model with relationships and DAX measures, and a published Direct Lake Power BI report---with benchmarks, RLS, and a capacity cost estimate as evidence.
+
+\textbf{Estimated time.} 8--10 hours across the milestone's components.
+
+\textbf{What you'll practice.}
+\begin{itemize}
+    \item Manifest-driven \texttt{COPY INTO} loads into warehouse staging.
+    \item Stored procedures building dimensions and facts, with SCD2 where history matters.
+    \item Custom semantic model authoring: surrogate-key relationships, measure library, RLS roles.
+    \item Direct Lake versus DirectQuery benchmarking with fallback telemetry.
+    \item Producing the six rubric artifacts: runnable repo, diagram, tests, monitoring evidence, cost estimate, security review.
+\end{itemize}
+\end{capstonebox}
+
+\subsection*{Scenario}
+Contoso Retail's analytics program graduates from lakehouse exploration (Part~I) to a governed serving layer. Raw order, customer, and product extracts stage in OneLake. Finance requires a warehouse star schema with customer history; executives require the live Direct Lake dashboard from Friday's use case; security requires regional RLS.
+
+\subsection*{Requirements}
+\begin{itemize}
+    \item Lakehouse \texttt{lh\_stage} plus warehouse \texttt{dw\_retail} in workspace \texttt{fabric-de-milestone2}.
+    \item Manifest-gated \texttt{COPY INTO} loading staged Parquet into \texttt{stg} tables (Chapter~5 pattern).
+    \item Stored procedures building \texttt{dim\_date}, \texttt{dim\_customer} (SCD2), \texttt{dim\_product}, \texttt{dim\_store}, \texttt{fact\_sales}.
+    \item Custom semantic model with relationships on surrogate keys, a named measure library, and two RLS roles tested with View-As.
+    \item A published Direct Lake report and a DirectQuery twin with a completed benchmark table.
+    \item Capacity Metrics app evidence: CU consumption and fallback events.
+    \item The cost estimate with two documented optimization decisions.
+\end{itemize}
+
+\subsection*{Reference Architecture}
+\begin{figure}[H]
+    \centering
+    \begin{tikzpicture}[node distance=8mm and 9mm]
+        \node[store] (onelake) at (0,0) {OneLake\\Delta staging};
+        \node[stage] (wh) at (4.0,0) {Synapse Data\\Warehouse};
+        \node[stage] (sql) at (4.0,-2.2) {SQL Analytics\\Endpoint};
+        \node[stage] (model) at (8.4,-2.2) {Semantic Model\\(star, DAX, RLS)};
+        \node[stage, fill=orange!10] (pbi) at (12.8,-2.2) {Power BI\\(Direct Lake)};
+        \node[doc, minimum width=2.6cm, minimum height=1.0cm] (sec) at (8.4,-4.2) {RLS \& object-level\\security};
+
+        \draw[arrow] (onelake) -- node[above, font=\scriptsize]{COPY INTO} (wh);
+        \draw[arrow] (onelake.south) |- (sql.west);
+        \draw[arrow] (wh) -- (sql);
+        \draw[arrow] (sql) -- (model);
+        \draw[arrow] (model) -- (pbi);
+        \draw[biarrow, dashed] (sec) -- (model);
+
+        \node[note, text width=12cm, align=center] at (6.2,-5.4) {Milestone 2 serving stack: staged files to governed, benchmarked, secured BI.};
+    \end{tikzpicture}
+    \caption{Milestone 2 reference architecture: warehouse-to-Direct Lake serving layer.}
+    \label{fig:chapter8-capstone-architecture}
+\end{figure}
+
+\subsection*{Implementation Steps}
+\begin{enumerate}
+    \item Provision the workspace, lakehouse, and warehouse; stage partitioned Parquet extracts.
+    \item Implement manifest-gated \texttt{COPY INTO} per Chapter~5's capstone pattern.
+    \item Write the star-schema stored procedures; implement \texttt{dim\_customer} as SCD2 per Chapter~7.
+    \item Build the custom semantic model; author the measure library; configure and test RLS as multiple personas.
+    \item Publish the Direct Lake report; build the DirectQuery twin; complete the benchmark table.
+    \item Capture Capacity Metrics evidence, including one deliberate fallback.
+    \item Write the cost estimate and security review; commit everything with a README that runs end-to-end from a clean environment.
+\end{enumerate}
+
+\begin{lstlisting}[language=SQL,caption={Milestone 2: idempotent warehouse load with manifest recording.},label={lst:chapter8-capstone-copy}]
+-- Idempotent load: only files not yet in the manifest
+COPY INTO dbo.stg_sales
+FROM 'https://onelake.dfs.fabric.microsoft.com/<ws>/<lh>/Files/stage/sales/2026-07/'
+WITH ( FILE_TYPE = 'PARQUET' );
+
+INSERT cfg.load_manifest (batch_path, rows_loaded, loaded_ts)
+VALUES ('2026-07', @@ROWCOUNT, CURRENT_TIMESTAMP);
+\end{lstlisting}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item Git repository that rebuilds the workflow from a clean environment (load $\rightarrow$ model $\rightarrow$ report).
+    \item Architecture diagram (TikZ, draw.io, or PNG) showing Warehouse, SQL endpoint, semantic model, and Power BI.
+    \item At least three automated data-quality tests (referential integrity, measure totals, row counts) with a failing-case demonstration.
+    \item Benchmark results and captured fallback events.
+    \item Monthly capacity cost estimate with two documented optimization decisions (for example V-Order and column pruning).
+    \item Security review: RLS demonstrated as multiple test users, least-privilege roles, no hardcoded secrets.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item[\(\square\)] The end-to-end workflow runs from a clean environment following the repository README.
+    \item[\(\square\)] Loads are idempotent: re-running a batch leaves the warehouse unchanged.
+    \item[\(\square\)] The star schema uses surrogate keys and SCD2 where history matters, verified by uniqueness tests.
+    \item[\(\square\)] All measures are named and reconcile to SQL aggregates.
+    \item[\(\square\)] The benchmark table is complete, and at least one fallback event was produced and explained.
+    \item[\(\square\)] RLS is proven with View-As for every role, not just the developer role.
+    \item[\(\square\)] The cost estimate cites measured CU consumption.
+    \item[\(\square\)] No secrets or personal paths appear in the repository.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Add an aggregation table for the largest fact and measure its effect on guardrail headroom.
+    \item Automate the benchmark as a repeatable script so regressions surface on every release.
+    \item Wire a Data Activator-style alert on fallback rate using capacity telemetry.
+    \item Extend RLS to a third persona with cross-region access and document the test evidence.
+\end{itemize}

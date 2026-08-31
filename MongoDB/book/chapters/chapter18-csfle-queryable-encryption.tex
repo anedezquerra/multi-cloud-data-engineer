@@ -1,0 +1,242 @@
+\chapter{Client-Side Field Level Encryption and Queryable Encryption}
+\index{CSFLE}\index{Queryable Encryption}\index{KMS}\index{data encryption key}\index{crypto-shredding}\index{TLS}\index{PrivateLink}\index{encryption at rest}\index{GDPR erasure}%
+
+\begin{objectives}
+\begin{itemize}
+    \item Architect the encryption layers: at rest, in transit, and in use (CSFLE and Queryable Encryption).
+    \item Manage Data Encryption Keys in a key vault wrapped by KMS master keys, with per-subject keys for erasure.
+    \item Choose deterministic versus random encryption and understand QE's supported query shapes.
+    \item Run equality queries over QE-encrypted fields and budget QE's 2--4$\times$ storage overhead.
+    \item Execute GDPR erasure via crypto-shredding and contrast it with row-level deletion.
+    \item Build a QE-encrypted PII lab with AWS KMS in the Thursday project.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+Every cloud offers the same encryption ladder---at-rest keys, TLS, client-side field encryption---but the in-use layer is where vendors genuinely differ.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{2.9cm}p{3.0cm}p{3.0cm}p{3.0cm}@{}} 
+\toprule
+\textbf{Layer} & \textbf{AWS} & \textbf{Azure} & \textbf{GCP} \\
+\midrule
+Key management & KMS / CloudHSM & Key Vault / Managed HSM & Cloud KMS / HSM \\
+At-rest & EBS/S3 SSE, RDS TDE & Disk + TDE & Default + CMEK \\
+In transit & TLS everywhere & TLS + private endpoints & TLS + PSC \\
+In use & SDK client-side encryption & Always Encrypted (SQL) & Confidential computing \\
+Private connectivity & PrivateLink & Private Link & Private Service Connect \\
+Erasure primitive & KMS key deletion & Key Vault purge & Key destruction \\
+\addlinespace
+Snowflake / Fabric & \multicolumn{3}{l}{Tri-Secret Secure (composite keys), column-level policies; customer-managed keys for the account layer} \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+MongoDB's Queryable Encryption is the rare in-use implementation that keeps \emph{equality queries} server-side without the server ever seeing plaintext---the cryptographic boundary sits in the client driver, keyed by a KMS you control \cite{mongodbQueryableEncryptionDocs,mongodbCSFLEDocs}.
+\end{crosscloud}
+
+\section{Week 18 Roadmap: Encryption as a Data-Lifecycle Control}
+Chapter 17 controlled \emph{who} can reach the data; this week controls \emph{what is readable} when every other control fails. The design spine: encryption at rest is table stakes, TLS is assumed, and the interesting engineering is in-use encryption---CSFLE and Queryable Encryption---plus the key-lifecycle design that turns GDPR erasure from a scavenger hunt into a key deletion \cite{mongodbCSFLEDocs,mongodbQueryableEncryptionDocs}.
+
+\begin{definitionbox}
+\textbf{Client-Side Field Level Encryption (CSFLE)} encrypts designated fields in the driver before transmission; the server stores and processes ciphertext it cannot read. \textbf{Queryable Encryption (QE)} extends this with server-side encrypted indexes so equality (and, in newer versions, range/prefix) queries execute without decryption on the server.
+\end{definitionbox}
+
+\begin{keyterms}
+\textbf{DEK}: data encryption key, encrypts field values. \textbf{Master key (CMK)}: KMS key that wraps DEKs. \textbf{Key vault collection}: the MongoDB collection storing wrapped DEKs. \textbf{Deterministic encryption}: same plaintext $\to$ same ciphertext (equality-queryable, leak-prone). \textbf{Random encryption}: fresh ciphertext per write (not queryable). \textbf{Crypto-shredding}: destroying a subject's DEK to render all their ciphertext unreadable everywhere.
+\end{keyterms}
+
+\section{Monday: The Key Hierarchy}
+\subsection{KMS, Master Keys, and DEKs}
+The hierarchy is three layers: application fields are encrypted by DEKs; DEKs are wrapped (encrypted) by a customer master key in a KMS---AWS KMS, Azure Key Vault, GCP KMS, or a KMIP provider; and the KMS enforces IAM policy, rotation, and audit on every unwrap. The client driver unwraps DEKs at runtime; the MongoDB server never sees plaintext keys or values. The catastrophic-failure rule follows directly: losing the master key makes every wrapped DEK unrecoverable and every encrypted field permanently unreadable---KMS key policy and backup are the most consequential security configuration in this architecture.
+
+\subsection{Key Granularity as an Erasure Design}
+One DEK per encrypted \emph{field} is the simple posture. One DEK per \emph{data subject}---with \texttt{keyAltNames} binding the key to the subject ID---is the GDPR posture: erasure becomes deleting one key from the key vault, after which every ciphertext for that subject is unreadable in the primary, secondaries, shards, change-stream events already consumed, search indexes embedding encrypted values, and backup snapshots---without waiting for retention expiry. The Friday section develops this fully; the Monday decision is that key granularity is chosen at schema-design time and is nearly impossible to retrofit.
+
+\begin{pitfall}
+\textbf{Shared DEKs across data subjects.} If one DEK encrypts ten thousand patients' SSNs, per-subject erasure is impossible and you are back to row-level deletion with its propagation burden (Friday). Choose per-subject keys on day one for any field covered by erasure rights.
+\end{pitfall}
+
+\section{Tuesday: Deterministic versus Random Encryption}
+\subsection{The Queryability/Leakage Trade}
+Deterministic encryption preserves equality: the same plaintext always encrypts to the same ciphertext, so equality filters work on ciphertext---but frequency analysis leaks (a column of encrypted ``yes/no'' is readable in aggregate). Random encryption adds fresh randomness per write: no leakage, no equality queries. CSFLE exposes this choice per field; the design rule is deterministic only where equality lookup is required, random everywhere else, and never deterministic on low-cardinality fields.
+
+\section{Wednesday: Queryable Encryption}
+\subsection{Searching Encrypted Fields}
+QE removes the trade's operational cost: encrypted indexes let the server answer supported query shapes (equality first; range and prefix in later versions) over ciphertext, with structured encryption metadata collections tracking the searchable state. The costs to design around: storage overhead of 2--4$\times$ on encrypted collections, restricted query shapes on encrypted fields, and write amplification from encrypted-index maintenance. Encrypt the fields that genuinely require it---PII, PHI, payment data---and leave operational fields plaintext for indexing economy \cite{mongodbQueryableEncryptionDocs}.
+
+\begin{tipbox}
+Prototype every intended query shape against QE in staging before enabling it in production. The set of supported operators is versioned; a query that compiles today on a non-encrypted field may need a redesign to run encrypted.
+\end{tipbox}
+
+\section{Thursday Hands-On Project: Queryable Encryption with AWS KMS}
+Encrypt PII fields with QE and prove that equality queries work while the server sees only ciphertext.
+
+\subsection{Lab Outline}
+Using PyMongo with the QE-aware client encryption library: create a KMS master key (or a local testing provider for the lab), generate two DEKs with \texttt{keyAltNames} per data subject, create an encrypted collection declaring \texttt{patients.ssn} and \texttt{patients.name} as QE-encrypted, insert records, and run equality queries through the encrypted client. Then verify the boundary: connect with a plain client and confirm the fields are ciphertext; dump the key vault and confirm DEKs are wrapped.
+
+\begin{lstlisting}[language=Python, caption={QE round-trip: encrypt at the driver, query the ciphertext.}]
+from pymongo import MongoClient
+from pymongo.encryption import ClientEncryption
+from pymongo.encryption_options import AutoEncryptionOpts
+
+kms = {"aws": {"accessKeyId": AKID, "secretAccessKey": SAK}}
+master = {"key": MASTER_KEY_ARN, "region": "us-east-1"}
+
+ce = ClientEncryption(kms, "encryption.__keyVault", admin_client, KMS_OPTS)
+dek = ce.create_data_key("aws", master_key=master,
+                         key_alt_names=[f"patient:{patient_id}"])
+
+encrypted_fields = {
+  "fields": [
+    {"path": "ssn", "bsonType": "string", "keyId": dek,
+     "queries": {"queryType": "equality"}},
+    {"path": "name", "bsonType": "string", "keyId": dek}
+  ]
+}
+db.create_collection("patients", encryptedFields=encrypted_fields)
+secure = MongoClient(URI, auto_encryption_opts=AutoEncryptionOpts(
+    {"aws": (AKID, SAK)}, "encryption.__keyVault",
+    encrypted_fields_map={"clinic.patients": encrypted_fields}))
+secure.clinic.patients.insert_one({"patient_id": patient_id, "ssn": "123-45-6789",
+                                   "name": "A. Doe", "city": "Monterrey"})
+doc = secure.clinic.patients.find_one({"ssn": "123-45-6789"})   # works
+plain.clinic.patients.find_one({})                               # ciphertext only
+\end{lstlisting}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item The QE setup scripts (KMS, DEKs with \texttt{keyAltNames}, encrypted collection).
+    \item The round-trip demonstration: equality query succeeds; plain-client read shows ciphertext.
+    \item A crypto-shredding demonstration: delete one subject's DEK and prove their records are unrecoverable.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item The equality query returns the correct document through the encrypted client.
+    \item A plain client (no QE configuration) sees only ciphertext for encrypted fields.
+    \item After DEK deletion, even the encrypted client cannot decrypt the subject's records.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Measure the storage overhead of QE metadata collections against a plaintext twin.
+    \item Attempt a range query on an encrypted field and document the version-dependent outcome.
+\end{itemize}
+
+\section{Friday Use Case and Architecture: HIPAA/PCI Platform with Crypto-Shredding Erasure}
+\subsection{Scenario and Requirements}
+A healthcare provider must secure patient records to HIPAA and PCI-DSS standards, satisfy GDPR-style erasure for its EU patients, and prove---to an auditor---that erased data is unreadable in backups, archives, replicas, search indexes, and downstream consumers.
+
+\subsection{The Erasure Argument}
+Row-level deletion fails the audit structurally: \texttt{deleteMany} removes the live document, but copies survive in continuous-backup snapshots, the PITR oplog window, Online Archive tiers, already-emitted change-stream events, and derived collections. Crypto-shredding inverts the problem: per-subject DEKs (Monday) mean one key deletion renders \emph{every} copy unreadable simultaneously, everywhere, including backups whose retention you do not control. The audit story is a key-vault deletion record plus the KMS audit log, not a cross-system deletion propagation proof.
+
+Legal hold is the designed exception: keys under hold are quarantined in the KMS---flagged, never destroyed---until the hold releases, and every destroy/quarantine decision lands in the audit log with actor and justification. The remaining layers compose from this and last week: PrivateLink isolation, x.509/OIDC service identity, least-privilege RBAC, QE on PII fields, scoped auditing, and Online Archive (Chapter 19) for the seven-year retention tier.
+
+\begin{notebox}
+Crypto-shredding changes the threat model for the key vault itself: the key vault collection becomes the highest-value deletion target in the estate. Protect it with the strictest RBAC, separate backup of wrapped DEKs, and dual-control procedures for key destruction.
+\end{notebox}
+
+\subsection{Compliance Mapping}
+HIPAA technical safeguards map to: access control (Chapter 17 RBAC), audit controls (scoped filters to SIEM, Chapter 19), integrity (Chapter 11 transactions), transmission security (TLS 1.3 + PrivateLink, Chapter 19), and encryption (at rest + QE). PCI-DSS scope narrows materially because cardholder fields are ciphertext to every system except the QE-aware client---including to the database administrators themselves.
+
+\section{Interview Q\&A}
+\subsection{Encryption and Perimeter}
+\begin{enumerate}
+    \item \textbf{Q: CSFLE versus Queryable Encryption?}\\
+    A: CSFLE encrypts client-side with explicit deterministic/random choices per field; QE adds server-side encrypted indexes so supported queries run without server decryption. QE costs 2--4$\times$ storage and restricts query shapes.
+
+    \item \textbf{Q: Why is deterministic encryption dangerous on low-cardinality fields?}\\
+    A: Identical plaintexts yield identical ciphertexts, so frequency analysis recovers values (``yes''/``no,'' blood type, state codes) without breaking the cipher.
+
+    \item \textbf{Q: Why is losing the KMS master key catastrophic?}\\
+    A: Every DEK is wrapped by it; without the master key, no DEK unwraps and no encrypted field is ever readable again. KMS policy, backup, and rotation drills are the control.
+
+    \item \textbf{Q: Which query shapes does QE support, and at what cost?}\\
+    A: Equality first, with range and prefix in later versions---executed on encrypted indexes server-side without decryption. The costs are 2--4$\times$ storage, write amplification from encrypted-index maintenance, and versioned operator support; network isolation of the whole path is Chapter 19''s subject.
+
+    \item \textbf{Q: Why is naive DELETE insufficient for GDPR erasure?}\\
+    A: Copies persist in backups, oplog windows, archives, change-stream consumers, and derived data. Crypto-shredding makes all copies unreadable with one key deletion.
+\end{enumerate}
+
+\section{Further Reading}
+The CSFLE and Queryable Encryption manuals define the architecture, supported query shapes, and storage implications \cite{mongodbCSFLEDocs,mongodbQueryableEncryptionDocs}. The erasure design pairs with Chapter 20's retention and archiving controls \cite{mongodbOnlineArchiveDocs} and Chapter 8's residency zones \cite{mongodbZoneShardingDocs}; the network perimeter that completes the architecture is Chapter 19's \cite{mongodbPrivateLinkDocs,mongodbTLSDocs}.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item Encryption layers stack: at rest (assumed), in transit (enforced), in use (the engineering).
+    \item Key granularity is a schema-time decision; per-subject DEKs are what make erasure provable.
+    \item Deterministic encryption buys equality at the price of frequency leakage; never on low-cardinality fields.
+    \item QE moves equality queries to the server without server decryption, at 2--4$\times$ storage and restricted shapes.
+    \item Per-subject crypto-shredding turns erasure into key management; network isolation completes the perimeter (Chapter 19).
+    \item Crypto-shredding turns erasure into key management; protect the key vault accordingly.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Classify ten example fields (SSN, email, city, blood type, balance, \ldots) into QE-equality, QE-non-queryable, and plaintext, and defend each.
+    \item \textbf{(Conceptual)} Explain why crypto-shredding covers Atlas Search indexes that embed encrypted values.
+    \item \textbf{(Conceptual)} Design the legal-hold key-quarantine workflow with its audit events.
+    \item \textbf{(Hands-on)} Extend the lab with per-subject DEKs and script a full erasure drill with before/after query evidence.
+    \item \textbf{(Hands-on)} Measure QE write amplification: insert latency and storage versus a plaintext twin collection.
+    \item \textbf{(Design)} Write the key-management policy: master-key rotation, DEK backup, destruction dual control, hold quarantine.
+    \item \textbf{(Design)} Extend the Friday architecture with Chapter 19's network perimeter: PrivateLink, TLS 1.3, and the rule that nothing public remains.
+    \item \textbf{(Interview)} ``Legal asks: prove patient 4471's data is gone everywhere, including backups.'' Give the crypto-shredding answer and the row-delete answer, and explain why only one survives audit.
+\end{enumerate}
+
+\section{Capstone Project: Provable Erasure Evidence Pack}\label{sec:ch18-capstone}
+
+\begin{capstonebox}
+\textbf{Mission:} build the end-to-end erasure control for a healthcare platform: per-subject DEKs, QE-encrypted PII, a one-command erasure drill that renders a subject's data unreadable across live data, replicas, streams, and backup artifacts---with the audit trail an examiner requires.
+
+\textbf{Estimated time:} 5--7 hours.
+
+\textbf{What you will practice:}
+\begin{itemize}
+    \item Per-subject key management with \texttt{keyAltNames}.
+    \item Queryable Encryption round-trips and boundary verification.
+    \item Producing compliance-grade erasure evidence.
+\end{itemize}
+\end{capstonebox}
+
+\subsection*{Scenario}
+The healthcare provider's regulator requires a demonstrated erasure capability, not a policy document. You will execute the full drill on the lab cluster and package the evidence.
+
+\subsection*{Requirements}
+\begin{itemize}
+    \item QE on at least two PII fields with per-subject DEKs via \texttt{keyAltNames}.
+    \item The erasure drill: insert, replicate, stream (change event captured to a downstream collection), snapshot (backup artifact or file copy), erase, then prove unreadability at every layer.
+    \item The audit trail: key destruction logged with actor, timestamp, and justification; legal-hold quarantine path implemented and demonstrated.
+    \item A cost note: measured QE storage overhead and its impact on the platform budget.
+    \item A threat note: key-vault protection posture (RBAC, backup, dual control).
+\end{itemize}
+
+\subsection*{Implementation Steps}
+\begin{enumerate}
+    \item \textbf{Encrypt.} Implement the QE schema and per-subject key issuance.
+    \item \textbf{Replicate and stream.} Stand up the replica set and a change-stream consumer writing to a derived collection.
+    \item \textbf{Snapshot.} Produce a backup artifact containing the subject's ciphertext.
+    \item \textbf{Erase.} Destroy the subject's DEK; attempt reads at every layer; capture the failure evidence.
+    \item \textbf{Package.} Assemble the audit log, the unreadability matrix, and the cost/threat notes.
+\end{enumerate}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item All scripts, the unreadability evidence matrix, and the audit trail export.
+    \item The legal-hold quarantine demonstration.
+    \item The cost and threat notes.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item Post-erasure, no layer (primary, secondary, derived collection, snapshot) yields the subject's plaintext.
+    \item Other subjects' data remains fully readable---the erasure is surgical.
+    \item The audit trail reconstructs who erased what, when, and why, including the hold exception.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Add a restore-from-backup test proving the snapshot still cannot yield the erased subject.
+    \item Implement the same control with CSFLE deterministic fields and compare the query trade-offs.
+\end{itemize}

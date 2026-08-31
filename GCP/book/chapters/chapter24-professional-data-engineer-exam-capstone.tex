@@ -1,0 +1,344 @@
+\chapter{Production DataOps and the Professional Data Engineer Exam}
+\index{Terraform}\index{Dataform}\index{CI/CD}\index{Cloud Build}\index{expand-contract}\index{Professional Data Engineer exam}\index{data mesh!capstone}
+
+\begin{objectives}
+\begin{itemize}
+    \item Provision data infrastructure---buckets, datasets, Composer environments---with Terraform and remote state.
+    \item Ship Dataform SQLX models with assertions as data-quality tests through scheduled runs.
+    \item Build CI/CD for data pipelines: plan/apply on merge, Dataform compilation and assertions on every pull request.
+    \item Execute zero-downtime schema evolution with the expand-migrate-contract pattern.
+    \item Map the Professional Data Engineer exam domains to this book's weeks and identify weak areas.
+    \item Complete the Milestone~6 capstone: a secure, governed, three-project data mesh.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+Infrastructure-as-code and SQL transformation pipelines are platform-portable disciplines; only the resource names change.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{2.8cm}p{3.0cm}p{3.0cm}p{3.0cm}@{}} \\
+\toprule
+\textbf{Capability} & \textbf{GCP} & \textbf{AWS} & \textbf{Azure / Fabric} \\
+\midrule
+IaC & Terraform google provider / Deployment Manager & Terraform aws / CloudFormation & Terraform azurerm / Bicep \\
+SQL pipelines & Dataform (SQLX, assertions) & dbt on Redshift / Athena & dbt on Synapse/Fabric \\
+CI/CD & Cloud Build + Workload Identity & CodePipeline / GitHub Actions & Azure DevOps / GitHub Actions \\
+State backend & GCS backend with locking & S3 + DynamoDB locking & Azure Storage backend \\
+Exam analog & Professional Data Engineer & Data Engineer Associate & DP-203 / DP-600 \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+\textbf{Snowflake} practitioners reach for dbt or Terraform's Snowflake provider; \textbf{MongoDB} for the Atlas provider and schema-versioned migrations. The DataOps constant: infrastructure and transformations are code---reviewed, planned, applied, and rolled back through the same pipeline machinery as application software.
+\end{crosscloud}
+
+\begin{keyterms}
+\textbf{Terraform}: declarative infrastructure-as-code; the google provider maps resources (\texttt{google\_bigquery\_dataset}) to GCP APIs.
+\textbf{State}: Terraform's recorded mapping of managed resources; remote backends (GCS) with locking make it team-safe.
+\textbf{SQLX}: Dataform's SQL extension adding model configs, dependencies (\texttt{ref}), and assertions to plain SQL.
+\textbf{Assertion}: a declarative data-quality query that fails the run when it returns rows (i.e., when violations exist).
+\textbf{Expand-contract}: zero-downtime schema evolution: add new shape, dual-write and backfill, migrate consumers, remove old shape.
+\textbf{Workload Identity Federation}: keyless CI authentication to GCP (Chapter~21)---the only acceptable credential story in pipelines.
+\end{keyterms}
+
+\section{Week 24 Roadmap}
+Week~24 completes the program by industrializing delivery and certifying mastery. Monday provisions with Terraform. Tuesday models with Dataform. Wednesday wires CI/CD and the expand-contract discipline. Thursday builds the full IaC-plus-Dataform-plus-CI project with an expand-contract drill. Friday runs the compressed exam preparation. The book closes with the Milestone~6 capstone.
+
+\begin{definitionbox}
+\textbf{DataOps} applies software-delivery discipline to data platforms: infrastructure and transformations as versioned code, continuous integration with automated tests, staged deployment, and observable production operation. On GCP the reference stack is Terraform for infrastructure, Dataform for warehouse transformations, and Cloud Build for the pipeline itself \cite{terraformgoogleprovider,googleclouddataformdocs,googlecloudbuilddocs}.
+\end{definitionbox}
+
+\section{Monday: Infrastructure as Code with Terraform}
+\index{Terraform!google provider}\index{state!remote backend}\index{workspaces}
+
+\subsection{The google Provider}
+Terraform declares desired state; the google provider maps resources to GCP APIs. The data engineer's resource vocabulary: \texttt{google\_storage\_bucket}, \texttt{google\_bigquery\_dataset}, \texttt{google\_bigquery\_table} (with schema JSON and partitioning blocks), \texttt{google\_composer\_environment}, \texttt{google\_pubsub\_topic}, plus the IAM binding resources that wire them. Every resource from Chapters 1--23 is provisionable this way---the \texttt{gcloud} commands throughout this book were the learning surface; Terraform is the production surface.
+
+\begin{lstlisting}[caption={Terraform provisioning a governed BigQuery dataset.}]
+terraform {
+  required_providers {
+    google = { source = "hashicorp/google", version = "~> 5.0" }
+  }
+}
+
+provider "google" {
+  project = var.project_id
+  region  = "us-central1"
+}
+
+resource "google_bigquery_dataset" "analytics" {
+  dataset_id    = "analytics_curated"
+  location      = "US"
+  description   = "Curated data products, managed by Terraform"
+  default_table_expiration_ms = 7776000000  # 90 days
+  labels        = { env = "prod", team = "data-engineering" }
+}
+\end{lstlisting}
+
+\subsection{State, Backends, and Workspaces}
+Terraform's state file is the source of truth for what it manages---and a sensitive artifact (it can contain attribute values). Teams store state in a \textbf{GCS remote backend} with state locking, never in git and never on laptops. \textbf{Workspaces} or---better for data platforms---\textbf{separate state per environment and per project} bound blast radius: the dev apply cannot touch prod because it cannot see prod's state. Per-project state also prevents the cross-project apply races that corrupt multi-project mesh deployments.
+
+\begin{pitfall}
+\texttt{terraform apply} from a laptop with broad credentials is the shadow-IaC incident generator: unreviewed changes, stale state, and no audit trail. Gate \texttt{apply} behind CI with PR approval (Wednesday) and give humans \texttt{plan}-only permissions in production.
+\end{pitfall}
+
+\begin{tipbox}
+Manage IAM with authoritative resources per surface: \texttt{google\_project\_iam\_binding} for project roles you fully own, \texttt{...\_member} for additive grants. Mixing authoritative and additive resources on the same role produces plan flapping that erodes trust in the pipeline.
+\end{tipbox}
+
+\section{Tuesday: Dataform---SQL Pipelines as Code}
+\index{Dataform!SQLX}\index{assertions}\index{dependency trees}
+
+\subsection{SQLX Models}
+Dataform is BigQuery's native SQL pipeline tool. A SQLX file is a query plus a \texttt{config} block declaring its type (\texttt{table}, \texttt{incremental}, \texttt{view}), schema, and dependencies via \texttt{\$\{ref('model')\}}. From \texttt{ref}s, Dataform builds the dependency DAG and executes models in topological order---no scheduler configuration, no orchestration code; the DAG is derived from the SQL. \textbf{Incremental models} process only new data per run with \texttt{when(incremental())} predicates, which is partition-overwrite idempotency (Chapter~12) expressed natively.
+
+\begin{lstlisting}[language=SQL,caption={A SQLX model with an assertion file.}]
+-- definitions/curated/daily_sales.sqlx
+config {
+  type: "incremental",
+  schema: "curated",
+  bigquery: { partitionBy: "sale_date", clusterBy: ["store_id"] }
+}
+
+SELECT sale_date, store_id, SUM(amount) AS revenue
+FROM ${ref('stg_sales')}
+${when(incremental(), "WHERE sale_date = CURRENT_DATE()")}
+GROUP BY sale_date, store_id
+
+-- definitions/curated/daily_sales_asserts.sqlx
+config { type: "assertion", schema: "curated" }
+SELECT sale_date FROM ${ref('daily_sales')}
+GROUP BY sale_date HAVING COUNT(*) = 0 OR SUM(revenue) < 0
+\end{lstlisting}
+
+\subsection{Assertions as Quality Gates}
+Assertions run as part of the pipeline: a failing assertion (the query returns rows---violations) fails the run and blocks downstream dependents. This is the AutoDQ idea (Chapter~22) embedded in the transformation layer: row counts, null checks, uniqueness, and freshness travel with the model code through review and CI. Note dbt as the cross-platform alternative with the same philosophy; Dataform's advantage on GCP is native integration and zero external infrastructure.
+
+\begin{notebox}
+\texttt{dbt} users will find Dataform immediately familiar---models, refs, tests, and a DAG. The exam and this book use Dataform; production portability arguments sometimes favor dbt. Know both, choose per organization's multi-warehouse posture.
+\end{notebox}
+
+\section{Wednesday: CI/CD and Zero-Downtime Schema Evolution}
+\index{Cloud Build!triggers}\index{expand-contract!four stages}\index{schema evolution}
+
+\subsection{The Pipeline}
+The reference CI/CD flow: on every pull request, Cloud Build (or GitHub Actions, authenticated via Workload Identity Federation---never committed keys) runs \texttt{terraform plan}, compiles the Dataform project, and executes assertions against a CI dataset; on merge to main, \texttt{terraform apply} and a Dataform release deploy. Budget alerts on the CI project guard cost; branch protection makes the pipeline the only path to production.
+
+\subsection{Expand-Contract Migrations}
+Zero-downtime schema change is a four-stage sequence, each stage a separate ordered deployment through the same pipeline. \textbf{Expand}: add the nullable new column. \textbf{Migrate}: dual-write and backfill it. \textbf{Switch}: move consumers to the new column behind a backward-compatible view shim. \textbf{Contract}: drop the old column---only after every consumer has moved. The deploy-order rule: schema expands first, consumers migrate to the shim, contraction ships last---never bundled.
+
+\begin{pitfall}
+The failure story that teaches this pattern: a team renamed \texttt{email} to \texttt{email\_address} in the same release as the Dataform model change; the Looker dashboard deployed an hour later, and every tile errored on the missing column, paging on-call. Expand-contract would have kept both columns alive until consumers switched. Bundling all three stages in one release is how a routine rename becomes an incident review.
+\end{pitfall}
+
+\section{Thursday Hands-On Project: Terraform + Dataform + CI with an Expand-Contract Drill}
+\index{hands-on project}\index{Dataform!CI}\index{pull request checks}
+This lab builds the full DataOps loop: a GitHub repository with Terraform provisioning a dataset and bucket, a Dataform project with three SQLX models and five assertions, a Cloud Build trigger compiling and testing on every pull request---then a four-stage column rename across four PRs, keeping a dashboard green throughout.
+
+\subsection{Repository Skeleton}
+\begin{enumerate}
+    \item \texttt{infra/}: Terraform for the GCS state backend (bootstrap, hand-run once), the \texttt{analytics} dataset, a raw bucket, and the CI service account with Workload Identity Federation binding.
+    \item \texttt{dataform/}: \texttt{dataform.json} plus \texttt{definitions/}: \texttt{stg\_sales.sqlx} (view over raw), \texttt{daily\_sales.sqlx} (incremental, partitioned), \texttt{sales\_by\_region.sqlx} (table), and assertion files covering row counts, nulls, uniqueness, freshness, and non-negative revenue.
+    \item \texttt{cloudbuild.yaml}: steps to run \texttt{terraform plan}, \texttt{dataform compile}, and \texttt{dataform test} against the CI dataset on every PR.
+\end{enumerate}
+
+\begin{lstlisting}[language=bash,caption={Local verification before pushing the first PR.}]
+cd infra
+terraform init
+terraform plan -out=plan.tfplan
+
+cd ..\dataform
+dataform compile
+dataform test
+\end{lstlisting}
+
+\subsection{The Expand-Contract Drill}
+Rename \texttt{amount} to \texttt{amount\_usd} in \texttt{stg\_sales} across four PRs: (1) add \texttt{amount\_usd} alongside \texttt{amount}; (2) backfill and dual-write both; (3) switch \texttt{daily\_sales} and the dashboard's view shim to \texttt{amount\_usd}; (4) drop \texttt{amount}. After each PR's merge, confirm the dashboard tile querying the model still renders. Record the four green checks as the drill's evidence.
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item The repository: Terraform, Dataform project, Cloud Build configuration, and README with bootstrap steps.
+    \item PR-check evidence: compile-and-test results on a pull request.
+    \item The four-PR expand-contract sequence with dashboard-green evidence at each stage.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item \texttt{terraform apply} runs only from CI after PR approval; local applies are impossible by IAM design.
+    \item All five assertions pass on the CI dataset, and a deliberately seeded bad row fails one visibly.
+    \item The rename completes in four stages with zero consumer-visible downtime or errors.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Add a scheduled Dataform release (nightly) with a notification channel on run failure.
+    \item Extend CI with a bytes-scanned budget check that fails PRs whose SQLX models exceed a dry-run threshold.
+    \item Reproduce the pipeline with GitHub Actions instead of Cloud Build and compare the Workload Identity setup.
+\end{itemize}
+
+\section{Friday: Professional Data Engineer Exam Preparation}
+\index{exam guide}\index{case studies!EHR Healthcare}\index{case studies!Helium Sports}\index{mock exams}
+
+\subsection{Exam Domains Mapped to This Book}
+The Professional Data Engineer exam assesses design and operational judgment, not syntax recall \cite{googlecloudpdeexam}. Map its domains to your study weeks: \textbf{designing data processing systems} (Chapters 1--4: storage, database selection, migration); \textbf{ingesting and processing data} (Chapters 9--15: Dataproc, Data Fusion, Datastream, Composer, Pub/Sub, Dataflow); \textbf{storing data} and \textbf{preparing/using data for analysis} (Chapters 5--8, 16--17: BigQuery depth, lakehouse, BI, BQML); \textbf{maintaining and automating workloads} (Chapters 12, 18--20, 24: orchestration, MLOps, DataOps); and the security/compliance thread woven through Chapters 21--23.
+
+\subsection{The Case Studies}
+The exam's case studies present fixed business scenarios---\textbf{EHR Healthcare} (compliance-driven migration: the Chapter 11 CDC, Chapter 21 perimeter, and Chapter 23 DLP patterns) and \textbf{Helium Sports} (real-time analytics at scale: Chapters 13--16 streaming patterns). Questions reference these scenarios; read both case-study documents before the exam and annotate each requirement with the GCP service and this book's chapter that answers it. Most case-study questions reduce to a selection decision you have already made hands-on: which storage class, which ingestion path, which security control.
+
+\subsection{Readiness Method}
+Take the first full-length mock exam closed-book and untimed-but-tracked; score by domain, not in aggregate---a 60\% in one domain matters more than an 82\% average. Weak domains map back to weeks for a targeted one-week review loop: rebuild that week's lab, re-read the Friday use case, re-answer the self-checks. Take the second mock timed after the review loop; a score above 85\% with no domain below 70\% is the schedule-the-real-exam threshold. Exam questions reward operational judgment: prefer managed services over self-managed, least-privilege over convenient, and the answer that includes monitoring over the one that merely works.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{4.6cm}p{4.2cm}p{3.6cm}@{}} \\
+\toprule
+\textbf{Exam domain} & \textbf{Book chapters} & \textbf{Typical trap} \\
+\midrule
+Designing data processing systems & 1--4, 21 & Self-managed over managed answers \\
+Ingesting and processing & 9--15 & Batch answers to streaming requirements \\
+Storing data & 1--8 & Ignoring lifecycle/partition cost levers \\
+Preparing and using data & 5--8, 16--17 & Skipping governance and semantics \\
+Maintaining and automating & 12, 18--20, 24 & Solutions without monitoring or CI/CD \\
+Security and compliance & 21--23 & IAM-only answers ignoring perimeters \\
+\bottomrule
+\end{tabular}
+\caption{Exam domains mapped to book chapters, with the trap each domain sets.}
+\label{tab:ch24-exam-domains}
+\end{table}
+
+\begin{tipbox}
+In scenario questions, the correct answer usually optimizes the stated constraint---cost, latency, compliance, operational simplicity---not technical elegance. Identify the constraint in the stem first, then eliminate the two answers that ignore it; the remaining two differ on a trade-off you practiced in a Friday use case.
+\end{tipbox}
+
+\section{Interview Q\&A}
+\subsection{Concepts and Trade-offs}
+\begin{enumerate}
+    \item \textbf{Q: Why must Terraform state live in a remote backend for team work?}\\
+    A: Local state diverges between engineers and laptops, causing conflicting applies and untracked resources; a locked GCS backend serializes changes and makes state an auditable shared artifact.
+
+    \item \textbf{Q: What does a Dataform assertion guarantee about a model's output?}\\
+    A: That no row violates the assertion query at run time---failures block the run and its dependents, making quality a pipeline gate rather than a report.
+
+    \item \textbf{Q: What should run on every pull request: plan, apply, or both?}\\
+    A: Plan (plus Dataform compile and assertions). Apply belongs post-merge behind approval---PRs propose; merges deploy.
+
+    \item \textbf{Q: Why is Workload Identity Federation safer than committed keys?}\\
+    A: No long-lived secret exists to leak from the repository or CI variables; access is short-lived tokens bound to the workload's identity, fully audit-logged.
+
+    \item \textbf{Q: How do SQLX dependencies determine Dataform's execution order?}\\
+    A: \texttt{ref()} calls build the dependency DAG; Dataform executes models in topological order---orchestration derived from the SQL itself.
+\end{enumerate}
+
+\section{Further Reading}
+Read the Terraform google provider reference for the full resource vocabulary \cite{terraformgoogleprovider}, the Dataform documentation for SQLX, assertions, and releases \cite{googleclouddataformdocs}, and Cloud Build for triggers and Workload Identity Federation \cite{googlecloudbuilddocs}. The Professional Data Engineer certification page hosts the current exam guide and case studies \cite{googlecloudpdeexam}, and the Architecture Framework supplies the review questions the exam's design domains reward \cite{googlecloudarchitectureframework}.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item Infrastructure and transformations are code: versioned, reviewed, planned, applied, and observable.
+    \item Remote locked state and CI-gated applies are non-negotiable for team Terraform.
+    \item Dataform derives orchestration from \texttt{ref}s and gates quality with assertions---the DAG lives in the SQL.
+    \item Expand-contract is four deployments, never one release; dashboards stay green at every stage.
+    \item CI authenticates with Workload Identity Federation; committed keys are disqualifying.
+    \item Exam readiness is measured per domain against the guide, with hands-on rebuilds as the review loop.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Explain why \texttt{terraform apply} belongs in CI even for a solo engineer.
+    \item \textbf{(Conceptual)} A colleague proposes skipping the view shim ``since we deploy everything at once anyway.'' Write the incident story that answers them.
+    \item \textbf{(Hands-on)} Reproduce the Thursday lab, then break one assertion deliberately and capture the failed PR check.
+    \item \textbf{(Hands-on)} Add a sixth assertion (freshness) and a CI step failing on dry-run bytes above a threshold.
+    \item \textbf{(Design)} Write your personal exam-readiness plan: domain self-scores, the two weakest domains, and the one-week rebuild loop for each.
+    \item \textbf{(Architecture)} Design the CI/CD topology for the three-project mesh capstone below: state layout, apply ordering, and cross-project dependency handling.
+\end{enumerate}
+
+\section{Milestone 6 Capstone: Secure, Governed Data Mesh}\label{sec:ch24-capstone}
+\index{Milestone 6 capstone}\index{data mesh!three projects}\index{VPC SC!capstone}
+
+\begin{capstonebox}
+\textbf{Mission:} Build a multi-project secure data mesh: Project~A ingests streaming PII and tokenizes it with DLP; Project~B hosts BigLake analytics over the tokenized data; Project~C runs Dataplex governance with row-level security---all three inside one VPC Service Controls perimeter, everything provisioned by Terraform, so the blast radius of any single compromise is one project.
+
+\textbf{Estimated time:} 12--16 hours.
+
+\textbf{What you'll practice:}
+\begin{itemize}
+    \item Terraform across three projects with per-project state and explicit ordering.
+    \item DLP deterministic tokenization with KMS-wrapped keys (Chapter~23).
+    \item BigLake exposure with row- and column-level security (Chapter~8).
+    \item Dataplex policy enforcement and AutoDQ scans (Chapter~22).
+    \item VPC Service Controls perimeter with negative testing (Chapter~21).
+\end{itemize}
+\end{capstonebox}
+
+\subsection*{Scenario}
+The conglomerate from Chapter~22 must now demonstrate its mesh under regulatory scrutiny: PII exists only tokenized in analytics, governance is centralized, and the perimeter is enforced and tested. This capstone integrates the entire book---ingestion, warehousing, streaming, ML-readiness, security, governance, and DataOps---into one defensible platform.
+
+\subsection*{Requirements}
+\begin{itemize}
+    \item Terraform provisions all three projects, the perimeter, and every resource; applies run from CI with PR approval.
+    \item Project A streams synthetic PII through Pub/Sub and Dataflow, tokenizing with DLP FFX under a KMS-wrapped key.
+    \item Project B exposes only tokenized tables as BigLake assets with row access policies.
+    \item Project C owns the Dataplex lake, taxonomy, policy tags, and AutoDQ scans; row-level security is verified with negative tests.
+    \item The VPC SC perimeter encloses all three projects; the negative perimeter test passes and an audit-log alert on violations is exported.
+    \item Cost estimate with two documented optimizations (DLP scan sampling, Dataplex tier, per-project budgets).
+\end{itemize}
+
+\subsection*{Reference Architecture}
+\begin{figure}[H]
+    \centering
+    \resizebox{0.9\textwidth}{!}{%
+    \begin{tikzpicture}[
+        proj/.style={rectangle, rounded corners, draw=primary, thick, fill=primary!6, text width=3.0cm, minimum height=1.2cm, align=center, font=\small\bfseries},
+        sec/.style={rectangle, rounded corners, draw=magenta, thick, fill=magenta!8, text width=3.2cm, minimum height=0.9cm, align=center, font=\footnotesize\bfseries},
+        arrow/.style={-{Stealth[length=2.5mm]}, draw=primary, thick},
+        dasharrow/.style={-{Stealth[length=2.5mm]}, draw=codegray, thick, dashed}
+    ]
+        \node[proj] (pa) at (0,0) {Project A\\Ingest + DLP\\tokenize PII};
+        \node[proj] (pb) at (4.6,0) {Project B\\BigLake\\Analytics};
+        \node[proj] (pc) at (9.2,0) {Project C\\Dataplex\\Governance};
+        \node[sec] (perim) at (4.6,2.0) {VPC Service Controls Perimeter};
+        \node[sec] (iam) at (4.6,-2.0) {IAM + Workload Identity\\+ KMS (CMEK)};
+
+        \draw[arrow] (pa) -- (pb);
+        \draw[arrow] (pc) -- (pb);
+        \draw[dasharrow] (perim) -- (pa);
+        \draw[dasharrow] (perim) -- (pb);
+        \draw[dasharrow] (perim) -- (pc);
+        \draw[dasharrow] (iam) -- (pa);
+        \draw[dasharrow] (iam) -- (pb);
+        \draw[dasharrow] (iam) -- (pc);
+    \end{tikzpicture}%
+    }
+    \caption{Milestone 6 reference architecture: three projects, one perimeter, centralized governance.}
+    \label{fig:ch24-capstone-mesh}
+\end{figure}
+
+\subsection*{Implementation Notes}
+Order the Terraform applies per project with explicit \texttt{depends\_on} or separate state---cross-project races are the classic failure. Remember that the perimeter blocks CI and orchestration API calls from outside: add the CI's federated identity and Composer's project to the perimeter or to ingress rules before enforcement. Finally, run DLP risk analysis on the ``safe'' tokenized tables: quasi-identifiers re-identify where tokens cannot (Chapter~23).
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item A repository deploying the mesh from a clean organization: Terraform for all three projects plus documented gcloud fallbacks.
+    \item The architecture diagram showing projects, perimeter, and governance flows.
+    \item At least three automated data-quality tests (Dataplex AutoDQ or Dataform assertions) with failing-case evidence.
+    \item Monitoring evidence: audit-log alerts on perimeter violations and DLP findings.
+    \item Cost estimate and the security review: least-privilege per project, tokenized PII verified unreadable in the clear, negative perimeter test passed.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item The mesh deploys end-to-end from the README without manual console steps.
+    \item Tokenized analytics in Project B contain no cleartext PII, verified by DLP inspection of the ``safe'' tables.
+    \item The perimeter denies an external API call with valid credentials; the denial is alerted on.
+    \item Row-level security in Project C passes its negative test, and policy tags deny by default with a verified positive path.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Add a fourth domain project onboarded entirely through the Terraform module, proving the mesh scales.
+    \item Extend the perimeter game day with a stolen-credential drill and a legal-hold suspension drill (Chapter~23).
+    \item Publish the mesh's data products through Analytics Hub clean-room listings for partner access (Chapter~8).
+    \item Add the book-closing retrospective: map every capstone requirement back to the exam domains and score your readiness per domain.
+\end{itemize}

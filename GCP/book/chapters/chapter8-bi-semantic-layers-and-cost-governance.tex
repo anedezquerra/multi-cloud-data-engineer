@@ -1,0 +1,349 @@
+\chapter{Data Lakehouse, Analytics Hub, and Cost Governance}
+\index{BigLake}\index{Object Tables}\index{Analytics Hub}\index{data clean room}\index{policy tags}\index{row access policy}\index{lakehouse}
+
+\begin{objectives}
+\begin{itemize}
+    \item Build BigLake tables that give Cloud Storage files warehouse-grade, fine-grained security.
+    \item Index unstructured files---PDFs and images---with Object Tables and route them to AI and SQL processing.
+    \item Publish governed datasets through Analytics Hub listings without copying data.
+    \item Apply row access policies and column-level policy tags, and verify them with negative tests.
+    \item Architect a data clean room that merges CRM and advertising data without exposing raw PII.
+    \item Complete the Milestone~2 capstone: a governed enterprise data lakehouse over five years of retail data.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+The lakehouse pattern---open files in object storage with warehouse-grade security and governance layered on top---exists on every platform, with different names for the unification layer.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{2.8cm}p{3.0cm}p{3.0cm}p{3.0cm}@{}} \\
+\toprule
+\textbf{Capability} & \textbf{GCP} & \textbf{AWS} & \textbf{Azure / Fabric} \\
+\midrule
+Lakehouse tables & BigLake (+ Iceberg engine support) & Lake Formation governed tables / Athena & OneLake lakehouse (Delta) \\
+Unstructured indexing & Object Tables & Athena + external metadata & OneLake files + AI skills \\
+Row-level security & Row access policies & Lake Formation row filters & Row-level security (SQL) \\
+Column-level security & Policy tags & Lake Formation column grants & Column-level security / Purview \\
+Data sharing & Analytics Hub & Data Exchange / Redshift sharing & Fabric external data sharing \\
+Data clean rooms & Analytics Hub clean rooms & AWS Clean Rooms & Confidential clean rooms \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+\textbf{Snowflake} delivers the same story through external tables, Iceberg tables, row access policies, masking policies, and listings on its Marketplace. \textbf{MongoDB}'s analog is field-level encryption and role-based views---the shared principle is that governance belongs on the data asset itself, not on each downstream copy.
+\end{crosscloud}
+
+\begin{keyterms}
+\textbf{BigLake table}: a table over Cloud Storage files that supports BigQuery's fine-grained security and is readable by multiple engines through one connection.
+\textbf{Object table}: a read-only BigQuery table that indexes unstructured Cloud Storage objects (images, PDFs, audio) with metadata and signed URLs.
+\textbf{Analytics Hub}: a BigQuery exchange for publishing and subscribing to governed data listings across organizational boundaries.
+\textbf{Policy tag}: a taxonomy-based label attached to columns that enforces access control at query time.
+\textbf{Row access policy}: a filter predicate enforced on a table per principal, regardless of the query written.
+\textbf{Data clean room}: a governed environment where parties analyze combined data without either side seeing the other's raw records.
+\end{keyterms}
+
+\section{Week 8 Roadmap}
+Week~8 completes Part~II by turning the warehouse outward: governed lakes, unstructured data, and cross-organization sharing. Monday introduces BigLake and the lakehouse unification. Tuesday covers Object Tables for unstructured files. Wednesday covers Analytics Hub, listings, and data clean rooms. Thursday builds a BigLake table with column-level security and publishes a dataset to a partner. Friday architects an advertising data clean room. The week closes with the Milestone~2 capstone.
+
+\begin{definitionbox}
+A \textbf{lakehouse} combines the open, low-cost file storage of a data lake with the schema enforcement, performance features, and fine-grained security of a warehouse. On GCP the pattern is Cloud Storage files exposed through BigLake tables, governed by the same IAM, policy tags, and row access policies as native BigQuery tables \cite{googlecloudbiglake}.
+\end{definitionbox}
+
+\section{Monday: BigLake---Unifying Lake and Warehouse}
+\index{BigLake!connections}\index{fine-grained security}\index{open table formats}
+
+\subsection{Architecture}
+A BigLake table points at files in Cloud Storage (Parquet, Avro, CSV, or Iceberg metadata) through a \textbf{Cloud resource connection}---a service identity the files' bucket trusts. Queries execute in BigQuery but read governed files; the same tables are readable by Spark on Dataproc through the BigLake connector, so one copy of the data serves SQL analysts and data scientists without exports. Because access flows through the connection rather than per-user bucket permissions, users query files they could never read directly---the warehouse becomes the security boundary for the lake.
+
+\subsection{Fine-Grained Security on the Lake}
+BigLake's central value is that lake files inherit warehouse security primitives: \textbf{column-level security} via policy tags and \textbf{row-level security} via row access policies, enforced at query time for every engine reading through the table. Without BigLake, file-level IAM is all-or-nothing per object; with it, an analyst sees only permitted rows and columns of the very Parquet files a Spark job writes.
+
+\begin{notebox}
+BigLake also supports Apache Iceberg table metadata, letting BigQuery query Iceberg tables that other engines (Spark, Trino, Snowflake) read and write---a practical hedge against format lock-in \cite{apacheiceberg}.
+\end{notebox}
+
+\begin{pitfall}
+The Cloud resource connection's service account needs read access to the bucket---and nothing more. Granting it broad \texttt{storage.objectAdmin} on production buckets converts a query-time read path into a data-management backdoor. Least privilege applies to connections too.
+\end{pitfall}
+
+\section{Tuesday: Object Tables and Unstructured Data}
+\index{Object Tables!metadata}\index{unstructured data}\index{signed URLs}
+
+\subsection{Indexing Files as Rows}
+An Object Table is a read-only BigQuery table whose rows are the unstructured objects under a Cloud Storage prefix: PDFs, images, audio, video. Columns expose object metadata---URI, content type, size, generation---plus signed URLs for retrieval. That single abstraction lets SQL enumerate, filter, and join millions of files against structured tables, and it is the entry point for Document AI and Vision API enrichment: select the URIs matching a filter, send them through an ML transform, land the extracted fields in a structured table.
+
+\begin{lstlisting}[language=SQL,caption={Object table indexing a claims document prefix.}]
+CREATE OR REPLACE EXTERNAL TABLE claims.docs
+WITH CONNECTION `us.doc-processor-connection`
+OPTIONS (
+  object_metadata = 'SIMPLE',
+  metadata_cache_mode = 'AUTOMATIC',
+  uris = ['gs://claims-documents/incoming/*.pdf']);
+
+-- Enumerate recent large PDFs for downstream OCR
+SELECT uri, content_type, size
+FROM claims.docs
+WHERE content_type = 'application/pdf'
+  AND size > 1048576;
+\end{lstlisting}
+
+\begin{tipbox}
+Keep the object-metadata cache mode automatic for prefixes with steady churn; stale object listings are the most common Object Table surprise when upstream processes write and delete files continuously.
+\end{tipbox}
+
+\section{Wednesday: Analytics Hub and Data Clean Rooms}
+\index{Analytics Hub!listings}\index{data clean room}\index{data sharing}
+
+\subsection{Sharing Without Copying}
+Analytics Hub is an exchange built into BigQuery. A \textbf{publisher} creates a listing over a dataset; a \textbf{subscriber} links it into their own project as a read-only, always-current \textbf{linked dataset}---no export, no copy, no stale extract. Governance travels with the listing: policy tags and row access policies on the source tables apply to subscribers, and revoking the listing revokes access everywhere. This replaces the classic anti-pattern of nightly CSV drops to an SFTP server with unknown downstream copies.
+
+\subsection{Data Clean Rooms}
+An Analytics Hub \textbf{data clean room} adds analysis rules to shared data: contributors publish data where queries must aggregate over a minimum number of distinct individuals, columns can be designated join-only or unqueryable, and results cannot be exported below threshold. Two parties---say, an advertiser and a publisher---can measure campaign overlap without either side reading the other's row-level PII.
+
+\begin{definitionbox}
+A \textbf{data clean room} is a governed sharing environment in which parties run approved analyses over combined data while analysis rules prevent any party from observing another party's raw, row-level records \cite{googlecloudanalyticshub}.
+\end{definitionbox}
+
+\begin{pitfall}
+Aggregation thresholds stop naive snooping, not clever snooping: differencing two carefully crafted aggregations can isolate an individual. Treat clean-room query governance as an ongoing review discipline, not a one-time configuration.
+\end{pitfall}
+
+\section{Thursday Hands-On Project: BigLake Security and an Analytics Hub Listing}
+\index{hands-on project}\index{policy tags}\index{row access policy}\index{Analytics Hub!listing}
+This lab creates a BigLake table over Parquet files, applies column-level and row-level security, verifies both with negative tests, and publishes a curated dataset through an Analytics Hub listing.
+
+\subsection{Create the BigLake Table}
+\begin{lstlisting}[language=bash,caption={Creating a Cloud resource connection and BigLake table.}]
+$env:PROJECT_ID = "my-gcp-lakehouse-lab"
+$env:BUCKET = "my-gcp-lakehouse-lab-retail"
+
+bq mk --connection --location=US --connection_type=CLOUD_RESOURCE lakehouse-conn
+
+# Grant the connection's service account read access to the bucket only:
+# gcloud storage buckets add-iam-policy-binding gs://$env:BUCKET `
+#   --member=serviceAccount:<connection-sa> --role=roles/storage.objectViewer
+
+bq query --nouse_legacy_sql `
+  "CREATE OR REPLACE EXTERNAL TABLE lakehouse.fact_sales
+   WITH CONNECTION \``us.lakehouse-conn\``
+   OPTIONS(format='PARQUET',
+           uris=['gs://$env:BUCKET/curated/fact_sales/*.parquet'])"
+\end{lstlisting}
+
+\subsection{Apply Row and Column Security}
+\begin{lstlisting}[language=SQL,caption={Row access policy and policy tag enforcement on the lakehouse table.}]
+CREATE ROW ACCESS POLICY region_filter
+ON lakehouse.fact_sales
+GRANT TO ("group:analysts-eu@example.com")
+FILTER USING (region = 'EU');
+-- Negative test: query as an analysts-us member must return zero EU rows.
+
+-- Policy tags: Data Catalog taxonomy -> tag on the customer_email column.
+-- Analysts without the Fine-Grained Reader role on the tag see NULLs.
+\end{lstlisting}
+
+\subsection{Publish via Analytics Hub}
+In the BigQuery console (or API), create a \textbf{data exchange} \texttt{partner-exchange}, then a \textbf{listing} over a curated, already-secured dataset. Subscribe from a second project representing the partner and confirm the linked dataset appears read-only and reflects source updates within seconds. Finally, run the negative tests: a US analyst queries the row-policed table and sees no EU rows; an untagged user sees \texttt{NULL} (or an access error) in the tagged column.
+
+\begin{notebox}
+Policy tags deny by default. A forgotten group grant blocks dashboards silently and indistinguishably from a data outage---always pair every policy tag with a negative test and a positive access test for the intended group.
+\end{notebox}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item DDL for the BigLake table, row access policy, and policy-tag assignments.
+    \item Evidence of the negative tests: query output (or error) for the unauthorized principal.
+    \item A screenshot of the Analytics Hub listing and the partner project's linked dataset.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item The BigLake table reads Cloud Storage files through a least-privilege connection.
+    \item Row access policy filters rows per group and is verified with a negative test.
+    \item The listing shares a live, read-only dataset with no data copy.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Recreate the curated layer as Iceberg-format BigLake tables and read them from a Spark job.
+    \item Add a second row access policy for another region and prove the filters compose per principal.
+    \item Convert the listing into a data clean room with an aggregation-threshold analysis rule.
+\end{itemize}
+
+\section{Friday Use Case and Architecture: An Advertising Data Clean Room}
+\index{data clean room!advertising}\index{PII protection}\index{identity resolution}
+
+\subsection{Scenario}
+An ad agency wants to merge its client's CRM segments with Google Ads exposure data to measure campaign reach and conversion overlap. Both datasets contain PII; neither party may see the other's raw records; regulators require documented controls.
+
+\subsection{Architecture}
+Both parties contribute governed tables to an Analytics Hub clean room. The CRM side publishes a table where direct identifiers are pre-hashed and designated join-only; the ads side does the same with its identifiers. An analysis rule requires every query to aggregate over at least fifty distinct individuals; overlap measurement queries run inside the clean room and only aggregated results---never row-level data---leave it. Policy tags on quasi-identifiers (postal code, birth date) restrict them further, and all queries are audit-logged for the compliance file.
+
+\begin{figure}[H]
+    \centering
+    \resizebox{0.95\textwidth}{!}{%
+    \begin{tikzpicture}[
+        party/.style={rectangle, rounded corners, draw=codegray, thick, fill=white, text width=3.2cm, minimum height=1.1cm, align=center, font=\small\bfseries},
+        room/.style={rectangle, rounded corners, draw=primary, thick, fill=primary!6, text width=5.2cm, minimum height=2.4cm, align=center, font=\small\bfseries},
+        result/.style={rectangle, rounded corners, draw=codegreen!60!black, thick, fill=green!7, text width=3.2cm, minimum height=1.0cm, align=center, font=\small\bfseries},
+        arrow/.style={-{Stealth[length=2.5mm]}, draw=primary, thick}
+    ]
+        \node[party] (crm) at (0,1.2) {Agency CRM\\hashed IDs, join-only};
+        \node[party] (ads) at (0,-1.2) {Google Ads\\exposure data};
+        \node[room] (clean) at (6.8,0) {Analytics Hub\\Data Clean Room\\[1mm] \footnotesize aggregation threshold $\geq$ 50\\\footnotesize join-only columns\\\footnotesize no row-level export};
+        \node[result] (result) at (12.6,0) {Aggregated\\reach \& overlap\\report};
+
+        \draw[arrow] (crm) -- (clean);
+        \draw[arrow] (ads) -- (clean);
+        \draw[arrow] (clean) -- (result);
+    \end{tikzpicture}%
+    }
+    \caption{Data clean room: both parties contribute governed tables; only thresholded aggregates leave.}
+    \label{fig:ch8-clean-room}
+\end{figure}
+
+\begin{tipbox}
+Document the re-identification analysis alongside the clean-room configuration: which quasi-identifiers remain, what differencing attacks the analysis rules do and do not prevent, and who approved the residual risk. Chapter~23 covers DLP risk analysis for exactly this purpose.
+\end{tipbox}
+
+\section{Interview Q\&A}
+\subsection{Concepts and Trade-offs}
+\begin{enumerate}
+    \item \textbf{Q: How does BigLake give Cloud Storage files warehouse-grade security?}\\
+    A: Access flows through a governed connection and BigQuery's query engine, so policy tags and row access policies are enforced at query time on lake files just as on native tables.
+
+    \item \textbf{Q: What can an Object Table index that a regular external table cannot?}\\
+    A: Unstructured objects---PDFs, images, audio---as rows with metadata and signed URLs, with no requirement that the files share a tabular schema.
+
+    \item \textbf{Q: How does Analytics Hub share data without copying it?}\\
+    A: Subscribers receive a read-only linked dataset that references the publisher's live tables; revoking the listing revokes access instantly.
+
+    \item \textbf{Q: What does a data clean room prevent each party from seeing?}\\
+    A: The other party's row-level records; only analyses satisfying the configured rules (aggregation thresholds, join-only columns) may run or export.
+
+    \item \textbf{Q: Why use policy tags instead of separate views per role?}\\
+    A: Tags attach enforcement to the column itself across every table and query path, whereas per-role views multiply, drift, and are bypassed by direct table access.
+\end{enumerate}
+
+\section{Further Reading}
+Read the BigLake documentation for connection setup, Iceberg support, and security semantics \cite{googlecloudbiglake}, and the Analytics Hub documentation for exchanges, listings, and clean-room analysis rules \cite{googlecloudanalyticshub}. Review Apache Iceberg for the open table format underlying portable lakehouses \cite{apacheiceberg}. BigQuery's main documentation covers policy tags, row access policies, and authorized views in depth \cite{googlecloudbigquerydocs}, and the Architecture Framework supplies the governance review prompts \cite{googlecloudarchitectureframework}.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item BigLake turns lake files into governed tables: one copy of data, warehouse-grade security, multiple engines.
+    \item Object Tables make unstructured files enumerable and joinable from SQL, and are the front door to AI enrichment.
+    \item Analytics Hub replaces extract-based sharing with live, revocable, governed listings.
+    \item Row access policies and policy tags must be verified with negative tests---deny-by-default fails silently.
+    \item Clean rooms protect raw records, not against every inference attack; document residual re-identification risk.
+    \item Cost governance at the lakehouse layer means prunable layouts, monitored scans, and explicit sharing boundaries.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Explain why per-user bucket IAM cannot replace BigLake for column- and row-level security on Parquet files.
+    \item \textbf{(Conceptual)} A partner asks for ``the raw data, just this once, it is easier.'' Write three sentences explaining what breaks and the governed alternative.
+    \item \textbf{(Hands-on)} Reproduce the Thursday lab, then revoke the listing and confirm the linked dataset disappears for the subscriber.
+    \item \textbf{(Hands-on)} Create an Object Table over a prefix of sample PDFs and join it to a structured claims table on document ID.
+    \item \textbf{(Design)} Design the taxonomy for a retailer: three policy tags of increasing sensitivity, which columns get each, and which groups get Fine-Grained Reader.
+    \item \textbf{(Architecture)} Extend the clean-room design with audit-log export, a quarterly access review, and a differencing-attack mitigation note.
+\end{enumerate}
+
+\section{Milestone 2 Capstone: Enterprise Data Lakehouse Build}\label{sec:ch8-capstone}
+\index{Milestone 2 capstone}\index{lakehouse!capstone}\index{BigLake!capstone}
+
+\begin{capstonebox}
+\textbf{Mission:} Ingest five years of retail data into Cloud Storage, expose it through BigLake tables with region-based row- and column-level security, accelerate executive KPIs with materialized views and a BI Engine reservation, and publish a governed dataset through Analytics Hub---one governed copy serving internal dashboards and external partners.
+
+\textbf{Estimated time:} 8--10 hours.
+
+\textbf{What you'll practice:}
+\begin{itemize}
+    \item Landing five years of Parquet retail data in partitioned Cloud Storage zones.
+    \item Creating BigLake tables with row access policies on \texttt{region} and policy tags on customer PII.
+    \item Building materialized views for executive KPIs and sizing a BI Engine reservation.
+    \item Publishing a curated dataset via Analytics Hub and validating subscriber-side read-only access.
+    \item Producing a cost estimate comparing on-demand and Editions for the serving layer.
+\end{itemize}
+\end{capstonebox}
+
+\subsection*{Scenario}
+Meridian Retail operates across North America and Europe. Five years of order history exist as Parquet exports. Regional analysts must see only their region's rows; customer email and loyalty identifiers are restricted to a small data-steward group; executives need sub-second KPI dashboards; a logistics partner needs a governed, read-only feed of aggregated fulfillment metrics. One platform must satisfy all four without data copies.
+
+\subsection*{Requirements}
+\begin{itemize}
+    \item Land the five-year Parquet dataset in a curated Cloud Storage zone, partitioned by date.
+    \item Create BigLake tables over the files through a least-privilege Cloud resource connection.
+    \item Apply a row access policy on \texttt{region} and policy tags on customer PII columns; verify each with a negative test.
+    \item Build materialized views for the executive KPIs and add a BI Engine reservation sized to the hot window.
+    \item Publish the curated, secured dataset through an Analytics Hub listing and subscribe from a partner project.
+    \item Produce a monthly cost estimate (on-demand versus Editions) with two documented optimization decisions.
+\end{itemize}
+
+\subsection*{Reference Architecture}
+\begin{figure}[H]
+    \centering
+    \resizebox{0.95\textwidth}{!}{%
+    \begin{tikzpicture}[
+        store/.style={cylinder, shape border rotate=90, aspect=0.25, draw=primary, thick, fill=primary!10, text width=2.8cm, minimum height=1.3cm, align=center, font=\small\bfseries},
+        svc/.style={rectangle, rounded corners, draw=primary, thick, fill=primary!6, text width=2.9cm, minimum height=1.0cm, align=center, font=\small\bfseries},
+        sec/.style={rectangle, rounded corners, draw=magenta, thick, fill=magenta!8, text width=2.9cm, minimum height=0.9cm, align=center, font=\footnotesize\bfseries},
+        result/.style={rectangle, rounded corners, draw=codegreen!60!black, thick, fill=green!7, text width=2.7cm, minimum height=0.9cm, align=center, font=\small\bfseries},
+        arrow/.style={-{Stealth[length=2.5mm]}, draw=primary, thick},
+        dasharrow/.style={-{Stealth[length=2.5mm]}, draw=codegray, thick, dashed}
+    ]
+        \node[store] (gcs) at (0,0) {GCS Data Lake\\5 yrs retail};
+        \node[svc] (biglake) at (4.2,0) {BigLake Tables\\row/col security};
+        \node[svc] (bq) at (8.4,0) {BigQuery\\MVs + BI Engine};
+        \node[svc] (hub) at (12.6,0) {Analytics Hub\\listing};
+        \node[result] (dash) at (8.4,2.2) {Executive\\Dashboards};
+        \node[result] (partner) at (12.6,2.2) {Partner\\Project};
+        \node[sec] (iam) at (4.2,-2.2) {Policy Tags +\\Row Policies + IAM};
+
+        \draw[arrow] (gcs) -- (biglake);
+        \draw[arrow] (biglake) -- (bq);
+        \draw[arrow] (bq) -- (hub);
+        \draw[arrow] (bq) -- (dash);
+        \draw[arrow] (hub) -- (partner);
+        \draw[dasharrow] (iam) -- (biglake);
+        \draw[dasharrow] (iam) -- (bq);
+    \end{tikzpicture}%
+    }
+    \caption{Milestone 2 reference architecture: a governed lakehouse from Cloud Storage to shared analytics.}
+    \label{fig:ch8-capstone-lakehouse}
+\end{figure}
+
+\subsection*{Implementation Steps}
+\begin{enumerate}
+    \item \textbf{Land the data.} Upload five years of Parquet to \texttt{gs://\$BUCKET/curated/...} with a hive-partitioned layout by sale date; validate row counts against the source export manifest.
+    \item \textbf{Create the connection and BigLake tables.} One connection per environment, \texttt{storage.objectViewer} on the curated bucket only.
+    \item \textbf{Secure the tables.} Row access policy on \texttt{region} for the analyst groups; policy tags on \texttt{customer\_email} and \texttt{loyalty\_id} granted only to the data-steward group. Run negative tests for both.
+    \item \textbf{Accelerate serving.} Materialized views for daily revenue by region and fulfillment SLA by carrier; BI Engine reservation covering the trailing 90 days.
+    \item \textbf{Publish.} Analytics Hub exchange and listing over the curated views; subscribe from the partner project and confirm read-only, policy-enforced access.
+    \item \textbf{Estimate cost.} Four weeks of \texttt{INFORMATION\_SCHEMA} job telemetry; model on-demand versus an Enterprise Edition reservation; document two optimizations (for example, partition pruning and the MV/BI Engine serving layer).
+\end{enumerate}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item A repository that rebuilds the lakehouse from a clean environment: ingest scripts, DDL, security policies, and MV definitions.
+    \item An architecture diagram showing zones, security policies, and serving layers.
+    \item At least three automated data-quality tests (row counts, null checks, freshness) with a failing-case demonstration.
+    \item Monitoring evidence: query-cost and slot-utilization dashboards or exported alert policies.
+    \item The monthly cost estimate and the security review with negative-test evidence.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item The end-to-end lakehouse rebuilds from a clean environment following the README.
+    \item Row- and column-level policies are verified with negative tests; no hardcoded secrets anywhere.
+    \item The listing serves a live, read-only, policy-enforced dataset to the partner project.
+    \item The cost estimate compares on-demand and Editions with two justified optimizations.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Rebuild the curated zone as Iceberg tables and read them from both BigQuery and Dataproc Spark.
+    \item Add Dataplex AutoDQ scans (Chapter~22) to replace hand-written quality tests.
+    \item Convert the partner listing into a data clean room with aggregation thresholds.
+    \item Add a FinOps dashboard breaking storage, slots, and BI Engine cost down by label and team.
+\end{itemize}

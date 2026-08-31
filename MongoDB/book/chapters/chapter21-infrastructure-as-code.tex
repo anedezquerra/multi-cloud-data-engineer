@@ -1,0 +1,265 @@
+\chapter{Infrastructure as Code: Terraform and Database Change Management}
+\index{CI/CD}\index{Terraform}\index{infrastructure as code}\index{schema migration}\index{expand-contract}\index{GitOps}\index{Atlas Terraform provider}\index{database change management}%
+
+\begin{objectives}
+\begin{itemize}
+    \item Provision Atlas projects, clusters, users, and private endpoints with the MongoDB Atlas Terraform provider.
+    \item Manage search/vector indexes, roles, and network resources as reviewed code.
+    \item Automate index and \texttt{\$jsonSchema} migrations as numbered, idempotent CI/CD artifacts.
+    \item Execute zero-downtime expand--migrate--contract schema evolution with feature-flagged read switches.
+    \item Build the multi-environment GitOps pipeline in the Thursday lab.
+    \item Architect change management where infrastructure, indexes, and schemas ship as one reviewed unit.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+Infrastructure as code is the most vendor-neutral skill in this book: Terraform manages all six platforms, and the GitOps discipline---plan in CI, apply on merge, state locked remotely---is identical everywhere.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{2.9cm}p{3.0cm}p{3.0cm}p{3.0cm}@{}} 
+\toprule
+\textbf{Capability} & \textbf{AWS} & \textbf{Azure} & \textbf{GCP} \\
+\midrule
+Native IaC & CloudFormation / CDK & ARM / Bicep & Deployment Manager \\
+Terraform provider & \texttt{hashicorp/aws} & \texttt{azurerm} & \texttt{google} \\
+DB migration tools & Flyway / Liquibase / Alembic & Same & Same \\
+Plan-in-CI gate & \texttt{terraform plan} on PR & Same & Same \\
+State backend & S3 + DynamoDB lock & Azure Blob + lease & GCS + lock \\
+Secrets & Secrets Manager + CI vars & Key Vault + CI vars & Secret Manager + CI vars \\
+\addlinespace
+Snowflake / Fabric & \multicolumn{3}{l}{Snowflake provider for accounts/warehouses/grants; schemachange for migrations; Fabric via Terraform azapi and Git integration} \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+MongoDB's distinctive gap and opportunity: schema is not enforced by the engine, so \emph{change management}---validators, indexes, migrations---is the mechanism that keeps forty services' implicit schemas from drifting apart. CI/CD is where that discipline lives \cite{mongodbTerraformDocs,terraformDocs}.
+\end{crosscloud}
+
+\section{Week 21 Roadmap: The Database in the Pipeline}
+Everything prior in this book was learned against systems you built by hand; production forbids that. The week's claim: any change to infrastructure, indexes, roles, or validation rules that is not a reviewed, versioned, automatically applied artifact will eventually be an incident. We build the pipeline that makes the reviewed artifact the path of least resistance \cite{mongodbTerraformDocs}.
+
+\begin{definitionbox}
+\textbf{GitOps for databases} is the operating model where the Git repository is the desired state of infrastructure and schema, CI validates proposed changes (\texttt{terraform plan}, migration dry-runs, contract tests), and CD applies merged changes to environments in order (dev $\to$ staging $\to$ prod) with gates.
+\end{definitionbox}
+
+\begin{keyterms}
+\textbf{Terraform state}: the recorded mapping between configuration and real resources; stored remotely with locking. \textbf{Migration}: a numbered, idempotent script changing schema or indexes. \textbf{Expand--contract}: the zero-downtime schema evolution pattern (add new, dual-write, backfill, switch reads, remove old). \textbf{Contract test}: the CI check asserting a service's schema assumptions still hold. \textbf{Drift}: reality diverging from the repository.
+\end{keyterms}
+
+\section{Monday: The Atlas Terraform Provider}
+\subsection{What the Provider Owns}
+The \texttt{mongodbatlas} provider manages the Atlas control plane: organizations, projects, clusters (including sharded topologies and region configs), database users and custom roles, network peering and private endpoints, alert configurations, backup policies, Online Archive rules, and search/vector index definitions. The design consequence: everything from Parts III--V that was ``configured in the UI'' becomes reviewable HCL---zones, alerts, archive rules, QE-adjacent key policies---with the same pull-request rigor as application code \cite{mongodbTerraformDocs}.
+
+\begin{lstlisting}[language=bash, caption={Atlas cluster as Terraform HCL (from the syllabus, annotated).}]
+resource "mongodbatlas_cluster" "analytics" {
+  project_id   = var.atlas_project_id
+  name         = "analytics-sharded"
+  cluster_type = "SHARDED"
+
+  replication_specs {
+    num_shards = 2
+    regions_config {
+      region_name     = "US_EAST_1"
+      electable_nodes = 3
+      priority        = 7
+      read_only_nodes = 0
+    }
+  }
+
+  provider_name               = "AWS"
+  provider_instance_size_name = "M30"
+  mongo_db_major_version      = "8.0"
+  backup_enabled              = true        # Chapter 20/23 control, in code
+  pit_enabled                 = true        # PITR window, in code
+
+  labels {
+    key   = "environment"
+    value = "production"
+  }
+}
+\end{lstlisting}
+
+\subsection{State, Secrets, and the Plan Gate}
+Three rules make Terraform safe: state lives in a remote backend with locking (two concurrent applies corrupt state; locking prevents the second), secrets never appear in code (Atlas API keys come from CI secret stores into environment variables), and \texttt{terraform plan} runs on every pull request with the plan output posted for review---the reviewer approves the plan, not just the diff. Drift detection is a scheduled \texttt{plan} expecting zero changes; non-zero drift pages the platform team, because drift means someone changed production outside the repository.
+
+\begin{pitfall}
+\textbf{Clicking in the Atlas UI ``just this once.''} Every console change is drift the next apply will either revert (surprising the clicker) or absorb silently (losing the review trail). Emergency console changes are followed same-day by a PR codifying them, or by a deliberate revert---recorded either way.
+\end{pitfall}
+
+\section{Tuesday: Indexes, Roles, and Search as Code}
+The provider plus scripted \texttt{mongosh} migrations cover the database plane: search and vector index definitions as Terraform resources (Chapters 13--14's indexes reviewed like any schema), custom roles and users as resources (Chapter 17's grant matrix enforced), and alert policies as resources (Chapter 23's alerts-as-code). What Terraform does not own---collection-local artifacts like validators and non-search indexes---ships as numbered migrations (Wednesday). The boundary rule: if the Atlas API owns it, Terraform owns it; if the mongod owns it, migrations own it; nothing is owned by a human clicking.
+
+\section{Wednesday: Automated Migrations}
+\subsection{Numbered, Idempotent, Forward-Only}
+A migration is a numbered script (\texttt{0007\_expand\_contract.js}) applied exactly once per environment by a runner that records applied versions in a control collection. Migrations are idempotent (safe to re-run), forward-only (rollbacks are new migrations), and throttled when they touch data (batched, resumable writes---a one-shot full-collection update saturates the primary, as the syllabus failure story warns).
+
+\begin{lstlisting}[language=JavaScript, caption={Idempotent expand-phase migration, run by CI.}]
+// migrations/0007_expand_order_total.js
+db.orders.updateMany(
+  { order_total: { $exists: false }, total_price: { $exists: true } },
+  [ { $set: { order_total: "$total_price" } } ] );     // batched + throttled in prod
+db.orders.createIndex({ order_total: 1, status: 1 });
+db.migration_log.insertOne({ id: "0007", at: new Date(), by: "ci" });
+\end{lstlisting}
+
+\subsection{Expand--Migrate--Contract in Full}
+The zero-downtime rename from the syllabus failure story, done right: \textbf{expand}---deploy application code writing both \texttt{total\_price} and \texttt{order\_total}; \textbf{migrate}---backfill existing documents with a throttled, resumable pipeline; \textbf{switch reads}---flip consumers to the new field behind a feature flag, with a compatibility view shim for lagging consumers; \textbf{contract}---only when zero lagging readers remain, enforce the new field with \texttt{\$jsonSchema} (\texttt{validationAction} graduating \texttt{warn} $\to$ \texttt{error}) and \texttt{\$unset} the old field in a final batched migration. Every step is a separate reviewed migration; the failure story happened precisely because backfill and read-switch shipped in one release.
+
+\begin{notebox}
+The Week 3 schema contract test belongs in this same pipeline: a CI job asserting that a service's expected document shape still validates against the collection's \texttt{\$jsonSchema}, so schema, index, and infrastructure changes deploy as one reviewed unit.
+\end{notebox}
+
+\section{Thursday Hands-On Project: The Three-Environment GitOps Pipeline}
+Build the pipeline: Terraform modules for dev/staging/prod Atlas environments, a migrations runner, and CI that plans on PR and applies on merge per environment.
+
+\subsection{Repository Layout and Pipeline}
+\begin{lstlisting}[language=bash, caption={GitOps repository structure and CI stage outline.}]
+repo/
+  infra/            # Terraform: modules + envs (dev, staging, prod)
+    envs/prod/main.tf
+    modules/cluster/
+  migrations/       # numbered mongosh scripts + runner
+    0006_orders_indexes.js
+    0007_expand_order_total.js
+  k8s/              # Chapter 22 operator manifests (staging)
+  .github/workflows/db-change.yml
+
+# CI stages:
+#   PR open      -> terraform plan (all envs) + migration lint + contract tests
+#   merge        -> apply dev -> smoke tests -> apply staging -> smoke tests
+#   manual gate  -> apply prod -> post-deploy verification -> tag release
+\end{lstlisting}
+
+The lab exercises the failure modes deliberately: a plan showing an unexpected destroy is caught at PR review; a staging smoke-test failure blocks prod; and the expand--contract sequence for \texttt{total\_price} $\to$ \texttt{order\_total} runs end-to-end with the old app version still reading during the rollout---proving no orders are dropped, in contrast to the syllabus's cautionary tale.
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item The repository with Terraform modules, two migrations, and the CI workflow file.
+    \item Evidence of the plan gate catching a deliberately bad change.
+    \item The expand--contract run with dual-version application traffic and zero dropped orders.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item A PR produces plan output for all environments without applying anything.
+    \item Staging failure demonstrably blocks the production apply.
+    \item The migration runner applies each migration exactly once and is idempotent on re-run.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Add scheduled drift detection (zero-change \texttt{plan}) with alerting on drift.
+    \item Implement the contract phase as a time-delayed migration gated on a ``no lagging readers'' check.
+\end{itemize}
+
+\section{Friday Use Case and Architecture: Change Management for a Regulated Platform}
+\subsection{Scenario and Requirements}
+A fintech with SOX-adjacent change-control obligations must prove that every production database change was reviewed, tested in staging, applied by automation (not a human), and is attributable to an approved change request.
+
+\subsection{Architecture}
+The pipeline is the control: Git branch protection requires review on \texttt{infra/} and \texttt{migrations/}; CI links each PR to a change ticket; applies run as a CI service account holding least-privilege Atlas API keys (Chapter 17) from the CI vault; staging applies and smoke tests gate production; and the audit pack---PR, plan output, staging evidence, apply log, approver identity---is assembled per change automatically. Atlas audit events (Chapter 17) close the loop: any change to the cluster \emph{not} correlated with a pipeline run within an hour triggers the drift alert and a change-control incident.
+
+\begin{pitfall}
+\textbf{A pipeline humans can bypass.} If engineers retain direct Atlas write access ``for emergencies,'' the control is fiction. Human write access is break-glass only (alarmed, vaulted, expiring), and every break-glass use generates a retroactive PR plus a review note.
+\end{pitfall}
+
+\section{Interview Q\&A}
+\subsection{DataOps}
+\begin{enumerate}
+    \item \textbf{Q: Why remote state with locking?}\\
+    A: State is the source of truth for what exists; concurrent applies corrupt it, and local state is unshareable and unauditable. Locking serializes applies; the remote backend makes them reviewable.
+
+    \item \textbf{Q: Why forward-only migrations?}\\
+    A: Down migrations are code paths tested rarely and needed under maximum stress. Rollback = a new forward migration, reviewed and tested like any change.
+
+    \item \textbf{Q: What does expand--contract actually buy?}\\
+    A: Every intermediate state is valid for old and new code simultaneously, so rolling deploys never straddle an incompatible schema---the failure mode of same-release rename + backfill.
+
+    \item \textbf{Q: Where do Atlas API keys live?}\\
+    A: In the CI secret store, injected at runtime, scoped least-privilege, rotated on schedule---never in code, never in Terraform variable files committed to the repo.
+
+    \item \textbf{Q: Why bundle the schema contract test into the infra pipeline?}\\
+    A: Because schema, indexes, and infrastructure are one logical change; separating their validation lets a compatible-looking pair ship an incompatible system.
+\end{enumerate}
+
+\section{Further Reading}
+The Atlas Terraform provider registry documents every resource used here \cite{mongodbTerraformDocs}, and Terraform's own documentation covers backends and locking \cite{terraformDocs}. JSON Schema validation underpins the contract phase \cite{mongodbJsonSchemaDocs}. The GitOps operating model and its audit properties align with the SRE release-engineering chapters \cite{sreBook}, and Chapter 22 extends the same manifests-and-operators discipline onto Kubernetes \cite{mongodbK8sOperatorDocs}.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item Terraform owns the control plane; numbered migrations own the data plane; humans own neither directly.
+    \item Plan-on-PR is the review gate; zero-drift scheduled plans detect out-of-band change.
+    \item Migrations are numbered, idempotent, forward-only, and throttled when they touch data.
+    \item Expand--migrate--contract makes every intermediate state valid for old and new code.
+    \item Secrets come from the CI vault; API keys are least-privilege service accounts.
+    \item Auditability is the pipeline's byproduct: PR + plan + staging evidence + apply log per change.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Draw the boundary line between Terraform-owned and migration-owned resources for your current project.
+    \item \textbf{(Conceptual)} Why does the contract phase require zero lagging readers, and how do you prove that count is zero?
+    \item \textbf{(Conceptual)} Design the rollback for a destructive contract migration discovered wrong after release.
+    \item \textbf{(Hands-on)} Implement the migration runner with the control collection and demonstrate idempotent re-runs.
+    \item \textbf{(Hands-on)} Inject drift manually in the Atlas UI and show the scheduled plan detecting it.
+    \item \textbf{(Design)} Write the change-control policy satisfying the fintech's audit: gates, evidence, break-glass, retention.
+    \item \textbf{(Design)} Design migration throttling: batch size, sleep, oplog-window guard, and the abort condition.
+    \item \textbf{(Interview)} ``A junior applied Terraform to prod before staging passed.'' Enumerate the missing gates and the immediate remediation.
+\end{enumerate}
+
+\section{Capstone Project: The One-Pipeline Change Platform}\label{sec:ch21-capstone}
+
+\begin{capstonebox}
+\textbf{Mission:} deliver the change-management platform end-to-end: Terraform-managed three-environment Atlas infrastructure, a migration runner, contract tests, drift detection, and a demonstrated expand--contract evolution---with the per-change audit pack assembled automatically.
+
+\textbf{Estimated time:} 6--8 hours.
+
+\textbf{What you will practice:}
+\begin{itemize}
+    \item Structuring multi-environment Terraform with modules and remote state.
+    \item Running schema evolution with zero downtime and dual-version traffic.
+    \item Producing change-control evidence as a pipeline artifact.
+\end{itemize}
+\end{capstonebox}
+
+\subsection*{Scenario}
+The fintech adopts your pipeline as the mandatory path for all database change. The deliverable must survive an auditor reading one change end-to-end and an engineer executing one emergency change correctly.
+
+\subsection*{Requirements}
+\begin{itemize}
+    \item Terraform modules + three environments with remote, locked state; no secrets in the repo.
+    \item The migration runner (numbered, idempotent, logged) plus at least three real migrations including one expand--contract pair.
+    \item CI: plan on PR, contract tests, staged applies with smoke-test gates, manual prod gate.
+    \item Scheduled drift detection with a demonstrated detection.
+    \item The per-change audit pack assembled by CI and the break-glass procedure documented and drilled.
+\end{itemize}
+
+\subsection*{Implementation Steps}
+\begin{enumerate}
+    \item \textbf{Foundation.} Remote state, modules, environments; least-privilege CI service account.
+    \item \textbf{Migrations.} Runner + the three migrations; idempotency and throttle evidence.
+    \item \textbf{Pipeline.} Full CI flow with gates; demonstrate a staging failure blocking prod.
+    \item \textbf{Evolution.} Execute expand--contract under dual-version traffic; prove zero dropped orders.
+    \item \textbf{Audit.} Assemble the audit pack; drill the break-glass path with its retroactive PR.
+\end{enumerate}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item The repository, CI configuration, and all evidence artifacts.
+    \item The change-control policy document and the drilled break-glass record.
+    \item The expand--contract evidence pack.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item A full change flows PR $\to$ plan $\to$ dev $\to$ staging $\to$ gate $\to$ prod with no manual cluster access.
+    \item Drift and break-glass use are both detected and generate tracked follow-ups.
+    \item The auditor's end-to-end read of one change requires no oral explanation.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Add automated rollback: a revert PR generated from the failed change's plan.
+    \item Extend contract tests to consumer-driven contracts for the top five services.
+\end{itemize}

@@ -1,0 +1,341 @@
+\chapter{MLOps and Batch Scoring}
+\index{MLOps}\index{batch scoring}\index{PREDICT}\index{model inference}\index{data drift}\index{retraining pipeline}\index{training-serving skew}\index{model\_version}%
+
+\begin{objectives}
+\begin{itemize}
+    \item Apply registered MLflow models to Delta tables at scale with Spark UDFs and the \texttt{PREDICT} pattern.
+    \item Automate model inference through Fabric pipelines instead of manual notebook runs.
+    \item Design scoring output that honors a downstream schema contract and carries \texttt{model\_version} for auditability.
+    \item Detect data drift by comparing production feature distributions against training baselines.
+    \item Trigger retraining automatically when drift or quality signals breach thresholds.
+    \item Architect the full MLOps lifecycle for a production recommendation engine.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+The MLOps loop---train, register, score, monitor, retrain---exists on every platform; what varies is how much of it the platform holds natively.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{2.8cm}p{3.2cm}p{3.2cm}p{3.2cm}p{3.2cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{Fabric} & \textbf{AWS} & \textbf{GCP} & \textbf{Snowflake} \\
+\midrule
+Batch scoring & Spark UDF / \texttt{PREDICT} over Delta & SageMaker Batch Transform & Vertex batch prediction & Snowpark ML / Cortex \\
+Orchestrated inference & Pipelines invoking notebooks & Step Functions + SageMaker & Vertex Pipelines & Tasks \\
+Drift monitoring & Notebook/pipeline distribution checks & SageMaker Model Monitor & Vertex Model Monitoring & Snowflake model monitors \\
+Retrain trigger & Pipeline on drift signal & EventBridge + pipeline & Eventarc + pipeline & Tasks + alerts \\
+Model source of truth & MLflow registry (Ch.~18) & SageMaker registry & Vertex registry & Snowflake registry \\
+Scoring audit & \texttt{model\_version} on every row & Job metadata & Prediction metadata & Versioned functions \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+Databricks Mosaic ML and MLflow cover the same loop natively; MongoDB operationalizes predictions as documents written back by these pipelines. The portable laws: \emph{score with the same features you trained on, stamp every prediction with its model version, and monitor distributions, not just errors}.
+\end{crosscloud}
+
+\begin{keyterms}
+\textbf{MLOps}: the operational discipline that keeps models trained, deployed, monitored, and retrained as production systems. \quad
+\textbf{Batch scoring}: applying a model to a table of rows on a schedule, writing predictions back to storage. \quad
+\textbf{\texttt{PREDICT}}: the SQL/Spark pattern that applies a registered model as a query-time function. \quad
+\textbf{Training-serving skew}: divergence between feature computation at training time and at scoring time. \quad
+\textbf{Data drift}: distributional change in production features or outcomes relative to the training baseline. \quad
+\textbf{Retraining trigger}: the automated signal---drift, quality decay, schedule---that starts a new training run.
+\end{keyterms}
+
+\section{Week 20 Roadmap}
+Week~20 closes the ML loop and Part~V. Monday covers batch scoring with the Spark \texttt{PREDICT}/UDF pattern. Tuesday applies registered MLflow models to Delta tables. Wednesday automates inference through Fabric pipelines. Thursday is the hands-on project: load a registered model and score 100,000 rows, writing predictions to OneLake. Friday architects the drift-aware MLOps lifecycle for a recommendation engine. The chapter closes with the Milestone~5 capstone.
+
+Part~V's arc is now complete in outline: honest features (Chapter~17), honest models (Chapter~18), honest enrichment (Chapter~19), and---this week---honest \emph{operations}: scoring that is automated, auditable, and self-aware enough to know when the world has moved on \cite{microsoftFabricMlTraining,mlflowDocs}.
+
+\begin{notebox}
+The two sentences that define the week: predictions without \texttt{model\_version} cannot be audited or rolled back; and drift unmonitored means the model quietly rots---alert on distribution shift, not just errors.
+\end{notebox}
+
+\section{Monday: Batch Scoring with PREDICT}
+\index{batch scoring}\index{PREDICT}
+Batch scoring applies a model to a table on a schedule and writes predictions back---the dominant production pattern for churn scores, forecasts, recommendations, and risk ratings. In Fabric, the mechanism is a Spark notebook that loads the registered model as a UDF (or uses the \texttt{PREDICT} function where the runtime exposes it) and applies it across the cluster \cite{microsoftFabricMlTraining,microsoftFabricSparkCompute}.
+
+\begin{definitionbox}
+\textbf{Batch scoring} is scheduled, set-based inference: a pipeline applies a registered model to a Delta table partition and appends predictions---stamped with model version and score time---to a predictions table.
+\end{definitionbox}
+
+Why batch rather than per-request here: the consumers are analytical (reports, segments, nightly decisions), the volume is large, and the latency budget is generous. Per-request serving is a different architecture with different costs; choosing batch where batch suffices is the first MLOps economy.
+
+The schema contract of the output matters as much as the model: downstream reports, segments, and reverse-ETL pipelines consume the predictions table. Its columns---entity key, score, \texttt{model\_version}, \texttt{scored\_ts}---are a published contract (Chapter~9's discipline, applied to inference).
+
+\section{Tuesday: Applying Registered Models to Delta Tables}
+\index{MLflow!scoring}\index{training-serving skew}
+Chapter~18's registry discipline pays off: scoring code loads by alias, so promotion and rollback require no code change.
+
+\begin{lstlisting}[language=Python,caption={Batch scoring with the registered model as a Spark UDF.},label={lst:chapter20-scoring}]
+import mlflow
+from pyspark.sql import functions as F
+
+predict = mlflow.pyfunc.spark_udf(spark, "models:/churn_model/Production",
+                                  result_type="double")
+
+df = spark.read.table("gold.churn_features").where("as_of_date = '2026-07-31'")
+
+(df.withColumn("churn_score", predict(*df.columns))
+   .withColumn("model_version", F.lit("Production"))
+   .withColumn("scored_ts", F.current_timestamp())
+   .write.format("delta").mode("append")
+   .saveAsTable("gold.churn_predictions"))
+\end{lstlisting}
+
+The lurking failure is \textbf{training-serving skew}: features computed one way in training (Chapter~17's as-of-dated pipeline) and another way at scoring time (an ad hoc query, a subtly different join). The defense is architectural: scoring reads the \emph{same governed feature table} training read, rebuilt for the scoring as-of date by the \emph{same parameterized code}. There is one feature pipeline; training and serving are two consumers of it.
+
+\begin{pitfall}
+``The model got worse in production'' is very often ``the features are computed differently in production.'' Before retraining anything, diff the training and serving feature definitions---same code path, same window semantics, same as-of discipline---because a skewed feature pipeline retrains into the same skew.
+\end{pitfall}
+
+\section{Wednesday: Automating Inference via Pipelines}
+\index{model inference!automation}\index{pipeline!scoring}
+Manual notebook runs are how models silently stop scoring: someone is on holiday, the notebook errors, nobody notices until a stakeholder asks why last week's segment never updated. The fix is Chapter~12's orchestration applied to inference \cite{microsoftFabricPipelines,microsoftFabricMonitoringHub}:
+
+\begin{itemize}
+    \item A scheduled pipeline runs: feature rebuild (as-of today) $\rightarrow$ scoring notebook (by alias) $\rightarrow$ validation gate (row counts, null scores, distribution sanity) $\rightarrow$ ledger write.
+    \item On Failure paths alert with a runbook link, per the Part~III discipline.
+    \item The gate blocks publication of anomalous prediction batches---a model that suddenly scores everyone 0.5 is detected by distribution checks before consumers see it.
+    \item Parameters flow as always: \texttt{as\_of\_date} in, batch identity stamped on output.
+\end{itemize}
+
+\begin{tipbox}
+Keep the last-known-good batch promotable: write new scores to a versioned partition and flip consumers only after the gate passes. Bad batches then cost an alert, not a downstream incident.
+\end{tipbox}
+
+\section{Thursday: Hands-on Project}
+\index{hands-on lab}\index{batch scoring!hands-on}
+The Week~20 lab loads the Chapter~18 registered model and scores a fresh batch of 100,000 rows with the UDF pattern, writing predictions back to OneLake with the full audit contract.
+
+\subsection{Goal and Architecture}
+Reuse \texttt{fabric-de-week18}'s registry and \texttt{fabric-de-week17}'s feature pipeline. Generate a 100,000-row scoring partition of \texttt{gold.churn\_features} (or use the instructor dataset), then produce \texttt{gold.churn\_predictions} through a pipeline-orchestrated, gated run.
+
+\subsection{Step-by-Step Actions}
+\begin{enumerate}
+    \item Build the pipeline: feature rebuild for \texttt{as\_of\_date} $\rightarrow$ scoring notebook $\rightarrow$ gate.
+    \item Implement scoring by alias with \texttt{model\_version} and \texttt{scored\_ts} stamped.
+    \item Implement the gate: row count equals input, null-score rate zero, score distribution within trained bounds.
+    \item Run at 100,000 rows; record duration and CU consumption.
+    \item Re-run the same batch; verify idempotence (partition replace, not duplicate append).
+    \item Inject a skewed feature (shift one column's scale 10$\times$ in a copy) and watch the distribution gate catch it.
+    \item Promote a challenger model version and repeat: the alias move changes the scored output without code change.
+\end{enumerate}
+
+\subsection{Validation Checklist}
+\begin{itemize}
+    \item Scoring loads by alias; no version numbers in code.
+    \item Every prediction row carries \texttt{model\_version} and \texttt{scored\_ts}.
+    \item The gate catches the injected skew and blocks publication.
+    \item Reruns are partition-idempotent.
+    \item Duration and CU cost at 100k rows are recorded for capacity planning.
+    \item The alias move demonstrably changes output with zero code edits.
+\end{itemize}
+
+\section{Friday: Use Case and Architecture}
+\index{data drift!detection}\index{retraining pipeline}\index{recommendation engine}
+A production recommendation engine's click-through rate has decayed 15\% over a quarter. Nobody changed the model; the world changed. The task: an MLOps lifecycle that detects drift and automatically triggers retraining.
+
+\subsection{Drift Detection}
+Compare production feature distributions against the training baselines: population stability index (PSI) or KS statistics per feature, computed on a schedule over the same window semantics. Outcome drift (where labels arrive late---churn takes weeks to observe) is tracked separately from feature drift (visible immediately). Drift metrics land in a monitoring table; thresholds are set per feature from backtest evidence, not vibes.
+
+\subsection{The Retraining Trigger}
+A pipeline evaluates drift daily. On breach---say, any headline feature's PSI above 0.25, or business-metric decay beyond tolerance---it triggers the training pipeline (Chapter~18's instrumented flow) automatically: new run, tracked, registered to \texttt{Staging}, gated on the metric threshold, promoted on review. Humans remain in the loop at the promotion gate; machines handle detection and preparation.
+
+\begin{figure}[H]
+    \centering
+    \begin{tikzpicture}[node distance=8mm and 8mm]
+        \node[store] (feat) at (0,0) {gold features\\(as-of)};
+        \node[stage] (score) at (4.2,0) {Batch scoring\\(by alias)};
+        \node[store] (pred) at (8.4,0) {predictions\\+ version};
+        \node[stage, fill=orange!10] (drift) at (12.6,0) {Drift monitor\\(PSI/KS)};
+        \node[stage] (retrain) at (12.6,-2.4) {Retraining\\pipeline};
+        \node[store] (reg) at (8.4,-2.4) {Model\\registry};
+
+        \draw[arrow] (feat) -- (score);
+        \draw[arrow] (score) -- (pred);
+        \draw[arrow] (pred) -- (drift);
+        \draw[arrow, dashed] (feat.south) |- (drift.west);
+        \draw[arrow] (drift) -- node[right, font=\scriptsize]{breach} (retrain);
+        \draw[arrow] (retrain) -- (reg);
+        \draw[arrow] (reg) -- node[above, font=\scriptsize]{alias} (score.south east);
+
+        \node[note, text width=12.5cm, align=center] at (6.6,-4.0) {The loop closes itself: drift detected $\rightarrow$ retrain $\rightarrow$ register $\rightarrow$ alias $\rightarrow$ score, with humans gating promotion.};
+    \end{tikzpicture}
+    \caption{The self-aware MLOps lifecycle.}
+    \label{fig:chapter20-mlops}
+\end{figure}
+
+\begin{pitfall}
+Auto-promoting a retrained model without the gate is automating the failure mode: drift triggered by a data-quality bug (a broken upstream feed shifting distributions) retrains the model on garbage and ships it. Drift triggers \emph{retraining and evaluation}; promotion waits for metric evidence and review.
+\end{pitfall}
+
+\section{Operational Guidance for Week 20}
+MLOps is Chapter~12's orchestration discipline with statistical content: gates, ledgers, runbooks, and now distributions.
+
+\subsection{Performance and Reliability}
+Score by partition with idempotent replace. Measure scoring CU cost per million rows and trend it. Keep baseline distributions versioned beside the model they describe. Alert on gate failures with the prediction-batch runbook.
+
+\subsection{Security and Governance Checklist}
+\begin{itemize}
+    \item Scoring and retraining pipelines run under service principals, not personal accounts.
+    \item Prediction tables with personal data inherit classification and RLS (Chapters~21--22).
+    \item Drift thresholds and gate criteria are reviewed configuration, versioned.
+    \item Auto-retraining never auto-promotes; promotion is a human-gated alias move.
+    \item Model artifacts and baselines are access-controlled.
+    \item Every prediction row is attributable: model version, as-of date, batch.
+\end{itemize}
+
+\section{Interview Q\&A}
+\begin{enumerate}
+    \item \textbf{Q: What does the Spark \texttt{PREDICT}/UDF pattern do?}\\
+    A: It applies a registered model as a distributed function over a DataFrame---set-based inference across the cluster, with results stamped and written back to Delta.
+    \item \textbf{Q: Why score in scheduled batch instead of per-request here?}\\
+    A: Consumers are analytical and latency-tolerant while volumes are large; batch is dramatically cheaper and simpler, and per-request serving is a different architecture reserved for interactive needs.
+    \item \textbf{Q: Which signal indicates data drift in production?}\\
+    A: Distribution shift---PSI or KS statistics on production features versus training baselines---visible immediately, plus slower-arriving outcome/business-metric decay.
+    \item \textbf{Q: Why automate inference via pipelines instead of manual notebook runs?}\\
+    A: Manual runs silently stop: holidays, errors, no monitor. A scheduled, gated, ledgered pipeline makes scoring an operated system with alerts, not a habit.
+    \item \textbf{Q: Which schema contract must scoring output honor downstream?}\\
+    A: Entity key, score, \texttt{model\_version}, \texttt{scored\_ts}---the published columns reports, segments, and reverse ETL depend on; breaking them is a contract breach like any other.
+    \item \textbf{Q: Why does drift trigger retraining but not promotion?}\\
+    A: Drift can signal a broken upstream feed as easily as a changed world; retraining and evaluation are automated, but promotion waits for metric evidence and human review so a data bug cannot ship a garbage model.
+\end{enumerate}
+
+\section{Further Reading}
+Review model training and scoring in Fabric \cite{microsoftFabricMlTraining}, the MLflow model and registry documentation \cite{mlflowDocs,microsoftMlflowFabric}, and the Spark compute beneath \cite{microsoftFabricSparkCompute}. Orchestration reuses Chapter~12 \cite{microsoftFabricPipelines,microsoftFabricMonitoringHub}; feature honesty comes from Chapter~17 \cite{microsoftFabricDataScience}.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item Batch scoring is scheduled, set-based, gated inference; per-request serving is a different (rarely needed) architecture.
+    \item Load models by alias; promotion and rollback are pointer moves, not deploys.
+    \item One feature pipeline serves training and scoring---the structural cure for training-serving skew.
+    \item Every prediction row carries \texttt{model\_version} and batch identity; unauditable predictions are technical debt.
+    \item The scoring gate blocks anomalous batches before consumers see them.
+    \item Drift detection compares distributions to baselines; breaches trigger retraining, not promotion.
+    \item MLOps is orchestration plus statistics: pipelines, gates, ledgers---and PSI.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Explain training-serving skew with a concrete feature example and its symptom.
+    \item \textbf{(Conceptual)} Why is PSI computed per feature rather than one global drift number?
+    \item \textbf{(Hands-on)} Implement PSI for three features against the training baseline; chart them over two weeks.
+    \item \textbf{(Hands-on)} Make the lab's scoring partition-idempotent with \texttt{replaceWhere} and prove it.
+    \item \textbf{(Design)} Write the drift-response policy: thresholds, actions, and human gates per severity.
+    \item \textbf{(Design)} Design the monitoring table schema: what does one row mean, and who queries it weekly?
+    \item \textbf{(Interview)} In five sentences, describe the full loop from drift signal to safe redeployment.
+    \item \textbf{(Operational)} Write the runbook for ``scoring gate failed: distribution out of bounds.''
+\end{enumerate}
+
+\section{Milestone 5 Capstone: End-to-End MLOps Pipeline}\label{sec:ch20-capstone}
+\index{Milestone 5 capstone}\index{capstone project!Part V}\index{MLOps!capstone}\index{churn prediction}
+
+\begin{capstonebox}
+\textbf{Mission.} Close Part~V with the complete loop: a Data Factory pipeline orchestrating feature extraction from the lakehouse, a training notebook tracked in MLflow, registry promotion, and a daily batch-scoring notebook populating a Power BI Direct Lake report---with a drift monitor that triggers retraining on distribution shift.
+
+\textbf{Estimated time.} 10--14 hours across the milestone's components.
+
+\textbf{What you'll practice.}
+\begin{itemize}
+    \item Leakage-safe features with fixed training windows (Chapter~17).
+    \item Autologged, tagged training with registry promotion (Chapter~18).
+    \item Alias-based, partition-idempotent batch scoring with a distribution gate (this chapter).
+    \item Drift monitoring wired to automated retraining.
+    \item The six rubric artifacts, including metric thresholds and PII handling.
+\end{itemize}
+\end{capstonebox}
+
+\subsection*{Scenario}
+Contoso's retention team will act on churn scores weekly. The platform must produce them daily, auditably, and notice when the world drifts---without a human watching dashboards all day.
+
+\subsection*{Requirements}
+\begin{itemize}
+    \item Gold feature table with as-of discipline; no post-outcome columns; fixed training windows.
+    \item Training with \texttt{mlflow.autolog()}; the best run registered with dataset version and code commit as metadata.
+    \item Pipeline-orchestrated scoring writing predictions with \texttt{model\_version}, partition-idempotent.
+    \item The distribution gate and the drift check comparing feature distributions against training baselines, triggering retraining on breach.
+    \item A Direct Lake report over the predictions table.
+    \item Rubric artifacts: clean-environment run, diagram, three tests (feature nulls, metric threshold, scoring schema) with failing cases, MLflow and pipeline evidence, cost estimate, security review.
+\end{itemize}
+
+\subsection*{Reference Architecture}
+\begin{figure}[H]
+    \centering
+    \begin{tikzpicture}[node distance=8mm and 8mm]
+        \node[store] (gold) at (0,0) {Gold lakehouse\\(features)};
+        \node[stage] (nb) at (4.2,0) {Notebook\\(training)};
+        \node[stage] (mlflow) at (8.4,0) {MLflow\\experiment};
+        \node[store] (reg) at (8.4,-2.4) {Model\\registry};
+        \node[stage] (score) at (4.2,-2.4) {Batch scoring\\(PREDICT/UDF)};
+        \node[stage, fill=orange!10] (pbi) at (0,-2.4) {Power BI\\Direct Lake};
+        \node[doc, minimum width=2.6cm, minimum height=1.0cm] (drift) at (12.2,-1.2) {Drift\\monitor};
+
+        \draw[arrow] (gold) -- (nb);
+        \draw[arrow] (nb) -- (mlflow);
+        \draw[arrow] (mlflow) -- (reg);
+        \draw[arrow] (reg) -- (score);
+        \draw[arrow] (score) -- (pbi);
+        \draw[arrow, dashed] (score.east) -- (drift.south west);
+        \draw[arrow, dashed] (drift.north) |- (nb.east);
+
+        \node[note, text width=12.5cm, align=center] at (6.4,-4.0) {Features $\rightarrow$ train $\rightarrow$ register $\rightarrow$ score $\rightarrow$ report, with drift closing the loop.};
+    \end{tikzpicture}
+    \caption{Milestone 5 reference architecture: the MLflow-driven MLOps lifecycle.}
+    \label{fig:chapter20-capstone-architecture}
+\end{figure}
+
+\subsection*{Implementation Steps}
+\begin{enumerate}
+    \item Build the leakage-safe feature table (reuse Chapter~17's capstone where possible).
+    \item Train with autolog; register with metadata; write the model card.
+    \item Implement scoring by alias with partition-idempotent writes and the gate.
+    \item Orchestrate: features $\rightarrow$ score $\rightarrow$ gate $\rightarrow$ report refresh, with failure alerts.
+    \item Implement the drift monitor; wire breach $\rightarrow$ retraining pipeline (promotion stays human).
+    \item Run the failing-case drills: null features, sub-threshold model, skewed distribution.
+    \item Produce cost estimate and security review; finalize the README.
+\end{enumerate}
+
+\begin{lstlisting}[language=Python,caption={Milestone 5: alias-loaded batch scoring with audit columns.},label={lst:chapter20-capstone-scoring}]
+import mlflow
+from pyspark.sql import functions as F
+
+predict = mlflow.pyfunc.spark_udf(spark, "models:/churn_model/Production",
+                                  result_type="double")
+df = spark.read.table("gold.churn_features")
+
+(df.withColumn("churn_score", predict(*df.columns))
+   .withColumn("model_version", F.lit("Production"))
+   .write.format("delta").mode("append")
+   .saveAsTable("gold.churn_predictions"))
+\end{lstlisting}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item Repository running the full loop from a clean environment.
+    \item Architecture diagram showing lakehouse, MLflow, registry, and scoring flow.
+    \item The three automated tests with failing-case demonstrations.
+    \item Monitoring evidence: experiment metrics, drift signals, pipeline run history.
+    \item Cost estimate with two documented optimization decisions (for example batch window, pool sizing).
+    \item Security review: model artifacts access-controlled, no API keys in notebooks, PII handling documented.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item[\(\square\)] Features are leakage-safe and rebuildable for historical as-of dates.
+    \item[\(\square\)] Every training run is tracked with dataset and commit metadata.
+    \item[\(\square\)] Scoring loads by alias and stamps every row with \texttt{model\_version}.
+    \item[\(\square\)] The gate blocks the injected skew; the rerun is partition-idempotent.
+    \item[\(\square\)] The drift drill triggers retraining without auto-promotion.
+    \item[\(\square\)] The Direct Lake report reflects a new scored batch after framing.
+    \item[\(\square\)] No secrets, keys, or personal paths appear in any artifact.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Add champion/challenger scoring: two aliases, split traffic by entity hash, compare business metrics.
+    \item Add per-segment drift thresholds with a fairness review in the promotion gate.
+    \item Automate the metric-threshold check as a pre-promotion pipeline step.
+    \item Feed prediction outcomes back through Chapter~16's reverse ETL into the CRM.
+\end{itemize}

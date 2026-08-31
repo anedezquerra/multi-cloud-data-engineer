@@ -1,0 +1,285 @@
+\chapter{Global Clusters and Multi-Region Architectures}
+\index{zone sharding}\index{global cluster}\index{data residency}\index{read preference}\index{tag sets}\index{GDPR}\index{nearest read preference}\index{multi-region}%
+
+\begin{objectives}
+\begin{itemize}
+    \item Configure zone sharding to pin shard-key ranges to geographic shards for data-residency compliance.
+    \item Design Atlas global cluster topologies for local reads and writes with global consistency.
+    \item Choose read preferences (\texttt{primary}, \texttt{primaryPreferred}, \texttt{secondaryPreferred}, \texttt{nearest}) and tag sets for locality and workload isolation.
+    \item Pin European users to EU shards in the Thursday lab and verify placement with chunk evidence.
+    \item Architect a GDPR-compliant global platform with auditable residency guarantees.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+Data residency is a compliance requirement that every cloud implements as a routing primitive: data pinned to regions by policy. MongoDB's zone sharding is the hands-on version of what the managed services wrap in UI toggles.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{2.9cm}p{3.0cm}p{3.0cm}p{3.0cm}@{}} 
+\toprule
+\textbf{Capability} & \textbf{AWS} & \textbf{Azure} & \textbf{GCP} \\
+\midrule
+Residency primitive & DynamoDB global tables + Regions & Cosmos DB multi-region + policies & Spanner placements / Firestore multi-region \\
+Local writes & Multi-region active-active & Multi-region writes & Multi-region configs \\
+Read locality & Global tables nearest region & Cosmos DB preferred regions & Spanner read-only replicas \\
+Residency enforcement & Region-scoped IAM + SCPs & Azure Policy + regions & Org policy constraints \\
+Conflict handling & Last-writer-wins & LWW / custom merge & Synchronous commit \\
+\addlinespace
+Snowflake / Fabric & \multicolumn{3}{l}{Database replication between regions; residency by account placement rather than row-level pinning} \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+MongoDB's zone sharding pins \emph{ranges of data} to shards in named regions---row-level residency with auditable chunk evidence---which is a stronger and more provable guarantee than account-level regional placement \cite{mongodbZoneShardingDocs,mongodbGlobalClustersDocs}.
+\end{crosscloud}
+
+\section{Week 8 Roadmap: Geography as a First-Class Design Axis}
+Part II has built the distributed-systems machinery: replica sets for availability, sharding for scale, transactions for invariants. This week aims that machinery at geography: serving users from nearby infrastructure for latency, and pinning data to jurisdictions for law. The two goals share primitives but pull in different directions---latency wants data near readers; residency demands data stay put---and the architecture is the negotiation between them \cite{mongodbGlobalClustersDocs}.
+
+\begin{definitionbox}
+\textbf{Zone sharding} associates shard-key ranges with named zones, each mapped to a set of shards, so the balancer keeps every chunk whose keys fall in a range on shards assigned to that zone---provable data placement driven by document content.
+\end{definitionbox}
+
+\begin{keyterms}
+\textbf{Zone}: a named set of shards. \textbf{Zone range}: a shard-key interval pinned to a zone. \textbf{Read preference}: the driver's member-selection rule. \textbf{Tag set}: per-member labels (e.g. \texttt{dc: "eu"}) that read preferences match. \textbf{Global write}: Atlas global cluster local-write routing by location field. \textbf{Residency evidence}: the chunk map proving placement.
+\end{keyterms}
+
+\section{Monday: Zone Sharding}
+\subsection{Mechanics}
+Zone sharding layers on Chapter 6's balancer: \texttt{sh.addShardToZone()} labels shards, \texttt{sh.updateZoneKeyRange()} binds a shard-key range to a zone, and the balancer migrates any chunk whose range violates its zone until placement converges. Two design rules follow. First, the shard key must begin with the residency field (\texttt{country\_code}); a zone range can only be expressed in the shard key's domain. Second, zone ranges must cover the key space deliberately---uncovered ranges float to any shard, which for regulated data is a residency bug, not a convenience.
+
+\begin{pitfall}
+\textbf{Zoning after the bulk load.} Adding zone ranges to a populated sharded collection triggers a migration storm as terabytes of misplaced chunks move at once. Define zones and ranges before loading data; if you cannot, throttle migrations to a window and plan for days of balancer activity.
+\end{pitfall}
+
+\subsection{Residency as an Auditable Property}
+The compliance value of zones is provability: \texttt{sh.status()} and the \texttt{config.chunks} collection show every chunk's range and shard, and the \texttt{config.tags}/zone mapping shows which shards carry which zone. A residency audit is a query, not a promise: assert that no chunk whose range intersects the EU key space lives on a non-EU shard. Automating that assertion as a scheduled job converts residency from an architecture claim into a monitored control.
+
+\section{Tuesday: Global Clusters in Atlas}
+\subsection{Local Writes, Global Reads}
+Atlas global clusters extend zone sharding into a managed product: documents carry a location field, and Atlas routes writes for each location value to the region hosting that zone, giving users local write latency while the cluster presents one logical namespace. Reads follow the same map: a query including the location field is targeted to the local shard; a query without it scatters globally---the Chapter 6 trade-off, now with intercontinental latency amplifying the cost of every scatter.
+
+\subsection{Electors Across Fault Domains}
+A global cluster's replica-set electors must span at least three fault domains: a two-region deployment cannot form a majority when one region is lost (Chapter 5's arithmetic applies to geography). Atlas handles elector placement in managed topologies, but the design review must still ask: if our largest region vanishes, which zones keep write availability, and is that the right answer for the business?
+
+\begin{tipbox}
+Residency and availability are separate sliders. A strict-residency EU zone with all its electors in the EU cannot accept writes during a full-EU outage; that is often the legally correct answer. Make the choice explicit per zone and write it down.
+\end{tipbox}
+
+\section{Wednesday: Read Preferences and Tag Sets}
+\subsection{The Five Read Preferences}
+The driver picks a member per operation: \texttt{primary} (default, strongest currency), \texttt{primaryPreferred} (failover-tolerant), \texttt{secondary} (reporting isolation), \texttt{secondaryPreferred} (latency-tolerant reads that must not fail), and \texttt{nearest} (lowest network latency regardless of state). \texttt{nearest} plus tag sets is the global-cluster workhorse: ``read from the closest member in my region'' becomes \texttt{readPreference: "nearest", tags: [{dc: "eu"}]}.
+
+\begin{table}[H]
+\centering\footnotesize
+\begin{tabular}{@{}p{3.2cm}p{4.6cm}p{5.4cm}@{}}
+\toprule
+\textbf{Preference} & \textbf{Guarantee} & \textbf{Use} \\
+\midrule
+\texttt{primary} & Current data, one node & Strong reads, admin \\
+\texttt{primaryPreferred} & Current, or secondary in outage & Resilient strong reads \\
+\texttt{secondary} & Only secondaries & ETL, reporting offload \\
+\texttt{secondaryPreferred} & Secondaries, primary if none & Latency-tolerant reads \\
+\texttt{nearest} (+tags) & Lowest-latency member & Geo-local reads, cache fill \\
+\bottomrule
+\end{tabular}
+\caption{Read preferences: every non-primary choice trades currency for latency or isolation.}
+\label{tab:ch12-readpref}
+\end{table}
+
+\subsection{Tag Sets for Workload Isolation}
+Tags label members with arbitrary key-value pairs (\texttt{dc}, \texttt{workload: "analytics"}, \texttt{tier: "nvme"}). A read preference can require or forbid tags, which is how you keep the nightly ETL off latency-sensitive members: analytics nodes tagged \texttt{workload: analytics}, the ETL's read preference pinned to that tag. Combined with \texttt{maxStalenessSeconds}, tags become a freshness-bounded offload mechanism rather than a correctness gamble.
+
+\begin{pitfall}
+\textbf{Reading from secondaries without a staleness bound.} A secondary can fall arbitrarily behind during a write burst. Any read preference that touches secondaries should carry \texttt{maxStalenessSeconds} chosen from the application's actual freshness tolerance.
+\end{pitfall}
+
+\section{Thursday Hands-On Project: Zone-Pinned User Residency Lab}
+Extend the Chapter 6 two-shard cluster into a residency lab: zone shard A as EU, shard B as US, pin \texttt{country\_code} ranges, load users, and prove placement.
+
+\subsection{Configuration}
+\begin{lstlisting}[language=JavaScript, caption={Zone sharding for EU/US residency.}]
+// On mongos (port 29999 from the Chapter 6 lab):
+sh.addShardToZone("shA", "EU");
+sh.addShardToZone("shB", "US");
+
+sh.enableSharding("app");
+db.users.createIndex({ country_code: 1, _id: 1 });
+sh.shardCollection("app.users", { country_code: 1, _id: 1 });
+
+// Pin EU country codes to the EU zone (ranges shown conceptually):
+sh.updateZoneKeyRange("app.users",
+  { country_code: "DE", _id: MinKey },
+  { country_code: "DF", _id: MinKey }, "EU");
+sh.updateZoneKeyRange("app.users",
+  { country_code: "FR", _id: MinKey },
+  { country_code: "FS", _id: MinKey }, "EU");
+sh.updateZoneKeyRange("app.users",
+  { country_code: "US", _id: MinKey },
+  { country_code: "UT", _id: MinKey }, "US");
+\end{lstlisting}
+
+\subsection{Load and Verify}
+Load 200,000 synthetic users across DE, FR, and US country codes, wait for the balancer to settle, then audit: \texttt{sh.status()} chunk listing must show every EU chunk on \texttt{shA}; the automated assertion queries \texttt{config.chunks} joined against the zone mapping. Finish by inserting a user with an uncovered country code (e.g. \texttt{JP}) and documenting where that chunk lands---the uncovered-range leak, demonstrated.
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item The zone configuration script and the synthetic user loader.
+    \item The automated residency assertion (chunks $\times$ zones) with passing output.
+    \item The uncovered-range demonstration and its remediation note.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item Every chunk in the EU key ranges resides on EU-zoned shards, proven by the assertion script.
+    \item A targeted query with \texttt{country\_code} hits exactly one shard in \texttt{explain()}.
+    \item The uncovered-range leak is documented with a fix (full-coverage range design or a default zone).
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Simulate an EU-region outage (stop shard A) and document which reads and writes continue.
+    \item Add a third shard zoned APAC and re-run the residency assertion end-to-end.
+\end{itemize}
+
+\section{Friday Use Case and Architecture: GDPR-Compliant Global Platform}
+\subsection{Scenario and Requirements}
+A consumer platform operates in the EU, US, and APAC. GDPR requires EU residents' personal data to remain within EU borders (with legal-review for any transfer), product requires sub-100 ms profile reads worldwide, and analytics requires global aggregation across all users.
+
+\subsection{Architecture}
+User profiles shard on \texttt{\{country\_code, \_id\}} with zone ranges pinning every EU code to EU shards; zone coverage is exhaustive (every supported country code is in exactly one zone) and the residency assertion runs hourly as a compliance control. Profile reads carry \texttt{readPreference: "nearest"} with regional tag sets and \texttt{maxStalenessSeconds: 30} for cache-fill paths; the ``edit my profile'' flow reads primary for read-your-writes. Global analytics runs against a per-region tagged analytics secondary and merges results in the warehouse---analytics queries never scatter across production shards during business hours. Data-subject erasure composes with crypto-shredding (Chapter 18) so deleted EU data cannot linger in backups of any region.
+
+\begin{figure}[H]
+    \centering
+    \resizebox{0.95\textwidth}{!}{%
+    \begin{tikzpicture}[
+        zone/.style={rectangle, rounded corners, draw=primary, thick, fill=primary!6, minimum width=3.2cm, minimum height=2.1cm, align=center},
+        shardN/.style={cylinder, shape aspect=0.25, draw=primary, thick, fill=primary!10, shape border rotate=90, align=center, minimum width=1.5cm, minimum height=1.0cm, font=\scriptsize\bfseries},
+        box/.style={rectangle, rounded corners, draw=green!45!black, fill=green!8, minimum width=2.6cm, minimum height=0.9cm, align=center, font=\scriptsize\bfseries},
+        arrow/.style={-{Stealth[length=2.5mm]}, draw=primary, thick}
+    ]
+        \node[box] (mongos) at (0,3.4) {\texttt{mongos} + zone map};
+        \node[zone, label={[font=\small\bfseries]above:Zone EU}] (zeu) at (-4.4,0) {};
+        \node[shardN] (eu) at (-4.4,0) {shards\\EU};
+        \node[zone, label={[font=\small\bfseries]above:Zone US}] (zus) at (0,0) {};
+        \node[shardN] (us) at (0,0) {shards\\US};
+        \node[zone, label={[font=\small\bfseries]above:Zone APAC}] (zap) at (4.4,0) {};
+        \node[shardN] (ap) at (4.4,0) {shards\\APAC};
+        \node[box] (audit) at (8.6,0) {Hourly residency\\assertion job};
+        \draw[arrow] (mongos) -- (zeu);
+        \draw[arrow] (mongos) -- (zus);
+        \draw[arrow] (mongos) -- (zap);
+        \draw[arrow, dashed] (zeu.east) -- (audit);
+        \draw[arrow, dashed] (zus.east) -- (audit);
+        \draw[arrow, dashed] (zap.east) -- (audit);
+    \end{tikzpicture}%
+    }
+    \caption{GDPR global platform: exhaustive zone ranges, local reads via \texttt{nearest}+tags, and an automated residency assertion as a compliance control.}
+    \label{fig:ch12-gdpr}
+\end{figure}
+
+\subsection{Guardrails}
+Three controls make residency durable: exhaustive zone ranges (no uncovered key space), the hourly automated residency assertion paging on violation, and a change-management rule that any new country code or new shard triggers a zone-mapping review before deployment. Latency guardrails are Chapter 7's: count shards hit per query shape, and alert when the global profile endpoint starts scattering.
+
+\section{Interview Q\&A}
+\subsection{Global Design}
+\begin{enumerate}
+    \item \textbf{Q: What exactly does zone sharding pin?}\\
+    A: Shard-key ranges, via chunks, to shards carrying the zone label. The residency unit is the chunk, so the residency field must lead the shard key.
+
+    \item \textbf{Q: How do you prove EU residency to an auditor?}\\
+    A: Query the chunk map: every chunk intersecting EU key ranges must live on EU-zoned shards. Automate it as a scheduled assertion, not a slide.
+
+    \item \textbf{Q: What does \texttt{nearest} actually minimize?}\\
+    A: Network latency by ping time, regardless of member state or region---which is why tag sets are needed to keep ``nearest'' inside the right jurisdiction or workload.
+
+    \item \textbf{Q: Why three fault domains for electors?}\\
+    A: A majority must survive the loss of any one domain; two domains cannot both form a majority, so one loss either halts writes or risks split brain.
+
+    \item \textbf{Q: What breaks if a country code is not covered by any zone range?}\\
+    A: Its chunks float to any shard, anywhere---a silent residency violation that only an exhaustive-coverage review or the assertion job catches.
+\end{enumerate}
+
+\section{Further Reading}
+MongoDB's zone sharding and global cluster documentation define the mechanics \cite{mongodbZoneShardingDocs,mongodbGlobalClustersDocs}; read-preference semantics and tag sets are in the replication manual \cite{mongodbReadPreferenceDocs,mongodbReplicationDocs}. The GDPR framing of residency-by-design pairs naturally with Chapter 18's crypto-shredding erasure \cite{mongodbQueryableEncryptionDocs}. For cross-cloud contrast, see Cosmos DB multi-region policies \cite{cosmosPartitionDocs} and Spanner's placement model via the sibling GCP track.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item Zone sharding turns residency into document-content-driven, auditable chunk placement.
+    \item The residency field must lead the shard key; zone ranges must cover the key space exhaustively.
+    \item Global clusters make location a routing primitive: local writes, local reads, explicit scatter for global queries.
+    \item Read preferences plus tag sets deliver locality and workload isolation---always with a staleness bound.
+    \item Electors must span three fault domains; residency zones must state their outage behavior explicitly.
+    \item Residency is a monitored control (hourly assertion), not a one-time configuration.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Why must the residency field lead the shard key rather than appear as a suffix?
+    \item \textbf{(Conceptual)} Compare zone sharding with application-level ``route to region X's cluster'' designs: what does each make provable?
+    \item \textbf{(Conceptual)} When is \texttt{secondaryPreferred} preferable to \texttt{nearest}?
+    \item \textbf{(Hands-on)} Extend the Thursday lab with the APAC zone and prove three-zone placement with one assertion script.
+    \item \textbf{(Hands-on)} Configure an analytics-tagged member and verify an ETL read never touches untagged members.
+    \item \textbf{(Design)} Design the residency architecture for a health platform spanning EU, UK (post-Brexit), and Switzerland, including the uncovered-code policy.
+    \item \textbf{(Design)} Write the compliance control description for the hourly residency assertion: owner, evidence, failure response.
+    \item \textbf{(Interview)} ``Our EU users' reads are served from the US.'' Give the three most likely misconfigurations.
+\end{enumerate}
+
+\section{Milestone 2 Capstone (Distributed Systems): Globally Distributed Multi-Region Sharded Cluster}\label{sec:ch8-capstone}
+
+\begin{capstonebox}
+\textbf{Mission:} integrate Part II into one system: a multi-region sharded cluster (four shards across three simulated regions) with zone sharding for residency, a live shard-key refinement on 20 million documents, measured scatter-gather reduction, and a full region-outage drill that preserves write availability.
+
+\textbf{Estimated time:} 6--8 hours.
+
+\textbf{What you will practice:}
+\begin{itemize}
+    \item End-to-end scripted deployment of a global sharded topology.
+    \item Zone-first data loading and auditable residency verification.
+    \item Live shard-key refinement and failure-drill evidence collection.
+\end{itemize}
+\end{capstonebox}
+
+\subsection*{Scenario}
+The GDPR platform from Friday must be demonstrated end-to-end before launch. The evidence demanded: the cluster deploys from scripts, EU data is provably EU-resident, the hot shard from a naive key is fixed live, and losing a region does not halt \texttt{w:majority} writes.
+
+\subsection*{Requirements}
+\begin{itemize}
+    \item Scripted deployment: CSRS, four shard replica sets across three simulated regions (port/domain namespacing), and \texttt{mongos}, from one command.
+    \item Zones defined and key ranges pinned \emph{before} loading 20 million synthetic users by continent.
+    \item Per-zone document counts and the automated residency assertion as data-quality tests, including one deliberately failing case.
+    \item A live \texttt{refineCollectionShardKey} fixing a hot shard, with scatter-gather counts (shards hit in \texttt{explain("executionStats")}) measured before and after.
+    \item A region-outage drill (stop one region's nodes) proving \texttt{w:majority} writes continue via remaining electors.
+    \item Replication-lag and balancer-activity alerts configured (evidence: exported config or screenshots), plus a multi-region cost estimate with two documented optimizations.
+\end{itemize}
+
+\subsection*{Implementation Steps}
+\begin{enumerate}
+    \item \textbf{Deploy.} Script the full topology; verify \texttt{sh.status()} shows all shards and zones.
+    \item \textbf{Zone first.} Define zones and exhaustive ranges, then load data; prove placement with the assertion job.
+    \item \textbf{Refine live.} Introduce the hot-shard workload, then refine the key with a random suffix; measure the before/after.
+    \item \textbf{Break a region.} Run the outage drill; record write-availability evidence and election timeline.
+    \item \textbf{Govern.} Configure the alerts, write the cost estimate, and document the security review (least-privilege roles, no hardcoded secrets, residency notes).
+\end{enumerate}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item All deployment, load, refinement, and drill scripts, plus the architecture diagram.
+    \item The three data-quality tests with a demonstrated failing case.
+    \item Alert evidence, cost estimate, and the security-review note.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item Clean-environment deploy succeeds from the README alone.
+    \item The residency assertion passes for all zones and demonstrably fails for an injected violation.
+    \item Scatter-gather reduction is measured in shards-hit, not just latency.
+    \item The region-outage drill shows continuous \texttt{w:majority} write acknowledgement.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Add cross-region read-locality measurement: p95 read latency per region with \texttt{nearest}+tags versus \texttt{primary}.
+    \item Automate the entire evidence pack as a single CI job producing a dated report artifact.
+\end{itemize}

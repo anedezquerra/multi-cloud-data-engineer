@@ -1,0 +1,355 @@
+\chapter{Business Intelligence, Power BI, and Reverse ETL}
+\index{Power BI}\index{semantic model}\index{DirectQuery}\index{Import mode}\index{row-level security}\index{DAX}%
+\begin{objectives}
+\begin{itemize}
+    \item Explain the Power BI architecture---Desktop, Service, semantic models, and dataflows---and where the data engineer's responsibility ends and the analyst's begins.
+    \item Choose among Import, DirectQuery, and Dual storage modes based on freshness, latency, and source-load requirements.
+    \item Design a star-schema semantic model with role-playing dimensions, correct relationships, and measures instead of calculated columns.
+    \item Write basic DAX measures using CALCULATE, filter context, and time-intelligence functions.
+    \item Implement row-level security with static and dynamic roles and validate the result with ``View as role.''
+    \item Connect Power BI to a Synapse dedicated pool with DirectQuery and tune the model so queries stay fast at the source.
+    \item Design the BI access layer for 500 analysts where regional managers see only their own regions.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+The BI layer is the least portable part of the stack---each cloud has a native analytics front end---but the underlying concepts (extracted versus live models, row-level security, measure semantics) transfer directly.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{3.0cm}p{2.9cm}p{3.1cm}p{3.2cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{AWS} & \textbf{Azure} & \textbf{GCP} \\
+\midrule
+BI service & Amazon QuickSight & Power BI & Looker / Looker Studio \\
+Live query mode & Direct query to Redshift/Athena & DirectQuery & Live connection to BigQuery \\
+Extracted cache & SPICE & Import mode (in-memory) & Extracted data / BI Engine \\
+Row-level security & QuickSight RLS & Power BI RLS roles & Looker access filters \\
+Metrics layer & QuickSight datasets & Semantic model + DAX & LookML \\
+\addlinespace
+\multicolumn{4}{@{}l@{}}{\textbf{Fabric}: Power BI with DirectLake over OneLake; \textbf{Snowflake}: Snowsight + partner BI; \textbf{MongoDB}: Atlas Charts + BI Connector.} \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+Power BI's \textbf{DirectLake} mode in Microsoft Fabric is the emerging fourth storage mode: the engine reads Delta tables in OneLake directly, combining Import-mode speed with DirectQuery freshness. When evaluating Azure BI architecture after this chapter, DirectLake is the first alternative to benchmark.
+\end{crosscloud}
+
+\begin{keyterms}
+\textbf{Semantic model}: the governed, in-memory or live-connected data model behind Power BI reports---tables, relationships, measures, and security.\quad
+\textbf{Import mode}: data is extracted and cached in the VertiPaq engine; refreshes are scheduled.\quad
+\textbf{DirectQuery}: visuals generate SQL against the source at query time; nothing is cached.\quad
+\textbf{RLS}: row-level security, filtering rows per user through DAX role rules.\quad
+\textbf{DAX}: Data Analysis Expressions, the measure language of semantic models.
+\end{keyterms}
+
+\section{Week 16 Overview: The Last Mile of the Data Platform}
+Every pipeline in this book terminates, eventually, in front of a human. Power BI is where Azure data platforms most often meet their users, and the meeting point is a \textbf{semantic model}: a curated, governed, business-named layer between the warehouse and the report \cite{microsoft2025powerbi}. Data engineers who dismiss BI as ``the analysts' job'' discover that storage-mode decisions, model shapes, and RLS design are data-engineering decisions---they determine warehouse load, query latency, and whether a regional manager can see another region's revenue.
+
+Week 16 closes Part IV with the three decisions that dominate a semantic model's behavior: where the data lives at query time (Import, DirectQuery, Dual), how the model is shaped (star schema, measures, relationships), and who can see which rows (RLS). The Thursday project wires a live DirectQuery dashboard against the Chapter 5 dedicated pool; the Friday use case scales the design to 500 analysts.
+
+\begin{notebox}
+Terminology check: Microsoft renamed Power BI ``datasets'' to \emph{semantic models}. Older documentation, job descriptions, and the DP-203 exam pool may use either word; they are the same object.
+\end{notebox}
+
+\section{Monday: Power BI Architecture}
+\index{Power BI!architecture}\index{dataflow}
+
+\subsection{Desktop, Service, Semantic Models, Dataflows}
+\textbf{Power BI Desktop} is the authoring tool: connect, shape with Power Query, model, and build report pages. Publishing pushes two artifacts to the \textbf{Power BI Service}: the report (visuals) and the semantic model (tables, relationships, measures, security). The service handles refresh scheduling, sharing, app workspaces, and governance. \textbf{Dataflows} are reusable, cloud-executed Power Query transformations---the right home for shaping logic that more than one model needs, so that twenty models do not re-implement the same customer cleanup.
+
+The architectural principle that matters to data engineers: \emph{many reports should hang off few certified semantic models}. A certified model owned by the data platform team, marked as the endorsed source for a domain, prevents the spreadsheet-ification of the warehouse---fifty near-identical revenue numbers, none reconciled.
+
+\subsection{The Serving Contract}
+A semantic model is a contract between the data platform and its consumers. Tables and measures get business names, not \texttt{stg\_ord\_ln\_v3}; relationships are documented; RLS is tested like code. When the warehouse schema changes, the model absorbs the change---this is why Chapter 24's expand--contract migrations keep a view shim between the physical tables and the model.
+
+\section{Tuesday: Import, DirectQuery, and Dual}
+\index{Import mode}\index{DirectQuery}\index{Dual mode}
+
+\subsection{Import Mode}
+Import extracts data into the VertiPaq columnar engine inside the service. Queries hit memory, not the source: sub-second visuals, full DAX, no load on the warehouse. The costs are staleness (data is as fresh as the last scheduled refresh---eight per day on Pro, forty-eight on Premium) and capacity memory. Import is the default and the right choice for most reporting.
+
+\subsection{DirectQuery Mode}
+DirectQuery stores only metadata; every visual interaction generates SQL against the source \cite{microsoft2025directquery}. Freshness is real-time and there is no extract to govern, but every filter click is a warehouse query: latency depends on the source, concurrency multiplies load, and some DAX patterns are not translatable. DirectQuery is the right choice when data must be current to the minute, when the dataset is too large to cache, or---as in this week's project---when a governed warehouse is the single source of truth and duplicating it adds risk, not value.
+
+\subsection{Dual Mode and Aggregation Tables}
+Dual mode marks a table as both: serve from cache when possible, fall back to DirectQuery. Combined with \textbf{aggregation tables}---small imported pre-aggregates over a large DirectQuery fact---Dual gives dashboard-speed summaries with drill-through to live detail. This is the pattern behind the ``real-time dashboard over a large fact'' requirement that naive DirectQuery models fail.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{2.6cm}p{4.0cm}p{3.6cm}p{3.4cm}@{}}
+\toprule
+\textbf{Mode} & \textbf{Strengths} & \textbf{Costs} & \textbf{Choose when} \\
+\midrule
+Import & Fastest visuals; full DAX; no source load & Staleness; capacity memory & Default; refresh cadence acceptable \\
+DirectQuery & Real-time; no extract; single source of truth & Source latency and load; some DAX limits & Freshness SLAs; huge datasets; governed warehouse \\
+Dual + aggregations & Cached summaries, live detail & Model complexity & Large DirectQuery facts behind dashboards \\
+\bottomrule
+\end{tabular}
+\caption{Storage-mode selection for semantic models.}
+\label{tab:ch16-storage-modes}
+\end{table}
+
+\begin{pitfall}
+\textbf{DirectQuery over an unoptimized source.} A DirectQuery report is a load generator pointed at your warehouse. Every slicer change is a SQL query per visual per user. Benchmark the source under realistic visual concurrency before publishing.
+\end{pitfall}
+
+\section{Wednesday: RLS, DAX, and Reverse ETL}
+\index{row-level security}\index{DAX}\index{CALCULATE}
+
+\subsection{Row-Level Security}
+RLS restricts rows per user through roles containing DAX filter expressions \cite{microsoft2025powerbiRLS}. A \textbf{static} role hard-codes the filter: \texttt{[Region] = "West"}. A \textbf{dynamic} role derives it from the caller: \texttt{[ManagerEmail] = USERPRINCIPALNAME()} against a mapping table. Dynamic RLS is the only design that scales to 500 users---one role, one mapping table, no role-per-region sprawl.
+
+Rules that keep RLS honest: filters should flow from dimension to fact through single-direction relationships; bidirectional relationships for RLS propagation are a last resort because they also change measure semantics; and every role must be tested with \emph{View as role} plus a test account that belongs to it.
+
+\subsection{DAX Fundamentals}
+DAX measures are evaluated in a \textbf{filter context}: the set of filters applied by the visual, slicers, and report filters at evaluation time. The engine function is \texttt{CALCULATE}, which modifies filter context. Time-intelligence functions (\texttt{SAMEPERIODLASTYEAR}, \texttt{DATESYTD}) require a marked date table.
+
+\begin{lstlisting}[language={},caption={Core DAX measures for a sales model.},label={lst:ch16-dax}]
+Revenue = SUM ( FactSales[NetAmount] )
+
+Revenue LY =
+CALCULATE ( [Revenue], SAMEPERIODLASTYEAR ( DimDate[Date] ) )
+
+Revenue YTD =
+CALCULATE ( [Revenue], DATESYTD ( DimDate[Date] ) )
+
+Revenue YoY % =
+DIVIDE ( [Revenue] - [Revenue LY], [Revenue LY] )
+\end{lstlisting}
+
+\begin{tipbox}
+Measures over calculated columns, always, for anything aggregated. A calculated column is computed at refresh and stored per row; a measure is computed at query time in filter context. ``Total revenue'' as a column cannot respond to a region slicer; as a measure, it does so for free.
+\end{tipbox}
+
+\subsection{Reverse ETL: Warehouse Truth Back to Operations}
+\index{reverse ETL}\index{identity resolution}\index{Dataverse}
+
+\subsection{The Pattern}
+Reverse ETL queries the curated warehouse---say, \texttt{gold.churn\_risk\_customers}---and upserts the segment into the system of action: a Dynamics 365 marketing list, a Salesforce campaign, a support-tool priority flag. ADF or Synapse pipelines execute the sync; the CRM API is the sink. The pattern completes the loop: models score in the warehouse, humans act in the operational tool, and the action's outcome lands back in the lake as new training data.
+
+\subsection{Identity Resolution Before Sync}
+The warehouse's \texttt{customer\_key} means nothing to the CRM. Identity resolution---matching warehouse entities to CRM contacts by email, phone, or a persisted crosswalk table---must run before the sync, with explicit handling for unmatched records (create, skip, or route to an exceptions queue). Syncing unresolved identities creates duplicate CRM contacts at machine speed---the fastest way to make the sales team distrust the data platform.
+
+\subsection{Sync Frequency as a Trade-Off}
+Freshness costs API calls. Nightly syncs are cheap and coarse; hourly syncs multiply API consumption and risk rate limits; event-driven syncs (a Function fired when the gold table changes) are freshest and most complex. Choose by the action's urgency: a churn-risk flag that drives a weekly email cadence needs nightly, not real-time; a fraud hold needs minutes.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.0cm}p{4.4cm}p{5.6cm}@{}}
+\toprule
+\textbf{Sync cadence} & \textbf{Mechanism} & \textbf{Right for} \\
+\midrule
+Nightly batch & ADF pipeline, scheduled & Marketing segments, weekly cadences \\
+Hourly micro-batch & Tumbling-window trigger & Priority flags, daily workflows \\
+Event-driven & Function on gold-table change & Fraud holds, entitlement changes \\
+\bottomrule
+\end{tabular}
+\caption{Reverse-ETL cadence trades freshness against API cost and rate limits.}
+\label{tab:ch16-reverse-etl}
+\end{table}
+
+\section{Thursday Hands-on Project: DirectQuery Dashboard with RLS}
+\index{hands-on lab}\index{DirectQuery}
+This project connects Power BI Desktop to the Chapter 5 dedicated pool in DirectQuery mode, builds a sales monitoring dashboard, and enforces a regional RLS role.
+
+\subsection{Connect and Model}
+\begin{enumerate}
+    \item Resume the Chapter 5 pool (\texttt{az synapse sql pool resume}).
+    \item In Power BI Desktop: Get Data $\rightarrow$ Azure Synapse Analytics SQL $\rightarrow$ the pool endpoint $\rightarrow$ \textbf{DirectQuery}.
+    \item Import the star: \texttt{fact\_sales}, \texttt{dim\_customer}, \texttt{dim\_date}, \texttt{dim\_store}. Verify relationships (single direction, dims to fact), mark \texttt{dim\_date} as a date table.
+    \item Author the measures from Listing~\ref{lst:ch16-dax}.
+\end{enumerate}
+
+\subsection{Build and Secure the Dashboard}
+Create a revenue-by-region bar chart, a revenue-vs-LY line, and a date slicer. Then define the RLS role:
+
+\begin{lstlisting}[language={},caption={Dynamic RLS role filtering stores through the manager mapping table.},label={lst:ch16-rls}]
+-- Role: RegionalManager, applied to DimStore
+[Region] IN
+    SELECTCOLUMNS(
+        FILTER ( ManagerRegions,
+                 ManagerRegions[ManagerEmail] = USERPRINCIPALNAME() ),
+        "Region", ManagerRegions[Region]
+    )
+\end{lstlisting}
+
+Publish to the service, open \emph{Semantic model $\rightarrow$ Security}, assign a test account to \texttt{RegionalManager}, and validate with \emph{View as role}: the West manager sees only West revenue, and the totals reconcile against the unfiltered model.
+
+\subsection{Performance Check}
+Open Performance Analyzer, interact with the dashboard, and record the DirectQuery durations. If any visual exceeds three seconds, the fix lives in the warehouse (distribution, columnstore, resource class)---Chapter 6's toolkit---not in the report.
+
+\section{Friday Use Case: 500 Analysts, One Governed Model}
+\index{use case}\index{row-level security!at scale}
+An enterprise centralizes sales data in Synapse. Five hundred analysts query it; regional sales managers must see only their own regions; executives see everything; finance sees all regions but not customer identities.
+
+\subsection{Target Design}
+One certified semantic model in a dedicated workspace, DirectQuery against the gold star schema. Dynamic RLS with a \texttt{ManagerRegions} mapping table maintained by the sales-ops team through a small app---not by editing Power BI roles. A second role, \texttt{FinanceRestricted}, adds a DAX filter on customer-level columns via object-level security for the PII columns. Deployment pipelines move the model dev $\rightarrow$ test $\rightarrow$ prod, with RLS membership wired per environment.
+
+\subsection{Operating Model}
+\begin{itemize}
+    \item \textbf{Certification:} the model is endorsed; analyst-built models over exports are unsupported.
+    \item \textbf{Access:} role membership through Entra ID security groups, never individual emails.
+    \item \textbf{Audit:} RLS membership changes and model deployments logged; quarterly access reviews tie back to the mapping table's owner.
+    \item \textbf{Load:} warehouse concurrency sized for dashboard peaks (Chapter 5); aggregations in Dual mode absorb the top dashboards.
+\end{itemize}
+
+\begin{pitfall}
+\textbf{Role sprawl.} Fifty static roles---one per region---guarantee that a reorg breaks security silently. One dynamic role plus a governed mapping table is the design that survives organizational change.
+\end{pitfall}
+
+\section{Architectural Decision Record Template}
+\index{architectural decision record}
+For each semantic model record: storage mode per table with the freshness SLA that justifies it; the RLS design (dynamic rule, mapping-table owner, test accounts); the measure inventory owned by the platform team; and the certification status with the refresh or source-latency budget.
+
+\section{Operational Deep Dive: Refresh, Endorsement, and Tenant Settings}
+\index{refresh}\index{governance!Power BI}
+Import models fail operationally, not visually: a failed 06:00 refresh means yesterday's data presented as today's. Alert on refresh failures, monitor duration trends, and stage large models behind incremental refresh. At the tenant level, disable publish-to-web, restrict export of underlying data where policy requires, and use endorsement labels (promoted, certified) as the discoverability mechanism that keeps analysts on governed models.
+
+\section{Troubleshooting Patterns}
+\index{troubleshooting!Power BI}
+Blank visuals for one user mean RLS filters them to nothing---test with their principal name. Slow DirectQuery visuals mean the source plan is bad; capture the generated SQL and run it in the pool. Numbers that change when a slicer is added usually mean a missing relationship or a measure ignoring filter context incorrectly. Refresh failures after a schema change mean the model's source query referenced a renamed column---the Chapter 24 view shim exists to prevent exactly this.
+
+\section{Week 16 Lab Rubric}
+\index{rubric}
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.2cm}p{5.0cm}p{5.0cm}@{}}
+\toprule
+\textbf{Criterion} & \textbf{Meets expectation} & \textbf{Needs improvement} \\
+\midrule
+Storage mode & DirectQuery justified with a freshness requirement; Performance Analyzer evidence & Mode chosen by default; no latency measurement \\
+Modeling & Star schema, marked date table, measures not columns & Snowflake drift, calculated-column aggregates \\
+Security & Dynamic RLS validated with View-as-role and a test account & Static role, untested, or membership by individual email \\
+Governance & Model published to a governed workspace with endorsement & Report left in a personal workspace \\
+\bottomrule
+\end{tabular}
+\caption{Week 16 rubric for the Power BI deliverables.}
+\label{tab:ch16-rubric}
+\end{table}
+
+\section{Interview Q\&A}
+\subsection{Concepts and Trade-offs}
+\begin{enumerate}
+    \item \textbf{Q: When does DirectQuery beat Import mode?}\\
+    A: When data must be current to the minute, when the dataset exceeds cache capacity, or when the warehouse is the governed source of truth and duplication adds risk.
+    \item \textbf{Q: How does RLS restrict what a regional sales manager sees?}\\
+    A: A role applies a DAX filter---ideally dynamic via \texttt{USERPRINCIPALNAME()} against a mapping table---that the engine applies to every query the user runs.
+    \item \textbf{Q: What is the difference between a measure and a calculated column?}\\
+    A: A column is computed at refresh and stored per row; a measure is computed at query time in the current filter context and responds to slicers.
+    \item \textbf{Q: Why mark a table as a date table?}\\
+    A: Time-intelligence functions like \texttt{SAMEPERIODLASTYEAR} require a contiguous, marked date table to compute correctly.
+\end{enumerate}
+
+\section{Further Reading}
+Start with the Power BI documentation hub \cite{microsoft2025powerbi}, the DirectQuery guide \cite{microsoft2025directquery}, and the RLS reference \cite{microsoft2025powerbiRLS}. The star-schema discipline behind every good model is Chapter 5's Kimball material \cite{kimball2013dwtk}. When the model outgrows DirectQuery latency, Chapter 6's optimization toolkit and Fabric's DirectLake mode are the next reading.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item The semantic model is a governed contract: business names, documented relationships, tested security---many reports, few certified models.
+    \item Import caches for speed; DirectQuery queries the source for freshness; Dual with aggregation tables combines both for large facts.
+    \item A DirectQuery report is a load generator against the warehouse; benchmark before publishing.
+    \item Dynamic RLS with a governed mapping table is the only design that scales; validate every role with View as role.
+    \item Measures, not calculated columns, for anything aggregated; CALCULATE and filter context are the heart of DAX.
+    \item Refresh failures are operational incidents---alert on them like pipeline failures.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Explain the filter context that evaluates \texttt{[Revenue]} when a user selects one region and one quarter.
+    \item \textbf{(Conceptual)} Why does bidirectional cross-filtering for RLS propagation risk incorrect measure results?
+    \item \textbf{(Conceptual)} A 2 TB fact table backs a dashboard viewed at 09:00 daily. Compare Import, DirectQuery, and Dual-with-aggregations designs.
+    \item \textbf{(Hands-on)} Complete the Thursday project and capture Performance Analyzer timings for three visuals.
+    \item \textbf{(Hands-on)} Add an \texttt{Orders} count measure and a YoY\% measure; break then fix them by removing the date-table marking.
+    \item \textbf{(Hands-on)} Extend the RLS model with a second mapping dimension (product line) and verify the two roles compose.
+    \item \textbf{(Design)} Design the workspace, endorsement, and deployment-pipeline layout for the 500-analyst enterprise.
+    \item \textbf{(Design)} Write the ADR choosing DirectQuery over Import for a fraud-monitoring dashboard with a 60-second freshness SLA.
+    \item \textbf{(Design)} Specify the audit evidence you would keep to prove RLS correctness during a compliance review.
+    \item \textbf{(Interview)} Prepare a two-minute answer to ``why are there three different revenue numbers in this company?''
+\end{enumerate}
+
+\section{Milestone 4 Capstone: Real-Time Fraud Detection}\label{sec:ch16-capstone}
+\index{capstone project}\index{fraud detection}
+
+\begin{capstonebox}
+\textbf{Mission:} Assemble Part IV: simulated credit-card swipes stream into Event Hubs partitioned by card; an ASA sliding-window query detects cards used in two cities within ten minutes; alerts land in Azure SQL and on a live Power BI dashboard---with tested late-data policies and an honest cost estimate.
+
+\textbf{Estimated time:} 8--10 hours.
+
+\textbf{What you will practice:}
+\begin{itemize}
+    \item Partitioned event ingestion with idempotent producers (Chapter 13).
+    \item Sliding-window detection queries with explicit time policies (Chapter 14).
+    \item Streaming observability: watermark delay, late events, input stalls.
+    \item Streaming-to-dashboard delivery without overwhelming Power BI push limits.
+\end{itemize}
+\end{capstonebox}
+
+\subsection*{Scenario}
+A card issuer needs same-minute detection of the impossible-travel pattern: one physical card used in two distant cities within ten minutes. Detection must tolerate devices uploading late, must never double-alert on producer retries, and must show alerts live to the fraud operations team.
+
+\subsection*{Requirements}
+\begin{itemize}
+    \item \textbf{Ingestion:} hub partitioned by \texttt{card\_id}; producer attaches unique \texttt{eventId} per swipe.
+    \item \textbf{Detection:} ASA sliding-window query with explicit late-arrival and out-of-order policies.
+    \item \textbf{Serving:} alerts to Azure SQL (idempotent key design) and a Power BI streaming dashboard fed by \emph{aggregates}, not raw swipes.
+    \item \textbf{Operations:} watermark-delay alert; at least three automated fraud-rule tests (duplicate swipe, borderline window, out-of-order event).
+    \item \textbf{Cost:} Event Hubs TUs, ASA SUs, and Power BI capacity estimated with two optimizations.
+\end{itemize}
+
+\subsection*{Reference Architecture}
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[node distance=1.1cm]
+        \node[stage] (swipes) {Card swipes\\(producer)};
+        \node[stage, right=1.2cm of swipes] (eh) {Event Hubs\\partition by card};
+        \node[stage, right=1.2cm of eh] (asa) {ASA sliding\\window rule};
+        \node[store, above right=0.5cm and 1.2cm of asa] (sql) {Azure SQL\\fraud\_alerts};
+        \node[stage, below right=0.5cm and 1.2cm of asa] (pbi) {Power BI\\streaming dash};
+        \node[doc, below=0.9cm of eh] (mon) {Azure Monitor\\watermark alerts};
+        \node[store, below=0.9cm of asa] (lake) {Capture $\rightarrow$ ADLS\\(reconciliation)};
+        \draw[arrow] (swipes) -- (eh);
+        \draw[arrow] (eh) -- (asa);
+        \draw[arrow] (asa) -- (sql);
+        \draw[arrow] (sql) -- (pbi);
+        \draw[arrow, dashed] (mon) -- (eh);
+        \draw[arrow, dashed] (eh) -- (lake);
+    \end{tikzpicture}%
+    }
+    \caption{Milestone 4 architecture: partitioned ingestion, sliding-window detection, idempotent alert sink, live dashboard, lake reconciliation.}
+    \label{fig:ch16-capstone-arch}
+\end{figure}
+
+\subsection*{Implementation Steps}
+\begin{enumerate}
+    \item Create the hub (card-partitioned) and the swipe producer with dedupe keys.
+    \item Author the ASA job: \texttt{GROUP BY card\_id, SlidingWindow(minute, 10) HAVING COUNT(DISTINCT city) > 1}, event time via \texttt{TIMESTAMP BY}.
+    \item Sink alerts to Azure SQL with a key design that tolerates redelivery; build the streaming dashboard.
+    \item Run the three rule tests; wire and fire the watermark-delay alert.
+    \item Reconcile a day of stream alerts against Capture files; produce the cost estimate.
+\end{enumerate}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item Producer, job definition, sink DDL, and tests in the repo with a README that runs from clean.
+    \item Evidence pack: rule-test results, watermark alert firing, stream/lake reconciliation.
+    \item Cost estimate with two documented optimizations.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item A two-city swipe pattern raises exactly one alert despite forced producer retries.
+    \item Late and out-of-order events follow the documented policy with metric proof.
+    \item The dashboard shows alerts within the freshness SLO without raw-swipe volume.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Reimplement the rule in Structured Streaming (Chapter 15) and compare operational burden.
+    \item Add a reverse-ETL hop: confirmed fraud flags pushed back to the card system of record.
+    \item Add a historical-features join (card's 30-day profile via reference data) to reduce false positives.
+\end{itemize}

@@ -1,0 +1,295 @@
+\chapter{Zero-Trust Data Platforms: Identity, Networking, and Secrets}
+\index{zero trust}\index{Microsoft Entra ID}\index{managed identity}\index{Private Endpoint}\index{Azure Key Vault}\index{customer-managed keys}%
+\begin{objectives}
+\begin{itemize}
+    \item Apply zero-trust principles---verify explicitly, least privilege, assume breach---to data platform architecture.
+    \item Distinguish Microsoft Entra ID identities: users, service principals, and system- versus user-assigned managed identities.
+    \item Deploy Private Endpoints and disable public network access so data services exist only inside your VNet.
+    \item Contrast Private Endpoints with service endpoints and explain the DNS requirements that make private access actually work.
+    \item Centralize secrets in Azure Key Vault with rotation policies and Event Grid-driven expiry notifications.
+    \item Evaluate customer-managed keys versus Microsoft-managed keys for regulatory and key-custody requirements.
+    \item Design a no-exfiltration data perimeter for a healthcare provider using Synapse data exfiltration protection.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+Zero-trust networking and identity-first access are cloud-universal; the product names differ but the architecture---private connectivity, no long-lived secrets, centralized keys---is identical.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{3.0cm}p{2.9cm}p{3.1cm}p{3.2cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{AWS} & \textbf{Azure} & \textbf{GCP} \\
+\midrule
+Identity plane & IAM & Microsoft Entra ID + Azure RBAC & Cloud IAM \\
+Workload identity & IAM roles for EC2/EKS & Managed identities & Service account impersonation \\
+Private service access & PrivateLink / VPC endpoints & Private Endpoints & Private Service Connect \\
+Secrets manager & Secrets Manager & Azure Key Vault & Secret Manager \\
+Key custody (CMK) & KMS & Key Vault / Managed HSM & Cloud KMS / HSM \\
+Bastion access & Systems Manager Session Manager & Azure Bastion & IAP TCP forwarding \\
+\addlinespace
+\multicolumn{4}{@{}l@{}}{\textbf{Fabric}: Entra ID + OneLake security + private links; \textbf{Snowflake}: private connectivity (PrivateLink) + Tri-Secret; \textbf{MongoDB}: Atlas private endpoints + customer key management.} \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+The exam and interview favorite---``why is a managed identity better than a service principal secret?''---has the same answer on every cloud: no secret material exists to leak, rotate, or commit to git.
+\end{crosscloud}
+
+\begin{keyterms}
+\textbf{Zero trust}: a security model that verifies every request explicitly, grants least privilege, and assumes the network is hostile.\quad
+\textbf{Managed identity}: an Entra ID identity whose lifecycle Azure manages---no credentials in code or configuration.\quad
+\textbf{Private Endpoint}: a network interface that binds a PaaS resource to a private IP inside your VNet.\quad
+\textbf{Service endpoint}: a VNet-optimized route to a PaaS service that still targets the public IP.\quad
+\textbf{CMK}: customer-managed keys---encryption keys you own in Key Vault, with your rotation and revocation policy.
+\end{keyterms}
+
+\section{Week 21 Overview: Part VI Opens with the Perimeter}
+Month 6 turns the platform from functional to defensible. The security model of the previous twenty weeks---managed identities on linked services, RBAC on storage, Key Vault for secrets---now becomes the explicit subject. Zero trust is the organizing principle: \emph{no implicit trust from network location}; every request authenticated, authorized, and encrypted; the blast radius of any single compromise minimized by least privilege \cite{microsoft2025entra,microsoft2025rbac}.
+
+For data platforms, zero trust resolves to four concrete engineering programs: identity (everything authenticates as a managed identity), networking (nothing is publicly reachable), secrets (nothing long-lived exists outside Key Vault), and custody (keys you can rotate and revoke). This chapter builds all four; Chapter 23 adds the data-privacy layer on top.
+
+\section{Monday: Entra ID, Service Principals, and Managed Identities}
+\index{Microsoft Entra ID}\index{service principal}\index{managed identity}
+
+\subsection{The Identity Spectrum}
+A \textbf{service principal} is an application identity in Entra ID, authenticated by a client secret or certificate that \emph{you} create, store, rotate, and eventually leak into a log file. A \textbf{managed identity} is a service principal whose credential lifecycle Azure owns: the resource (a VM, a Function, a Data Factory) simply \emph{has} an identity, requests tokens from a local endpoint, and never touches secret material. \textbf{System-assigned} identities live and die with one resource; \textbf{user-assigned} identities are standalone objects shared across resources (useful when many Functions need one identity, or when RBAC must exist before the resource does).
+
+\subsection{The Access Pattern}
+The zero-trust access pattern for any service-to-service call: caller has a managed identity $\rightarrow$ identity holds an RBAC role on the target at the tightest scope $\rightarrow$ caller requests a token $\rightarrow$ target validates. No connection strings, no keys, no rotation calendar. Chapters 5, 10, 11, and 18 already used this pattern for COPY loads, linked services, and AML datastores; this section names the principle they were applying.
+
+\begin{pitfall}
+\textbf{Broad roles to silence 403s.} Granting \texttt{Owner} or account-wide \texttt{Contributor} because a pipeline ``couldn't read storage'' converts a scoped authorization question into a standing breach. The correct response to a 403 is to identify the missing data-plane action---often \texttt{Storage Blob Data Reader} on one container---not to widen the role.
+\end{pitfall}
+
+\section{Tuesday: Private Networking---Endpoints, DNS, and Bastion}
+\index{Private Endpoint}\index{service endpoint}\index{Azure Bastion}
+
+\subsection{Private Endpoint vs.\ Service Endpoint}
+A \textbf{service endpoint} extends your VNet's identity to a PaaS service over the Azure backbone---the service still has its public IP; traffic is merely routed optimally, and the service firewall must allow your subnet. A \textbf{Private Endpoint} puts a private IP \emph{inside} your VNet that maps to one specific resource; disable public network access on that resource and it ceases to exist on the internet \cite{microsoft2025privateLink}. Zero trust wants the latter.
+
+\subsection{DNS: The Step Everyone Forgets}
+A private endpoint without DNS is a trap: clients resolve \texttt{stadls.dfs.core.windows.net} to the \emph{public} IP, traffic fails or leaks, and the misconfiguration is invisible in the portal. The complete pattern is private endpoint + \textbf{private DNS zone} (\texttt{privatelink.dfs.core.windows.net}) + VNet link + the zone group registration on the endpoint. Chapter 24's Terraform listing encodes all four; hand-built setups routinely omit the third or fourth.
+
+\subsection{Administration Without Exposure}
+With data services private, administrator access needs its own path: \textbf{Azure Bastion} provides browser-based RDP/SSH to VMs without public IPs on the VMs or NSG openings. The admin plane becomes: Bastion $\rightarrow$ jump VM $\rightarrow$ private endpoints. Nothing in the estate answers a public SYN packet.
+
+\begin{tipbox}
+Prove the perimeter from \emph{outside}: after disabling public access, attempt the data-plane call from your workstation and confirm it fails, then from the jump VM and confirm it succeeds. A private endpoint nobody tested is a hope, not a control.
+\end{tipbox}
+
+\section{Wednesday: Key Vault, Rotation, and CMK}
+\index{Azure Key Vault}\index{secret rotation}\index{customer-managed keys}
+
+\subsection{Secrets, Keys, Certificates}
+Azure Key Vault is the custody layer for three object classes: \textbf{secrets} (connection strings, API keys), \textbf{keys} (RSA/EC keys for encryption, including CMKs), and \textbf{certificates} (with managed issuance and renewal) \cite{microsoft2025keyVault}. The zero-trust rule: applications reference secrets \emph{by URI}; the vault enforces access via RBAC; managed identities do the authenticating. A rotated secret must require no code change---consumers read the current version at startup or per use.
+
+\subsection{Automated Rotation}
+Key Vault rotation policies plus Event Grid's \texttt{SecretNearExpiry} event close the loop: when a secret nears expiry, an event fires; a Function or Logic App regenerates the credential at the source (for example, a new storage key), writes the new value as a new secret version, and consumers pick it up on next read. The syllabus of Chapter 12's Logic Apps and Chapter 11's Event Grid converge here: rotation is just another event-driven pipeline, one whose payload happens to be a credential.
+
+\subsection{Customer-Managed Keys}
+At-rest encryption is on by default with Microsoft-managed keys. \textbf{CMK} moves key custody to your Key Vault: you control rotation, can revoke access by disabling the key (an instant cryptographic kill switch), and can produce the custody evidence regulated industries require. The operational price is real: key availability becomes your availability dependency, and a deleted key without purge protection is a data-loss event. CMK is a compliance answer, not a default posture.
+
+\begin{pitfall}
+\textbf{Key Vault references without purge protection.} Disabling purge protection saves nothing and turns an accidental key deletion into permanent ciphertext. Enable soft-delete \emph{and} purge protection on any vault holding CMKs.
+\end{pitfall}
+
+\section{Thursday Hands-on Project: A Private-Only Storage Account}
+\index{hands-on lab}\index{Private Endpoint!project}
+Create an ADLS Gen2 account, bind it to a private endpoint, disable public access, and prove the access pattern from a VM inside the VNet.
+
+\subsection{Build the Perimeter}
+\begin{lstlisting}[language=bash,caption={Private endpoint with DNS zone group, then public access disabled.},label={lst:ch21-pep}]
+$rg = "rg-de-azure-book-week21"
+az group create --name $rg --location eastus
+az network vnet create --name vnet-data --resource-group $rg `
+  --address-prefix 10.20.0.0/16 --subnet-name snet-data --subnet-prefix 10.20.1.0/24
+
+$adlsId = az storage account show --name <adls> --resource-group $rg --query id -o tsv
+
+az network private-endpoint create --name pep-adls-dfs --resource-group $rg `
+  --vnet-name vnet-data --subnet snet-data `
+  --private-connection-resource-id $adlsId `
+  --group-id dfs --connection-name adls-dfs-conn
+
+az network private-dns zone create --resource-group $rg `
+  --name "privatelink.dfs.core.windows.net"
+az network private-dns link vnet create --resource-group $rg `
+  --zone-name "privatelink.dfs.core.windows.net" --name link-data `
+  --virtual-network vnet-data --registration-enabled false
+
+az network private-endpoint dns-zone-group create --resource-group $rg `
+  --endpoint-name pep-adls-dfs --name dfszone `
+  --private-dns-zone "privatelink.dfs.core.windows.net" --zone-name dfs
+
+az storage account update --name <adls> --resource-group $rg `
+  --public-network-access Disabled --default-action Deny
+\end{lstlisting}
+
+\subsection{Prove It}
+Deploy a small VM into \texttt{snet-data} with Azure Bastion for access. From your workstation: \texttt{az storage fs list} against the account fails (no public path). From the VM via Bastion: the same call succeeds over the private IP, and \texttt{nslookup <adls>.dfs.core.windows.net} returns a 10.20.x.x address---the DNS proof that makes the perimeter real.
+
+\section{Friday Use Case: A No-Exfiltration Perimeter for Healthcare}
+\index{use case}\index{data exfiltration protection}
+A healthcare provider's compliance requirement: PHI processed in Synapse must not be copyable to any storage outside the governed perimeter, even by a credentialed insider.
+
+\subsection{The Design}
+Every data service (ADLS, Synapse, Key Vault, SQL) sits behind private endpoints with public access disabled. The Synapse workspace enables \textbf{data exfiltration protection}: the workspace's managed VNet blocks outbound connections to arbitrary endpoints, so a notebook cannot \texttt{pip install} from a personal repository or POST PHI to an external URL. Egress that \emph{is} required flows through an explicit firewall allowlist, logged. CMK with your rotation evidence satisfies key-custody requirements; Bastion mediates administration; Defender for Cloud (Chapter 23) watches the control plane. The insider threat is bounded: a credentialed user can read what their role allows, but the data has no network path out.
+
+\begin{pitfall}
+\textbf{Perimeter without egress control.} Private endpoints stop inbound exposure; they say nothing about a notebook exfiltrating to attacker-controlled storage. Exfiltration protection and egress allowlisting are the outbound half of the same control---deploy both or the perimeter is a one-way valve.
+\end{pitfall}
+
+\section{Architectural Decision Record Template}
+\index{architectural decision record}
+Per platform record: identity model per service (which managed identities, which RBAC roles, at what scopes), the private endpoint inventory with DNS evidence, public-access posture per resource, Key Vault topology (one vault per environment, RBAC mode), CMK scope and rotation ownership, and the egress policy with its allowlist owner.
+
+\section{Operational Deep Dive: Auditing the Perimeter}
+\index{audit!security}
+The perimeter drifts unless audited: a monthly automated check that lists every data resource with \texttt{publicNetworkAccess} not Disabled, every storage account with shared-key authorization enabled, every Key Vault without purge protection, and every role assignment broader than the approved set. Azure Policy can enforce most of these at deploy time (Chapter 23); the audit catches what predates the policy. Feed both into the same report so posture is one page, not two systems.
+
+\section{Troubleshooting Patterns}
+\index{troubleshooting!networking}
+Service unreachable after private endpoint creation $\rightarrow$ DNS zone/link/group incomplete; check resolution first. Intermittent private access $\rightarrow$ two DNS paths disagreeing (custom DNS forwarders); trace from the failing client. Pipeline fails after public access disabled $\rightarrow$ the Azure IR is outside the perimeter; use a SHIR inside the VNet (Chapter 10) or a managed VNet IR. Key Vault reference failing after rotation $\rightarrow$ consumer pinned a secret \emph{version} instead of the rolling URI.
+
+\section{Week 21 Lab Rubric}
+\index{rubric}
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.2cm}p{5.0cm}p{5.0cm}@{}}
+\toprule
+\textbf{Criterion} & \textbf{Meets expectation} & \textbf{Needs improvement} \\
+\midrule
+Identity & Managed identities everywhere; scoped RBAC & Service-principal secrets; broad roles \\
+Networking & Private endpoints + DNS proven from inside and outside & Endpoint without DNS; public access left enabled \\
+Secrets & Key Vault references; rotation via events; purge protection & Secrets in variables; no rotation story \\
+Verification & Outside-fails/inside-succeeds evidence captured & Controls asserted but never tested \\
+\bottomrule
+\end{tabular}
+\caption{Week 21 rubric for the zero-trust deliverables.}
+\label{tab:ch21-rubric}
+\end{table}
+
+\section{Interview Q\&A}
+\subsection{Concepts and Trade-offs}
+\begin{enumerate}
+    \item \textbf{Q: Why prefer managed identities over service principal client secrets?}\\
+    A: Azure owns the credential lifecycle---no secret to store, rotate, or leak; tokens are issued to the resource on demand.
+    \item \textbf{Q: Private Endpoint vs.\ Service Endpoint---what is the key difference?}\\
+    A: A private endpoint gives the resource a private IP in your VNet and enables disabling public access; a service endpoint only optimizes routing to the public IP.
+    \item \textbf{Q: What does the Key Vault SecretNearExpiry event enable?}\\
+    A: Automated rotation: an event-driven pipeline regenerates the credential at the source and publishes a new secret version with no code change.
+    \item \textbf{Q: What does VNet data-exfiltration protection in Synapse guard against?}\\
+    A: Outbound paths---notebooks or jobs copying data to endpoints outside the governed perimeter, even by credentialed users.
+\end{enumerate}
+
+\section{Further Reading}
+The Entra ID \cite{microsoft2025entra}, Azure RBAC \cite{microsoft2025rbac}, Private Link \cite{microsoft2025privateLink}, and Key Vault \cite{microsoft2025keyVault} documentations are the primary sources. The Well-Architected security pillar \cite{microsoft2025wellarchitected} frames the zero-trust review; Chapter 23 adds policy enforcement and the privacy layer.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item Zero trust for data platforms: managed identities, private-only networking, vault-custodied secrets, owned keys.
+    \item A 403 is a scoping question; broad roles are a standing breach, not a fix.
+    \item A private endpoint without its private DNS zone is a trap---test name resolution, not just connectivity.
+    \item Disable public access \emph{and} control egress; perimeters are two-way.
+    \item Rotation must be event-driven and code-invisible; \texttt{SecretNearExpiry} is the trigger.
+    \item CMK buys custody and revocation at the price of availability responsibility; protect the vault with purge protection.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Explain the token flow when an ADF managed identity reads ADLS Gen2.
+    \item \textbf{(Conceptual)} Why does disabling public network access require DNS changes, not just firewall changes?
+    \item \textbf{(Conceptual)} When is a user-assigned managed identity preferable to system-assigned?
+    \item \textbf{(Hands-on)} Complete the Thursday project, including the outside-fails/inside-succeeds proof.
+    \item \textbf{(Hands-on)} Implement a rotation pipeline for a storage key using \texttt{SecretNearExpiry} and a Function.
+    \item \textbf{(Hands-on)} Write the monthly posture-audit script and run it against your lab estate.
+    \item \textbf{(Design)} Design the egress allowlist for the healthcare Synapse workspace: what legitimately needs outbound?
+    \item \textbf{(Design)} Write the ADR for CMK versus Microsoft-managed keys for the PHI estate.
+    \item \textbf{(Design)} Plan the migration of a service-principal-based estate to managed identities with zero downtime.
+    \item \textbf{(Interview)} Prepare a two-minute answer to ``how would you exfiltrate data from your own platform---and what stops you?''
+\end{enumerate}
+
+\section{Capstone Project: Private-Only Lakehouse Perimeter}\label{sec:ch21-capstone}
+\index{capstone project}\index{zero trust!capstone}
+
+\begin{capstonebox}
+\textbf{Mission:} Convert the lab lakehouse into a zero-trust perimeter: private endpoints and DNS for every data service, public access disabled, managed identities only, Key Vault custody with rotation, Bastion-mediated administration, and an audited posture report.
+
+\textbf{Estimated time:} 4--6 hours.
+
+\textbf{What you will practice:}
+\begin{itemize}
+    \item Private endpoint + DNS deployment done completely and verifiably.
+    \item Identity-first access with scoped RBAC.
+    \item Rotation automation and CMK custody.
+    \item Posture auditing as a repeatable artifact.
+\end{itemize}
+\end{capstonebox}
+
+\subsection*{Scenario}
+The healthcare provider's security review blocks go-live until the analytics estate is provably unreachable from the internet and provably incapable of unsanctioned egress. Your Part II lakehouse is the conversion target.
+
+\subsection*{Requirements}
+\begin{itemize}
+    \item \textbf{Network:} private endpoints + DNS zones for ADLS, Synapse, Key Vault; public access disabled; outside-fails/inside-succeeds proof.
+    \item \textbf{Identity:} every service-to-service call on managed identities; no shared-key or SAS paths enabled.
+    \item \textbf{Secrets:} all secrets in Key Vault by URI reference; one rotation demonstrated via events.
+    \item \textbf{Egress:} Synapse exfiltration protection enabled; the allowlist documented.
+    \item \textbf{Audit:} the posture script output committed as evidence.
+\end{itemize}
+
+\subsection*{Reference Architecture}
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[node distance=1.2cm]
+        \node[stage] (admin) {Admin via\\Azure Bastion};
+        \node[stage, right=1.5cm of admin] (vm) {Jump VM\\(VNet)};
+        \node[stage, right=1.5cm of vm] (pep) {Private Endpoints\\+ privatelink DNS};
+        \node[store, right=1.4cm of pep] (svc) {ADLS / Synapse\\/ Key Vault};
+        \node[doc, below=0.9cm of pep] (egress) {Egress allowlist\\+ exfil protection};
+        \node[doc, below=0.9cm of svc] (audit) {Posture audit\\(monthly script)};
+        \node[stage, left=1.2cm of admin] (inet) {Public internet\\\textbf{denied}};
+        \draw[arrow] (admin) -- (vm);
+        \draw[arrow] (vm) -- (pep);
+        \draw[arrow] (pep) -- (svc);
+        \draw[arrow, dashed] (egress) -- (pep);
+        \draw[arrow, dashed] (audit) -- (svc);
+        \draw[biarrow, draw=red!60!black] (inet) -- node[above,font=\scriptsize\color{red!60!black}]{no path} (admin);
+    \end{tikzpicture}%
+    }
+    \caption{Capstone perimeter: no public path in, allowlisted egress out, every hop authenticated by identity.}
+    \label{fig:ch21-capstone-arch}
+\end{figure}
+
+\subsection*{Implementation Steps}
+\begin{enumerate}
+    \item Deploy endpoints and DNS for each service (Listing~\ref{lst:ch21-pep}).
+    \item Disable public access and shared-key authorization; retest all pipelines over managed identities.
+    \item Configure the vault, rotation policy, and one Event Grid rotation demo.
+    \item Enable exfiltration protection; document the allowlist.
+    \item Run the posture audit; fix what it finds; commit the clean report.
+\end{enumerate}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item CLI/Terraform artifacts for the perimeter and the DNS evidence.
+    \item The access proofs and the rotation demo recording.
+    \item The posture report and the ADR set for identity, network, secrets, and custody.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item No data service resolves publicly; every in-VNet access path works.
+    \item A rotated secret propagates to consumers with zero code or config change.
+    \item The posture audit reports zero public-access, shared-key, or purge-protection violations.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Convert the entire perimeter to Terraform (preview of Chapter 24) and destroy/rebuild it from code.
+    \item Add Defender for Cloud recommendations to the posture report.
+    \item Simulate an insider exfiltration attempt from a notebook and document which control stops it.
+\end{itemize}

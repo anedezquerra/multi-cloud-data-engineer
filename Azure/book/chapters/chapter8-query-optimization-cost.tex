@@ -1,0 +1,309 @@
+\chapter{Data Governance with Microsoft Purview}
+\index{Microsoft Purview}\index{data catalog}\index{data map}\index{data classification}\index{data lineage}\index{Azure Data Share}%
+\begin{objectives}
+\begin{itemize}
+    \item Explain why a governed catalog is a prerequisite---not an afterthought---for a data platform that serves hundreds of users.
+    \item Register ADLS Gen2 and Synapse sources in Microsoft Purview and run scans with managed-identity authentication.
+    \item Interpret automated classifications, and locate every \texttt{PII\_Email} column in a lake with a single catalog query.
+    \item Trace lineage from raw lake files through pipelines and views to a Power BI report for impact analysis.
+    \item Share datasets across Azure tenants with Azure Data Share without copying files into partner-controlled storage.
+    \item Architect a data clean room where an ad agency and an advertiser match audiences without exposing raw PII.
+    \item Complete the Part II milestone: an enterprise lakehouse with Delta storage, Purview governance, serverless serving, and measured cost.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+Every cloud pairs its storage and compute with a governance plane: a metastore-backed catalog, automated classification, and lineage. Purview's distinction is scope---it catalogs Azure, AWS, GCP, and on-premises sources in one data map.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{3.0cm}p{2.9cm}p{3.1cm}p{3.2cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{AWS} & \textbf{Azure} & \textbf{GCP} \\
+\midrule
+Catalog / data map & Glue Data Catalog + Lake Formation & Microsoft Purview & Dataplex \\
+PII discovery & Macie & Purview classifications & Sensitive Data Protection \\
+Lineage & Glue / CloudTrail analysis & Purview lineage & Dataplex lineage \\
+Cross-tenant sharing & AWS Data Exchange / S3 sharing & Azure Data Share & Analytics Hub / BigQuery sharing \\
+Clean room & AWS Clean Rooms & Data Share + confidential compute patterns & BigQuery data clean rooms \\
+\addlinespace
+\multicolumn{4}{@{}l@{}}{\textbf{Fabric}: Purview hub + OneLake catalog; \textbf{Snowflake}: Horizon Catalog + listings; \textbf{MongoDB}: Atlas auditing + federated governance.} \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+The governance loop taught here---register, scan, classify, trace, share with policy---is identical in shape on every platform; Chapter 22 extends it with custom classifications, sensitivity labels, and data-mesh operating models.
+\end{crosscloud}
+
+\begin{keyterms}
+\textbf{Data map}: Purview's automatically built graph of data assets, their schemas, classifications, and relationships.\quad
+\textbf{Classification}: a detected or assigned data category (for example, email address) attached to columns and assets.\quad
+\textbf{Lineage}: the recorded flow of data from source through transformations to reports.\quad
+\textbf{Azure Data Share}: the service for sharing datasets across tenants in place, with invitations, terms, and revocation.\quad
+\textbf{Data clean room}: an architecture where parties match and analyze overlapping data without either side seeing the other's raw PII.
+\end{keyterms}
+
+\section{Week 8 Overview: Governance Before Serving}
+Chapters 5--7 built the warehouse, tuned it, and replaced its copy pipelines with logical serving. Week 8 closes Month 2 with the question every audit, incident, and schema migration asks: \emph{what data do we have, where did it come from, and who can see it?} Microsoft Purview is Azure's answer: a unified governance service that scans sources into a searchable data map, auto-classifies sensitive columns, records lineage from lake to report, and brokers cross-tenant sharing \cite{microsoft2025purview}.
+
+The ordering principle of this chapter is the one the Milestone 2 capstone enforces: \textbf{classify before you serve}. A gold view published before the Purview scan runs is a PII exposure with a dashboard attached.
+
+\begin{definitionbox}
+\textbf{Data governance} is the operating discipline of knowing your data estate: what exists (catalog), what is sensitive (classification), how it flows (lineage), and who may use it (policies). Tools automate discovery; the discipline is deciding and enforcing.
+\end{definitionbox}
+
+\section{Monday: The Purview Data Map and Catalog}
+\index{Microsoft Purview!data map}\index{collection}
+
+\subsection{Register, Organize, Scan}
+Purview adoption follows three steps. \textbf{Register} sources: ADLS Gen2 accounts, Synapse workspaces, SQL databases, Power BI tenants, even S3 buckets and on-premises SQL Server. \textbf{Organize} them into \textbf{collections}---the management hierarchy that scopes scan rules and access, typically mirroring domains or environments. \textbf{Scan}: a scan connects with the Purview account's managed identity (or a self-hosted integration runtime for private sources---the Chapter 10 pattern applied to governance), crawls the source, extracts schemas and samples, and populates the data map.
+
+Scans are incremental and schedulable. The operational contract: every production source is registered, scanned on a cadence that matches its rate of schema change, and owned by a named steward. An unregistered source is invisible to every downstream governance control---classification, lineage, and policy all start at registration.
+
+\begin{tipbox}
+Grant the Purview managed identity read-only data-plane access (for example, \texttt{Storage Blob Data Reader}) at registration time and nothing more. Governance needs to see schemas and samples, not write data.
+\end{tipbox}
+
+\subsection{The Catalog as the Front Door}
+Once scanned, assets are searchable by name, schema, classification, glossary term, and owner. The cultural shift this enables: analysts \emph{find} the certified gold dataset instead of exporting a CSV, because finding is easier than asking. Business glossary terms (``net revenue,'' ``active subscriber'') attach to assets so technical and business vocabularies meet in one place.
+
+\section{Tuesday: Classification and Lineage}
+\index{data classification}\index{data lineage}
+
+\subsection{Automated Classification}
+During scans, Purview applies built-in classifiers---over two hundred rules for emails, credit cards, national IDs, and more---plus any custom rules (Chapter 22) to column samples. The result is queryable: ``show every column classified as email address across the estate'' is a catalog search, not an audit-week archaeology dig. Classifications travel with the asset, so a \texttt{PII\_Email} column discovered in bronze stays labeled when it flows into silver and gold.
+
+\begin{pitfall}
+\textbf{Scanning after serving.} If the first Purview scan runs after dashboards ship, PII was discoverable only after analysts could already query it. Scan and classify \emph{before} any serving view is published---and re-scan before every new gold view goes live.
+\end{pitfall}
+
+\subsection{Lineage for Impact Analysis}
+Purview ingests lineage automatically from ADF pipelines, Mapping Data Flows, Synapse, Databricks, and Power BI \cite{microsoft2025purviewLineage}. Two questions become queries instead of meetings. \emph{Upstream:} this report is wrong---which dataset, pipeline, and source file fed it? \emph{Downstream:} this column is changing---which views, models, and reports read it? The downstream direction is what makes Chapter 24's expand--contract migrations safe: the contract step drops a column only when lineage proves no consumer reads it.
+
+Lineage completeness has a hard rule: it covers what flows through instrumented services. An analyst's ad-hoc notebook that reads bronze and writes gold leaves no lineage edge. Standardize execution paths (Chapter 12's orchestration, Chapter 22's delivery templates) so that the lineage graph is the truth, not a sample of it.
+
+\section{Wednesday: Azure Data Share}
+\index{Azure Data Share}\index{cross-tenant sharing}
+
+\subsection{Sharing Without Copying}
+The traditional way to give a partner data---export files to their storage---creates an ungoverned copy you cannot update, watermark, or revoke. Azure Data Share shares datasets \emph{in place}: the provider creates a share, selects datasets (ADLS Gen2 containers or folders, SQL tables), invites the consumer, and the consumer maps the share to their own storage or SQL target with snapshot-based synchronization on a schedule \cite{microsoft2025dataShare}. The provider sees who accepted, what they received, and when snapshots ran; revocation stops future snapshots.
+
+\subsection{Sharing Discipline}
+Treat every share as a data product with a contract: schema, classification, permitted use, refresh cadence, and a named owner. Share curated gold-zone data, never raw zones. Snapshot schedules create point-in-time copies in the consumer's tenant---your classification work means you know exactly which columns require contractual protection before they leave.
+
+\section{Thursday Hands-on Project: Scan, Classify, Trace}
+\index{hands-on lab}\index{Microsoft Purview!project}
+Configure Purview over the lab ADLS Gen2 account and Synapse workspace, run a scan that auto-classifies \texttt{PII\_Email} columns, and trace lineage from lake to report.
+
+\subsection{Provision and Register}
+\begin{lstlisting}[language=bash,caption={Create the Purview account and register the lake.},label={lst:ch8-purview}]
+$rg = "rg-de-azure-book-week8"
+az group create --name $rg --location eastus
+az purview account create --name purview-wk8 --resource-group $rg `
+  --location eastus
+
+# grant the Purview managed identity read access to the lake
+az purview account show --name purview-wk8 --resource-group $rg `
+  --query identity.principalId -o tsv
+az role assignment create --assignee-object-id "<purview-principal-id>" `
+  --assignee-principal-type ServicePrincipal `
+  --role "Storage Blob Data Reader" `
+  --scope "/subscriptions/<sub>/resourceGroups/$rg/providers/Microsoft.Storage/storageAccounts/<adls>"
+\end{lstlisting}
+
+In the Purview portal: register the storage account and the Synapse workspace, create a collection \texttt{retail}, and scope both registrations to it.
+
+\subsection{Scan and Classify}
+Create a scan over the lake's bronze and silver containers with the default rule set (which includes email classification), scoped to the \texttt{retail} collection, and run it. Then search the catalog for the email classification and confirm the customers table's email column appears---this is the ``find every \texttt{PII\_Email} column'' query made concrete. Seed the lake first with the synthetic customer data from earlier chapters so the classifier has samples to work with.
+
+\subsection{Trace Lineage}
+Run the Chapter 10 ADF pipeline (or the Chapter 7 CETAS job) against the registered sources, then open the gold asset in Purview and walk the lineage graph upstream to the raw files and downstream to the Power BI semantic model. Screenshot the end-to-end chain: it is the impact-analysis deliverable.
+
+\section{Friday Use Case: A Data Clean Room for Ad-Tech}
+\index{use case}\index{data clean room}
+An ad agency wants to measure campaign overlap with an advertiser's customers: ``how many people who saw our ads bought from you?'' Both parties hold PII; neither may see the other's raw data.
+
+\subsection{Architecture}
+Each party keeps its CRM in its own tenant, in its own ADLS Gen2 account, classified and cataloged by Purview. The matching key (email) is tokenized with a keyed hash (HMAC) whose key is shared for the match but whose mapping tables never leave either tenant---Chapter 23's tokenization discipline applied between organizations. The agency publishes a \emph{tokenized, aggregate-only} audience extract through Azure Data Share; the advertiser's Synapse workspace joins tokens against its own tokenized customers, producing overlap counts and segment statistics---never row-level records. Purview classification proves which columns could leave; the share's snapshot history provides the audit trail; terms-of-use acceptance is recorded per consumer.
+
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[node distance=1.3cm]
+        \node[store] (crm1) {Agency CRM\\(tenant A)};
+        \node[stage, right=1.4cm of crm1] (tok1) {Tokenize\\HMAC(email)};
+        \node[stage, right=1.4cm of tok1] (share) {Azure Data Share\\(aggregate extract)};
+        \node[stage, right=1.4cm of share] (join) {Advertiser Synapse\\token match + count};
+        \node[store, right=1.4cm of join] (crm2) {Advertiser CRM\\(tenant B, tokens)};
+        \node[tool, above=1.0cm of share] (purv) {Purview: classification,\\terms, snapshot audit};
+        \draw[arrow] (crm1) -- (tok1);
+        \draw[arrow] (tok1) -- (share);
+        \draw[arrow] (share) -- (join);
+        \draw[arrow] (crm2) -- (join);
+        \draw[arrow, dashed] (purv) -- (share);
+    \end{tikzpicture}%
+    }
+    \caption{Data clean room: tokenized keys match across tenants; only aggregates cross the boundary; Purview supplies classification and audit evidence.}
+    \label{fig:ch8-clean-room}
+\end{figure}
+
+\begin{pitfall}
+\textbf{Sharing row-level extracts ``because the query is aggregated downstream.''} Once raw rows cross the tenant boundary, no downstream aggregation promise protects you. The clean room's invariant is that only tokens and aggregates ever move---enforce it in the share definition, not in a memo.
+\end{pitfall}
+
+\section{Architectural Decision Record Template}
+\index{architectural decision record}
+Per governance domain record: the collection hierarchy and its owners, the scan cadence per source class, the classification rule set in use, the lineage coverage statement (which execution paths are instrumented), and the sharing policy---which zones are shareable, to whom, under what terms.
+
+\section{Operational Deep Dive: Scan Cadence and Coverage Metrics}
+\index{scan cadence}\index{coverage}
+Governance decays by omission: new sources appear, schemas drift, and the data map quietly diverges from reality. Track three coverage metrics monthly: percentage of production storage accounts registered, percentage with a scan run inside its cadence window, and percentage of curated-zone assets carrying at least one classification or glossary term. The third metric is the one that moves behavior---unclassified gold assets are unowned data products.
+
+\section{Troubleshooting Patterns}
+\index{troubleshooting!Purview}
+Scan finds no assets $\rightarrow$ the managed identity lacks data-plane read, or the scan scope points at the wrong container. Classifications missing $\rightarrow$ the rule set excludes the file type, or sampling was too small for the classifier's confidence threshold. Lineage gaps after a pipeline change $\rightarrow$ the transform ran outside an instrumented service; re-route through ADF/Synapse/Databricks. Data Share snapshots failing $\rightarrow$ the consumer's mapping target permissions or a schema drift at the source broke the snapshot contract.
+
+\section{Week 8 Lab Rubric}
+\index{rubric}
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.2cm}p{5.0cm}p{5.0cm}@{}}
+\toprule
+\textbf{Criterion} & \textbf{Meets expectation} & \textbf{Needs improvement} \\
+\midrule
+Registration & Sources registered in collections with managed-identity read access & Sources unregistered or scanned with broad keys \\
+Classification & \texttt{PII\_Email} columns discovered by catalog query with evidence & Classification asserted but not queried \\
+Lineage & End-to-end chain traced from lake to report & Lineage partial or unexamined \\
+Sharing & Share defined with terms, cadence, and gold-zone-only scope & Raw zones shared or no terms recorded \\
+\bottomrule
+\end{tabular}
+\caption{Week 8 rubric for the governance deliverables.}
+\label{tab:ch8-rubric}
+\end{table}
+
+\section{Interview Q\&A}
+\subsection{Concepts and Trade-offs}
+\begin{enumerate}
+    \item \textbf{Q: What does a Purview scan automatically discover?}\\
+    A: Assets, schemas, and---via built-in and custom classifiers---sensitive data categories, organized into a searchable data map.
+    \item \textbf{Q: How does lineage help impact analysis before a schema change?}\\
+    A: The downstream query shows which views, models, and reports read a column, so you know exactly what breaks before you change it.
+    \item \textbf{Q: Why use Azure Data Share instead of copying files to a partner?}\\
+    A: Sharing in place keeps the data governed: invitations, terms, snapshot schedules, and revocation replace an ungoverned copy in someone else's storage.
+    \item \textbf{Q: What is a data clean room, and what must it never expose?}\\
+    A: An architecture where parties match overlapping data via tokenized keys and exchange only aggregates; it must never expose row-level raw PII across the boundary.
+\end{enumerate}
+
+\section{Further Reading}
+The Microsoft Purview documentation hub \cite{microsoft2025purview} and the lineage concept guide \cite{microsoft2025purviewLineage} are the primary sources, with Azure Data Share covered in \cite{microsoft2025dataShare}. Chapter 22 extends this foundation with custom classifications, sensitivity labels, access policies, quality gates, and the data-mesh operating model; Chapter 23 adds the privacy and compliance layer.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item Governance starts at registration: unregistered sources are invisible to classification, lineage, and policy.
+    \item Classify before you serve; re-scan before every new gold view goes live.
+    \item Classification turns ``where is our PII'' into a catalog query.
+    \item Lineage answers both ``where did this report come from'' and ``what breaks if I change this column.''
+    \item Azure Data Share replaces ungoverned copies with in-place sharing, terms, and revocation.
+    \item A clean room moves tokens and aggregates only; the invariant is enforced in the share definition.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Why does governance tooling fail culturally when finding data is harder than asking for a CSV?
+    \item \textbf{(Conceptual)} Explain the difference between a collection and a classification in Purview.
+    \item \textbf{(Conceptual)} Why does lineage completeness depend on standardized execution paths?
+    \item \textbf{(Hands-on)} Complete the Thursday project: scan, classify \texttt{PII\_Email}, and capture the lineage chain.
+    \item \textbf{(Hands-on)} Create a business glossary term, attach it to a gold asset, and find the asset by the term.
+    \item \textbf{(Hands-on)} Share a curated folder with a second subscription via Data Share and document the consumer mapping.
+    \item \textbf{(Design)} Design the collection hierarchy for a three-domain retail group; justify the boundaries.
+    \item \textbf{(Design)} Write the ADR for the clean room: tokenization key custody, share scope, and revocation procedure.
+    \item \textbf{(Design)} Define the three coverage metrics' targets and the monthly report that tracks them.
+    \item \textbf{(Interview)} Prepare a two-minute answer to ``an auditor asks where customer emails exist across the company---walk me through your answer.''
+\end{enumerate}
+
+\section{Milestone 2 Capstone: Enterprise Data Lakehouse Build}\label{sec:ch8-capstone}
+\index{capstone project}\index{lakehouse!capstone}\index{Microsoft Purview}
+
+\begin{capstonebox}
+\textbf{Mission:} Assemble Part II into one platform: ingest five years of retail data into ADLS Gen2 as Delta Lake, catalog and classify it in Microsoft Purview, and serve executive dashboards through Synapse serverless SQL views---without duplicating data into a dedicated warehouse.
+
+\textbf{Estimated time:} 8--10 hours.
+
+\textbf{What you will practice:}
+\begin{itemize}
+    \item Bronze/silver/gold Delta zones with OPTIMIZE and VACUUM hygiene.
+    \item Purview registration, scanning, PII classification, and lineage.
+    \item Serverless views as the governed serving contract to Power BI.
+    \item Cost estimation across storage, scanned TBs, and Purview.
+\end{itemize}
+\end{capstonebox}
+
+\subsection*{Scenario}
+A retailer holds five years of order, customer, and store history in exported CSVs. Leadership wants executive dashboards refreshed daily, PII discovered and classified before any analyst touches the data, and no warehouse compute bill while concurrency is low.
+
+\subsection*{Requirements}
+\begin{itemize}
+    \item \textbf{Storage:} ADLS Gen2 bronze/silver/gold zones in Delta format; gold modeled as the Chapter 5 star schema with declared grain and SCD2 customers.
+    \item \textbf{Hygiene:} scheduled \texttt{OPTIMIZE} + \texttt{VACUUM}; documented retention horizon.
+    \item \textbf{Governance:} Purview scan of the lake with \texttt{PII\_Email} classification evidenced before any gold view is published.
+    \item \textbf{Serving:} serverless SQL views over the gold Delta tables with partition filters and scan budgets (Chapter 7 contract).
+    \item \textbf{Dashboards:} Power BI connected with DirectQuery; at least one page of executive visuals.
+    \item \textbf{Cost:} monthly estimate (storage, TBs scanned, Purview) with two documented optimization decisions.
+\end{itemize}
+
+\subsection*{Reference Architecture}
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[node distance=1.2cm]
+        \node[stage] (src) {Retail sources\\(5 years)};
+        \node[store, right=1.4cm of src] (lake) {ADLS Gen2\\Delta zones\\B/S/G};
+        \node[stage, right=1.4cm of lake] (sql) {Synapse\\serverless views};
+        \node[stage, right=1.4cm of sql] (pbi) {Power BI\\dashboards};
+        \node[tool, above=1.0cm of lake] (purv) {Microsoft Purview\\catalog + lineage};
+        \node[doc, below=1.0cm of lake] (sec) {Entra ID / RBAC};
+        \draw[arrow] (src) -- (lake);
+        \draw[arrow] (lake) -- (sql);
+        \draw[arrow] (sql) -- (pbi);
+        \draw[biarrow] (purv) -- (lake);
+        \draw[arrow] (sec) -- (lake);
+    \end{tikzpicture}%
+    }
+    \caption{Milestone 2 architecture: one Delta lakehouse, Purview-governed, served logically through serverless views to Power BI.}
+    \label{fig:ch8-capstone-arch}
+\end{figure}
+
+\subsection*{Implementation Steps}
+\begin{enumerate}
+    \item Land raw retail files in bronze; clean and deduplicate into silver Delta tables.
+    \item Model gold as the star schema (grain declared first; SCD2 customers from Chapter 5).
+    \item Run \texttt{OPTIMIZE} and \texttt{VACUUM}; record the schedule.
+    \item Register and scan the lake in Purview; confirm the PII classifications.
+    \item Publish the gold serverless views with \texttt{filepath()} pruning; connect Power BI via DirectQuery.
+    \item Produce the cost estimate and the two optimization decisions.
+\end{enumerate}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item Repo with all SQL/Spark scripts and a README that runs end-to-end from a clean environment.
+    \item Architecture diagram of the lake zones and serving layer.
+    \item Purview evidence: classifications and a lineage screenshot from lake to report.
+    \item Scan-budget report and monthly cost estimate.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item Pipeline runs end-to-end from the README on a clean workspace.
+    \item At least three automated data-quality checks on the gold tables with a demonstrated failing case.
+    \item PII is classified in Purview \emph{before} any serving view exposes it.
+    \item Monthly cost estimate includes two optimization decisions with quantified impact.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Add the Chapter 6 workload groups to a small dedicated pool and compare executive-dashboard latency against pure serverless.
+    \item Wire a Log Analytics alert on any serverless query scanning over 500 GB.
+    \item Add RLS from Chapter 16 so regional executives see only their regions.
+\end{itemize}
+

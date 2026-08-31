@@ -1,0 +1,420 @@
+\chapter{Azure Synapse Analytics: Dedicated SQL Pools}
+\index{Azure Synapse Analytics}\index{dedicated SQL pool}\index{MPP}\index{Data Warehouse Units}\index{dimensional modeling}\index{star schema}%
+\begin{objectives}
+\begin{itemize}
+    \item Explain the massively parallel processing (MPP) architecture of Azure Synapse Analytics dedicated SQL pools, including the control node, compute nodes, and the Data Movement Service.
+    \item Relate Data Warehouse Units (DWUs and cDWUs) to performance, concurrency, and hourly cost, and explain pause, resume, and scale operations.
+    \item Apply Kimball dimensional modeling: declare the grain, choose among transaction, periodic snapshot, and accumulating snapshot fact tables, and design conformed dimensions.
+    \item Implement slowly changing dimensions with SCD Type 1 and SCD Type 2 patterns, including a MERGE-based Type 2 upsert.
+    \item Select hash, round-robin, or replicated distribution for a table based on join behavior and data volume.
+    \item Bulk-load Parquet data from ADLS Gen2 with the COPY statement and managed identity authentication.
+    \item Estimate the monthly cost of a dedicated pool versus a serverless SQL pool for an end-of-month BI workload.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+The MPP data warehouse is one of the most portable ideas in analytics engineering. Synapse dedicated SQL pools distribute tables across 60 physical distributions and execute queries with a control node coordinating many compute nodes; the same mental model applies to Amazon Redshift's ra3 clusters and Google BigQuery's slot-based execution.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{3.0cm}p{2.9cm}p{3.1cm}p{3.2cm}@{}} \\
+\toprule
+\textbf{Capability} & \textbf{AWS} & \textbf{Azure} & \textbf{GCP} \\
+\midrule
+MPP warehouse & Amazon Redshift & Synapse dedicated SQL pool & BigQuery (slot-based) \\
+Sizing unit & ra3 nodes / RPUs & cDWU (pauseable) & Slots / autoscaling editions \\
+Distribution & DISTKEY / DISTSTYLE & Hash / round-robin / replicated & Automatic (no user control) \\
+Bulk load from lake & COPY from S3 & COPY INTO from ADLS Gen2 & LOAD DATA from Cloud Storage \\
+Serverless SQL over lake & Athena / Redshift Spectrum & Synapse serverless SQL pool & BigQuery external tables \\
+Logical warehouse & Redshift views + Spectrum & Serverless views + external tables & BigQuery views \\
+\addlinespace
+\multicolumn{4}{@{}l@{}}{\textbf{Fabric} warehouse: T-SQL MPP on OneLake; \textbf{Snowflake}: virtual warehouses; \textbf{MongoDB}: Atlas SQL / federated queries (not MPP).} \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+The Kimball discipline---grain declarations, conformed dimensions, and slowly changing dimensions---is engine-neutral. A star schema designed well in this chapter would port to Redshift, BigQuery, Snowflake, or a Fabric warehouse with only dialect changes.
+\end{crosscloud}
+
+\begin{keyterms}
+\textbf{Dedicated SQL pool}: the provisioned MPP data warehouse inside Azure Synapse Analytics, billed per hour while running.\quad
+\textbf{DWU / cDWU}: Data Warehouse Unit, the bundled compute-memory-IO sizing metric of a dedicated pool.\quad
+\textbf{Distribution}: the placement strategy that decides which of the 60 distributions holds each row.\quad
+\textbf{Grain}: the precise business meaning of one row in a fact table.\quad
+\textbf{SCD Type 2}: a dimension design that preserves history by closing old rows and inserting new versions.
+\end{keyterms}
+
+\section{Week 5 Overview: The Provisioned Warehouse in a Lakehouse World}
+Month 2 shifts from storing data to serving it at warehouse scale. Azure Synapse Analytics is Microsoft's umbrella analytics service; inside it, the \textbf{dedicated SQL pool} is the provisioned, MPP data warehouse formerly known as Azure SQL Data Warehouse \cite{microsoft2025synapse}. The pool distributes a table's rows across 60 distributions mapped to compute nodes, and a control node parses queries, builds a distributed execution plan, and coordinates the compute nodes. This architecture is what lets a single query scan hundreds of terabytes---and it is also why placement decisions made at table-creation time dominate query performance later.
+
+Week 5 therefore pairs two disciplines that are often taught separately: the platform mechanics of Synapse dedicated pools (cDWUs, distributions, COPY) and the modeling discipline of Kimball dimensional design (grain, fact types, conformed dimensions, SCD Type 2). Neither is sufficient alone. A perfectly tuned pool running a grain-confused fact table produces fast wrong answers; a beautiful star schema on round-robin distributions produces slow right answers.
+
+\begin{definitionbox}
+\textbf{Massively parallel processing (MPP)} is an architecture in which a query is decomposed into parallel steps that execute across many compute nodes, each holding a slice of the data, with a control node assembling partial results into a final answer.
+\end{definitionbox}
+
+\begin{notebox}
+A dedicated pool bills by the hour whenever it is running, even when idle. Pause or scale down outside working hours, and treat an Azure Monitor cost alert as a mandatory guardrail: an idle DW1000c pool can cost thousands of dollars per month.
+\end{notebox}
+
+\section{Monday: MPP Architecture and Dimensional Modeling}
+\index{MPP!architecture}\index{control node}\index{compute node}\index{Data Movement Service}\index{Kimball}
+
+\subsection{Control Node, Compute Nodes, and the Data Movement Service}
+A dedicated SQL pool has one control node and one or more compute nodes. The control node accepts the T-SQL connection, optimizes the query into distributed operations, and coordinates execution. Compute nodes store distributions of user tables in Azure Storage-backed structures and execute the parallel steps. When a query needs rows that live on different compute nodes---for example, a join between two tables distributed on different keys---the \textbf{Data Movement Service} (DMS) shuffles rows between nodes. Data movement is the single most expensive operation in an MPP system; the craft of warehouse design is mostly the craft of avoiding it.
+
+\begin{definitionbox}
+A \textbf{Data Warehouse Unit} bundles CPU, memory, and IO into a single capacity knob. The current generation is expressed as cDWUs (for example DW100c through DW30000c). Scaling up adds compute nodes and raises concurrency limits; pausing stops compute billing while storage continues to bill.
+\end{definitionbox}
+
+Sizing decisions should be driven by measured workload behavior, not by the size of the data alone. A 10~TB warehouse serving three analysts differs from a 1~TB warehouse serving three hundred concurrent dashboards. Scale up for load windows, scale down after, and pause when the pool is unused for hours.
+
+\subsection{Declaring the Grain}
+Kimball dimensional modeling begins with a contract: \emph{one row in this fact table means exactly one thing} \cite{kimball2013dwtk}. Declaring the grain---``one row per order line,'' ``one row per account per day,'' ``one row per claim status change''---decides what joins are safe, what aggregations are legal, and which dimensions can attach. Skipping the declaration is the most common cause of double-counted revenue in production warehouses, because two fact rows at different grains joined together silently fan out.
+
+\subsection{Fact Table Types}
+\begin{itemize}
+    \item \textbf{Transaction fact}: one row per business event (a sale, a click, a payment). Highest detail, largest volume.
+    \item \textbf{Periodic snapshot fact}: one row per entity per time period (inventory per SKU per day). Answers ``what was the level at point T'' questions.
+    \item \textbf{Accumulating snapshot fact}: one row per process instance, updated as milestones complete (order placed, shipped, delivered). Models pipelines with measurable stage durations.
+\end{itemize}
+
+\begin{tipbox}
+When a business question is ``how long does it take from order to delivery,'' reach for an accumulating snapshot. When it is ``what was on hand on March 31,'' reach for a periodic snapshot. Forcing either question onto a transaction fact produces convoluted SQL and wrong answers.
+\end{tipbox}
+
+\subsection{Conformed Dimensions and Slowly Changing Dimensions}
+\textbf{Conformed dimensions} are dimensions shared, with identical keys and meanings, across multiple fact tables and data marts. A single \texttt{dim\_date}, \texttt{dim\_customer}, and \texttt{dim\_store} allow a revenue mart and an inventory mart to be combined in one query without reconciliation meetings. Conformance is an organizational achievement as much as a technical one: it requires one team to own the dimension and every other team to consume it.
+
+Slowly changing dimensions handle the fact that descriptive attributes change. \textbf{SCD Type 1} overwrites the old value---correct for typo fixes. \textbf{SCD Type 2} closes the current row (set \texttt{valid\_to}, set \texttt{is\_current = 0}) and inserts a new version, preserving history---required when the business asks ``what did we believe about this customer when the sale happened?''
+
+\begin{lstlisting}[language=SQL,caption={SCD Type 2 upsert on a Synapse dedicated SQL pool: close changed rows, then insert the new versions.},label={lst:ch5-scd2-merge}]
+-- SCD Type 2 upsert on a Synapse Dedicated SQL Pool
+MERGE INTO dim_customer AS tgt
+USING stg_customer AS src
+    ON tgt.customer_id = src.customer_id AND tgt.is_current = 1
+WHEN MATCHED AND (tgt.email <> src.email OR tgt.city <> src.city) THEN
+    UPDATE SET tgt.valid_to = CAST(GETDATE() AS date), tgt.is_current = 0
+WHEN NOT MATCHED THEN
+    INSERT (customer_id, email, city, valid_from, valid_to, is_current)
+    VALUES (src.customer_id, src.email, src.city,
+            CAST(GETDATE() AS date), '9999-12-31', 1);
+
+-- insert new versions for the rows just closed by the MERGE
+INSERT INTO dim_customer (customer_id, email, city, valid_from, valid_to, is_current)
+SELECT src.customer_id, src.email, src.city,
+       CAST(GETDATE() AS date), '9999-12-31', 1
+FROM stg_customer AS src
+JOIN dim_customer AS tgt
+    ON tgt.customer_id = src.customer_id AND tgt.is_current = 1
+WHERE tgt.email <> src.email OR tgt.city <> src.city;
+\end{lstlisting}
+
+\begin{pitfall}
+\textbf{Forgetting the second insert.} A MERGE alone closes changed rows but does not insert their new versions. The canonical Synapse SCD2 pattern pairs the MERGE with the follow-up INSERT shown in Listing~\ref{lst:ch5-scd2-merge}. Omitting it silently deletes history.
+\end{pitfall}
+
+\section{Tuesday: Distribution Types}
+\index{distribution!hash}\index{distribution!round-robin}\index{distribution!replicated}\index{data movement}
+
+\subsection{Hash Distribution}
+Hash distribution applies a hash function to one distribution column and assigns each row to one of the 60 distributions. Rows with the same hash value land together, so a join on the distribution key between two hash-distributed tables is \emph{co-located}: each compute node joins its local slices with no data movement. Choose as the distribution key a high-cardinality column that participates in the workload's dominant large joins---\texttt{customer\_id} for a customer-centric warehouse, \texttt{order\_id} for order-line facts. Avoid columns with heavy skew (one value holding 30\% of rows creates one hot distribution that straggles every query) and avoid nullable columns, because all nulls hash to the same distribution.
+
+\subsection{Round-Robin Distribution}
+Round-robin assigns rows to distributions in rotation, giving perfectly even storage but no co-location guarantee. Every large join on a round-robin table requires data movement. Use it for staging tables (where the goal is fast load, not fast join) and for small temporary tables where no good distribution key exists.
+
+\subsection{Replicated Distribution}
+A replicated table stores a full copy on every compute node. Reads against it never move data, so it is ideal for small dimensions---date, region, status codes---that join to large facts. The cost is paid at write time: every insert, update, and rebuild must write every copy, so replication is wrong for large or frequently updated tables.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{2.6cm}p{4.4cm}p{3.4cm}p{3.2cm}@{}}
+\toprule
+\textbf{Distribution} & \textbf{Mechanism} & \textbf{Best for} & \textbf{Watch-outs} \\
+\midrule
+Hash & Hash of one column assigns the row & Large facts and large dimensions with a dominant join key & Skew and nulls concentrate rows \\
+Round-robin & Rows rotate across distributions & Staging, loads, no good key & Every large join shuffles data \\
+Replicated & Full copy on each compute node & Small conformed dimensions & Writes multiply; rebuilds are heavy \\
+\bottomrule
+\end{tabular}
+\caption{Distribution selection is the highest-leverage physical design decision in a dedicated SQL pool.}
+\label{tab:ch5-distributions}
+\end{table}
+
+\begin{pitfall}
+\textbf{Round-robin production tables.} Leaving a production fact table on the default round-robin distribution makes every large join pay a full shuffle through the Data Movement Service. Benchmark, then hash-distribute on the dominant join key.
+\end{pitfall}
+
+\section{Wednesday: Ingestion with COPY and PolyBase}
+\index{COPY statement}\index{PolyBase}\index{managed identity!ingestion}
+
+\subsection{COPY: The Modern Bulk Loader}
+The \texttt{COPY INTO} statement is the recommended bulk-load path for dedicated SQL pools \cite{microsoft2025synapseCopy}. It reads CSV, Parquet, and ORC directly from ADLS Gen2 or Blob Storage, supports wildcards over folder hierarchies, and loads in parallel across distributions. Crucially, it authenticates with \textbf{managed identity}: grant the pool's system-assigned identity the \texttt{Storage Blob Data Reader} role on the lake container and the load needs no keys, no SAS tokens, and no secrets in code.
+
+\begin{lstlisting}[language=SQL,caption={Bulk-loading Parquet from ADLS Gen2 with COPY and managed identity.},label={lst:ch5-copy}]
+COPY INTO stg_sales_raw
+FROM 'https://stadlsdemo.dfs.core.windows.net/raw/sales/year=*/month=*/*.parquet'
+WITH (
+    FILE_TYPE = 'PARQUET',
+    CREDENTIAL = (IDENTITY = 'Managed Identity'),
+    MAXERRORS = 100,
+    ERRORFILE = 'https://stadlsdemo.dfs.core.windows.net/rejects/'
+);
+\end{lstlisting}
+
+\subsection{PolyBase: The Legacy Path}
+PolyBase predates COPY and loads through external tables: an external data source, an external file format, and an external table definition, then \texttt{INSERT INTO ... SELECT} from the external table. PolyBase remains useful when a load needs external-table semantics---for example, repeatedly querying a lake folder as a table from the dedicated pool---but for pure bulk loading, COPY is simpler, faster to authenticate, and the direction Microsoft documentation recommends \cite{microsoft2025synapseDedicatedBest}.
+
+\begin{notebox}
+Load into a round-robin staging table, then \texttt{INSERT ... SELECT} or \texttt{CREATE TABLE AS SELECT} (CTAS) into the final hash-distributed, clustered-columnstore table. CTAS is fully parallel and minimally logged; row-by-row inserts into a columnstore produce tiny rowgroups and poor compression.
+\end{notebox}
+
+\subsection{The Load-to-Serve Pattern}
+A disciplined dedicated-pool pipeline has three stages: land raw files in ADLS Gen2, COPY into round-robin staging tables, then CTAS into hash-distributed, columnstore production tables with the SCD2 MERGE applied for dimensions. This pattern keeps loads fast, keeps joins co-located, and gives a clean point to reject malformed files via \texttt{MAXERRORS} and \texttt{ERRORFILE}.
+
+\section{Thursday Hands-on Project: Ten Million Rows into a Star Schema}
+\index{hands-on lab}\index{COPY statement}\index{star schema}
+This lab provisions a dedicated SQL pool, loads 10~million synthetic Parquet rows from ADLS Gen2 with COPY, models them as a star schema, and applies the SCD Type 2 MERGE. Work in a sandbox subscription; pause or delete the pool when finished.
+
+\subsection{Provision the Pool}
+\begin{lstlisting}[language=bash,caption={Provisioning a Synapse workspace and a small dedicated SQL pool with Azure CLI.},label={lst:ch5-provision}]
+az login
+az account set --subscription "00000000-0000-0000-0000-000000000000"
+$rg = "rg-de-azure-book-week5"
+$loc = "eastus"
+$ws = "synapse-week5-001"
+$pool = "sqlpoolwk5"
+$adls = "stadlsweek5001"
+$sqladmin = "sqladminuser"
+$sqlpwd = Read-Host "SQL admin key" -AsSecureString
+
+az group create --name $rg --location $loc
+
+az storage account create --name $adls --resource-group $rg `
+  --location $loc --sku Standard_LRS --kind StorageV2 --hns true
+
+az synapse workspace create --name $ws --resource-group $rg `
+  --storage-account $adls --file-system synapsefs `
+  --sql-admin-login-user $sqladmin `
+  --sql-admin-login-password (ConvertFrom-SecureString $sqlpwd -AsPlainText) `
+  --location $loc
+
+az synapse sql pool create --name $pool --workspace-name $ws `
+  --resource-group $rg --performance-level DW100c
+
+az synapse workspace firewall-rule create --name allowClient `
+  --workspace-name $ws --resource-group $rg `
+  --start-ip-address "<your-ip>" --end-ip-address "<your-ip>"
+\end{lstlisting}
+
+Grant the workspace's system-assigned managed identity \texttt{Storage Blob Data Contributor} on the storage account so COPY can read the lake without secrets.
+
+\subsection{Generate and Stage Synthetic Data}
+Use the Python \texttt{faker} and \texttt{pyarrow} packages to write 10~million order rows as partitioned Parquet files (\texttt{year=/month=/}), then upload with \texttt{az storage fs file upload} or AzCopy. Ten million rows is large enough that distribution and columnstore choices are observable but small enough to load on DW100c in minutes.
+
+\subsection{Model the Star and Apply SCD2}
+Declare the grain first: \emph{one row per order line}. Create \texttt{fact\_sales} hash-distributed on \texttt{customer\_id} with a clustered columnstore index; create \texttt{dim\_date} as replicated; create \texttt{dim\_customer} hash-distributed on \texttt{customer\_id}. Load staging with COPY (Listing~\ref{lst:ch5-copy}), CTAS into production tables, then run the SCD2 MERGE from Listing~\ref{lst:ch5-scd2-merge} against a changed-customer staging batch and verify history with \texttt{SELECT ... WHERE is\_current = 1}.
+
+\subsection{Verify and Pause}
+Confirm row counts match between lake files and staging, confirm the columnstore rowgroups are compressed (\texttt{sys.pdw\_nodes\_column\_store\_row\_groups}), and confirm a sample customer shows two Type 2 versions. Then pause the pool:
+\begin{lstlisting}[language=bash,caption={Pausing the pool to stop compute billing.},label={lst:ch5-pause}]
+az synapse sql pool pause --name $pool --workspace-name $ws --resource-group $rg
+\end{lstlisting}
+
+\section{Friday Use Case: End-of-Month BI on a Budget}
+\index{use case}\index{cost optimization!Synapse}
+A financial services firm runs heavy BI only during the last five business days of each month: roughly 120 concurrency-hours of report load per month on 8~TB of curated data. The architecture question: dedicated pool, serverless pool, or a hybrid?
+
+\subsection{Cost Model for Dedicated}
+A dedicated pool bills per hour while running. A DW500c pool running 12 hours per day for five days is 60 hours---cheap. The same pool left running all month is roughly 720 hours---an order of magnitude more expensive with no additional value. The dedicated answer is viable only with disciplined automation: scale up at month-end, pause immediately after. Missed pauses, not the rate card, are the risk.
+
+\subsection{Cost Model for Serverless}
+The serverless SQL pool bills per TB scanned. If the month-end dashboards are well-partitioned Parquet with aggressive pruning and scan 2~TB per report cycle, the serverless bill can be a small fraction of a dedicated pool's idle spend---and there is nothing to pause. But cost scales with bytes scanned: a dashboard that scans CSV, or that re-scans a full 8~TB folder because queries lack partition filters, inverts the comparison immediately \cite{microsoft2025synapseServerless}.
+
+\subsection{Recommendation}
+For this workload---predictable calendar, high concurrency in bursts, curated Parquet---recommend a \textbf{hybrid}: serverless SQL views over the gold lake zone for exploration and lightweight reporting, with a DW500c dedicated pool scaled in for the month-end crunch when concurrency and latency SLAs are tight. The decision driver is not the rate card; it is the ratio of busy hours to idle hours and the discipline of the pause automation.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.2cm}p{3.1cm}p{3.5cm}p{3.8cm}@{}}
+\toprule
+\textbf{Option} & \textbf{Billing model} & \textbf{Best for} & \textbf{Watch-outs} \\
+\midrule
+Synapse dedicated SQL pool & cDWU per hour; pauseable & Predictable, high-concurrency warehouse workloads & Idle pools still bill; pause or resize off-hours \\
+Synapse serverless SQL & Per TB of data scanned & Ad-hoc exploration, logical warehouse over the lake & Cost scales with bytes scanned; prune partitions, use Parquet \\
+Fabric capacity (F SKU) & Reserved capacity units, per-second billing, pauseable & Unified lakehouse plus Power BI on one capacity & Burst-then-throttle when oversubscribed; size the SKU \\
+Azure SQL Database & vCore/hour or DTU; serverless option & OLTP systems and small departmental marts & Not MPP; scale ceiling below Synapse for large analytics \\
+\bottomrule
+\end{tabular}
+\caption{Azure compute cost comparison for warehousing workloads.}
+\label{tab:ch5-cost-comparison}
+\end{table}
+
+\section{Architectural Decision Record Template}
+\index{architectural decision record}
+Write an ADR for every dedicated-pool deployment: the grain declaration for each fact table; the distribution key per table with measured skew evidence; the cDWU sizing and the scale/pause schedule; the COPY authentication model; and the cost ceiling with the alert threshold that enforces it. An ADR that names the rejected alternatives---round-robin for the fact table, SAS-token loads, 24/7 running---is more useful in an incident than one that only describes the chosen design.
+
+\section{Operational Deep Dive: Concurrency, Skew, and Rowgroup Health}
+\index{concurrency}\index{data skew}\index{rowgroup}
+Three metrics predict dedicated-pool health before users complain. First, \textbf{concurrency slot pressure}: each cDWU level grants a fixed number of concurrency slots; when queued queries grow, either scale up or reduce concurrent load rather than letting queues lengthen silently. Second, \textbf{distribution skew}: query \texttt{sys.dm\_pdw\_request\_steps} and the distribution-level row counts; if one distribution holds multiples of the median, the hash key is wrong. Third, \textbf{rowgroup quality}: columnstore rowgroups should sit near one million rows; frequent small loads or updates fragment them, and \texttt{ALTER INDEX ... REORGANIZE} or a CTAS rebuild restores compression.
+
+\begin{tipbox}
+Schedule a weekly report of the ten largest tables with their distribution type, row count per distribution, and average rowgroup size. Skew and fragmentation are slow leaks; a dashboard makes them visible before the quarter-end query that exposes them.
+\end{tipbox}
+
+\section{Troubleshooting Patterns}
+\index{troubleshooting!Synapse dedicated pool}
+Slow joins usually mean data movement: check the query plan for \texttt{ShuffleMoveOperation} and re-examine distribution keys. COPY failures with authorization errors mean the managed identity lacks a data-plane RBAC role---Owner on the resource is not enough. \texttt{MAXERRORS} rejections that cluster on one folder usually mean a schema drift in one source file. Sudden cost spikes almost always mean a pool that was never paused; check the pause automation before checking the rate card.
+
+\section{Week 5 Lab Rubric}
+\index{rubric}
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.2cm}p{5.0cm}p{5.0cm}@{}}
+\toprule
+\textbf{Criterion} & \textbf{Meets expectation} & \textbf{Needs improvement} \\
+\midrule
+Modeling & Grain declared; fact type chosen deliberately; SCD2 verified with a two-version customer & Grain implied; SCD2 MERGE run but history never queried \\
+Distribution & Hash keys justified with join evidence; replicated small dims & Everything left round-robin without measurement \\
+Ingestion & COPY with managed identity; rejects captured via \texttt{ERRORFILE} & Keys or SAS tokens in code; silent load errors \\
+Cost & Pool paused or deleted; cost estimate documented & Pool left running; no cost evidence \\
+\bottomrule
+\end{tabular}
+\caption{Week 5 rubric for the dedicated-pool deliverables.}
+\label{tab:ch5-rubric}
+\end{table}
+
+\section{Interview Q\&A}
+\subsection{Concepts and Trade-offs}
+\begin{enumerate}
+    \item \textbf{Q: Why must you declare the grain before designing a fact table?}\\
+    A: The grain defines what one row means; without it, joins fan out and aggregates double-count silently.
+    \item \textbf{Q: Which fact type models a process with milestones such as order, ship, deliver?}\\
+    A: An accumulating snapshot---one row per process instance, updated as each milestone completes.
+    \item \textbf{Q: When is SCD Type 2 required instead of Type 1?}\\
+    A: When the business must reconstruct what was known at a past point in time, such as the customer's segment when an order was placed.
+    \item \textbf{Q: When does a serverless SQL pool beat a dedicated pool on cost?}\\
+    A: When queries are infrequent or bursty, data is columnar and partition-pruned, and the bytes scanned per month cost less than keeping a provisioned pool running.
+\end{enumerate}
+
+\section{Further Reading}
+Start with the Azure Synapse Analytics overview \cite{microsoft2025synapse} and the dedicated SQL pool best practices \cite{microsoft2025synapseDedicatedBest}. Study the COPY statement reference \cite{microsoft2025synapseCopy} before any bulk-load design. For dimensional modeling, Kimball and Ross remain the canonical text \cite{kimball2013dwtk}. Compare with the serverless SQL pool documentation \cite{microsoft2025synapseServerless} ahead of Chapter~7, and connect sizing and pause discipline to the Well-Architected cost pillar \cite{microsoft2025wellarchitected}.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item A dedicated SQL pool is an MPP warehouse: one control node coordinates compute nodes, and the Data Movement Service shuffles rows when distributions do not align.
+    \item cDWUs bundle compute, memory, and IO; billing is hourly while running, so pause and scale discipline dominates the cost story.
+    \item Declare the grain before building any fact table; choose transaction, periodic snapshot, or accumulating snapshot deliberately.
+    \item SCD Type 2 in Synapse is a MERGE to close old rows \emph{plus} a second INSERT for the new versions.
+    \item Hash-distribute large tables on the dominant join key, replicate small dimensions, and round-robin only staging.
+    \item COPY with managed identity is the modern bulk loader; PolyBase external tables remain for external-table semantics.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Explain the roles of the control node, compute nodes, and the Data Movement Service during a hash-mismatched join.
+    \item \textbf{(Conceptual)} A fact table stores one row per account balance per night. Which fact type is this, and what questions does it answer well?
+    \item \textbf{(Conceptual)} Why is \texttt{customer\_segment} a poor hash distribution key for \texttt{dim\_customer}?
+    \item \textbf{(Hands-on)} Run the Thursday lab, then compare load time of COPY into a round-robin staging table versus directly into a hash-distributed table. Explain the difference.
+    \item \textbf{(Hands-on)} Modify the SCD2 MERGE to also track \texttt{loyalty\_tier}. Demonstrate a three-version customer.
+    \item \textbf{(Hands-on)} Write a query against \texttt{sys.pdw\_nodes\_column\_store\_row\_groups} that reports compressed versus open rowgroups per table.
+    \item \textbf{(Design)} A warehouse has 400 concurrent dashboard users from 08:00--18:00 weekdays only. Propose a scale and pause schedule and estimate the monthly cDWU-hours.
+    \item \textbf{(Design)} Given \texttt{fact\_orders} (hash on \texttt{order\_id}) and \texttt{fact\_shipments} (hash on \texttt{shipment\_id}), explain the data movement cost of joining them and propose a redesign.
+    \item \textbf{(Design)} Write an ADR choosing DW1000c over DW500c for a quarter-end close. Include the evidence you would collect to defend the choice.
+    \item \textbf{(Interview)} Prepare a two-minute explanation of why ``the pool is big enough'' is not an answer to a slow-query complaint.
+\end{enumerate}
+
+\section{Capstone Project: Star Schema Warehouse with Managed SCD2 History}\label{sec:ch5-capstone}
+\index{capstone project}\index{star schema}\index{SCD Type 2}
+
+\begin{capstonebox}
+\textbf{Mission:} Build a small but production-shaped dedicated SQL pool warehouse: load 10~million rows from ADLS Gen2 with COPY and managed identity, model a declared-grain star schema with hash-distributed facts, replicated dimensions, and SCD Type 2 customer history, and demonstrate a measured scale/pause cost plan.
+
+\textbf{Estimated time:} 4--6 hours.
+
+\textbf{What you will practice:}
+\begin{itemize}
+    \item Provisioning a Synapse workspace and dedicated pool with Azure CLI and firewall-scoped access.
+    \item Bulk-loading partitioned Parquet with COPY using the workspace managed identity.
+    \item Declaring grain, choosing fact types, and implementing conformed dimensions.
+    \item Running the two-step SCD2 MERGE and verifying historical versions.
+    \item Hashing on the dominant join key and replicating small dimensions, with skew evidence.
+\end{itemize}
+\end{capstonebox}
+
+\subsection*{Scenario}
+A retail analytics team needs a warehouse over five years of order-line history. Analysts join sales to customers, dates, and stores thousands of times per day; the customer dimension changes weekly as segments and addresses are corrected. Finance requires that any historical report can be re-run as of a past date, so customer history must be preserved, not overwritten.
+
+\subsection*{Requirements}
+\begin{itemize}
+    \item \textbf{Grain contract:} \texttt{fact\_sales} is one row per order line, stated in the README and enforced by a uniqueness check.
+    \item \textbf{Distribution:} \texttt{fact\_sales} and \texttt{dim\_customer} hash on \texttt{customer\_id}; \texttt{dim\_date} and \texttt{dim\_store} replicated; staging round-robin.
+    \item \textbf{Ingestion:} COPY with \texttt{CREDENTIAL = (IDENTITY = 'Managed Identity')}; malformed files rejected to an error folder, never silently skipped.
+    \item \textbf{History:} SCD Type 2 on \texttt{dim\_customer} with \texttt{valid\_from}, \texttt{valid\_to}, and \texttt{is\_current}; an as-of query demonstrates reconstruction of a past state.
+    \item \textbf{Cost:} documented scale/pause schedule; pool paused at submission time; a cost estimate with the DWU-hours assumption.
+\end{itemize}
+
+\subsection*{Reference Architecture}
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[node distance=1.4cm]
+        \node[stage] (gen) {Synthetic\\generator};
+        \node[store, right=1.6cm of gen] (lake) {ADLS Gen2\\raw Parquet};
+        \node[stage, right=1.6cm of lake] (copy) {COPY INTO\\(managed identity)};
+        \node[store, right=1.6cm of copy] (stg) {Round-robin\\staging};
+        \node[store, right=1.6cm of stg] (fact) {fact\_sales\\hash + CCI};
+        \node[store, above=1.1cm of fact] (dims) {Replicated\\dims};
+        \node[store, below=1.1cm of fact] (dimc) {dim\_customer\\SCD2};
+        \node[stage, right=1.5cm of fact] (bi) {Analyst\\queries};
+        \node[doc, below=1.1cm of stg] (cost) {Pause/scale\\schedule};
+        \draw[arrow] (gen) -- (lake);
+        \draw[arrow] (lake) -- (copy);
+        \draw[arrow] (copy) -- (stg);
+        \draw[arrow] (stg) -- (fact);
+        \draw[arrow] (dims) -- (fact);
+        \draw[arrow] (dimc) -- (fact);
+        \draw[arrow] (fact) -- (bi);
+        \draw[arrow] (cost) -- (stg);
+    \end{tikzpicture}%
+    }
+    \caption{Capstone architecture: lake-staged Parquet, COPY with managed identity, round-robin staging, hash-distributed columnstore facts, and replicated dimensions.}
+    \label{fig:ch5-capstone-arch}
+\end{figure}
+
+\subsection*{Implementation Steps}
+\begin{enumerate}
+    \item Provision the workspace and pool from Listing~\ref{lst:ch5-provision}; assign the managed identity \texttt{Storage Blob Data Contributor}.
+    \item Generate 10~M order-line Parquet files partitioned by \texttt{year/month}; upload to \texttt{raw/sales/}.
+    \item COPY into \texttt{stg\_sales\_raw}; confirm \texttt{MAXERRORS} rejects land in \texttt{rejects/}.
+    \item Create the star schema; CTAS staging into \texttt{fact\_sales}; load dimensions.
+    \item Run the SCD2 MERGE (Listing~\ref{lst:ch5-scd2-merge}) against a batch with changed emails; verify two versions.
+    \item Benchmark a star join before and after fixing distributions; record the timings.
+    \item Pause the pool; record the monthly cost estimate.
+\end{enumerate}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item SQL scripts for staging, star schema, COPY, CTAS, and the SCD2 MERGE.
+    \item A one-page grain declaration and distribution rationale per table.
+    \item Query output proving two SCD2 versions and an as-of reconstruction.
+    \item Before/after join timings and a monthly cost estimate with pause evidence.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item Row counts reconcile between lake files, staging, and the fact table.
+    \item No credentials appear in any script; all loads use managed identity.
+    \item \texttt{is\_current = 1} returns exactly one row per customer.
+    \item The final pool state is paused or deleted.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Add a periodic snapshot fact for daily inventory and justify the grain in the README.
+    \item Measure distribution skew per table and document the fix if any distribution exceeds twice the median.
+    \item Re-run the COPY benchmark at DW200c and DW400c and plot load time versus cDWU.
+\end{itemize}

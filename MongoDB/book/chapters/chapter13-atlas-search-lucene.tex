@@ -1,0 +1,292 @@
+\chapter{Atlas Search: Lucene Integration}
+\index{Atlas Search}\index{Lucene}\index{analyzer}\index{tokenizer}\index{\$search}\index{autocomplete}\index{faceting}\index{relevance}\index{BM25}%
+
+\begin{objectives}
+\begin{itemize}
+    \item Explain the Atlas Search architecture: Apache Lucene indexes beside the cluster, the \texttt{\$search} aggregation stage, and index lifecycle states.
+    \item Define search indexes with custom analyzers, tokenizers (standard, keyword, ngram), and per-field mappings.
+    \item Compose operators---\texttt{text}, \texttt{phrase}, \texttt{wildcard}, \texttt{autocomplete}, \texttt{compound}---with relevance boosting and scoring controls.
+    \item Implement faceted navigation and highlighting in a single \texttt{\$search} pass.
+    \item Build a real-time product search box with autocomplete in the Thursday project.
+    \item Architect an e-commerce search platform with fuzzy matching, boosting, and facets over a ten-million-item catalog.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+Full-text search as a managed engine beside the operational store is a universal pattern: each cloud pairs its database with a Lucene-descended search service.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{2.9cm}p{3.0cm}p{3.0cm}p{3.0cm}@{}} 
+\toprule
+\textbf{Capability} & \textbf{AWS} & \textbf{Azure} & \textbf{GCP} \\
+\midrule
+Search service & OpenSearch & Azure AI Search & Vertex AI Search \\
+Engine lineage & Lucene & Lucene & Proprietary + vector \\
+Sync mechanism & DMS / streams / Lambda & Indexers / push API & Data connectors \\
+Analyzers/tokenizers & OpenSearch analyzers & Lucene + custom analyzers & Managed, less exposed \\
+Faceting & Aggregations & Facets & Built-in \\
+Typo tolerance & Fuzzy queries & Fuzzy + synonyms & Managed \\
+\addlinespace
+Snowflake / Fabric & \multicolumn{3}{l}{Snowflake Search Optimization + Cortex Search (managed hybrid); Fabric search via OneLake + AI Search} \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+Atlas Search's distinctive property is integration depth: the Lucene index lives inside the Atlas platform, syncs from the collection automatically via change streams, and is queried through the same aggregation pipeline as everything else---no second system to operate, secure, or reconcile \cite{mongodbAtlasSearchDocs,apacheLuceneRepo}.
+\end{crosscloud}
+
+\section{Week 13 Roadmap: When Search Is the Product}
+Chapter 9's text index answers ``contains these words'' inside an operational query. This week covers the tool for when search \emph{is} the feature: typo-tolerant, relevance-ranked, faceted, autocomplete-driven product and document search. The engineering questions are analyzers (how text becomes terms), operators (how queries match terms), and scoring (how results rank)---plus the operational discipline of index lifecycle: builds, rebuilds, and status polling \cite{mongodbAtlasSearchDocs}.
+
+\begin{definitionbox}
+\textbf{Atlas Search} is an embedded Apache Lucene service in MongoDB Atlas: search indexes are defined as JSON mappings over collection fields, kept synchronized with the collection automatically, and queried through the \texttt{\$search} and \texttt{\$searchMeta} aggregation stages.
+\end{definitionbox}
+
+\begin{keyterms}
+\textbf{Analyzer}: the pipeline that turns text into terms (tokenizer + filters such as lowercasing and stemming). \textbf{Mapping}: the per-field index definition (dynamic or static). \textbf{Operator}: a query clause (\texttt{text}, \texttt{phrase}, \texttt{autocomplete}, ...). \textbf{Compound query}: boolean composition of operators (\texttt{must}, \texttt{should}, \texttt{filter}, \texttt{mustNot}). \textbf{Score}: Lucene's BM25-based relevance value, modifiable by boosts. \textbf{Facet}: counted buckets over the result set for navigation UIs.
+\end{keyterms}
+
+\section{Monday: Atlas Search Architecture}
+\subsection{Lucene Beside the Cluster}
+An Atlas Search index is a separate Lucene index over selected collection fields, maintained by Atlas's synchronization machinery (change streams under the hood---Chapter 16's mechanism working for you). Writes commit to the collection first; the search index follows asynchronously and \emph{eventually consistently}. Two consequences matter for design: freshly written documents are not instantly searchable (index lag is a metric to watch), and bulk loads cause visible index-build lag---poll index status before serving traffic after a large import, as the syllabus pitfall warns.
+
+On dedicated search nodes (Search Nodes / separate search tier), the Lucene workload is isolated from data-node CPU and cache---the same workload-isolation principle as analytics nodes (Chapter 8), applied to search. On shared tiers, heavy faceting and highlighting compete with the operational workload; that is a tier decision to make deliberately.
+
+\subsection{The \texttt{\$search} Stage}
+\texttt{\$search} must be the first stage of its pipeline (or immediately after a \texttt{\$match} the optimizer can fuse). It returns documents with scores, and composes with everything downstream: \texttt{\$project} for shaping, \texttt{\$sort} on score, \texttt{\$facet} for multi-panel results, \texttt{\$limit} for pages. \texttt{\$searchMeta} returns metadata---counts and facet buckets---without documents, which is how search UIs render counts and filters without transferring result pages they will not display.
+
+\begin{notebox}
+\texttt{\$search} is not \texttt{\$text}. The Chapter 9 text index is a WiredTiger structure for operational ``contains'' queries; \texttt{\$search} is a Lucene query with analyzers, scoring, facets, and typo tolerance. New search features go to Atlas Search; the text index survives for lightweight in-query filtering.
+\end{notebox}
+
+\section{Tuesday: Index Definitions, Analyzers, and Mappings}
+\subsection{Analyzers and Tokenizers}
+An analyzer = tokenizer + token filters. The \textbf{standard} analyzer splits on whitespace/punctuation and lowercases---the default for descriptions. The \textbf{keyword} analyzer treats the whole string as one token---for exact fields like SKUs and status codes. \textbf{Ngram} and \textbf{edgeNgram} tokenizers emit substrings, powering ``contains'' matching and type-ahead autocomplete at index time (cheap queries, bigger indexes). Filters add stemming, stop-word removal, ASCII folding (caf\'e $\to$ cafe), and synonym expansion. The analyzer choice is per field and is the single largest determinant of search quality: it decides which user inputs can ever match.
+
+\begin{lstlisting}[language=JavaScript, caption={Atlas Search index with static mappings and per-field analyzers.}]
+{
+  "mappings": {
+    "dynamic": false,
+    "fields": {
+      "title": [
+        { "type": "string", "analyzer": "lucene.english" },
+        { "type": "autocomplete", "analyzer": "lucene.standard",
+          "tokenization": "edgeGram", "minGrams": 3, "maxGrams": 12 }
+      ],
+      "description": { "type": "string", "analyzer": "lucene.english" },
+      "sku":     { "type": "token" },
+      "price":   { "type": "number" },
+      "category":{ "type": "stringFacet" },
+      "inStock": { "type": "boolean" }
+    }
+  },
+  "synonyms": [
+    { "name": "apparel", "analyzer": "lucene.english",
+      "source": { "collection": "synonyms" }, "synonyms": "apparel" }
+  ]
+}
+\end{lstlisting}
+
+\subsection{Dynamic versus Static Mappings}
+Dynamic mapping indexes every field it can infer---convenient in development, dangerous in production: schema drift silently grows the index and changes query behavior. Production search indexes use static mappings: named fields, named types, named analyzers, reviewed like any schema change (and managed as code through the Atlas API or Terraform, Chapter 21). Date and numeric fields get their types so range queries work; facet fields get \texttt{stringFacet}/\texttt{numberFacet} types; embedding fields get \texttt{vector} (Chapter 14).
+
+\begin{pitfall}
+\textbf{Analyzers are write-time and query-time contracts.} Changing an analyzer requires an index rebuild; querying a field with a different analyzer than it was indexed with produces confusing misses (a stemmed index queried unstemmed never matches its own terms). Pin both sides in the index definition and the query builder.
+\end{pitfall}
+
+\section{Wednesday: Operators, Compound Queries, and Scoring}
+\subsection{The Operator Toolkit}
+\texttt{text} matches analyzed terms (with \texttt{fuzzy} for typo tolerance); \texttt{phrase} requires ordered adjacency; \texttt{wildcard} matches patterns (avoid leading wildcards---they defeat the term dictionary); \texttt{autocomplete} matches edge-ngrammed prefixes for type-ahead boxes; \texttt{range} and \texttt{equals} handle numbers, dates, and exact tokens; \texttt{moreLikeThis} finds similar documents. Real queries compose them with \texttt{compound}: \texttt{must} (all match, scored), \texttt{filter} (all match, unscored---cheaper), \texttt{should} (optional, boosts rank), \texttt{mustNot} (exclusions).
+
+\begin{lstlisting}[language=JavaScript, caption={Compound search: filtered, boosted, typo-tolerant.}]
+db.products.aggregate([
+  { $search: {
+      index: "catalog",
+      compound: {
+        must: [ { text: { query: "wireless headphons", path: "title",
+                          fuzzy: { maxEdits: 1 } } } ],
+        filter: [ { equals: { path: "inStock", value: true } },
+                  { range: { path: "price", lte: 300 } } ],
+        should: [ { text: { query: "pro", path: "title",
+                            score: { boost: { value: 2 } } } } ]
+      } } },
+  { $limit: 20 },
+  { $project: { title: 1, price: 1, score: { $meta: "searchScore" },
+                highlights: { $meta: "searchHighlights" } } }
+]);
+\end{lstlisting}
+
+\subsection{Facets and Highlighting}
+Facets render the navigation panel---counts per category, per price bucket---computed in the same pass as the query via \texttt{\$searchMeta} or the facet collector. Highlighting (\texttt{searchHighlights} metadata) returns matched-term spans so the UI can bold them. Both are reasons Atlas Search replaces application-side post-processing: one round trip returns results, counts, filters, and highlights.
+
+\begin{tipbox}
+Put unselective, scored clauses in \texttt{must}/\texttt{should} and selective yes/no constraints in \texttt{filter}. Filters skip scoring work and are cached-friendly; everything in \texttt{must} pays relevance computation.
+\end{tipbox}
+
+\section{Thursday Hands-On Project: Autocomplete Product Search}
+Build a product search box: a custom-analyzer index, an autocomplete endpoint, and a fuzzy full-text endpoint, over a seeded catalog.
+
+\subsection{Lab Protocol}
+\begin{enumerate}
+    \item Seed a 100{,}000-product collection (title, description, sku, price, category, inStock) with a generator script.
+    \item Create the search index from Tuesday's definition (UI, API, or Terraform---script it).
+    \item Implement the autocomplete endpoint: \texttt{autocomplete} operator on the \texttt{title} edge-ngram path, \texttt{\$limit: 8}, projected title + score; measure latency as the user types (three-keystroke minimum).
+    \item Implement the full-search endpoint: the Wednesday compound query with fuzzy matching and facets on category and price buckets via \texttt{\$searchMeta}.
+    \item Verify index lifecycle: after a bulk insert of 10{,}000 new products, poll index status and measure the lag before new products are searchable.
+\end{enumerate}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item The index definition (versioned JSON), the seeding script, and both endpoints.
+    \item Latency measurements for autocomplete keystrokes and full search.
+    \item The index-lag measurement after the bulk insert.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item Autocomplete returns relevant titles by the third keystroke under 150 ms.
+    \item The fuzzy query tolerates a one-edit typo and ranks the intended product first.
+    \item Facet counts match a ground-truth aggregation over the collection.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Add a synonym collection (``notebook'' = ``laptop'') and demonstrate the expanded recall.
+    \item Rebuild the index with a different analyzer and measure the relevance change on a fixed query set.
+\end{itemize}
+
+\section{Friday Use Case and Architecture: Ten-Million-Item E-Commerce Search}
+\subsection{Scenario and Requirements}
+A retailer's ten-million-product catalog needs fuzzy, relevance-boosted, faceted search with autocomplete, merchandising boosts (promoted brands), and sub-200 ms p95 latency at promotional-peak traffic. Merchandising changes boost rules weekly without deployments.
+
+\subsection{Architecture}
+The platform runs Atlas Search on dedicated search nodes, with statically mapped indexes per locale (analyzers are language-specific). Query construction is a server-side builder: user text goes to \texttt{must} with fuzzy; filters (stock, price, tenant) go to \texttt{filter}; merchandising boosts live in a \texttt{boost\_rules} collection applied as \texttt{should} clauses---a content change, not a deploy. Autocomplete uses the edge-ngram path with a three-keystroke minimum; facets and counts come from \texttt{\$searchMeta} in the same request. Relevance is managed as a measured product surface: a labeled query set runs in CI (Chapter 21), and weekly boost changes ship only if recall@10 on the labeled set does not regress. Index lifecycle is operationalized: status polling gates bulk-import completion, and index lag is a Chapter 23 alert with a runbook.
+
+\begin{figure}[H]
+    \centering
+    \resizebox{0.95\textwidth}{!}{%
+    \begin{tikzpicture}[
+        box/.style={rectangle, rounded corners, draw=primary, fill=primary!6, minimum width=2.6cm, minimum height=1.05cm, align=center, font=\small\bfseries},
+        luc/.style={rectangle, rounded corners, draw=codepurple, fill=codepurple!8, minimum width=2.6cm, minimum height=1.05cm, align=center, font=\small\bfseries},
+        store/.style={cylinder, shape aspect=0.25, draw=primary, thick, fill=primary!8, shape border rotate=90, align=center, minimum width=1.7cm, minimum height=1.15cm, font=\small\bfseries},
+        arrow/.style={-{Stealth[length=2.5mm]}, draw=primary, thick}
+    ]
+        \node[box] (ui) at (0,0) {Search UI\\(type-ahead,\\facets)};
+        \node[box] (api) at (3.9,0) {Query builder\\(boost rules\\from collection)};
+        \node[luc] (lucene) at (7.9,0) {Atlas Search\\Lucene index\\(dedicated nodes)};
+        \node[store] (coll) at (7.9,-2.4) {products\\collection};
+        \node[box] (eval) at (12.0,0) {Labeled-query\\CI gate};
+        \draw[arrow] (ui) -- (api);
+        \draw[arrow] (api) -- (lucene);
+        \draw[arrow, dashed] (coll) -- node[right,font=\scriptsize]{auto-sync} (lucene);
+        \draw[arrow, dashed] (api) -- (eval);
+    \end{tikzpicture}%
+    }
+    \caption{E-commerce search: UI $\to$ query builder (with merchandising rules) $\to$ dedicated Lucene nodes; relevance gated in CI.}
+    \label{fig:ch13-search}
+\end{figure}
+
+\begin{pitfall}
+\textbf{Treating relevance as a one-time tuning.} Analyzers, boosts, and synonyms are a living product surface. Without a labeled query set and a CI gate, every merchandising tweak is an unmeasured experiment on revenue.
+\end{pitfall}
+
+\section{Interview Q\&A}
+\subsection{Search Engineering}
+\begin{enumerate}
+    \item \textbf{Q: Which engine powers Atlas Search, and how does data reach it?}\\
+    A: Apache Lucene, running inside the Atlas platform (optionally on dedicated search nodes), synchronized from the collection automatically---eventually consistent, with observable index lag.
+
+    \item \textbf{Q: Which aggregation stage invokes Atlas Search, and what is its position rule?}\\
+    A: \texttt{\$search} (or \texttt{\$searchMeta}), as the first stage of the pipeline, composed downstream with projection, sorting, and faceting.
+
+    \item \textbf{Q: Which operator suits a type-ahead box, and why?}\\
+    A: \texttt{autocomplete} over an edge-ngram tokenized path: prefixes match indexed partial tokens at interactive latency without leading-wildcard scans.
+
+    \item \textbf{Q: Standard versus keyword versus ngram analyzers?}\\
+    A: Standard tokenizes and lowercases prose; keyword treats the whole value as one exact token; ngram emits substrings for partial matching at the cost of index size.
+
+    \item \textbf{Q: Why does a bulk import need index-status polling?}\\
+    A: Sync is asynchronous; a large import lags the collection. Serving traffic before the index catches up returns incomplete results with no error.
+\end{enumerate}
+
+\section{Further Reading}
+The Atlas Search documentation covers index definitions, analyzers, operators, and lifecycle \cite{mongodbAtlasSearchDocs}; Lucene's scoring and analysis model is documented by the Apache project \cite{apacheLuceneRepo}. Chapter 14 continues into vector and hybrid retrieval \cite{mongodbAtlasVectorSearch}, and Chapter 21 covers managing these index definitions as reviewed code \cite{mongodbTerraformDocs}.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item Atlas Search is embedded Lucene: synced automatically, eventually consistent, queried via \texttt{\$search}.
+    \item Analyzers are the relevance contract: choose per field, pin both write and query sides, rebuild on change.
+    \item Static mappings in production; dynamic mapping is a development convenience with drift risk.
+    \item \texttt{compound} separates scored clauses (\texttt{must}/\texttt{should}) from cheap constraints (\texttt{filter}).
+    \item Facets, counts, and highlights ride the same \texttt{\$search} pass---no post-processing round trips.
+    \item Relevance is a measured product surface: labeled query sets, CI gates, and index-lag alerts.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Explain why changing an analyzer requires an index rebuild and what happens to queries during the rebuild window.
+    \item \textbf{(Conceptual)} When would you choose a leading-wildcard-free design over \texttt{wildcard} queries, and what index-time feature replaces it?
+    \item \textbf{(Conceptual)} Why do \texttt{filter} clauses cost less than \texttt{must} clauses?
+    \item \textbf{(Hands-on)} Extend the lab with a second locale's analyzer and compare recall on a translated query set.
+    \item \textbf{(Hands-on)} Measure index size with and without the edge-ngram path on \texttt{title}; quantify the autocomplete tax.
+    \item \textbf{(Design)} Design the boost-rules system: storage, precedence, cache invalidation, and the CI gate.
+    \item \textbf{(Design)} Specify the search index's lifecycle policy: rebuild windows, status polling, rollback.
+    \item \textbf{(Interview)} ``Search results are great in staging and stale in production.'' Give the three most likely causes.
+\end{enumerate}
+
+\section{Capstone Project: Relevance-Governed Catalog Search}\label{sec:ch13-capstone}
+
+\begin{capstonebox}
+\textbf{Mission:} deliver catalog search as a governed product surface: scripted index definitions with custom analyzers, autocomplete plus fuzzy compound search with facets, a merchandising boost layer, and a labeled-query CI gate---with index lifecycle (builds, lag, status) fully operationalized.
+
+\textbf{Estimated time:} 5--7 hours.
+
+\textbf{What you will practice:}
+\begin{itemize}
+    \item Search index definition as reviewed, versioned code.
+    \item Operator composition with scoring discipline.
+    \item Relevance measurement as a release gate.
+\end{itemize}
+\end{capstonebox}
+
+\subsection*{Scenario}
+The retailer's search team ships weekly merchandising changes with no safety net. Your deliverable is the governed pipeline: indexes as code, boosts as data, and a relevance gate that blocks regressions.
+
+\subsection*{Requirements}
+\begin{itemize}
+    \item A scripted index definition (static mappings, per-field analyzers, autocomplete path, facet types) applied via API or Terraform.
+    \item The two endpoints (autocomplete, compound search with facets and highlighting) with measured p95 latency.
+    \item The boost-rules collection consumed by the query builder, with a demonstrated no-deploy boost change.
+    \item A labeled query set (${\geq}50$ queries) with recall@10 computed in CI; a deliberately bad boost change must fail the gate.
+    \item Index-lag monitoring evidence after a scripted bulk import.
+\end{itemize}
+
+\subsection*{Implementation Steps}
+\begin{enumerate}
+    \item \textbf{Define.} Author the index JSON; review like a schema change; apply via code.
+    \item \textbf{Serve.} Implement both endpoints; measure latency under a scripted load.
+    \item \textbf{Boost.} Implement the rules layer; demonstrate a merchandising change.
+    \item \textbf{Gate.} Build the labeled set and the CI recall check; demonstrate a failure.
+    \item \textbf{Operate.} Bulk-import and capture index-lag evidence; write the runbook entry.
+\end{enumerate}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item Index definitions, endpoints, boost layer, and the CI gate configuration.
+    \item Latency measurements, the relevance report, and the index-lag evidence.
+    \item The search runbook entry and rollback procedure.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item The CI gate demonstrably blocks a relevance regression and passes the baseline.
+    \item Autocomplete p95 under 150 ms; full search p95 under 200 ms at lab scale.
+    \item Index definitions redeploy identically from the repository.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Add synonym management as data with its own CI validation.
+    \item Combine the search index with Chapter 14's vector path into a hybrid endpoint and evaluate the recall change.
+\end{itemize}

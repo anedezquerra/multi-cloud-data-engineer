@@ -1,0 +1,288 @@
+\chapter{Advanced Analytics SQL and Dimensional Modeling}
+\index{window functions}\index{QUALIFY}\index{dimensional modeling}\index{SCD Type 2}\index{Week 12}%
+\begin{objectives}
+\begin{itemize}
+    \item Write window-function analytics with \texttt{PARTITION BY}, \texttt{ORDER BY}, frames, and the \texttt{QUALIFY} clause.
+    \item Aggregate across multiple grains with \texttt{GROUPING SETS}, \texttt{CUBE}, \texttt{ROLLUP}, and pivot/unpivot tables.
+    \item Declare fact grain first and model star schemas with conformed dimensions, following Kimball practice.
+    \item Implement SCD Type 1 and Type 2 loads driven by streams.
+    \item Build a hands-on star schema with a 30-day moving-average analytics query and an SCD2 load.
+    \item Design a cohort-retention and churn engine over 50 million subscription billing records.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+Window functions and dimensional modeling are the most portable skills in this book---ISO SQL semantics and Kimball method travel unchanged; only convenience clauses differ.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{2.8cm}p{3.0cm}p{3.0cm}p{3.0cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{AWS (Redshift)} & \textbf{Azure (Synapse/Fabric)} & \textbf{GCP (BigQuery)} \\
+\midrule
+Window functions & Full ISO support & Full ISO support & Full ISO support \\
+Filter window output & Subquery wrapper & Subquery wrapper & \texttt{QUALIFY} \\
+Multi-grain aggregation & GROUPING SETS / CUBE / ROLLUP & Same & Same \\
+Pivot & CASE / PIVOT variants & PIVOT operator & PIVOT operator \\
+Dimensional modeling & Sort/dist keys shape stars & Distribution + partitioning & Partition + cluster the fact \\
+\addlinespace
+Snowflake equivalent & \multicolumn{3}{l}{\texttt{QUALIFY}, GROUPING SETS, PIVOT/UNPIVOT; star schemas exploit micro-partition pruning} \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+Snowflake and BigQuery both offer \texttt{QUALIFY}; Redshift and Synapse require a subquery. \textbf{MongoDB} expresses the same analytics in aggregation pipelines (\texttt{\$group}, \texttt{\$setWindowFields}). The durable insight: star schemas remain the serving layer of choice because denormalized dimensions match how columnar engines prune and join.
+\end{crosscloud}
+
+\section{Week 12 Roadmap}
+Pipelines end in questions humans ask: top-N per group, moving averages, retention by cohort. This chapter equips the two toolkits those questions demand---analytic SQL and dimensional design---and closes Milestone 3 by integrating them with the CDC machinery of Chapter 7.
+
+Monday masters window functions and \texttt{QUALIFY}. Tuesday covers multi-grain aggregation and pivoting. Wednesday is the Kimball method adapted to Snowflake's physics. Thursday builds the star schema and SCD2 load. Friday designs the cohort-retention engine.
+
+\begin{keyterms}
+\textbf{Window function}: a computation over a set of rows related to the current row, without collapsing them.\quad
+\textbf{QUALIFY}: Snowflake's clause filtering window-function results without a wrapping subquery.\quad
+\textbf{Grain}: the precise definition of what one fact-table row represents.\quad
+\textbf{Conformed dimension}: a dimension shared, with identical keys and meaning, across multiple fact tables and marts.\quad
+\textbf{SCD Type 2}: slowly changing dimension handling that versions rows with validity windows instead of overwriting.
+\end{keyterms}
+
+\section{Monday: Window Functions and QUALIFY}
+\index{window functions}\index{QUALIFY}\index{frame specification}
+A window function computes across a \emph{frame} of rows related to the current row while leaving every row in the output---unlike \texttt{GROUP BY}, which collapses. The three-part anatomy: \texttt{PARTITION BY} divides rows into groups; \texttt{ORDER BY} sequences within the group; the frame specification (\texttt{ROWS BETWEEN ...} or \texttt{RANGE BETWEEN ...}) bounds which peers participate.
+
+\begin{lstlisting}[language=SQL, caption={Moving average and ranking with QUALIFY}]
+SELECT customer_id, order_ts, order_total,
+       AVG(order_total) OVER (
+         PARTITION BY customer_id
+         ORDER BY order_ts
+         ROWS BETWEEN 29 PRECEDING AND CURRENT ROW
+       ) AS avg_30_orders,
+       ROW_NUMBER() OVER (
+         PARTITION BY customer_id
+         ORDER BY order_ts DESC
+       ) AS recency_rank
+FROM gold.fct_orders
+QUALIFY recency_rank <= 5;   -- keep each customer's 5 newest orders
+\end{lstlisting}
+
+\texttt{QUALIFY} filters window results in place; without it, the same logic needs a wrapping subquery. Two disciplines separate fluent practitioners: \textbf{choose ROWS versus RANGE deliberately} (ROWS counts physical rows; RANGE counts value peers---on duplicate order dates they differ), and \textbf{remember windows compute after WHERE}, so a moving average over ``the last 30 orders'' must not pre-filter those orders away.
+
+\begin{pitfall}
+\textbf{Filtering before windowing silently corrupts rolling metrics.} \texttt{WHERE order\_ts >= DATEADD(day, -30, CURRENT\_DATE())} plus a 30-row frame is not a 30-day average when orders are sparse. Compute the window over the full set, then filter with \texttt{QUALIFY}.
+\end{pitfall}
+
+\section{Tuesday: Grouping Sets, CUBE, ROLLUP, and Pivoting}
+\index{GROUPING SETS}\index{CUBE}\index{ROLLUP}\index{PIVOT}
+Executive reporting asks the same measure at many grains: revenue by region, by region-and-month, and grand total. \texttt{GROUPING SETS} computes multiple groupings in one scan; \texttt{ROLLUP} generates the hierarchical prefix chain (\texttt{(region, month)} yields region-month, region, and total); \texttt{CUBE} generates every combination. One scan, one pass, every grain---dramatically cheaper than unioned queries.
+
+\begin{lstlisting}[language=SQL, caption={Multi-grain revenue in a single scan}]
+SELECT region, DATE_TRUNC('month', order_date) AS month,
+       SUM(order_total) AS revenue,
+       GROUPING(region, month) AS grouping_flags
+FROM gold.fct_orders
+GROUP BY ROLLUP(region, month);
+-- grouping_flags decodes which columns are aggregated away
+\end{lstlisting}
+
+\texttt{PIVOT} rotates row values into columns (months across, regions down) and \texttt{UNPIVOT} reverses it---essential when reshaping normalized data into report matrices and when unpivoting wide spreadsheet-shaped inputs back into analyzable long form.
+
+\section{Wednesday: Kimball Dimensional Modeling on Snowflake}
+\index{Kimball}\index{star schema}\index{grain}\index{conformed dimensions}
+Dimensional modeling is the discipline of making analytical data legible to the business. Its rules, applied to Snowflake \cite{kimball2013toolkit}:
+
+\subsection{Declare the Grain First}
+Every fact table begins with a sentence: ``one row per \emph{order line}.'' The grain determines what joins are legal, what aggregation means, and what duplication bugs look like. Grain declared late is the root cause of most exploding joins (Chapter 10).
+
+\subsection{Choose the Fact Type}
+\index{fact table!types}
+\begin{itemize}
+    \item \textbf{Transaction fact}: one row per business event (order placed). Largest, most detailed, insert-mostly.
+    \item \textbf{Periodic snapshot fact}: one row per entity per period (daily account balance). Pre-computed state at a regular grain.
+    \item \textbf{Accumulating snapshot fact}: one row per lifecycle (order: placed, shipped, delivered, returned), updated as milestones land. Rare in Snowflake practice because updates rewrite micro-partitions---often modeled as a transaction fact plus a current-state table.
+\end{itemize}
+
+\subsection{Star Versus Snowflake}
+\index{star schema!vs. snowflake schema}
+Denormalized \textbf{star} schemas---dimensions wide and flat around the fact---favor Snowflake's physics: fewer joins, and dimension filters prune the fact through equijoins on compact keys. \textbf{Snowflaking} (normalized dimension hierarchies) pays off only for very large shared dimensions where duplication would be genuinely expensive. Default to star; snowflake deliberately.
+
+\subsection{Conformed Dimensions and SCD}
+\index{SCD Type 1}\index{SCD Type 2}
+\textbf{Conformed dimensions}---\texttt{dim\_customers} meaning the same thing to orders, returns, and support tickets---are what turn tables into a data warehouse. When attributes change, \textbf{Type 1} overwrites (correct for typo fixes), while \textbf{Type 2} versions: close the current row (\texttt{is\_current = FALSE}, set \texttt{valid\_to}) and insert the new version. Type 2 preserves history at the cost of exactly-once update discipline---which Chapter 7's stream consumers provide:
+
+\begin{lstlisting}[language=SQL, caption={SCD Type 2 from a stream: close current rows, then insert new versions}]
+-- Step 1: close the current version of changed rows
+MERGE INTO gold.dim_customers tgt
+USING raw.customer_stream src
+  ON tgt.customer_id = src.customer_id AND tgt.is_current = TRUE
+WHEN MATCHED AND src.METADATA$ACTION = 'INSERT' AND
+     (tgt.name <> src.name OR tgt.region <> src.region)
+  THEN UPDATE SET is_current = FALSE,
+                  valid_to = CURRENT_TIMESTAMP();
+
+-- Step 2: insert the new versions
+INSERT INTO gold.dim_customers
+  (customer_id, name, region, is_current, valid_from, valid_to)
+SELECT customer_id, name, region, TRUE, CURRENT_TIMESTAMP(), NULL
+FROM raw.customer_stream
+WHERE METADATA$ACTION = 'INSERT';
+\end{lstlisting}
+
+\begin{notebox}
+Both steps must run in one transaction, and the stream consumption in both steps must agree---wrap them in a stored procedure with an explicit transaction so a failure between steps never leaves a customer with zero or two current rows.
+\end{notebox}
+
+\section{Thursday Hands-On Project: Star Schema with SCD2 and Moving Averages}
+\index{hands-on project!star schema}
+This lab assembles the week: a star schema at a declared grain, a financial analytics query, and a stream-driven SCD2 dimension.
+
+\subsection*{Scenario}
+The retailer of Chapters 7--8 needs a finance-grade order mart: order-line grain, conformed customer and product dimensions, 30-day moving-average revenue analytics, and customer history preserved as Type 2.
+
+\subsection*{Procedure}
+\begin{enumerate}
+    \item Write the grain statement for \texttt{fct\_orders} (one row per order line) and the bus matrix of facts versus dimensions.
+    \item Create \texttt{fct\_orders}, \texttt{dim\_customers} (SCD2 columns), and \texttt{dim\_products}; generate 1 million fact rows.
+    \item Write the analytics query: 30-day moving average and cumulative sum of customer spend, \texttt{QUALIFY} retaining only top-ranked customers.
+    \item Drive the SCD2 load from \texttt{raw.customer\_stream} (Chapter 7) inside a single transaction.
+    \item Mutate customers upstream; verify versions close and open correctly and that no customer ever has two current rows.
+    \item Add a \texttt{CUBE} report over region and month; validate totals against single-grain queries.
+\end{enumerate}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item \textbf{DDL and grain statement} with the bus matrix.
+    \item \textbf{Analytics SQL:} moving-average/cumulative query with \texttt{QUALIFY}.
+    \item \textbf{SCD2 procedure:} transactional two-step load with stream consumption.
+    \item \textbf{Validation evidence:} uniqueness checks on fact grain and ``exactly one current row per customer'' query results.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item The grain statement is written down and the fact table provably satisfies it (uniqueness check).
+    \item SCD2 load is transactional and idempotent under re-run.
+    \item Moving-average results are reproducible and documented against a hand-computed sample.
+    \item The CUBE report reconciles to the detailed fact at every grain.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Convert the SCD2 procedure into a stream-gated task and show end-to-end latency from source mutation to versioned dimension.
+    \item Add \texttt{dim\_dates} with fiscal calendars and rewrite the moving average on fiscal weeks.
+    \item Compare star versus snowflaked \texttt{dim\_products} (category split out) on join cost and storage.
+\end{itemize}
+
+\section{Friday Real-World Architecture: Cohort Retention and Churn at 50M Rows}
+\index{Real-World Architecture!cohort retention}\index{churn}
+A subscription business bills 50 million times a year. Executives ask monthly: which signup cohorts retain, and where does churn concentrate?
+
+\subsection{The Analytical Shape}
+Cohort retention is a two-step analytic: assign each subscriber a cohort (signup month), then compute, per cohort and months-since-signup, the share still active. Window functions do both: \texttt{MIN(bill\_month) OVER (PARTITION BY customer\_id)} stamps cohorts; a self-join or conditional aggregation against a spine of cohort $\times$ month cells produces the retention matrix. Churn is retention's complement, sliced by plan, region, and acquisition channel from conformed dimensions.
+
+\begin{figure}[H]
+    \centering
+    \resizebox{0.95\textwidth}{!}{%
+    \begin{tikzpicture}[
+        tbl/.style={rectangle, rounded corners, draw=codegreen!60!black, thick, fill=green!8, align=center, minimum width=3.0cm, minimum height=0.95cm, font=\small\bfseries},
+        sf/.style={rectangle, rounded corners, draw=primary, thick, fill=primary!6, align=center, minimum width=3.0cm, minimum height=0.95cm, font=\small\bfseries},
+        arrow/.style={-{Stealth[length=2.5mm]}, draw=primary, thick},
+        lbl/.style={font=\scriptsize\itshape, text=codegray}
+    ]
+        \node[tbl] (fct) at (0, 0) {fct\_billing\\50M rows/yr\\(monthly snapshot)};
+        \node[tbl] (dim) at (0, -2.0) {dim\_customers\\SCD2: plan, region, channel};
+        \node[sf] (cohort) at (5.4, -1.0) {cohort spine\\cohort $\times$ month};
+        \node[sf] (ret) at (10.4, -1.0) {retention matrix\\+ churn flags};
+        \node[sf] (dt) at (14.0, -1.0) {dynamic table\\lag 1 day};
+        \draw[arrow] (fct) -- (cohort);
+        \draw[arrow] (dim) -- (cohort);
+        \draw[arrow] (cohort) -- (ret);
+        \draw[arrow] (ret) -- node[lbl, above]{serving} (dt);
+    \end{tikzpicture}%
+    }
+    \caption{Cohort engine: a periodic-snapshot billing fact and SCD2 dimensions feed a cohort spine; a daily dynamic table serves the matrix.}
+    \label{fig:chapter12-cohort-architecture}
+\end{figure}
+
+\subsection{Design Decisions}
+\begin{enumerate}
+    \item \textbf{Periodic snapshot fact, not events.} Billing state per customer per month is the grain that makes retention arithmetic simple and prunable.
+    \item \textbf{SCD2 dimensions anchor cohorts to truth.} Plan upgrades and region moves belong to the version valid at that month---Type 1 would rewrite history and corrupt churn attribution.
+    \item \textbf{The spine prevents missing-cell bugs.} Left-joining a cohort $\times$ month spine against activity yields true zeros instead of absent rows.
+    \item \textbf{A daily-lag dynamic table serves dashboards.} The expensive matrix computes once per day; a thousand dashboard viewers read the result.
+\end{enumerate}
+
+\begin{pitfall}
+\textbf{Defining ``active'' loosely corrupts every cohort.} Active means paid, or merely not-cancelled? Write the definition into the mart as a documented column derivation, version it, and never let it live only in a dashboard's SQL.
+\end{pitfall}
+
+\section{Interview Q\&A}
+\begin{enumerate}
+    \item \textbf{Q: What does QUALIFY filter without a subquery?}\\
+    A: Window-function results---rankings, row numbers, moving averages---evaluated in the same SELECT that computed them.
+    \item \textbf{Q: Why declare the grain before building a fact table?}\\
+    A: The grain defines legal joins and aggregation semantics; late grain discovery is the root cause of fan-out and double-counting bugs.
+    \item \textbf{Q: Name the three Kimball fact types.}\\
+    A: Transaction, periodic snapshot, and accumulating snapshot.
+    \item \textbf{Q: When does a snowflake schema beat a star in Snowflake?}\\
+    A: Rarely---only for very large shared dimensions where denormalized duplication is genuinely expensive; star schemas prune and join better by default.
+    \item \textbf{Q: What physically changes in a dimension under SCD Type 2?}\\
+    A: The current row closes (\texttt{is\_current = FALSE}, \texttt{valid\_to} set) and a new versioned row opens---history is preserved as rows, not overwritten.
+\end{enumerate}
+
+\section{Further Reading}
+Snowflake's analytic-function reference details window syntax and \texttt{QUALIFY} \cite{snowflakeWindowFunctionsDocs}. Kimball's \emph{Data Warehouse Toolkit} is the dimensional method's canonical text \cite{kimball2013toolkit}. Chapter 11's dynamic tables \cite{snowflakeDynamicTablesDocs} and Chapter 7's streams \cite{snowflakeStreamsDocs} are the pipeline machinery this chapter's models ride on.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item Window functions compute across frames without collapsing rows; \texttt{QUALIFY} filters them in place.
+    \item Windows compute after \texttt{WHERE}---filter with \texttt{QUALIFY} or a spine, never before a rolling frame.
+    \item \texttt{ROLLUP}/\texttt{CUBE}/\texttt{GROUPING SETS} deliver multi-grain reports in one scan.
+    \item Grain first, fact type second, star by default, conformed dimensions always.
+    \item SCD Type 2 is a transactional two-step (close, then insert) that stream consumers make idempotent.
+    \item Cohort analytics is a spine-driven window computation served by a daily dynamic table.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Contrast \texttt{GROUP BY}, window functions, and \texttt{QUALIFY} on the same top-3-per-region question.
+    \item \textbf{(Conceptual)} Explain ROWS versus RANGE frames on duplicate ordering values.
+    \item \textbf{(Hands-on)} Write a 7-day rolling revenue average that is correct for days with zero orders.
+    \item \textbf{(Hands-on)} Build a \texttt{GROUPING SETS} report at three grains and decode \texttt{GROUPING()} flags in the output.
+    \item \textbf{(Hands-on)} Break the SCD2 load into two transactions, observe the double-current-row state, then fix it transactionally.
+    \item \textbf{(Design)} Choose fact types for: page views, monthly account balances, and insurance-claim lifecycles. Justify each.
+    \item \textbf{(Design)} Draw the bus matrix for orders, returns, and support tickets sharing two conformed dimensions.
+    \item \textbf{(Operations)} Write the daily check that no SCD2 dimension has overlapping validity windows or dual current rows.
+    \item \textbf{(Performance)} Compare the cohort query against the 50M-row fact with and without a monthly snapshot pre-aggregation.
+    \item \textbf{(Interview)} Explain to a product manager why their ``simple'' churn number changed after SCD Type 1 was replaced with Type 2.
+\end{enumerate}
+
+\section{Capstone Project: Semi-Structured Telemetry Lakehouse and Declarative Pipeline}\label{sec:ch12-capstone}
+\index{capstone project!Milestone 3}
+\begin{capstonebox}
+\textbf{Mission.} Integrate Weeks 9--12: ingest 10 GB of nested JSON IoT telemetry into a raw VARIANT landing, flatten payloads into a Bronze dynamic table, and build Silver and Gold dynamic tables at escalating target lags, using window functions and \texttt{QUALIFY} to compute real-time anomaly metrics.
+
+\textbf{Estimated time.} 6--9 hours across the four weeks' labs.
+
+\textbf{Deliverable checklist.}
+\begin{itemize}
+    \item Bronze-to-Gold pipeline refreshes end-to-end from a clean environment per a committed README.
+    \item Architecture diagram of the dynamic-table DAG with target lags (5 min / 15 min / 1 hour).
+    \item At least three automated data-quality tests (null-rate, freshness, anomaly bounds) with a failing-case demonstration.
+    \item Monitoring evidence: refresh-history query and lag-breach alert configuration.
+    \item Monthly cost estimate comparing dynamic tables versus the equivalent task DAG, with two optimization decisions.
+    \item Security review: VARIANT landing access scoped, no PII in raw payloads or logs.
+\end{itemize}
+\end{capstonebox}
+
+The capstone's hardest element---rolling-window anomaly detection over the silver layer---follows this pattern:
+
+\begin{lstlisting}[language=SQL, caption={Anomaly flag via 7-day rolling average}]
+SELECT device_id, day, reading_count,
+       AVG(reading_count) OVER (
+         PARTITION BY device_id ORDER BY day
+         ROWS BETWEEN 6 PRECEDING AND CURRENT ROW) AS avg_7d
+FROM silver.daily_metrics
+QUALIFY reading_count > 3 * avg_7d;
+\end{lstlisting}
+
+Field pitfalls to defend against: downstream lag shorter than upstream lag plus refresh time causes perpetual staleness; a schema change forces incremental-to-full refresh fallback and a credit spike; and hard casts instead of \texttt{TRY\_*} kill the load on schema drift.

@@ -1,0 +1,378 @@
+\chapter{Pipeline Orchestration with Amazon MWAA and Step Functions}
+\index{Apache Airflow}\index{Amazon MWAA}\index{AWS Step Functions}\index{DAG}\index{orchestration}\index{XCom}\index{sensors}%
+\begin{objectives}
+\begin{itemize}
+    \item Apply core Apache Airflow concepts: DAGs, operators, tasks, scheduling, retries, and XComs.
+    \item Explain Amazon MWAA architecture and its operational model versus self-managed Airflow.
+    \item Use AWS Step Functions for native serverless orchestration and know when it beats Airflow.
+    \item Author a production-grade DAG that waits for S3 arrival, triggers a Glue job, runs an Athena validation, and alerts on failure.
+    \item Design a resilient, self-healing orchestration layer for a 15-system banking reconciliation.
+    \item Assemble the Milestone~3 automated batch ELT pipeline with a data-quality gate.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+Orchestration splits into two families everywhere: general-purpose DAG schedulers and native state machines. Both exist on every cloud.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{2.8cm}p{3.0cm}p{3.0cm}p{3.0cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{AWS} & \textbf{Azure} & \textbf{GCP} \\
+\midrule
+Managed Airflow & Amazon MWAA & Data Factory managed Airflow & Cloud Composer \\
+Native state machine & Step Functions & Azure Logic Apps / Durable Functions & Workflows \\
+File-arrival trigger & EventBridge + sensor & Event Grid trigger & Eventarc trigger \\
+Failure alerting & SNS via operator/rule & Monitor alerts & Alerting to Pub/Sub \\
+\addlinespace
+Inter-task data & XComs (small) / S3 (large) & Pipeline variables / ADLS & XComs / GCS \\
+Retry semantics & Task retries + backoff & Activity retry policy & Step retry blocks \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+\textbf{Fabric} pipelines play the orchestrator role inside the SaaS boundary. \textbf{Snowflake} tasks and DAGs orchestrate in-warehouse work, and dbt (Chapter~24) orchestrates transformation graphs---the same dependency idea at the SQL layer. \textbf{MongoDB} triggers and Atlas schedulers cover the document-store corner.
+\end{crosscloud}
+
+\section{Week 12 Roadmap and Mental Model}
+Weeks 9--11 built the engines; Week~12 conducts them. An orchestrator answers four questions a scheduler cron entry cannot: What depends on what? What happens when a step fails? What data does a run produce, and which run produced it? And who gets paged? This week's two instruments approach those questions from different histories: \textbf{Airflow} (via Amazon MWAA) is the general-purpose, code-first DAG platform the industry standardized on \cite{apacheAirflow}; \textbf{Step Functions} is AWS's native, serverless state machine with deep service integrations and per-transition billing \cite{awsStepFunctionsDocs}.
+
+The professional skill is not picking one---it is knowing the boundary. Rule of thumb this chapter defends: Step Functions for event-driven, high-rate, AWS-native task graphs; Airflow for schedule-driven, dependency-heavy data estates with cross-day logic and a Python-native team.
+
+\begin{definitionbox}
+\textbf{Orchestration} is the managed execution of a directed acyclic graph (DAG) of data tasks with dependency resolution, retry and alerting policy, run history, and parameterized scheduling---distinct from the \emph{computation} the tasks themselves perform.
+\end{definitionbox}
+
+\begin{keyterms}
+\textbf{DAG}: the code-defined graph of tasks and dependencies. \textbf{Operator}: a task template (run Glue job, run Athena query). \textbf{Sensor}: a polling operator that waits for a condition (file exists). \textbf{XCom}: Airflow's small inter-task message channel. \textbf{catchup}: whether Airflow backfills missed schedules on deploy. \textbf{State machine}: Step Functions' Amazon States Language definition of task flow. \textbf{Execution role / task role}: MWAA's separation between the environment's identity and per-task AWS permissions.
+\end{keyterms}
+
+\section{Monday: Airflow Concepts}
+\subsection{DAGs, Operators, Tasks, and Scheduling}
+A DAG is Python code declaring tasks and their dependency edges; a \emph{DAG run} is one scheduled or triggered execution; a \emph{task instance} is one task within one run. Operators wrap actions---\texttt{GlueJobOperator}, \texttt{AthenaOperator}, \texttt{SnsPublishOperator}---and sensors poll for external conditions like file arrival. Scheduling is cron or timetable-based, with two settings that bite newcomers: \texttt{catchup} (if true, deploying a DAG with a past \texttt{start\_date} instantly schedules every missed run) and retries with backoff, which convert transient failures---throttling, a brief S3 inconsistency---into eventual success instead of pages \cite{apacheAirflow}.
+\index{catchup}\index{retry}\index{sensor}
+
+\begin{pitfall}
+\textbf{Deploying with \texttt{catchup=True} and a past \texttt{start\_date}.} The scheduler will cheerfully launch months of backfill runs against production systems the moment the DAG file lands. Set \texttt{catchup=False} unless you have designed the backfill, and design the backfill deliberately when you need one.
+\end{pitfall}
+
+\subsection{XComs and the Data Rule}
+XComs pass small values between tasks---a row count, an S3 key, a status. They are stored in the metadata database, so they are \emph{not} a data channel: the rule is \textbf{data flows through S3, signals flow through XComs}. A task that XComs a dataframe will bloat the metadata database and fail mysteriously at scale; a task that writes S3 and XComs the key scales indefinitely.
+
+\section{Tuesday: Amazon MWAA Architecture}
+\subsection{Managed Airflow, Honest Boundaries}
+Amazon MWAA runs Airflow for you: a managed scheduler and web server, with workers autoscaling on ECS Fargate, all inside your VPC \cite{awsMWAADocs}. You choose an environment class, a worker range, and a requirements file. DAGs deploy by syncing an S3 bucket---the \emph{dags} prefix is the deployment surface, so CI/CD for DAGs is ``merge to main, sync to S3'' (Chapter~24 formalizes this).
+
+The operational realities: environment updates cause brief scheduler restarts; worker scaling lags sudden parallelism spikes; and every AWS call from a DAG uses the execution role, so least-privilege means that role can call exactly the Glue jobs, Athena workgroups, and SNS topics the DAGs need---no more.
+\index{MWAA execution role}
+
+\begin{tipbox}
+Wire MWAA and Glue failures to CloudWatch alarms that publish to an SNS topic subscribed by the on-call runbook. Alarm on \texttt{FailedTasks} and DAG-duration anomalies---never rely on someone noticing a red box in the Airflow UI. Every alert must link to a runbook entry with triage steps.
+\end{tipbox}
+
+\section{Wednesday: AWS Step Functions}
+\subsection{Native Serverless Orchestration}
+Step Functions defines workflows in Amazon States Language (JSON/YAML): Task states call AWS services (with optimized integrations that handle polling and callbacks), Choice states branch on payload fields, Map states fan out, and built-in retry/catch blocks implement per-state failure policy \cite{awsStepFunctionsDocs}. Standard workflows run up to a year with full execution history; Express workflows handle high-rate, sub-five-minute event processing.
+
+Step Functions' signature advantage for data pipelines is the \emph{service integrations}: triggering a Glue job, running an EMR Serverless job, or executing an Athena query is a one-line Task state with IAM scoped per state. Its signature constraint is the 256~KB payload limit between states---the same ``S3 for data, signals for state'' rule as XComs, enforced by the platform.
+\index{Step Functions}\index{Amazon States Language}
+
+\subsection{Choosing Between MWAA and Step Functions}
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.4cm}p{4.4cm}p{4.4cm}@{}}
+\toprule
+\textbf{Criterion} & \textbf{MWAA (Airflow)} & \textbf{Step Functions} \\
+\midrule
+Sweet spot & Schedule-driven estates, cross-day dependencies, rich backfill & Event-driven, high-rate, AWS-service-centric flows \\
+Programming model & Python DAGs, huge operator ecosystem & ASL JSON/YAML, visual designer \\
+Billing & Environment-hours (always on) & Per state transition (per request for Express) \\
+Data passing & XComs (discipline required) & Payloads capped at 256 KB (enforced) \\
+Team fit & Python-native data engineers & Platform/app teams, event architectures \\
+\bottomrule
+\end{tabular}
+\caption{Choosing the orchestrator: MWAA versus Step Functions.}
+\label{tab:ch12-orchestrators}
+\end{table}
+
+\section{Thursday Hands-on Project: A Production-Shaped MWAA DAG}
+\index{hands-on project!MWAA DAG}
+Author and deploy a DAG that waits for a file in S3, triggers a Glue job, validates the load with Athena, and publishes an SNS alert on any failure.
+
+\subsection*{Lab Objectives}
+\begin{itemize}
+    \item Deploy the DAG to an MWAA environment's S3 DAG bucket.
+    \item Configure the execution role with least-privilege access to exactly the four services used.
+    \item Prove the failure path: force the Glue job to fail and confirm the SNS alert fires.
+    \item Explain every scheduling-related setting in the DAG header.
+\end{itemize}
+
+\subsection*{Procedure}
+The DAG below is the lab's complete artifact. Read it once for the task graph and once for the operational settings: \texttt{catchup=False}, retries with delay, a tuned sensor, and a failure-triggered alert.
+
+\begin{lstlisting}[language=Python,caption={The daily reconciliation DAG for MWAA.},label={lst:ch12-dag}]
+from datetime import datetime
+from airflow import DAG
+from airflow.providers.amazon.aws.sensors.s3 import S3KeySensor
+from airflow.providers.amazon.aws.operators.glue import GlueJobOperator
+from airflow.providers.amazon.aws.operators.athena import AthenaOperator
+from airflow.providers.amazon.aws.operators.sns import SnsPublishOperator
+
+with DAG(
+    dag_id="daily_recon_pipeline",
+    schedule="@daily",
+    start_date=datetime(2026, 1, 1),
+    catchup=False,
+    default_args={"retries": 2, "retry_delay": 300},
+) as dag:
+    wait_for_file = S3KeySensor(
+        task_id="wait_for_file",
+        bucket_name="bank-raw-ingest",
+        bucket_key="recon/{{ ds }}/transactions.csv",
+        poke_interval=300, timeout=3600,
+    )
+    run_glue = GlueJobOperator(
+        task_id="run_glue", job_name="recon-etl", iam_role_name="GlueExecRole",
+    )
+    validate = AthenaOperator(
+        task_id="validate", query="SELECT COUNT(*) FROM recon.daily_load",
+        database="recon", output_location="s3://bank-athena-results/",
+    )
+    alert = SnsPublishOperator(
+        task_id="alert", target_arn="arn:aws:sns:us-east-1:123456789012:data-alerts",
+        message="Recon pipeline failed for {{ ds }}", trigger_rule="one_failed",
+    )
+    wait_for_file >> run_glue >> validate >> alert
+\end{lstlisting}
+
+Deploy by uploading to the environment's DAG prefix:
+
+\begin{lstlisting}[language=bash,caption={Deploying the DAG and watching it appear.},label={lst:ch12-deploy}]
+$MwaaEnv = "week12-mwaa"
+$DagBucket = (aws mwaa get-environment --name $MwaaEnv `
+  --query 'Environment.DagS3Path' --output text) -replace '/dags$',''
+
+aws s3 cp daily_recon_pipeline.py "s3://$DagBucket/dags/"
+
+# The scheduler picks it up within a minute or two:
+aws mwaa get-environment --name $MwaaEnv --query 'Environment.Status'
+\end{lstlisting}
+
+Design notes worth being able to defend in review:
+\begin{itemize}
+    \item \texttt{S3KeySensor} with \texttt{poke\_interval=300} trades freshness against S3 LIST request cost; \texttt{timeout=3600} bounds the wait so a missing file fails visibly rather than hanging the run forever.
+    \item The alert task uses \texttt{trigger\_rule="one\_failed"} so it runs precisely on the failure path---without it, the alert would be skipped when its upstream is skipped.
+    \item The \texttt{\{\{ ds \}\}} template makes runs partition-aligned and rerunnable for any logical date---idempotency at the orchestration layer, matching Chapter~10's job-layer discipline.
+\end{itemize}
+
+\subsection*{Verification}
+\begin{itemize}
+    \item Uploading a matching file triggers a run that completes all four tasks.
+    \item A run with a deliberately broken Glue job ends with the SNS alert published and the Airflow UI showing the failure path.
+    \item A run with no file fails after one hour with a clear sensor timeout, not an indefinite hang.
+    \item Rerunning a past logical date reprocesses exactly that date's partition (job-layer bookmarks honored).
+\end{itemize}
+
+\section{Friday Use Case: Self-Healing Banking Reconciliation Across Fifteen Systems}
+\index{use case!banking reconciliation orchestration}
+A bank reconciles positions daily across fifteen systems---core banking, card processor, SWIFT gateway, general ledger, and eleven more. Files arrive at different times with different formats; the close cannot complete until all fifteen reconcile; and yesterday's manual rerun procedure takes an engineer four hours. Design the orchestration.
+
+\subsection{Architecture}
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[
+        box/.style={rectangle, rounded corners, draw=primary, thick, fill=primary!6, align=center, minimum width=2.9cm, minimum height=1.0cm, font=\small\bfseries},
+        guard/.style={rectangle, rounded corners, draw=red!60!black, thick, fill=red!5, align=center, minimum width=2.6cm, minimum height=0.9cm, font=\footnotesize\bfseries},
+        arr/.style={-{Stealth[length=2.5mm]}, draw=primary, thick}
+    ]
+        \node[box] (eb) at (0,0) {EventBridge\\file arrivals};
+        \node[box] (sf) at (3.4,0) {Step Functions\\per-system ingest};
+        \node[box] (s3) at (6.8,0) {S3 staging\\per system/date};
+        \node[box] (mwaa) at (10.2,0) {MWAA daily\\recon DAG};
+        \node[box] (rs) at (13.2,0) {Redshift\\recon marts};
+        \node[guard] (sns) at (10.2,2.0) {SNS alerts\\+ runbooks};
+        \node[guard] (dq) at (6.8,-2.0) {Data-quality gate\\(DataBrew/DQ)};
+        \draw[arr] (eb) -- (sf);
+        \draw[arr] (sf) -- (s3);
+        \draw[arr] (s3) -- (mwaa);
+        \draw[arr] (mwaa) -- (rs);
+        \draw[arr, dashed] (sns) -- (mwaa);
+        \draw[arr, dashed] (dq) -- (s3);
+    \end{tikzpicture}%
+    }
+    \caption{Two-tier orchestration: Step Functions handles per-arrival, per-system ingestion; MWAA owns the cross-system daily reconciliation with dependencies, retries, and alerting.}
+    \label{fig:ch12-banking}
+\end{figure}
+
+\subsection{Design Decisions}
+\textbf{Two tiers, each at its strength.} Step Functions runs fifteen per-system ingestion state machines, triggered by EventBridge on each file's arrival---event-driven, high-rate, AWS-native. MWAA owns the daily reconciliation DAG: one task per system reading that system's staged partition, a barrier task requiring all fifteen, the cross-system match, and the exception report. Step Functions is wrong for the cross-day dependency logic; Airflow is wrong for fifteen independent arrival streams. The boundary is the staged S3 partition.
+
+\textbf{Self-healing by construction.} Every task is idempotent and partition-scoped (\texttt{system/date}), so any rerun is safe. Retries with backoff absorb transient failures. A sensor per system replaces human polling, with a timeout that escalates to the on-call with the system name and expected SLA. The ``manual rerun procedure'' becomes ``click \emph{Clear} on the failed task''---the four-hour incident becomes a five-minute one.
+
+\textbf{Blast-radius controls.} Each system's task is isolated: a broken card-processor file fails that branch and alerts, while the other fourteen stage normally and the barrier reports exactly which system blocks the close. Partial close with flagged exceptions is a business decision; silent partial data is not an option.
+
+\begin{pitfall}
+\textbf{A single mega-DAG that recomputes everything on any failure.} If the failure of one of fifteen inputs forces reprocessing all fifteen, every incident is maximal. Partition-scoped, idempotent tasks with a barrier are what make reruns cheap enough to be the recovery strategy.
+\end{pitfall}
+
+\section{Interview Q\&A}
+\subsection{Concepts and Trade-offs}
+\begin{enumerate}
+    \item \textbf{Q: What does \texttt{catchup=False} prevent when you deploy a DAG?}\\
+    A: Backfill storms. With catchup enabled and a past \texttt{start\_date}, the scheduler immediately launches every missed historical run on deploy---often against production systems that did not expect it.
+    \item \textbf{Q: When are Step Functions a better orchestrator than Airflow?}\\
+    A: For event-driven, high-rate workflows composed of AWS service calls---per-file ingestion, per-order processing---where per-transition billing and native service integrations beat running an always-on scheduler.
+    \item \textbf{Q: What do retries with backoff protect a pipeline against?}\\
+    A: Transient failures---throttling, brief network or consistency hiccups---converting them into eventual success instead of pages. They do not fix deterministic failures; those need the failure path.
+    \item \textbf{Q: Why tune an \texttt{S3KeySensor}'s \texttt{poke\_interval}?}\\
+    A: Each poll is S3 LIST requests billed per thousand. A 300-second interval for a daily file balances freshness against request cost; a 5-second interval buys nothing and pays continuously.
+    \item \textbf{Q: When should data move through S3 instead of XComs?}\\
+    A: Always, for datasets. XComs live in the metadata database and suit small signals---keys, counts, statuses. Step Functions enforces the same rule with its 256~KB payload limit.
+    \item \textbf{Q: Why does the alert task need \texttt{trigger\_rule="one\_failed"}?}\\
+    A: Default trigger rules skip a task when its upstream is skipped. Without the explicit rule, the alert itself would be skipped on exactly the runs it exists for.
+\end{enumerate}
+
+\section{Further Reading}
+The Airflow documentation is the reference for DAG semantics, scheduling, sensors, and trigger rules \cite{apacheAirflow}; the MWAA User Guide covers environment classes, worker scaling, and the S3 deployment model \cite{awsMWAADocs}; and the Step Functions Developer Guide covers ASL, service integrations, and Standard versus Express workflows \cite{awsStepFunctionsDocs}. The EventBridge guide covers the arrival-trigger half of the Friday architecture \cite{awsEventBridgeDocs}.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item Orchestration is dependency management, failure policy, and observability---computation belongs to the engines.
+    \item Airflow's sharp edges are scheduling semantics: catchup, start dates, trigger rules, and retry policy.
+    \item MWAA makes Airflow managed, not magic: execution-role least privilege and S3-based deployment are the operational core.
+    \item Step Functions excels at event-driven AWS-native flows; its 256~KB payload limit enforces the S3-for-data rule.
+    \item Sensors replace human polling; idempotent, partition-scoped tasks replace manual rerun procedures.
+    \item Two-tier orchestration---native state machines for arrival, a DAG platform for cross-system logic---serves the 15-system reconciliation better than either tool alone.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Explain the difference between a DAG, a DAG run, and a task instance, and which one a ``rerun for yesterday'' operates on.
+    \item \textbf{(Conceptual)} Why is an always-on MWAA environment the wrong economic shape for a workload of pure per-arrival event reactions?
+    \item \textbf{(Hands-on)} Deploy the Thursday DAG, then add a second sensor for a \texttt{control/} file and make the Glue task require both arrivals.
+    \item \textbf{(Hands-on)} Force each failure mode---missing file, Glue failure, Athena failure---and record the alert behavior for each.
+    \item \textbf{(Hands-on)} Reimplement the DAG's happy path as a Step Functions state machine and compare the operational evidence each tool gives you.
+    \item \textbf{(Design)} Design the barrier task for the fifteen-system recon: how does it report exactly which systems are missing, and what happens at the close deadline?
+    \item \textbf{(Design)} Write the MWAA execution-role policy for the Thursday DAG as least privilege; justify each statement.
+    \item \textbf{(Architecture)} Extend the Friday architecture with a cross-region failover posture: what must exist in the second region, and what state is hard to replicate?
+\end{enumerate}
+
+\section{Milestone 3 Capstone: Automated Batch ELT Pipeline}\label{sec:ch12-capstone}
+\index{capstone project}\index{Milestone 3 capstone}\index{Step Functions!capstone}
+
+\begin{capstonebox}
+\textbf{Mission.} Build an end-to-end automated batch ELT pipeline: an EventBridge rule fires on S3 upload, a Step Functions state machine runs a DataBrew data-quality check that gates an EMR Serverless Spark feature job, and the curated output loads into Redshift---with MWAA handling cross-day scheduling dependencies.
+
+\textbf{Estimated time.} 6--8 hours in a sandbox AWS account.
+
+\textbf{What you\textquotesingle{}ll practice.}
+\begin{itemize}
+    \item Event-driven triggering: S3 notifications to EventBridge to Step Functions.
+    \item Data-quality gating inside a state machine with a Choice state.
+    \item EMR Serverless job submission from orchestration.
+    \item Failure routing to SNS with runbook-linked alerts.
+\end{itemize}
+\end{capstonebox}
+
+\subsection*{Scenario}
+The bank's analytics team receives daily feature extracts from an upstream vendor. Files arrive irregularly; quality varies; and the ML feature pipeline must never consume a failed-quality file. Automate arrival-to-Redshift with a hard quality gate and full failure visibility.
+
+\subsection*{Requirements}
+\textbf{Functional requirements.}
+\begin{itemize}
+    \item S3 event notifications to EventBridge; a rule matching the raw prefix starts the state machine with the object key in the payload.
+    \item The state machine runs a DataBrew (or Glue Data Quality) check; a Choice state halts and alerts on failure.
+    \item On pass, an EMR Serverless Spark job computes features; output is COPYed into Redshift.
+    \item MWAA orchestrates the cross-day dependencies (yesterday's recon must finish before today's features publish).
+    \item Failures at any state publish to SNS with the execution ARN.
+\end{itemize}
+
+\textbf{Non-functional requirements.}
+\begin{itemize}
+    \item End-to-end runs from a clean environment per the README: upload a file, pipeline completes.
+    \item At least three automated data-quality checks with a failing-case demonstration that halts the load.
+    \item CloudWatch alarms on \texttt{ExecutionsFailed} and on MWAA task failures.
+    \item A monthly cost estimate (EMR Serverless vCPU-hours, Glue DPUs, Step Functions transitions) with two optimization decisions documented.
+    \item Task-scoped IAM roles per pipeline stage; secrets in Secrets Manager; no hardcoded credentials anywhere.
+\end{itemize}
+
+\subsection*{Reference Architecture}
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[
+        node distance=0.55cm and 1.0cm,
+        box/.style={rectangle, rounded corners, draw=orange!75!black, thick, fill=orange!10, align=center, font=\small, minimum height=0.9cm, inner sep=4pt},
+        side/.style={rectangle, rounded corners, draw=brown!70!black, thick, fill=brown!10, align=center, font=\footnotesize, inner sep=3pt},
+        arr/.style={-{Stealth}, thick}
+    ]
+    \node[box] (s3) {S3 upload\\(raw file)};
+    \node[box, right=of s3] (eb) {EventBridge\\rule};
+    \node[box, right=of eb] (sf) {Step Functions\\state machine};
+    \node[box, right=of sf, yshift=1.0cm] (dq) {Glue DataBrew\\DQ check};
+    \node[box, right=of sf, yshift=-1.0cm] (emr) {EMR Serverless\\Spark features};
+    \node[box, right=of emr, yshift=1.0cm] (rs) {Redshift\\(curated)};
+    \node[side, below=0.6cm of sf] (mwaa) {MWAA (Airflow) cross-DAG deps};
+    \draw[arr] (s3) -- (eb);
+    \draw[arr] (eb) -- (sf);
+    \draw[arr] (sf) -- (dq);
+    \draw[arr] (sf) -- (emr);
+    \draw[arr] (dq) -- (rs);
+    \draw[arr] (emr) -- (rs);
+    \draw[arr, dashed] (mwaa) -- (sf);
+    \end{tikzpicture}%
+    }
+    \caption{Milestone 3 reference architecture: automated batch ELT pipeline with a data-quality gate.}
+    \label{fig:ch12-capstone-arch}
+\end{figure}
+
+\subsection*{Implementation Steps}
+\begin{enumerate}
+    \item Enable S3 event notifications to EventBridge and create the prefix-matched rule targeting the state machine.
+    \item Define the state machine: DataBrew job Task, the Choice gate, EMR Serverless Task, Redshift COPY Task, SNS failure catches.
+    \item Create the EMR Serverless application and feature job; pass S3 keys---never data---between states (the 256~KB rule).
+    \item Build the MWAA DAG that sequences the cross-day dependency.
+    \item Wire the \texttt{ExecutionsFailed} alarm and MWAA failure alerts to SNS with runbook links.
+    \item Write the cost model and the security review; tag resources for cleanup.
+\end{enumerate}
+
+The hardest state is the quality gate; the ASL Choice state is small but load-bearing:
+
+\begin{lstlisting}[language=json,caption={The data-quality gate as a Choice state.},label={lst:ch12-choice}]
+"CheckDataQuality": {
+  "Type": "Choice",
+  "Choices": [{
+    "Variable": "$.dq_status",
+    "StringEquals": "FAILED",
+    "Next": "AlertAndHalt"
+  }],
+  "Default": "RunSparkFeatures"
+}
+\end{lstlisting}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item The state-machine definition (ASL), the DAG, and the EMR job code, all in version control.
+    \item Evidence of the happy path (upload to Redshift rows) and of the DQ gate halting a bad file with an SNS alert.
+    \item Alarm configurations and one triggered-alarm record.
+    \item The cost estimate with two documented optimizations and the IAM/security review.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item A file upload triggers the pipeline with no manual step; the object key flows through as payload.
+    \item A quality failure halts the load before any Spark or Redshift work and pages with context.
+    \item No state passes bulk data through payloads; all data moves through S3 keys.
+    \item Each pipeline stage runs under its own least-privilege role.
+    \item The MWAA dependency demonstrably blocks today's publish until yesterday's recon succeeds.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Add a Map state to fan out per-file processing when a manifest lists multiple files.
+    \item Convert the DataBrew check to Glue Data Quality rules and compare rule expressiveness.
+    \item Add Step Functions redrive policies and test recovery from a throttled EMR submission.
+    \item Emit pipeline metrics (arrival-to-curated latency) to CloudWatch and dashboard the trend.
+\end{itemize}

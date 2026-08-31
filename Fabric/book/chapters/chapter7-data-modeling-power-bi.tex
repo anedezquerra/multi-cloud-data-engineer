@@ -1,0 +1,385 @@
+\chapter{Data Modeling for Power BI}
+\index{data modeling}\index{Kimball dimensional modeling}\index{star schema}\index{fact table}\index{conformed dimensions}\index{slowly changing dimensions}\index{semantic model}\index{DAX}\index{bridge table}%
+
+\begin{objectives}
+\begin{itemize}
+    \item Declare the grain of a fact table before adding columns, and distinguish transaction, periodic snapshot, and accumulating snapshot facts.
+    \item Design conformed dimensions shared across fact tables and choose correctly between SCD Type~1 and Type~2 handling.
+    \item Explain the default Power BI semantic model in Fabric workspaces and when to replace it with a custom model.
+    \item Create a custom semantic model, define one-to-many relationships, and write DAX measures.
+    \item Implement an SCD Type~2 upsert against a Gold lakehouse using Delta \texttt{MERGE}.
+    \item Resolve circular dependencies in an enterprise model with a bridge-table architecture.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+Dimensional modeling is platform-independent discipline---Kimball's method predates every cloud---but each platform has a native place where the model lives. In Fabric it is the Power BI semantic model over OneLake tables.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{2.8cm}p{3.2cm}p{3.2cm}p{3.2cm}p{3.2cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{Fabric} & \textbf{AWS} & \textbf{GCP} & \textbf{Snowflake} \\
+\midrule
+Model home & Power BI semantic model & Redshift tables + QuickSight datasets & BigQuery + Looker semantic layer (LookML) & Snowflake tables + Snowsight/BI tool models \\
+Star-schema DDL & Warehouse/lakehouse Delta tables & Redshift (dist/sort keys) & BigQuery (partition/cluster) & Native tables, clustering \\
+SCD2 implementation & Delta \texttt{MERGE} & \texttt{MERGE} / staging upserts & \texttt{MERGE} & \texttt{MERGE} / streams+tasks \\
+Measure language & DAX & SQL / QuickSight calculated fields & LookML / SQL & SQL / BI tool calcs \\
+Denormalization norm & Star over Delta & Star (sort keys) & Often wide nested tables & Star or flattened \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+Databricks teams model in Delta tables and serve through SQL warehouses or BI tools; MongoDB modeling is document-oriented---embedding versus referencing---which is a different but equally grain-first discipline. The transferable skills are the ones this chapter teaches: declare the grain, conform the dimensions, version the history.
+\end{crosscloud}
+
+\begin{keyterms}
+\textbf{Grain}: the precise meaning of one row in a fact table, declared before any column is added. \quad
+\textbf{Conformed dimension}: a dimension with identical keys and meaning shared across multiple fact tables. \quad
+\textbf{SCD Type 1}: overwrite history; old attribute values are lost. \quad
+\textbf{SCD Type 2}: version history with effective dates; every change closes one row and opens another. \quad
+\textbf{Semantic model}: the Power BI layer of tables, relationships, and DAX measures that reports query. \quad
+\textbf{Bridge table}: a resolving table that converts a many-to-many or circular relationship into composable one-to-many paths.
+\end{keyterms}
+
+\section{Week 7 Roadmap}
+Week~7 moves from storing data to modeling it for humans and measures. Monday is dimensional modeling proper: grain declaration, the three fact table types, conformed dimensions, and SCD Type~1 versus Type~2. Tuesday examines the default semantic model every Fabric workspace generates. Wednesday builds custom semantic models with deliberate relationships. Thursday is the hands-on project: define a Date-to-Sales relationship, write a DAX measure, and implement an SCD Type~2 \texttt{MERGE} against the Gold lakehouse. Friday tackles a classic enterprise modeling failure---circular dependencies---and resolves it with a bridge table.
+
+Modeling is where data engineering meets business meaning. A lakehouse full of clean Delta tables still fails if the model above it double-counts revenue or forgets what a row means. Kimball's discipline \cite{kimballToolkit} plus Fabric's semantic model \cite{microsoftFabricSemanticModels} is the combination this week builds.
+
+\begin{notebox}
+The single most expensive modeling mistake is skipping the grain declaration. Every double-counting bug, every wrong total, and every ``why doesn't this filter work'' traces back to a fact table whose grain was never stated.
+\end{notebox}
+
+\section{Monday: Kimball Dimensional Modeling}
+\index{grain}\index{fact table!types}\index{conformed dimensions}\index{slowly changing dimensions}
+Kimball dimensional modeling organizes analytical data into \emph{facts} (measurements) and \emph{dimensions} (context) \cite{kimballToolkit}. The method begins not with columns but with a sentence: \emph{what does one row of this fact table mean?}
+
+\begin{definitionbox}
+The \textbf{grain} of a fact table is the exact business meaning of a single row---``one row per order line,'' ``one row per account per day,'' ``one row per shipment from pickup to delivery.'' It is declared first and never silently changed.
+\end{definitionbox}
+
+\subsection{The Three Fact Table Types}
+\begin{itemize}
+    \item \textbf{Transaction facts} record one row per business event at the lowest useful grain (order lines, payments, clicks). They are insert-heavy and additive.
+    \item \textbf{Periodic snapshot facts} record one row per entity per time period (daily account balances, monthly inventory). They answer ``as of'' questions.
+    \item \textbf{Accumulating snapshot facts} record one row per process instance, updated as milestones complete (order placed, shipped, delivered, returned). Their columns are milestones on a journey.
+\end{itemize}
+
+\subsection{Conformed Dimensions}
+A dimension is \emph{conformed} when two fact tables can join the same dimension table and produce comparable results. \texttt{dim\_date}, \texttt{dim\_customer}, and \texttt{dim\_product} shared by sales, returns, and inventory facts are what turn a pile of marts into an enterprise model. Conformance is a governance decision before it is a technical one: someone must own the dimension's definitions.
+
+\subsection{Slowly Changing Dimensions}
+When a customer moves region, what happens to history? \textbf{Type~1} overwrites the region---simple, but last year's ``East'' sales silently become ``West.'' \textbf{Type~2} closes the current row (\texttt{valid\_to}, \texttt{is\_current = false}) and inserts a new version---preserving what the world looked like when each fact occurred. Type~2 is required whenever the business asks ``as it was'' questions or audits decisions made under old attribute values.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.4cm}p{5.2cm}p{5.2cm}@{}}
+\toprule
+\textbf{Aspect} & \textbf{SCD Type 1} & \textbf{SCD Type 2} \\
+\midrule
+History & Lost (overwrite) & Preserved (versioned rows) \\
+Row count & Stable & Grows with changes \\
+Query pattern & Simple joins & Joins must respect \texttt{is\_current} or effective dates \\
+Best for & Corrections (typo fixes), irrelevant history & Attribution, audit, ``as-was'' reporting \\
+Fabric implementation & Delta \texttt{MERGE} update & Two-step \texttt{MERGE}: expire, then insert \\
+\bottomrule
+\end{tabular}
+\caption{Choosing between SCD Type 1 and Type 2.}
+\label{tab:chapter7-scd}
+\end{table}
+
+\begin{pitfall}
+Mixing Types silently: overwriting \texttt{segment} in a dimension that downstream models treat as Type~2 rewrites history without telling anyone. Document the type per attribute, not per table---a dimension often fixes typos with Type~1 on some columns while versioning \texttt{region} and \texttt{segment} with Type~2.
+\end{pitfall}
+
+\section{Tuesday: The Default Semantic Model}
+\index{semantic model!default}
+Every lakehouse and warehouse in Fabric automatically exposes a \emph{default semantic model}: Power BI generates a model whose tables mirror the item's tables, so a report can be built minutes after data lands \cite{microsoftFabricSemanticModels}.
+
+The default model is a convenience, not a deliverable. It carries every table, technical columns and all; it has no deliberate relationships beyond auto-detect guesses, no business-named measures, no security roles, and no curated folder structure. Treat it as scaffolding for exploration.
+
+\begin{notebox}
+The default semantic model inherits its tables directly from the lakehouse. That is why Part~I's physical discipline---clean Delta tables, sensible names, no \texttt{\_corrupt\_record} columns leaking into Gold---pays off here: the default model can only be as presentable as the tables beneath it.
+\end{notebox}
+
+\subsection{When the Default Model Is Enough}
+Exploration, prototyping, and sanity checks. The moment a report goes to a stakeholder, graduate to a custom model: rename tables and columns to business language, hide technical keys, declare relationships deliberately, and move calculations into named DAX measures instead of implicit per-visual aggregations.
+
+\section{Wednesday: Custom Semantic Models and Relationships}
+\index{semantic model!custom}\index{relationships}\index{DAX}
+A custom semantic model is a first-class Fabric item: you select the tables, define relationships with explicit cardinality and cross-filter direction, and author measures \cite{microsoftFabricSemanticModels,microsoftDax}.
+
+\subsection{Relationships}
+The healthy default is one-to-many from dimension to fact, single cross-filter direction, active. Bidirectional filters and many-to-many relationships exist for legitimate cases but multiply the ways a filter can silently change a total; reach for them only with a written justification.
+
+\subsection{DAX Measures}
+DAX (Data Analysis Expressions) is the formula language of semantic models \cite{microsoftDax}. Measures are evaluated in filter context at query time, which is what makes them reusable across every visual and slice.
+
+\begin{lstlisting}[language=SQL,caption={Foundational DAX measures over the star schema.},label={lst:chapter7-dax}]
+Total Revenue = SUM ( fact_sales[net_amount] )
+
+Order Count = DISTINCTCOUNT ( fact_sales[order_id] )
+
+Average Order Value = DIVIDE ( [Total Revenue], [Order Count] )
+
+Revenue YTD =
+CALCULATE ( [Total Revenue], DATESYTD ( dim_date[full_date] ) )
+\end{lstlisting}
+
+\begin{tipbox}
+Build measures on top of measures: \texttt{Average Order Value} referencing \texttt{Total Revenue} and \texttt{Order Count} means one definition change propagates everywhere. Implicit aggregations in visuals do the opposite---they fork your business logic into every report.
+\end{tipbox}
+
+\begin{pitfall}
+Auto-detected relationships guess cardinality from data profiles and are wrong often enough to matter---especially with SCD2 dimensions, where a \texttt{customer\_id} appears many times in the dimension. Always define relationships on surrogate keys (\texttt{customer\_key}), never on business keys in a versioned dimension.
+\end{pitfall}
+
+\section{Thursday: Hands-on Project}
+\index{hands-on lab}\index{SCD Type 2!MERGE}\index{DAX!hands-on}
+The Week~7 lab has two halves: in the semantic model, define a one-to-many relationship between a Date dimension and a Sales fact and write a DAX measure; in the lakehouse, implement the SCD Type~2 \texttt{MERGE} below against \texttt{gold.dim\_customer} and verify that a changed customer attribute closes the old row and opens a new one.
+
+\subsection{Goal and Architecture}
+Work in a workspace \texttt{fabric-de-week07} with a lakehouse containing \texttt{fact\_sales}, \texttt{dim\_date}, and \texttt{dim\_customer} (SCD2-modeled with \texttt{customer\_key}, \texttt{customer\_id}, \texttt{segment}, \texttt{region}, \texttt{is\_current}, \texttt{valid\_from}, \texttt{valid\_to}). Part one is modeling; part two is the dimensional history pipeline that keeps the model honest.
+
+\subsection{Step-by-Step Actions}
+\begin{enumerate}
+    \item Open the semantic model view in the workspace and create a new custom model over the three tables.
+    \item Define a one-to-many relationship from \texttt{dim\_date[date\_key]} to \texttt{fact\_sales[date\_key]}; repeat for \texttt{dim\_customer[customer\_key]}.
+    \item Create the four DAX measures from Wednesday's listing; test \texttt{Total Revenue} and \texttt{Revenue YTD} in a quick visual.
+    \item In a notebook, run step 1 of the SCD2 merge: expire current rows whose tracked attributes changed.
+    \item Run step 2: insert new versions for changed attributes and brand-new customers.
+    \item Verify with a before/after query: the changed customer now has two rows, exactly one current.
+    \item Refresh the semantic model and confirm the report now attributes facts to the correct customer version.
+\end{enumerate}
+
+\begin{lstlisting}[language=Python,caption={SCD Type 2 upsert into gold.dim\_customer via Delta MERGE.},label={lst:chapter7-scd2-merge}]
+# SCD Type 2 upsert into gold.dim_customer via Delta MERGE (PySpark)
+from delta.tables import DeltaTable
+
+tgt = DeltaTable.forName(spark, "gold.dim_customer")
+src = spark.read.table("silver.customer_daily")  # today's snapshot
+
+# Step 1: expire current rows whose tracked attributes changed
+(tgt.alias("t").merge(src.alias("s"),
+    "t.customer_id = s.customer_id AND t.is_current = true")
+ .whenMatchedUpdate(
+    condition="t.segment <> s.segment OR t.region <> s.region",
+    set={"is_current": "false", "valid_to": "s.change_date"})
+ .execute())
+
+# Step 2: insert new versions (changed attributes + brand-new customers)
+(tgt.alias("t").merge(src.alias("s"),
+    "t.customer_id = s.customer_id AND t.is_current = true"
+    " AND t.segment = s.segment AND t.region = s.region")
+ .whenNotMatchedInsert(values={
+    "customer_id": "s.customer_id", "segment": "s.segment",
+    "region": "s.region", "is_current": "true",
+    "valid_from": "s.change_date", "valid_to": "null"})
+ .execute())
+\end{lstlisting}
+
+The two-step structure is essential: the first \texttt{MERGE} closes the current row, and the second---whose match condition now fails for just-expired rows---inserts the successor version. Running them in the wrong order, or as one combined step, either double-inserts or loses the closing date.
+
+\subsection{Validation Checklist}
+\begin{itemize}
+    \item The relationship uses \texttt{date\_key}/\texttt{customer\_key} surrogate keys, one-to-many, single direction.
+    \item \texttt{Total Revenue} in a visual equals a direct SQL \texttt{SUM} on the fact table.
+    \item A customer with a changed \texttt{segment} has exactly two dimension rows; exactly one has \texttt{is\_current = true}.
+    \item The old row's \texttt{valid\_to} equals the new row's \texttt{valid\_from}.
+    \item Facts are attributed to the customer version that was current at the fact's date.
+    \item Re-running the merge against the same snapshot changes nothing (idempotence).
+\end{itemize}
+
+\section{Friday: Use Case and Architecture}
+\index{circular dependency}\index{bridge table}
+An enterprise model for a university system has collapsed into ambiguity: \texttt{Students}, \texttt{Enrollments}, \texttt{Courses}, and \texttt{Scholarships} form a loop. Power BI deactivated one relationship to break the cycle, and now scholarship reports filter enrollments incorrectly. The task is to restore correct filtering with a bridge-table architecture.
+
+\subsection{Diagnosing the Cycle}
+Circular dependencies arise when two alternative filter paths exist between the same tables. The engine resolves the ambiguity by deactivating a path, and the deactivated path is always the one someone needed. The fix is never to force both paths active; it is to restructure so that only one unambiguous path remains.
+
+\subsection{The Bridge Table Pattern}
+Identify the many-to-many heart of the loop---students hold multiple scholarships; a scholarship covers multiple students---and factor it into a bridge table: \texttt{bridge\_student\_scholarship(student\_key, scholarship\_key)}. Both dimensions relate one-to-many into the bridge; facts relate through the bridge or directly to dimensions; every filter path is now a composable chain of one-to-many hops.
+
+\begin{figure}[H]
+    \centering
+    \begin{tikzpicture}[node distance=7mm and 12mm,
+        dim/.style={stage, minimum width=2.6cm},
+        bridge/.style={stage, draw=codegreen!60!black, fill=green!6},
+        fact/.style={stage, fill=orange!10}]
+        \node[dim] (stu) at (0,1.6) {dim\_student};
+        \node[dim] (sch) at (0,-1.6) {dim\_scholarship};
+        \node[bridge] (brg) at (4.6,0) {bridge\_student\_\\scholarship};
+        \node[fact] (fact) at (9.4,0) {fact\_enrollment};
+
+        \draw[arrow] (stu) -- node[above, font=\scriptsize]{1:N} (brg);
+        \draw[arrow] (sch) -- node[below, font=\scriptsize]{1:N} (brg);
+        \draw[arrow] (brg) -- node[above, font=\scriptsize]{1:N} (fact);
+        \draw[arrow] (stu.east) to[out=0,in=135] node[above, font=\scriptsize]{1:N} (fact.north west);
+
+        \node[note, text width=12.5cm, align=center] at (4.8,-3.2) {After bridging, every filter path is one-to-many; no ambiguity remains for the engine to ``resolve.''};
+    \end{tikzpicture}
+    \caption{Resolving a circular dependency with a bridge table.}
+    \label{fig:chapter7-bridge}
+\end{figure}
+
+\begin{pitfall}
+A bridge table changes query semantics: filtering by scholarship now flows to students through the bridge, which can surprise report authors expecting a direct relationship. Document the bridge's existence and grain in the model, and hide its keys from report view.
+\end{pitfall}
+
+\section{Operational Guidance for Week 7}
+Models are contracts. Publish a modeling standard---grain declarations, surrogate-key rules, SCD types per attribute, measure naming---and review every semantic model change against it. A model that quietly redefines \texttt{Total Revenue} causes more organizational damage than most outages.
+
+\subsection{Performance and Reliability}
+Keep models narrow: hide technical columns, remove unused tables, and prefer integer surrogate keys over wide string keys for relationship columns. Star beats snowflake for Power BI: each extra hop between fact and dimension costs filter-propagation work on every visual. Version the SCD2 merge like any pipeline---it is one, and its failures silently corrupt history.
+
+\subsection{Security and Governance Checklist}
+\begin{itemize}
+    \item Declare grain and SCD type per attribute in the model documentation.
+    \item Assign an owner to every conformed dimension.
+    \item Define relationships on surrogate keys with explicit cardinality; justify every bidirectional filter in writing.
+    \item Keep all business calculations in named DAX measures; prohibit per-visual implicit aggregation in certified reports.
+    \item Validate SCD2 merges with a uniqueness test: one current row per business key.
+    \item Record which reports depend on which measures before changing a measure definition.
+\end{itemize}
+
+\section{Interview Q\&A}
+\begin{enumerate}
+    \item \textbf{Q: Why must you declare the grain before adding fact columns?}\\
+    A: Every column and every aggregation is only meaningful relative to the grain. Undeclared grain is how two reports produce two different ``correct'' revenue numbers.
+    \item \textbf{Q: Name the three Kimball fact table types.}\\
+    A: Transaction facts (one row per event), periodic snapshots (one row per entity per period), and accumulating snapshots (one row per process instance, updated at milestones).
+    \item \textbf{Q: What makes a dimension conformed?}\\
+    A: Shared keys and identical business meaning across fact tables, so sales and inventory sliced by the same customer dimension produce comparable results.
+    \item \textbf{Q: When is SCD Type 2 required instead of Type 1?}\\
+    A: When the business must answer ``as it was'' questions---attribution, audit, or any report that must reflect the attribute values in effect when the fact occurred.
+    \item \textbf{Q: In the MERGE snippet, what closes the current SCD2 row?}\\
+    A: Step 1's \texttt{whenMatchedUpdate}, which fires when the business key matches, \texttt{is\_current} is true, and a tracked attribute differs---setting \texttt{is\_current = false} and stamping \texttt{valid\_to}.
+    \item \textbf{Q: How does a bridge table resolve a circular dependency?}\\
+    A: It factors the many-to-many heart of the loop into its own table, converting every filter path into composable one-to-many hops, so the engine never faces ambiguous alternative paths.
+\end{enumerate}
+
+\section{Further Reading}
+Read Kimball's dimensional modeling method \cite{kimballToolkit} as the canonical reference. For Fabric specifics, review semantic model documentation \cite{microsoftFabricSemanticModels}, the DAX reference \cite{microsoftDax}, and the Direct Lake overview that Week~8 builds upon \cite{microsoftDirectLake}. The SCD2 merge relies on Delta Lake semantics \cite{deltaLakeDocs,armbrust2020delta}.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item Grain is declared before columns; every downstream number inherits it.
+    \item Transaction, periodic snapshot, and accumulating snapshot facts answer different questions; do not blend them.
+    \item Conformed dimensions are a governance achievement as much as a technical one---they are what make cross-mart analysis comparable.
+    \item SCD Type 2 is implemented as two ordered \texttt{MERGE} steps: expire, then insert. Order is correctness.
+    \item The default semantic model is scaffolding; production reporting deserves a custom model with deliberate relationships and named measures.
+    \item Relationships belong on surrogate keys; DAX measures belong in the model, not in visuals.
+    \item Circular dependencies are resolved by restructuring---a bridge table---never by fighting the engine's ambiguity rules.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Declare the grain for: a bank account balance table, a shipment tracking table, and a web clickstream table. Which fact type is each?
+    \item \textbf{(Conceptual)} A dimension fixes a typo in \texttt{customer\_name} (Type 1) but versions \texttt{segment} (Type 2). Explain why per-attribute typing is correct and what breaks if you version the typo fix.
+    \item \textbf{(Hands-on)} Add an accumulating snapshot fact \texttt{fact\_order\_journey} with milestone dates; write one DAX measure computing average days from order to delivery.
+    \item \textbf{(Hands-on)} Extend the SCD2 merge to track a third attribute, \texttt{loyalty\_tier}, and prove idempotence by running it twice.
+    \item \textbf{(Design)} Draw the bridge-table solution for the university model, including which keys live in the bridge and which relationships remain direct.
+    \item \textbf{(Design)} Propose a conformed \texttt{dim\_date} that serves sales (daily grain), finance (fiscal calendar), and HR (pay periods). What columns must it carry?
+    \item \textbf{(Interview)} In five sentences, explain why Power BI deactivates a relationship when a model contains a loop, and what you do about it.
+    \item \textbf{(Operational)} Write the data-quality test that catches a broken SCD2 merge in production (hint: current-row uniqueness and date-chain contiguity).
+\end{enumerate}
+
+\section{Capstone Project: Conformed Star Schema with SCD2 History}\label{sec:ch7-capstone}
+\index{capstone project}\index{star schema!capstone}\index{SCD Type 2!capstone}
+
+\begin{capstonebox}
+\textbf{Mission.} Build a conformed star schema for a retail group: \texttt{fact\_sales} and \texttt{fact\_returns} sharing \texttt{dim\_date}, \texttt{dim\_customer} (SCD2), and \texttt{dim\_product}; a custom semantic model with deliberate relationships and a named measure library; and a tested SCD2 merge pipeline keeping customer history correct. Prove correctness with reconciliation queries and a uniqueness test.
+
+\textbf{Estimated time.} 5--7 hours.
+
+\textbf{What you'll practice.}
+\begin{itemize}
+    \item Declaring grains for multiple facts and conforming shared dimensions.
+    \item Implementing and testing an SCD Type 2 pipeline with Delta \texttt{MERGE}.
+    \item Building a custom semantic model with surrogate-key relationships and DAX measures.
+    \item Validating a model with reconciliation queries and uniqueness tests.
+\end{itemize}
+\end{capstonebox}
+
+\subsection*{Scenario}
+Contoso Retail reports sales and returns separately, and executives suspect the two reports disagree because they use different customer and date logic. Your job: one conformed star where both facts share dimensions, customer history is versioned, and \texttt{Net Revenue = Sales - Returns} is a single governed measure.
+
+\subsection*{Requirements}
+\begin{itemize}
+    \item Written grain declarations for both facts, committed to the repository.
+    \item \texttt{dim\_date}, \texttt{dim\_customer} (SCD2 columns), and \texttt{dim\_product} in the Gold lakehouse, shared by both facts.
+    \item The two-step SCD2 merge implemented as a parameterized notebook.
+    \item A custom semantic model: surrogate-key relationships, single-direction filters, hidden technical columns.
+    \item A measure library: \texttt{Gross Revenue}, \texttt{Return Amount}, \texttt{Net Revenue}, \texttt{Net Revenue YTD}.
+    \item A uniqueness test proving one current customer row per \texttt{customer\_id}.
+    \item Reconciliation: model totals equal direct SQL aggregates on the facts.
+\end{itemize}
+
+\subsection*{Reference Architecture}
+\begin{figure}[H]
+    \centering
+    \begin{tikzpicture}[node distance=8mm and 11mm,
+        dim/.style={stage, minimum width=2.5cm},
+        fact/.style={stage, fill=orange!10, minimum width=2.5cm},
+        model/.style={stage, draw=codegreen!60!black, fill=green!6}]
+        \node[dim] (date) at (0,2.2) {dim\_date};
+        \node[dim] (cust) at (0,0) {dim\_customer\\(SCD2)};
+        \node[dim] (prod) at (0,-2.2) {dim\_product};
+        \node[fact] (sales) at (5.0,1.1) {fact\_sales};
+        \node[fact] (rets) at (5.0,-1.1) {fact\_returns};
+        \node[model] (sm) at (9.8,0) {Semantic model\\relationships + DAX};
+
+        \draw[arrow] (date) -- (sales);
+        \draw[arrow] (date) -- (rets);
+        \draw[arrow] (cust) -- (sales);
+        \draw[arrow] (cust) -- (rets);
+        \draw[arrow] (prod) -- (sales);
+        \draw[arrow] (prod) -- (rets);
+        \draw[arrow] (sales) -- (sm);
+        \draw[arrow] (rets) -- (sm);
+
+        \node[note, text width=12.5cm, align=center] at (5.0,-3.6) {Conformance: both facts join the same dimension tables, so every report slices by identical definitions.};
+    \end{tikzpicture}
+    \caption{Week 7 capstone: conformed star schema feeding one semantic model.}
+    \label{fig:chapter7-capstone-architecture}
+\end{figure}
+
+\subsection*{Implementation Steps}
+\begin{enumerate}
+    \item Write and commit the grain declarations; review them before building anything.
+    \item Build the three dimensions and two facts in Gold from Silver sources.
+    \item Implement the SCD2 merge notebook with the uniqueness test as a final assertion.
+    \item Create the custom semantic model and wire relationships on surrogate keys.
+    \item Author the measure library; verify \texttt{Net Revenue} against SQL.
+    \item Change a customer's \texttt{segment}, rerun the merge, and prove history is preserved and the model still reconciles.
+\end{enumerate}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item Grain declarations and the modeling standard excerpt used.
+    \item The SCD2 notebook with test output.
+    \item Screenshots of the model view (relationships) and the measure library.
+    \item Reconciliation evidence: SQL aggregates versus model measures.
+    \item The uniqueness test result before and after a customer change.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item[\(\square\)] Grain declarations exist, are specific, and match the physical fact tables.
+    \item[\(\square\)] Both facts share all three dimensions; no per-fact dimension copies exist.
+    \item[\(\square\)] The SCD2 merge is idempotent and passes the uniqueness test after every run.
+    \item[\(\square\)] All relationships are one-to-many, single-direction, on surrogate keys.
+    \item[\(\square\)] \texttt{Net Revenue YTD} in a visual equals the equivalent SQL aggregation.
+    \item[\(\square\)] A customer attribute change produces a closed old row and a new current row with contiguous validity dates.
+    \item[\(\square\)] No business logic lives in report visuals; all calculations are named measures.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Add a degenerate dimension (order number) and document why it lives in the fact.
+    \item Add RLS from Chapter~6 so regional managers see only their region's facts.
+    \item Add a bridge table resolving a many-to-many between customers and promotion campaigns.
+    \item Benchmark the model's query time before and after switching relationships to integer surrogate keys.
+\end{itemize}

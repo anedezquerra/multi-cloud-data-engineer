@@ -1,0 +1,245 @@
+\chapter{Column- and Row-Level Security, Data Tagging, and Erasure}
+\index{masking policy}\index{row access policy}\index{object tagging}\index{GDPR}\index{Week 18}%
+\begin{objectives}
+\begin{itemize}
+    \item Classify sensitive data with object tags on databases, schemas, tables, and columns.
+    \item Enforce dynamic data masking policies keyed on session context and tags.
+    \item Restrict row visibility with row access policies driven by \texttt{CURRENT\_ROLE()} and entitlements tables.
+    \item Propagate GDPR erasure across schemas, clones, streams, and shares---or erase by crypto-shredding.
+    \item Build a hands-on tag-based masking policy plus a regional row access policy.
+    \item Design a HIPAA/GDPR compliance framework with automatic classification and dynamic masking.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+Classification-driven policy enforcement is the industry pattern: tag the data once, let policies follow the tags everywhere.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{2.8cm}p{3.0cm}p{3.0cm}p{3.0cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{AWS} & \textbf{Azure / Fabric} & \textbf{GCP (BigQuery)} \\
+\midrule
+Classification & Macie + resource tags & Purview sensitivity labels & Sensitive Data Protection + policy tags \\
+Column masking & Redshift dynamic masking / Lake Formation & Synapse/Fabric dynamic masking & BigQuery dynamic masking via policy tags \\
+Row-level security & Lake Formation row filters & Synapse RLS / OneLake security & BigQuery row access policies \\
+Policy-tag binding & LF tag expressions & Label-inherited protection & Policy tag taxonomy \\
+Erasure support & S3 Object Lock exceptions, KMS shred & Purview + CMK shredding & CMEK key destruction \\
+\addlinespace
+Snowflake equivalent & \multicolumn{3}{l}{Object tags, tag-based masking policies, row access policies, crypto-shredding} \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+\textbf{MongoDB} offers client-side field-level encryption; \textbf{Fabric} inherits Purview labels into OneLake. Snowflake's distinctive leverage: tags attach to \emph{columns}, policies attach to \emph{tags}, so classifying a column once protects it in every query, clone, and share that touches it.
+\end{crosscloud}
+
+\section{Week 18 Roadmap}
+Chapter 17 controlled who reaches the door. This chapter controls what they see through it: masking columns for unauthorized eyes, filtering rows by entitlement, and---when regulation demands---making data vanish everywhere it ever flowed, including clones and Fail-safe \cite{snowflakeMaskingDocs,snowflakeRowAccessDocs}.
+
+Monday covers object tagging as classification infrastructure. Tuesday builds dynamic masking. Wednesday handles row access policies and the GDPR erasure problem. Thursday implements tag-based masking plus regional row filtering. Friday assembles the full compliance framework.
+
+\begin{keyterms}
+\textbf{Object tag}: a key-value label applied to Snowflake objects for classification and governance.\quad
+\textbf{Masking policy}: a column-attached rule returning obfuscated values based on session context.\quad
+\textbf{Tag-based masking}: a masking policy attached to a tag, protecting every column carrying that tag.\quad
+\textbf{Row access policy}: a table-attached predicate filtering visible rows by caller context.\quad
+\textbf{Crypto-shredding}: rendering data unrecoverable by destroying its per-subject encryption key.
+\end{keyterms}
+
+\section{Monday: Object Tagging as Classification Infrastructure}
+\index{object tagging}\index{data classification}
+An object tag is governed metadata: \texttt{pii\_email = 'true'} on a column declares what the data \emph{is}, independent of who queries it. Tags are schema objects with their own RBAC, propagate to columns via \texttt{ALTER TABLE ... SET TAG}, and are visible in \texttt{ACCOUNT\_USAGE.TAG\_REFERENCES}---which turns ``where is all the PII?'' from an audit project into a query.
+
+\begin{definitionbox}
+\textbf{Tag-based governance} separates classification from enforcement: tags classify data once; masking policies, access rules, and lineage reports all consume the tags. Adding a new PII column is a tagging decision, and every existing control applies automatically.
+\end{definitionbox}
+
+Snowflake's \texttt{SNOWFLAKE.CORE} functions (and automatic classification for new tables) can suggest PII tags by profiling column content---useful for the initial estate inventory, but the engineered state is intentional tags in DDL, reviewed like code. Tags also power lineage: \texttt{OBJECT\_TAGGING} lineage reports show where tagged data flows through views, CTAS, and clones.
+
+\begin{tipbox}
+Standardize a tag taxonomy early: \texttt{pii\_*} (classification), \texttt{fin\_*} (financial), \texttt{retention\_*} (lifecycle). Allowed-values lists on tags (\texttt{ALLOWED\_VALUES}) prevent the taxonomy from decaying into free text.
+\end{tipbox}
+
+\section{Tuesday: Dynamic Data Masking}
+\index{masking policy}\index{tag-based masking}
+A masking policy is a function over a column value plus the caller's context: return the value for entitled roles, an obfuscation for everyone else. Policies evaluate per query at runtime---the stored data is untouched, so no desensitized copies drift out of sync.
+
+\begin{lstlisting}[language=SQL, caption={A role-aware masking policy, bound to a tag}]
+CREATE OR REPLACE MASKING POLICY pii_mask AS
+  (val STRING) RETURNS STRING ->
+  CASE WHEN IS_ROLE_IN_SESSION('HR_ROLE') THEN val
+       WHEN IS_ROLE_IN_SESSION('ANALYST') THEN
+            REGEXP_REPLACE(val, '.+@', '***@')   -- domain visible
+       ELSE '***MASKED***' END;
+
+ALTER TAG pii_email SET MASKING POLICY pii_mask;
+-- every column tagged pii_email is now masked by role
+\end{lstlisting}
+
+Binding the policy to the \emph{tag} rather than each column is the scaling move: the hundredth PII column is protected by tagging it, with zero new policy code. Masking policies apply to views, clones, and shares automatically---the policy follows the column, not the container.
+
+\begin{pitfall}
+\textbf{Masking does not protect against aggregate inference.} If analysts can \texttt{AVG(salary) GROUP BY department} on unmasked numerics, small groups leak individuals. Masking is column-level; inference control needs row access policies (Wednesday) plus minimum-cohort rules in shared products (Chapter 20).
+\end{pitfall}
+
+\begin{notebox}
+Test masking policies against \emph{every consuming role}, including simulated \texttt{ACCOUNTADMIN}. Policy bugs that show cleartext to an over-privileged role are found by negative tests, not by reading the CASE expression.
+\end{notebox}
+
+\section{Wednesday: Row Access Policies and GDPR Erasure}
+\index{row access policy}\index{GDPR erasure}\index{crypto-shredding}
+\subsection{Row Access Policies}
+A row access policy is a filter the engine applies invisibly: the query's author writes \texttt{SELECT * FROM sales}; the engine evaluates the policy per row. Entitlements typically live in a mapping table---\texttt{sales\_entitlements(role, region)}---so policy bodies stay stable while access changes are data changes:
+
+\begin{lstlisting}[language=SQL, caption={Row access policy driven by an entitlements table}]
+CREATE OR REPLACE ROW ACCESS POLICY regional_rap AS
+  (sales_region STRING) RETURNS BOOLEAN ->
+  IS_ROLE_IN_SESSION('REGIONAL_ADMIN')
+  OR EXISTS (
+    SELECT 1 FROM gov.sales_entitlements e
+    WHERE e.role_name = CURRENT_ROLE()
+      AND e.region = sales_region
+  );
+
+ALTER TABLE gold.sales ADD ROW ACCESS POLICY regional_rap ON (region);
+\end{lstlisting}
+
+Policies compose with masking orthogonally: masking decides \emph{what a visible row shows}; row policies decide \emph{which rows exist for you}. Multi-tenant designs lean on both.
+
+\subsection{GDPR Erasure: Why DELETE Is Not Enough}
+\index{right to erasure}
+A naive \texttt{DELETE} leaves the subject recoverable everywhere: Time Travel (up to 90 days), Fail-safe (7 further days), clones created before the delete (they share micro-partitions), unconsumed stream offsets (deletes replay downstream), Snowpipe Streaming channel buffers, and reader-account views. A defensible erasure process therefore chooses one of two architectures:
+
+\begin{enumerate}
+    \item \textbf{Retention-bounded deletion:} delete the rows everywhere (raw, silver, gold; recreate or swap clones; let stream consumers replay the delete), set \texttt{DATA\_RETENTION\_TIME\_IN\_DAYS = 0} on PII schemas, and wait out Fail-safe---documented, slow, complete.
+    \item \textbf{Crypto-shredding:} encrypt PII per data subject with subject-specific keys held in an external KMS (reached via external functions, or customer-managed keys with Tri-Secret Secure). Erasure destroys the subject's key; every copy---clones, backups, Fail-safe---becomes permanently unreadable instantly.
+\end{enumerate}
+
+\begin{pitfall}
+\textbf{Legal hold must override erasure.} An erasure task checks a legal-hold table first; held subjects are exempted with extended \texttt{DATA\_RETENTION\_TIME\_IN\_DAYS} documented as the audit-trail exception. Deleting held data is worse than keeping it.
+\end{pitfall}
+
+\section{Thursday Hands-On Project: Tag-Based Masking and Regional Row Filtering}
+\index{hands-on project!masking}
+This lab implements both enforcement layers and tests them adversarially.
+
+\subsection*{Scenario}
+HR data carries SSNs that only HR may see; sales reps must see only their region's rows. New PII columns added next quarter must be protected by tagging alone.
+
+\subsection*{Procedure}
+\begin{enumerate}
+    \item Create tags \texttt{pii\_ssn} and \texttt{pii\_email} with the governance taxonomy.
+    \item Create the masking policy from Tuesday and bind it to both tags; tag the relevant columns.
+    \item Create the entitlements table and regional row access policy from Wednesday; attach to \texttt{gold.sales}.
+    \item As each role (HR, ANALYST, SALES\_EAST, SALES\_WEST), run the same queries and record the visible differences.
+    \item Add a brand-new SSN column, tag it only, and prove masking applies with no policy change.
+    \item Attempt bypasses: aggregate inference on a small group, and a direct entitlements-table edit attempt as a non-admin.
+\end{enumerate}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item \textbf{DDL pack:} tags, masking policy, row access policy, entitlements table, grants.
+    \item \textbf{Test matrix:} role $\times$ query with observed outputs, including the bypass attempts.
+    \item \textbf{Classification report:} \texttt{TAG\_REFERENCES} query listing all PII columns and their policies.
+    \item \textbf{Rollout plan:} how new columns acquire protection (tagging in CI) and how policies are recertified.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item Non-HR roles never see cleartext SSN through any tested path, including via views and clones.
+    \item Regional filtering holds for direct queries, joins, and aggregates.
+    \item A newly tagged column is masked with zero policy edits.
+    \item The aggregate-inference test is documented with its row-policy mitigation.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Implement the retention-bounded erasure procedure end to end on a sandbox subject, including clone swap.
+    \item Prototype crypto-shredding with per-subject keys via an external KMS mock.
+    \item Build the masking-policy CI gate: untagged PII-looking column names fail the deploy.
+\end{itemize}
+
+\section{Friday Real-World Architecture: HIPAA/GDPR Compliance Framework}
+\index{Real-World Architecture!compliance framework}\index{HIPAA}
+A health-tech company processes patient-adjacent data across 40 schemas. Regulators require demonstrable classification, enforced minimization, and provable erasure.
+
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[
+        cls/.style={rectangle, rounded corners, draw=primary, thick, fill=primary!6, align=center, minimum width=3.0cm, minimum height=1.0cm, font=\small\bfseries},
+        pol/.style={rectangle, rounded corners, draw=codegreen!60!black, thick, fill=green!8, align=center, minimum width=3.0cm, minimum height=1.0cm, font=\small\bfseries},
+        era/.style={rectangle, rounded corners, draw=red!60!black, thick, fill=red!8, align=center, minimum width=3.0cm, minimum height=1.0cm, font=\small\bfseries},
+        arrow/.style={-{Stealth[length=2.5mm]}, draw=primary, thick},
+        lbl/.style={font=\scriptsize\itshape, text=codegray}
+    ]
+        \node[cls] (tag) at (0, 0) {Tag taxonomy\\pii\_*, phi\_*, retention\_*};
+        \node[pol] (mask) at (4.6, 1.3) {Tag-based masking\\policies};
+        \node[pol] (rap) at (4.6, -1.3) {Row access policies\\+ entitlements};
+        \node[era] (shred) at (9.4, 0) {Erasure service\\crypto-shredding\\+ legal-hold check};
+        \node[cls] (audit) at (13.4, 0) {Audit evidence\\TAG\_REFERENCES,\\ACCESS\_HISTORY};
+        \draw[arrow] (tag) -- (mask);
+        \draw[arrow] (tag) -- (rap);
+        \draw[arrow] (tag) -- node[lbl, above]{subject keys} (shred);
+        \draw[arrow] (mask) -- (audit);
+        \draw[arrow] (rap) -- (audit);
+        \draw[arrow] (shred) -- (audit);
+    \end{tikzpicture}%
+    }
+    \caption{Compliance framework: classification tags feed enforcement (masking, row policies) and erasure (crypto-shredding), with ACCOUNT\_USAGE as the evidence layer.}
+    \label{fig:chapter18-compliance}
+\end{figure}
+
+\subsection{Framework Components}
+\begin{enumerate}
+    \item \textbf{Classification as code:} tags in DDL, suggested tags from automatic classification reviewed into the taxonomy, and the CI gate rejecting untagged sensitive-looking columns.
+    \item \textbf{Enforcement:} tag-based masking for identifiers and contact data; row access policies for ward/clinic tenancy; minimum-cohort rules on any shared aggregate.
+    \item \textbf{Erasure:} per-subject envelope encryption keys in an external KMS; the erasure service checks legal hold, then destroys the key---rendering every copy unreadable, Fail-safe included.
+    \item \textbf{Evidence:} \texttt{TAG\_REFERENCES} for classification coverage, \texttt{ACCESS\_HISTORY} for who touched PHI, masking-policy test results, and erasure completion logs---the audit binder regenerates itself weekly.
+\end{enumerate}
+
+\begin{pitfall}
+\textbf{A framework measured by policy count instead of test results is compliance theater.} The artifacts that survive audits are the negative-test matrix, the erasure completion log, and the coverage query showing zero untagged sensitive columns---all produced continuously, not assembled before the audit.
+\end{pitfall}
+
+\section{Interview Q\&A}
+\begin{enumerate}
+    \item \textbf{Q: What session context does a masking policy evaluate?}\\
+    A: Functions like \texttt{CURRENT\_ROLE()} and \texttt{IS\_ROLE\_IN\_SESSION()} over the querying session, evaluated per query at runtime against the stored value.
+    \item \textbf{Q: How does tag-based masking scale across hundreds of columns?}\\
+    A: The policy binds to the tag once; every column carrying the tag is protected automatically, including columns added later.
+    \item \textbf{Q: What do row access policies typically filter on?}\\
+    A: Caller context (role, user) joined to an entitlements mapping table, so access changes are data changes, not policy redeploys.
+    \item \textbf{Q: Why doesn't a plain DELETE satisfy a GDPR erasure request?}\\
+    A: Deleted rows persist in Time Travel, Fail-safe, pre-delete clones, unconsumed stream offsets, and shared/reader-account views.
+    \item \textbf{Q: How does crypto-shredding erase data held in clones and Fail-safe?}\\
+    A: PII is encrypted per subject with external KMS keys; destroying the subject's key makes every copy of the ciphertext---backups and Fail-safe included---permanently unreadable.
+\end{enumerate}
+
+\section{Further Reading}
+Snowflake's column-level and row-level security guides define masking and row access policies \cite{snowflakeMaskingDocs,snowflakeRowAccessDocs}; the object-tagging documentation covers tags and lineage \cite{snowflakeTaggingDocs}. Chapter 4's Time Travel and Fail-safe mechanics define the erasure boundary \cite{snowflakeTimeTravelDocs,snowflakeFailSafeDocs}, and Chapter 20 extends these ideas into multi-party clean rooms.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item Tags classify once; policies enforce everywhere the data flows---columns, views, clones, shares.
+    \item Masking decides what a visible row shows; row access policies decide which rows exist.
+    \item Entitlements tables keep policy bodies stable while access changes as data.
+    \item Masking is not inference control---aggregates leak; add row policies and cohort minimums.
+    \item DELETE is not erasure: Time Travel, Fail-safe, clones, streams, and shares all retain.
+    \item Crypto-shredding with per-subject keys is the only instant, total erasure; legal hold overrides everything.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Compare masking policies, secure views, and row access policies as enforcement points.
+    \item \textbf{(Conceptual)} Explain why policy-on-tag beats policy-on-column at 500 columns.
+    \item \textbf{(Hands-on)} Build a masking policy with three role tiers and prove each tier's output.
+    \item \textbf{(Hands-on)} Demonstrate the aggregate-inference leak and close it with a row policy or cohort floor.
+    \item \textbf{(Hands-on)} Execute the retention-bounded erasure on a test subject and document every copy eliminated.
+    \item \textbf{(Design)} Write the tag taxonomy and allowed-values design for a financial-services tenant.
+    \item \textbf{(Design)} Design the legal-hold table and the erasure task's decision flow.
+    \item \textbf{(Operations)} Build the classification-coverage report: sensitive-looking columns lacking tags.
+    \item \textbf{(Security)} Threat-model the entitlements table: who can write it, and how are edits audited?
+    \item \textbf{(Interview)} Explain crypto-shredding to a regulator in five sentences.
+\end{enumerate}

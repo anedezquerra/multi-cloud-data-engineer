@@ -1,0 +1,321 @@
+\chapter{Data Science Foundations in Fabric}
+\index{Data Science experience}\index{Data Wrangler}\index{exploratory data analysis}\index{feature engineering}\index{data leakage}\index{Pandas}\index{PySpark!EDA}%
+
+\begin{objectives}
+\begin{itemize}
+    \item Navigate the Fabric Data Science experience: notebooks, Data Wrangler, and the lakehouse connection.
+    \item Clean data visually with Data Wrangler and export the generated PySpark code.
+    \item Perform exploratory data analysis on samples before committing to full Spark passes.
+    \item Engineer features that are safe from target and temporal leakage.
+    \item Keep feature sets governed in the lakehouse instead of scattered CSV exports.
+    \item Architect a Spark-native daily inventory forecasting system for 1,000 retail stores.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+Notebook-centered data science over lake storage is the dominant pattern across platforms; the differences are in how tightly tracking, registry, and storage are integrated.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{2.8cm}p{3.2cm}p{3.2cm}p{3.2cm}p{3.2cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{Fabric} & \textbf{AWS} & \textbf{GCP} & \textbf{Snowflake} \\
+\midrule
+Notebooks & Fabric notebooks (Spark) & SageMaker Studio / EMR notebooks & Vertex AI Workbench / Colab & Snowflake Notebooks \\
+Visual prep & Data Wrangler & Data Wrangler (SageMaker) & Vertex / Colab tooling & Snowsight / worksheets \\
+Compute for EDA & Starter pools + custom pools & SageMaker instances / EMR & Vertex runtimes / Dataproc & Snowpark warehouses \\
+Feature storage & Lakehouse Delta tables & Feature Store (SageMaker) & Vertex AI Feature Store & Feature Store / tables \\
+Experiment tracking & Built-in MLflow & SageMaker Experiments / MLflow & Vertex AI Experiments & MLflow / Snowpark ML \\
+Sample-first EDA & Pandas on Spark samples & SageMaker Processing & BigQuery sampling & \texttt{SAMPLE} clauses \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+Databricks is the closest relative---Fabric's data-science experience deliberately mirrors its notebook-first, MLflow-tracked shape. MongoDB feeds these platforms through connectors rather than hosting ML itself. The portable discipline: \emph{explore on samples, engineer features without leakage, and store features as governed tables}.
+\end{crosscloud}
+
+\begin{keyterms}
+\textbf{Data Wrangler}: the visual, code-generating data-cleaning tool embedded in Fabric notebooks. \quad
+\textbf{EDA}: exploratory data analysis---profiling distributions, nulls, and relationships before modeling. \quad
+\textbf{Feature}: a model input column derived from raw data. \quad
+\textbf{Data leakage}: information in training features that would not exist at prediction time. \quad
+\textbf{Feature set}: a governed, versioned Delta table of model-ready features. \quad
+\textbf{Spark-native}: computed where the data lives, in distributed Spark, rather than exported to single-node tools.
+\end{keyterms}
+
+\section{Week 17 Roadmap}
+Week~17 opens Part~V, the data-science and AI arc---written, like the rest of this book, for the data engineer who must make ML work \emph{production-shaped}. Monday covers the Data Science experience: notebooks and Data Wrangler. Tuesday builds EDA discipline with Pandas and PySpark, samples first. Wednesday is the conceptual core: feature engineering and the leakage failure modes that silently invalidate models. Thursday is the hands-on project: visual cleaning in Data Wrangler with generated PySpark code. Friday architects Spark-native daily inventory forecasting for 1,000 stores.
+
+Data engineers do not usually train the models, but they own everything the models stand on: clean inputs, honest features, reproducible pipelines. A model trained on leaked features is a production incident scheduled for later \cite{microsoftFabricDataScience}.
+
+\begin{notebox}
+The week's recurring trap: a workflow that works beautifully in a notebook on a sample, then fails silently at full scale---either computationally (a Pandas pattern that does not distribute) or statistically (a feature computed with tomorrow's information). Both are engineering failures, and both are this week's business.
+\end{notebox}
+
+\section{Monday: The Data Science Experience}
+\index{Data Science experience}\index{Data Wrangler!overview}
+Fabric's Data Science experience centers on the notebook you already know from Week~3, extended with ML-native items: experiments, models, and the visual Data Wrangler tool \cite{microsoftFabricDataScience}. The lakehouse attachment is the constant: notebooks read and write Delta tables in OneLake, so data science inherits the governance of Part~I rather than inventing a parallel storage world.
+
+\subsection{Data Wrangler}
+Data Wrangler is visual data cleaning inside the notebook: point at a DataFrame, apply operations---fill nulls, drop columns, encode categories, filter outliers---through a UI, and watch the corresponding PySpark code generate live. The generated code is the deliverable: it is reviewable, diffable, and reusable, which a point-and-click session alone is not.
+
+\begin{definitionbox}
+\textbf{Data Wrangler} is Fabric's visual data-preparation surface that converts interactive cleaning steps into executable PySpark or Pandas code, merging the speed of visual exploration with the reproducibility of code.
+\end{definitionbox}
+
+\begin{pitfall}
+Data Wrangler's output is only as reproducible as you make it. Export the generated code into a parameterized notebook cell, not into a one-off cell you ran by hand once. The visual session is exploration; the exported code is engineering.
+\end{pitfall}
+
+\section{Tuesday: EDA with Pandas and PySpark}
+\index{exploratory data analysis}\index{Pandas!versus PySpark}\index{sampling}
+EDA answers three questions before any modeling: what is in this data (distributions, types, ranges), what is wrong with it (nulls, duplicates, impossible values), and what relates to what (correlations, group structures) \cite{microsoftFabricDataScience}.
+
+The scale discipline: \textbf{explore on samples, verify at scale}. Pull a 1--5\% sample (or a time-bounded slice) into Pandas for fast iteration---histograms, scatter matrices, value counts. Then confirm the sample's claims with targeted full-set PySpark aggregations: global null rates, cardinalities, min/max bounds. The sample is for thinking speed; the full pass is for truth.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{4.6cm}p{4.4cm}p{4.6cm}@{}}
+\toprule
+\textbf{EDA task} & \textbf{Tool} & \textbf{Scale note} \\
+\midrule
+Distributions, plots, quick pivots & Pandas on a sample & Fast iteration; mind sampling bias \\
+Null/duplicate/validity rates & PySpark full pass & Cheap aggregations, full truth \\
+Cardinality and joins feasibility & PySpark full pass & \texttt{approx\_count\_distinct} for huge sets \\
+Correlations on big data & Sample first, verify on full & Correlation on a biased sample lies \\
+\bottomrule
+\end{tabular}
+\caption{Sample-first EDA: which tool answers which question.}
+\label{tab:chapter17-eda}
+\end{table}
+
+\begin{tipbox}
+Sample \emph{stratified}, not just randomly, when the data has structure: a random 1\% of clickstream is mostly your noisiest hour. Sample per day or per segment so the exploration matches the population.
+\end{tipbox}
+
+\section{Wednesday: Feature Engineering and Leakage}
+\index{feature engineering}\index{data leakage}\index{training-serving skew}
+Feature engineering transforms raw columns into model inputs: ratios, aggregates over windows, encodings, flags. In Fabric, features are computed in Spark and stored as Delta tables in the lakehouse---governed, versioned, and shared---rather than as CSV exports on a laptop \cite{microsoftFabricDataScience,microsoftFabricNotebooks}.
+
+\subsection{The Leakage Taxonomy}
+Leakage is information in training that will not exist at prediction time. It produces models that ace evaluation and fail in production. The recurring species:
+
+\begin{itemize}
+    \item \textbf{Target leakage}: a feature derived from the outcome---a ``churn\_reason'' column available only after churn.
+    \item \textbf{Temporal leakage}: aggregates computed over windows that include the future---a customer's ``total lifetime spend'' used to predict their second purchase.
+    \item \textbf{Preprocessing leakage}: scalers or encodings fit on the full dataset before the train/test split, so test statistics bleed into training.
+    \item \textbf{Group leakage}: the same entity split across train and test---one customer's sessions in both sets.
+\end{itemize}
+
+\begin{definitionbox}
+\textbf{Data leakage} is the presence of information in model inputs that would be unavailable---or computed differently---at the time the model must actually make its prediction.
+\end{definitionbox}
+
+The engineering defenses: fixed training windows (features computed as-of a declared cutoff date, never ``as of now''); the same feature-computation code path for training and serving (Chapter~20's skew battle); group-aware splits; and a feature table with an \texttt{as\_of\_date} column that makes temporality explicit.
+
+\begin{pitfall}
+``As-of-now'' features are the quiet killer. A feature pipeline that computes aggregates over all history up to run time trains on the future for every historical row. Every feature needs an explicit as-of timestamp, and the training set must be rebuildable for any historical date.
+\end{pitfall}
+
+\section{Thursday: Hands-on Project}
+\index{hands-on lab}\index{Data Wrangler!hands-on}
+The Week~17 lab uses Data Wrangler in a notebook to visually clean a dataset---missing values, type fixes, outlier handling---and generates the corresponding PySpark code automatically, then hardens that code into a reusable, parameterized cell.
+
+\subsection{Goal and Architecture}
+Work in \texttt{fabric-de-week17} with lakehouse \texttt{lh\_retail}. Use a Silver retail table from Part~I or a provided messy extract (\texttt{silver\_store\_sales\_raw}) containing nulls, string-typed numbers, and outliers. The output is a cleaned Delta table \texttt{features\_store\_sales} plus the exported, parameterized cleaning code.
+
+\subsection{Step-by-Step Actions}
+\begin{enumerate}
+    \item Load the raw table into a notebook DataFrame and open Data Wrangler.
+    \item Clean visually: fill missing \texttt{units} with 0, cast \texttt{revenue} from string to double, drop rows with negative revenue, cap outliers at the 99th percentile.
+    \item Export the generated PySpark code into a notebook cell.
+    \item Parameterize it: input table, output table, and \texttt{as\_of\_date} come from the parameter cell.
+    \item Run the parameterized cell end-to-end and validate the output schema and counts.
+    \item Compute one windowed feature---\texttt{revenue\_7d\_avg} per store---with the window ending at \texttt{as\_of\_date}, never after.
+    \item Write \texttt{features\_store\_sales} as a Delta table with the \texttt{as\_of\_date} column.
+\end{enumerate}
+
+\begin{lstlisting}[language=Python,caption={Leakage-safe windowed feature: the window ends at the as-of date.},label={lst:chapter17-feature}]
+from pyspark.sql import functions as F, Window
+
+as_of = dbutils.widgets.get("as_of_date") if "dbutils" in dir() else "2026-07-31"
+
+df = spark.read.table("features_store_sales").where(F.col("sale_date") <= as_of)
+
+w = (Window.partitionBy("store_id")
+           .orderBy("sale_date")
+           .rowsBetween(-6, 0))  # trailing 7 days, ending at the row's date
+
+features = (df.withColumn("revenue_7d_avg", F.avg("revenue").over(w))
+              .withColumn("as_of_date", F.lit(as_of)))
+
+(features.write.format("delta").mode("overwrite")
+         .option("replaceWhere", f"as_of_date = '{as_of}'")
+         .saveAsTable("gold.features_store_daily"))
+\end{lstlisting}
+
+\subsection{Validation Checklist}
+\begin{itemize}
+    \item The exported Data Wrangler code runs unmodified and reproduces the visual result.
+    \item The parameterized version rebuilds the feature table for any historical \texttt{as\_of\_date}.
+    \item No feature uses information dated after its row's \texttt{as\_of\_date}.
+    \item Null, negative, and outlier handling are visible in the exported code, not just the UI.
+    \item The feature table is a governed Delta table, not a CSV.
+    \item A teammate can regenerate yesterday's features exactly.
+\end{itemize}
+
+\section{Friday: Use Case and Architecture}
+\index{forecasting!inventory}\index{Spark-native pipelines}
+A retail group must forecast daily inventory needs for 1,000 stores. Constraint: purely Spark-based pipelines---no per-store Python loops on a driver node, no exports to a separate ML estate.
+
+\subsection{The Architecture}
+Nightly, a pipeline lands yesterday's sales into the lakehouse; a feature notebook rebuilds \texttt{gold.features\_store\_daily} partition-by-partition (one \texttt{replaceWhere} per \texttt{as\_of\_date}); a training notebook fits per-store or per-segment models distributed across the cluster---Spark MLlib, or a pandas-UDF pattern applying a simple model per store group; predictions land in \texttt{gold.inventory\_forecast}, keyed by store, date, and model version. Everything reads and writes Delta; nothing leaves the lakehouse; Chapter~20 adds the scoring automation and drift detection that complete the loop.
+
+\begin{figure}[H]
+    \centering
+    \begin{tikzpicture}[node distance=8mm and 9mm]
+        \node[store] (sales) at (0,0) {silver sales\\(nightly)};
+        \node[stage] (feat) at (4.4,0) {Feature build\\(as-of windows)};
+        \node[store] (ft) at (8.8,0) {gold.features\_\\store\_daily};
+        \node[stage] (train) at (13.0,0) {Distributed\\training};
+        \node[store] (fc) at (16.8,0) {gold.inventory\_\\forecast};
+
+        \draw[arrow] (sales) -- (feat);
+        \draw[arrow] (feat) -- (ft);
+        \draw[arrow] (ft) -- (train);
+        \draw[arrow] (train) -- (fc);
+
+        \node[note, text width=13cm, align=center] at (8.4,-1.9) {Spark-native: every stage reads and writes Delta in OneLake; no exports, no driver-node loops.};
+    \end{tikzpicture}
+    \caption{Spark-native inventory forecasting for 1,000 stores.}
+    \label{fig:chapter17-forecast}
+\end{figure}
+
+\begin{pitfall}
+The ``loop over 1,000 stores in the driver'' pattern works on the sample and dies in production: hours of serial compute, one giant point of failure, no parallelism. Grouped map / pandas UDFs or per-segment distributed models keep the work on the executors where the data already lives.
+\end{pitfall}
+
+\section{Operational Guidance for Week 17}
+Data science becomes engineering when someone else must rerun it. Parameterize, version, and make every feature reproducible for any historical date.
+
+\subsection{Performance and Reliability}
+Explore on samples; verify with targeted full passes. Cache intermediate DataFrames deliberately, not reflexively. Partition feature tables by \texttt{as\_of\_date} so rebuilds are surgical. Keep Data Wrangler exports under review like any transformation code.
+
+\subsection{Security and Governance Checklist}
+\begin{itemize}
+    \item Feature tables carry owners, as-of semantics, and sensitivity classifications.
+    \item Personal data in features inherits Part~I and Chapter~22 protections.
+    \item Notebook parameters replace all hardcoded paths and dates.
+    \item Sampling methods are documented---stratification choices are modeling decisions.
+    \item Leakage review is a standing agenda item for every new feature set.
+    \item No CSV extracts leave the governed lakehouse for model inputs.
+\end{itemize}
+
+\section{Interview Q\&A}
+\begin{enumerate}
+    \item \textbf{Q: What does Data Wrangler generate from your visual cleaning steps?}\\
+    A: Executable PySpark (or Pandas) code---the visual session is exploration, and the exported, parameterized code is the engineering artifact that enters version control.
+    \item \textbf{Q: Why run EDA on a sample before a full PySpark pass?}\\
+    A: Iteration speed---plots and pivots return in seconds on a sample---followed by targeted full-set aggregations to confirm the sample's claims, because biased samples lie.
+    \item \textbf{Q: Name two leakage risks in feature engineering.}\\
+    A: Temporal leakage---windows computed past the as-of date---and preprocessing leakage---scalers fit before the train/test split. (Target and group leakage are the other canonical pair.)
+    \item \textbf{Q: Why keep feature sets in the lakehouse instead of CSV exports?}\\
+    A: Governance and reproducibility: Delta tables carry schema enforcement, history, owners, and as-of partitions; CSVs carry none of that and fork silently.
+    \item \textbf{Q: What makes a forecasting pipeline Spark-native?}\\
+    A: Every stage reads and writes Delta in OneLake and distributes across executors---no driver-node serial loops, no exports to a separate ML estate.
+    \item \textbf{Q: Why must training features be rebuildable for any historical date?}\\
+    A: Because a feature computed ``as of now'' for a historical row trains on the future; explicit as-of dating is what makes backtests honest and leakage testable.
+\end{enumerate}
+
+\section{Further Reading}
+Review the Fabric Data Science experience \cite{microsoftFabricDataScience} and notebook guidance \cite{microsoftFabricNotebooks}. Feature storage inherits the lakehouse and Delta discipline of Part~I \cite{microsoftFabricLakehouse,deltaLakeDocs}. The tracking and operationalization continuations arrive in Chapters~18--20 \cite{microsoftMlflowFabric,mlflowDocs,microsoftFabricMlTraining}.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item Fabric data science runs on the same lakehouse governance as data engineering---there is no separate storage world.
+    \item Data Wrangler accelerates exploration; its exported, parameterized code is the production artifact.
+    \item EDA is sample-first for speed, full-pass for truth---and stratified sampling is a modeling decision.
+    \item Leakage---target, temporal, preprocessing, group---is an engineering defect with statistical symptoms.
+    \item Every feature carries an as-of date, and every training set is rebuildable historically.
+    \item Feature sets are governed Delta tables, never CSV exports.
+    \item Spark-native means distributed compute over lake data; driver-node loops over 1,000 stores are a scalability bug.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Give one realistic example of each leakage species from a churn-prediction project.
+    \item \textbf{(Conceptual)} Why does a biased sample corrupt EDA conclusions even when the full data is available later?
+    \item \textbf{(Hands-on)} Rebuild the lab's feature table for three historical as-of dates and verify partitions are disjoint.
+    \item \textbf{(Hands-on)} Add a leakage test: assert no feature row references data dated after its \texttt{as\_of\_date}.
+    \item \textbf{(Design)} Design the feature-table schema for the inventory forecast: keys, as-of columns, and the rebuild contract.
+    \item \textbf{(Design)} Choose between per-store models and per-segment models for the 1,000-store problem; defend with sparsity and operations arguments.
+    \item \textbf{(Interview)} In five sentences, explain how you would detect temporal leakage in a colleague's feature pipeline.
+    \item \textbf{(Operational)} Write the runbook for ``yesterday's features disagree with a same-day rebuild''---where do you look first?
+\end{enumerate}
+
+\section{Capstone Project: Leakage-Safe Feature Store Slice}\label{sec:ch17-capstone}
+\index{capstone project}\index{feature engineering!capstone}\index{data leakage!capstone}
+
+\begin{capstonebox}
+\textbf{Mission.} Build the feature foundation for the Part~V capstones: a governed, as-of-dated feature table for store-day forecasting, produced by a parameterized notebook with Data Wrangler-exported cleaning, a leakage test suite, and historical rebuilds proven for three dates.
+
+\textbf{Estimated time.} 4--6 hours.
+
+\textbf{What you'll practice.}
+\begin{itemize}
+    \item Converting visual cleaning into parameterized, reviewed code.
+    \item As-of-dated windowed features with surgical partition rebuilds.
+    \item Automated leakage and schema tests over feature tables.
+    \item Documentation that makes a feature set a governed product.
+\end{itemize}
+\end{capstonebox}
+
+\subsection*{Scenario}
+Contoso Retail's data scientists are ready to model daily store demand, but their last attempt trained on leaked features and embarrassed everyone in backtesting. Engineering will deliver the feature table and the proof that it is leak-free; science will build models on it in Chapter~18.
+
+\subsection*{Requirements}
+\begin{itemize}
+    \item \texttt{gold.features\_store\_daily} partitioned by \texttt{as\_of\_date}, keyed by (\texttt{store\_id}, \texttt{as\_of\_date}).
+    \item At least five features including a trailing-window aggregate and a calendar feature.
+    \item The parameterized build notebook with Data Wrangler-exported cleaning steps.
+    \item A test suite: schema, nulls, uniqueness, and the leakage assertion.
+    \item Rebuild evidence for three historical dates with identical re-run results.
+    \item A feature dictionary: per-feature definition, window, source columns, owner.
+\end{itemize}
+
+\subsection*{Implementation Steps}
+\begin{enumerate}
+    \item Clean the source in Data Wrangler; export and parameterize the code.
+    \item Implement the windowed features with as-of discipline.
+    \item Write the partitioned Delta table with \texttt{replaceWhere}.
+    \item Implement the test suite; prove it fails on an injected leak.
+    \item Rebuild three historical dates; capture identity evidence.
+    \item Write the feature dictionary.
+\end{enumerate}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item The build notebook and test suite in the repository.
+    \item Test output including the deliberate-leak failure case.
+    \item Rebuild identity evidence (row counts and checksums per date).
+    \item The feature dictionary.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item[\(\square\)] The feature table rebuilds identically for any historical as-of date.
+    \item[\(\square\)] The leakage test demonstrably fails when a future-dated input is injected.
+    \item[\(\square\)] Keys are unique per (store, as-of date) and the suite proves it.
+    \item[\(\square\)] No feature references data after its row's as-of date.
+    \item[\(\square\)] The feature dictionary defines every column and its owner.
+    \item[\(\square\)] No CSV exports or hardcoded paths exist anywhere in the flow.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Add stratified-sample EDA evidence to the feature dictionary.
+    \item Add a second window length and measure its effect on downstream model skill.
+    \item Automate the rebuild as a pipeline step with the Chapter~12 alerting discipline.
+    \item Publish feature freshness SLAs and the monitor that enforces them.
+\end{itemize}

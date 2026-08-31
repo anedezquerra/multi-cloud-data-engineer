@@ -1,0 +1,288 @@
+\chapter{Administration and CI/CD}
+\index{capacity management}\index{Capacity Metrics app}\index{throttling}\index{surge protection}\index{Git integration}\index{deployment pipelines}\index{disaster recovery}\index{expand-contract}\index{BCDR}%
+
+\begin{objectives}
+\begin{itemize}
+    \item Manage Fabric capacities: metrics, throttling behavior, pause/resume, and scale-up decisions.
+    \item Sync workspaces with Azure DevOps or GitHub through Git integration.
+    \item Promote items through Dev $\rightarrow$ Test $\rightarrow$ Prod with deployment pipelines.
+    \item Explain Fabric's disaster-recovery reality: Git as item recovery, Delta time travel as data recovery, no automatic cross-region failover.
+    \item Deploy zero-downtime schema changes with the expand--migrate--contract pattern and deploy ordering.
+    \item Design an enterprise CI/CD workflow for multiple teams sharing one lakehouse.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+Infrastructure-as-code discipline, staged promotion, and capacity observability are universal; the Fabric-specific twist is that workspace items are SaaS objects whose source of truth must be externalized to Git.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{2.8cm}p{3.2cm}p{3.2cm}p{3.2cm}p{3.2cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{Fabric} & \textbf{AWS} & \textbf{GCP} & \textbf{Snowflake} \\
+\midrule
+Source control & Workspace Git integration (ADO/GitHub) & CloudFormation/CDK in Git & Terraform/Deployment Manager in Git & Git integration / Terraform provider \\
+Staged promotion & Deployment pipelines (Dev/Test/Prod) & Multi-account pipelines & Multi-project pipelines & Multi-database/Account promotion \\
+Capacity observability & Capacity Metrics app & CloudWatch & Cloud Monitoring & Account usage views \\
+Throttling model & CU smoothing + rejection & Per-service quotas & Quotas + rate limits & Warehouse queuing/credits \\
+DR for definitions & Git rehydration & IaC redeploy & IaC redeploy & IaC / replication \\
+DR for data & Delta time travel; no auto cross-region & Cross-region replication & Multi-region buckets/datasets & Database replication/failover \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+Databricks externalizes to Git through Repos and asset bundles; MongoDB Atlas through Terraform and API-driven automation. The portable disciplines: \emph{definitions live in Git, data recovery is a separate design, and deploy order is a correctness property}.
+\end{crosscloud}
+
+\begin{keyterms}
+\textbf{Capacity Metrics app}: the per-capacity observability surface for CU consumption and throttling. \quad
+\textbf{Throttling}: capacity protection that smooths or rejects work when CU demand exceeds supply. \quad
+\textbf{Git integration}: bidirectional sync between a workspace's items and an Azure DevOps or GitHub repository. \quad
+\textbf{Deployment pipeline}: the Dev $\rightarrow$ Test $\rightarrow$ Prod promotion mechanism with per-stage rules. \quad
+\textbf{Expand--migrate--contract}: the zero-downtime schema-change sequence: add nullable, dual-write and backfill, switch consumers, drop later. \quad
+\textbf{BCDR}: business continuity and disaster recovery design.
+\end{keyterms}
+
+\section{Week 23 Roadmap}
+Week~23 makes the estate administrable and deployable. Monday covers capacity management: the metrics app, throttling, and pause/resume discipline. Tuesday covers Git integration and its disaster-recovery role. Wednesday covers deployment pipelines, multi-region BCDR, and zero-downtime schema evolution with deploy ordering. Thursday is the hands-on project: connect a workspace to Azure DevOps, commit notebooks and pipelines, and promote through a deployment pipeline. Friday designs the enterprise CI/CD topology for multiple teams sharing a lakehouse.
+
+The week's mindset shift: workspace items are production code, and production code lives in version control with staged promotion. Fabric's SaaS convenience does not exempt it from the discipline---it makes the discipline easier to skip and therefore more important to enforce \cite{microsoftFabricGitIntegration,microsoftFabricDeploymentPipelines}.
+
+\begin{notebox}
+Fabric DR reality check, stated once and remembered: OneLake has no traditional backup/restore. Workspace items are recoverable because Git integration plus deployment pipelines rehydrate them; OneLake \emph{data} recovery relies on Delta time travel and soft-delete patterns; multi-region BCDR requires a deliberate dual-workspace design---there is no automatic cross-region failover today.
+\end{notebox}
+
+\section{Monday: Capacity Management}
+\index{capacity management}\index{throttling}\index{Capacity Metrics app}
+Capacity is the shared compute pool every chapter has drawn on; Monday teaches its management \cite{microsoftFabricCapacity,microsoftFabricMetricsApp}.
+
+\subsection{The Metrics App and Throttling}
+The Fabric Capacity Metrics app decomposes CU consumption by item, operation, and time, separating interactive from background usage. Throttling is the enforcement: when demand exceeds supply, the platform first \emph{smooths} (spreads background work forward), then \emph{delays}, then \emph{rejects}---interactive rejection being the user-facing failure. The operational insight: throttling is smoothed and delayed, so by the time users complain, you have already burned hours of interactive capacity. Watch the trend, not the complaint queue \cite{microsoftFabricMetricsApp}.
+
+\subsection{Pause, Resume, and Surge Protection}
+Pay-as-you-go capacities pause and resume on a schedule---the dev/test economy from Chapter~5. \textbf{Surge protection} guards interactive capacity against background storms: configured limits keep a runaway Spark job from consuming the executives' dashboard capacity. Alerting on CU consumption---the metrics app plus Activator rules on capacity events---turns capacity from a surprise into a signal.
+
+\begin{pitfall}
+Scaling up is not the default answer to throttling. First: find the consumer (the metrics app names it), fix the pathology (unbounded queries, unoptimized Spark, fallback storms), then size. A bigger capacity under a pathological workload is a more expensive pathology.
+\end{pitfall}
+
+\section{Tuesday: Git Integration}
+\index{Git integration}\index{disaster recovery!workspace items}
+Git integration syncs a workspace's items---notebooks, pipelines, semantic models, reports---bidirectionally with an Azure DevOps or GitHub repository \cite{microsoftFabricGitIntegration}. Commit from the workspace to Git; update the workspace from Git; branch, review, and merge with the team's normal flow.
+
+Two consequences deserve emphasis. \textbf{Disaster recovery}: because Fabric has no traditional backup for workspace metadata, Git integration plus deployment pipelines \emph{are} the recovery mechanism---a deleted workspace is rehydrated by reconnecting its repository to a fresh workspace. \textbf{Secret discipline}: items sync verbatim, so a credential pasted into a notebook (Chapter~19's warning) becomes a credential in the repository. Secret scanning on the repository is not optional.
+
+\begin{tipbox}
+Commit from the workspace at every meaningful milestone, with real messages. The Git history is simultaneously your code review record, your change log, and your disaster-recovery point. ``Commit when it works'' is a recovery strategy; ``commit eventually'' is not.
+\end{tipbox}
+
+\section{Wednesday: Deployment Pipelines, BCDR, and Zero-Downtime Schema Change}
+\index{deployment pipelines}\index{BCDR}\index{expand-contract}\index{deploy ordering}
+\subsection{Dev $\rightarrow$ Test $\rightarrow$ Prod}
+Deployment pipelines promote items across stage-bound workspaces, with deployment rules adjusting per-stage specifics (connection strings, parameters, default lakehouses) so the same item definition serves each environment \cite{microsoftFabricDeploymentPipelines}. The promotion path is the only path to production: nothing is hand-built in Prod.
+
+\subsection{Multi-Region BCDR}
+OneLake data is not automatically replicated across regions. Deliberate designs only: dual-workspace/dual-capacity layouts with data re-ingestion from source, or Delta clone strategies copying tables between regions on a schedule. Recovery objectives (RPO/RTO) are chosen per workload and priced; the default is no regional failover at all.
+
+\subsection{Zero-Downtime Schema Evolution}
+The expand--migrate--contract pattern sequences a breaking schema change so consumers never see a broken intermediate state:
+
+\begin{enumerate}
+    \item \textbf{Expand}: add the new nullable column; old and new coexist.
+    \item \textbf{Migrate}: dual-write and backfill the new column; deploy backward-compatible view shims on the SQL analytics endpoint exposing the old shape.
+    \item \textbf{Contract}: switch consumers to the new column; after a full release cycle, drop the old column.
+\end{enumerate}
+
+\textbf{Deploy ordering} is the operational crux: schema-change notebooks and view shims deploy \emph{before} the pipelines, notebooks, and semantic models that depend on them. The failure story is canonical: a deployment pipeline promoted a notebook that renamed \texttt{customer\_segment} before the Gold view shim was deployed; the Direct Lake semantic model still referenced the old column, and every executive dashboard errored at 8 a.m. The fix: view shims are a separate, always-first deployment stage, and old columns drop only after one full cycle of dual-running.
+
+\begin{pitfall}
+Deployment pipelines promote item definitions, not data and not state. A promoted pipeline points at whatever its deployment rules configure; a promoted notebook does not carry its Dev test results. Validate per stage---the artifact that passed Test is the same definition, running against different connections, which is not the same thing as the same outcome.
+\end{pitfall}
+
+\section{Thursday: Hands-on Project}
+\index{hands-on lab}\index{Git integration!hands-on}\index{deployment pipelines!hands-on}
+The Week~23 lab connects a workspace to an Azure DevOps repository, commits notebooks and pipelines, and creates a deployment pipeline promoting items to a Prod workspace.
+
+\subsection{Goal and Architecture}
+Three workspaces---\texttt{fabric-de-w23-dev}, \texttt{-test}, \texttt{-prod}---one Azure DevOps repository, one deployment pipeline binding them. Content: a lakehouse, a notebook, and a pipeline from any earlier week.
+
+\subsection{Step-by-Step Actions}
+\begin{enumerate}
+    \item Connect the Dev workspace to the repository (new branch \texttt{main} or \texttt{dev}).
+    \item Commit the lakehouse, notebook, and pipeline; verify the items appear in the repository as JSON definitions.
+    \item Create the deployment pipeline; assign the three workspaces to stages.
+    \item Deploy Dev $\rightarrow$ Test; configure a deployment rule (for example the default lakehouse reference); verify the rule applied.
+    \item Make a notebook change in Dev; commit; promote through Test to Prod; verify Prod reflects it.
+    \item Prove the DR property: disconnect and delete nothing destructive, but document---or with an instructor, execute---rehydrating a workspace from the repository.
+    \item Review the repository's secret-scanning status; remediate anything found.
+\end{enumerate}
+
+\subsection{Validation Checklist}
+\begin{itemize}
+    \item Item definitions live in Git with meaningful commit messages.
+    \item Promotion flows Dev $\rightarrow$ Test $\rightarrow$ Prod only through the pipeline.
+    \item Deployment rules correctly rewire per-stage references.
+    \item The rehydration path is documented or demonstrated.
+    \item Secret scanning runs on the repository and reports clean.
+    \item Nothing in Prod was hand-edited---the audit trail proves it.
+\end{itemize}
+
+\section{Friday: Use Case and Architecture}
+\index{enterprise CI/CD}\index{multi-team collaboration}
+Three data-engineering teams share one lakehouse-backed analytics platform. Requirements: nobody overwrites another team's code; releases are reviewed; Prod changes only through pipelines; a bad deploy rolls back in minutes.
+
+\subsection{The Design}
+\begin{itemize}
+    \item \textbf{Branch-per-team, review-to-main}: each team works in a feature branch bound to its own Dev workspace; pull requests gate merge to \texttt{main}; CODEOWNERS assigns review by folder (team A's notebooks, team B's dataflows).
+    \item \textbf{Shared contract surfaces}: the Gold schema and the cross-team table contracts (Chapter~9) live in a folder owned by the platform team; changes there require platform review---the shared lakehouse is protected by review topology, not hope.
+    \item \textbf{One deployment pipeline, staged gates}: Test requires automated checks (notebook smoke tests, contract validation); Prod requires approval; rollback is the previous commit re-promoted.
+    \item \textbf{Deploy ordering encoded}: the pipeline's stage order enforces shims-first; the contract stage deploys schema changes before dependent items.
+\end{itemize}
+
+\begin{figure}[H]
+    \centering
+    \begin{tikzpicture}[node distance=7mm and 7mm]
+        \node[stage, minimum width=2.2cm] (ta) at (0,1.6) {Team A\\branch + Dev ws};
+        \node[stage, minimum width=2.2cm] (tb) at (0,-1.6) {Team B/C\\branches + Dev ws};
+        \node[store] (git) at (4.8,0) {Git repo\\(review, CODEOWNERS)};
+        \node[stage] (test) at (9.2,0) {Test ws\\(gates)};
+        \node[stage, fill=orange!10] (prod) at (13.0,0) {Prod ws\\(approval)};
+
+        \draw[arrow] (ta) -- (git);
+        \draw[arrow] (tb) -- (git);
+        \draw[arrow] (git) -- (test);
+        \draw[arrow] (test) -- (prod);
+
+        \node[note, text width=12.5cm, align=center] at (6.6,-3.0) {Review topology protects shared surfaces; the pipeline enforces order; rollback is re-promoting the previous commit.};
+    \end{tikzpicture}
+    \caption{Multi-team CI/CD over one shared platform.}
+    \label{fig:chapter23-cicd}
+\end{figure}
+
+\begin{pitfall}
+Three teams sharing one \emph{workspace} (rather than one platform through branches and stages) collides daily: item names clash, edits race, and there is no review boundary. The unit of team isolation is the branch-bound Dev workspace; the unit of integration is the reviewed merge; the unit of release is the pipeline stage.
+\end{pitfall}
+
+\section{Operational Guidance for Week 23}
+Administration is mostly calendars and drills: weekly capacity review, monthly throttling analysis, quarterly DR rehearsal, per-release deploy-order check.
+
+\subsection{Performance and Reliability}
+Trend CU consumption weekly; investigate regressions before they throttle. Pause non-production on schedule. Rehearse workspace rehydration quarterly---an untested recovery plan is a hope, and hope is not a strategy.
+
+\subsection{Security and Governance Checklist}
+\begin{itemize}
+    \item Secret scanning enabled on every integrated repository.
+    \item Prod workspace membership minimal; changes flow through the pipeline, not the portal.
+    \item Deployment rules reviewed like code---they rewire production references.
+    \item Capacity alerts configured before the first throttling complaint.
+    \item DR objectives (RPO/RTO) documented per workload with their design implication.
+    \item Deploy-order rule (shims first) encoded in the pipeline, not the wiki alone.
+\end{itemize}
+
+\section{Interview Q\&A}
+\begin{enumerate}
+    \item \textbf{Q: Which CU consumption behavior triggers background throttling?}\\
+    A: Sustained demand beyond capacity supply: the platform first smooths background work forward, then delays, then rejects---interactive rejection being the last and user-visible stage.
+    \item \textbf{Q: Why is Git integration the recovery mechanism for workspace items?}\\
+    A: Fabric has no traditional backup of workspace metadata; the repository holds item definitions, so reconnecting it to a fresh workspace rehydrates the estate.
+    \item \textbf{Q: Why is there no automatic cross-region failover for OneLake?}\\
+    A: OneLake data is not automatically replicated across regions; continuity requires deliberate dual-workspace/dual-capacity designs with re-ingestion or Delta clones---chosen and priced per workload.
+    \item \textbf{Q: What does surge protection guard against?}\\
+    A: Background storms consuming interactive capacity---a runaway job degrading the dashboards executives are watching; limits reserve interactive headroom.
+    \item \textbf{Q: Why pause non-production capacities on a schedule?}\\
+    A: Pay-as-you-go billing is per-second; idle dev/test capacity is pure waste, and schedules remove the human memory from the loop.
+    \item \textbf{Q: Walk through expand--migrate--contract for renaming a column.}\\
+    A: Add the new nullable column (expand); dual-write and backfill, with view shims exposing the old shape (migrate); switch consumers, then drop the old column after a full release cycle (contract)---shims deploying always-first.
+\end{enumerate}
+
+\section{Further Reading}
+Review Git integration \cite{microsoftFabricGitIntegration}, deployment pipelines \cite{microsoftFabricDeploymentPipelines}, the Capacity Metrics app \cite{microsoftFabricMetricsApp}, and capacity concepts \cite{microsoftFabricCapacity}. The schema-change discipline composes Chapter~9's contracts with Chapter~6's endpoint shims; governance framing continues in Chapter~22 \cite{microsoftPurviewFabric}.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item Capacity management is proactive: trend CUs, configure surge protection, and scale after---not before---fixing pathologies.
+    \item Git integration externalizes workspace definitions, enabling review, history, and disaster recovery.
+    \item Deployment pipelines are the only path to production; deployment rules rewire per-stage references.
+    \item Fabric DR: Git rehydrates items, Delta time travel covers data, and multi-region is a deliberate dual design---never automatic.
+    \item Expand--migrate--contract plus shims-first ordering makes schema change zero-downtime; reversed ordering makes the 8 a.m.\ incident.
+    \item Multi-team safety comes from branch isolation, review topology (CODEOWNERS), and staged gates.
+    \item Recovery plans are drilled quarterly or they are fiction.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Explain smoothing, delay, and rejection to a manager who asked ``why not just buy more capacity?''
+    \item \textbf{(Conceptual)} Why do deployment pipelines promote definitions, not state---and what validation does that imply per stage?
+    \item \textbf{(Hands-on)} Add a Test-stage gate: a smoke-test notebook must pass before Prod approval unlocks.
+    \item \textbf{(Hands-on)} Execute the expand--migrate--contract sequence for a real column rename across two deployments.
+    \item \textbf{(Design)} Write the RPO/RTO table for the estate's five most critical workloads and the design each implies.
+    \item \textbf{(Design)} Design the CODEOWNERS map for the three-team platform, including the shared-contract folder.
+    \item \textbf{(Interview)} In five sentences, describe Fabric's DR posture and the three mechanisms that substitute for traditional backup.
+    \item \textbf{(Operational)} Write the quarterly DR rehearsal procedure with pass/fail evidence.
+\end{enumerate}
+
+\section{Capstone Project: Git-Native Staged Delivery}\label{sec:ch23-capstone}
+\index{capstone project}\index{Git integration!capstone}\index{deployment pipelines!capstone}
+
+\begin{capstonebox}
+\textbf{Mission.} Deliver the full Week~23 stack on a real estate: Git-bound Dev workspace, three-stage deployment pipeline with rules and gates, an expand--migrate--contract schema change shipped zero-downtime, capacity alerting, and a documented---or executed---workspace rehydration drill.
+
+\textbf{Estimated time.} 6--8 hours.
+
+\textbf{What you'll practice.}
+\begin{itemize}
+    \item Git discipline: commits, reviews, secret scanning.
+    \item Staged promotion with deployment rules and a Test gate.
+    \item Zero-downtime schema change with shims-first ordering.
+    \item Capacity alerting and the DR drill.
+\end{itemize}
+\end{capstonebox}
+
+\subsection*{Scenario}
+Contoso's platform team formalizes delivery. The current ``edit in the workspace and hope'' model ends this sprint; your capstone is the reference implementation the other teams will copy.
+
+\subsection*{Requirements}
+\begin{itemize}
+    \item Dev/Test/Prod workspaces bound to one repository with branch policy and secret scanning.
+    \item The deployment pipeline with per-stage rules and a Test-stage automated gate.
+    \item One real expand--migrate--contract change promoted with the shim deploying first.
+    \item Capacity alerts configured (metrics app + Activator rule).
+    \item The rehydration drill report (executed or tabletop with exact steps).
+    \item A rollback demonstration: previous commit re-promoted to Prod.
+\end{itemize}
+
+\subsection*{Implementation Steps}
+\begin{enumerate}
+    \item Bind Dev to Git; establish branch policy and CODEOWNERS.
+    \item Build the pipeline with rules and the Test gate.
+    \item Ship the schema change in correct order; capture dashboard-stays-green evidence.
+    \item Configure capacity alerting; fire a test alert.
+    \item Run the rehydration drill and the rollback demonstration; document both.
+\end{enumerate}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item Repository with policies, history, and clean secret scan.
+    \item Pipeline definition and deployment evidence per stage.
+    \item The schema-change evidence: shim first, consumers green throughout.
+    \item Alert configuration and test-fire evidence.
+    \item Drill and rollback reports.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item[\(\square\)] No direct Prod edits; every change arrived through the pipeline.
+    \item[\(\square\)] The Test gate demonstrably blocked one failing change.
+    \item[\(\square\)] The schema change caused zero consumer-visible errors, evidenced.
+    \item[\(\square\)] The rollback restored the prior state in minutes, timed.
+    \item[\(\square\)] The rehydration drill produced a working workspace from the repository.
+    \item[\(\square\)] Secret scanning is enabled and clean; no credentials in history.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Add PR-triggered validation (lint notebooks, validate contracts) before merge.
+    \item Extend to a second team with its own branch and Dev workspace; run a collision drill.
+    \item Add automated CU-regression detection comparing release-over-release consumption.
+    \item Draft the dual-region BCDR design for one workload with priced RPO/RTO.
+\end{itemize}

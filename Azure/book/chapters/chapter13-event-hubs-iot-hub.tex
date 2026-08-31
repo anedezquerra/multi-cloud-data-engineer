@@ -1,0 +1,329 @@
+\chapter{Event Ingestion at Scale: Event Hubs and IoT Hub}
+\index{Event Hubs}\index{IoT Hub}\index{Service Bus}\index{partition!Event Hubs}\index{consumer group}\index{Event Hubs Capture}%
+\begin{objectives}
+\begin{itemize}
+    \item Distinguish message queues from event streams, and choose between Azure Service Bus and Event Hubs for a given workload.
+    \item Design an Event Hubs partition strategy, size throughput units, and explain why partition count caps consumer parallelism.
+    \item Implement producer-side idempotency with unique event identifiers and consumer-side checkpointing with at-least-once semantics.
+    \item Configure consumer groups so independent readers share one stream without interfering.
+    \item Enable Event Hubs Capture for automatic batched delivery to ADLS Gen2 and consume Event Hubs through its Kafka-compatible endpoint.
+    \item Position IoT Hub for device management scenarios versus Event Hubs for pure telemetry firehoses.
+    \item Architect a global telemetry ingestion point for five million mobile game clients partitioned by user ID.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+The partitioned, replayable event log is a cross-cloud primitive. Event Hubs' model---partitions, consumer groups, offsets, retention---is deliberately Kafka-shaped, and every cloud offers an equivalent.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{3.0cm}p{2.9cm}p{3.1cm}p{3.2cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{AWS} & \textbf{Azure} & \textbf{GCP} \\
+\midrule
+Event streaming & Kinesis Data Streams / MSK & Event Hubs (+ Kafka endpoint) & Pub/Sub / Managed Kafka \\
+Message queue & SQS / Amazon MQ & Service Bus queues and topics & Pub/Sub (pull) \\
+Device ingestion & IoT Core & IoT Hub & (partner; IoT Core retired) \\
+Stream-to-lake export & Kinesis Firehose & Event Hubs Capture & Pub/Sub to GCS subscriptions \\
+Partition key & Partition key per record & Partition key per event & Ordering keys \\
+Consumer isolation & Enhanced fan-out & Consumer groups & Subscriptions \\
+\addlinespace
+\multicolumn{4}{@{}l@{}}{\textbf{Fabric}: eventstreams into OneLake; \textbf{Snowflake}: Snowpipe Streaming; \textbf{MongoDB}: change streams as a source.} \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+Because Event Hubs speaks the Kafka protocol, producer and consumer skills transfer to Amazon MSK, Confluent, and self-managed Kafka clusters with only endpoint and credential changes \cite{apache2025kafka}.
+\end{crosscloud}
+
+\begin{keyterms}
+\textbf{Partition}: an ordered, append-only log shard; the unit of parallelism and ordering in Event Hubs.\quad
+\textbf{Throughput unit (TU)}: the capacity slice of a standard Event Hubs namespace (1 MB/s or 1{,}000 events/s ingress, 2 MB/s egress per TU).\quad
+\textbf{Consumer group}: a named, independent view over a hub's partitions with its own offsets.\quad
+\textbf{Checkpoint}: a consumer's persisted position, enabling resume after restart.\quad
+\textbf{Capture}: automatic batched write of hub traffic to ADLS Gen2 or Blob Storage in Avro format.
+\end{keyterms}
+
+\section{Week 13 Overview: Unbounded Data Arrives}
+Part IV changes the fundamental assumption: data no longer arrives in files on a schedule---it arrives continuously, unordered, duplicated, and sometimes very late. The ingestion layer's job is to absorb whatever producers throw at it, durably, and let many independent consumers read at their own pace. Azure's answer splits by intent: \textbf{Service Bus} for commanded messages (each message consumed once, by one consumer), \textbf{Event Hubs} for observed events (each event retained and replayable by many consumers) \cite{microsoft2025eventhubs}.
+
+\begin{definitionbox}
+An \textbf{event stream} is an append-only, time-ordered, replayable log of immutable facts. A \textbf{message queue} is a work-distribution mechanism where each message is claimed and removed by one consumer. Streams remember; queues forget.
+\end{definitionbox}
+
+\section{Monday: Decoupling with Service Bus}
+\index{Service Bus}\index{queue}\index{topic}
+
+\subsection{Queues and Topics}
+A Service Bus \textbf{queue} delivers each message to exactly one competing consumer---work distribution with built-in load leveling, dead-lettering, and scheduled delivery. A \textbf{topic} adds subscriptions: each subscription receives its own copy, filtered by rules---publish/subscribe with per-subscriber curation. Choose Service Bus when the message is a \emph{command} or \emph{task}: process this payment, send this email, provision this account. Sessions add ordered processing per key; transactions add atomic multi-entity operations; duplicate detection suppresses producer retries.
+
+\subsection{Service Bus vs.\ Event Hubs}
+The comparison is semantic, not about scale. Service Bus optimizes for \emph{per-message guarantees}: completion, abandonment, dead-letter, TTL. Event Hubs optimizes for \emph{stream throughput and replay}: partitions, offsets, retention windows, multiple consumer groups. A payment instruction belongs in Service Bus; a clickstream belongs in Event Hubs; a telemetry flood from five million devices belongs in Event Hubs; an order workflow belongs in Service Bus.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.4cm}p{4.9cm}p{4.9cm}@{}}
+\toprule
+\textbf{Dimension} & \textbf{Service Bus} & \textbf{Event Hubs} \\
+\midrule
+Semantics & Message consumed once by one consumer & Event retained; replayable by many readers \\
+Ordering & Sessions per key & Per partition \\
+Throughput target & Thousands of messages/s & Millions of events/s \\
+Delivery model & Pull with settlement (complete/abandon) & Pull by offset; consumer checkpoints \\
+Typical payload & Commands, business transactions & Telemetry, logs, clickstream \\
+\bottomrule
+\end{tabular}
+\caption{Queues distribute work; streams record history.}
+\label{tab:ch13-sb-vs-eh}
+\end{table}
+
+\section{Tuesday: Event Hubs---Partitions, Consumer Groups, Throughput}
+\index{Event Hubs!partitions}\index{throughput units}\index{consumer group}
+
+\subsection{Partitions: Parallelism and Ordering}
+Every event lands in exactly one partition, chosen by hash of the partition key (or round-robin when no key is set). Within a partition, order is guaranteed; across partitions, it is not. The design consequence: \emph{choose the partition key to be the entity whose ordering you need}---\texttt{user\_id}, \texttt{card\_id}, \texttt{device\_id}---and choose the partition count for peak consumer parallelism, because a partition can be read by only one consumer instance per consumer group at a time. Partition count is set at creation and effectively immutable, so size for the future peak, not today's.
+
+\subsection{Throughput Units and Consumer Groups}
+Standard namespaces sell capacity as throughput units; Premium and Dedicated tiers add reserved capacity, longer retention, and stronger isolation. \textbf{Consumer groups} let independent applications---a real-time scorer, a data-lake archiver, a fraud rules engine---each read the full stream at their own offset pace. Create one consumer group per application, and never share one between production and experiments.
+
+\subsection{At-Least-Once and Idempotency}
+Event Hubs guarantees at-least-once delivery: retries and replays mean the same event can arrive twice. Producers should attach a unique \texttt{eventId}; consumers must be idempotent---deduplicate on sink upserts, never assume uniqueness. Consumers persist \textbf{checkpoints} (offsets) to Blob Storage so restarts resume from the last committed position rather than in-memory state.
+
+\begin{pitfall}
+\textbf{Partitioning by a low-cardinality key.} Partitioning game telemetry by platform (iOS/Android) creates two hot partitions and thirty idle ones. Partition by \texttt{user\_id}: high cardinality, even spread, per-user ordering preserved.
+\end{pitfall}
+
+\section{Wednesday: Capture and the Kafka Endpoint}
+\index{Event Hubs Capture}\index{Kafka!Event Hubs endpoint}
+
+\subsection{Capture: The Stream-to-Lake Bridge}
+Event Hubs Capture writes stream traffic to ADLS Gen2 automatically, batched by time or size window, in Avro format, into a folder pattern you define (\texttt{namespace/hub/year/month/day/hour/minute}). It converts the streaming estate into a batch-ingestible bronze zone with zero consumer code---the stream equivalent of the Chapter 12 landing zone. Downstream, the Chapter 9 Databricks jobs or Chapter 7 serverless queries read the captured files exactly like any lake data.
+
+\subsection{Kafka Compatibility}
+Event Hubs exposes an Apache Kafka protocol endpoint: existing Kafka producers and consumers---including Spark Structured Streaming's Kafka source in Chapter 15---connect by changing bootstrap server and credentials, not code \cite{apache2025kafka}. The practical notes: use the \texttt{\$ConnectionString} username pattern with SASL over SSL, keep secrets in Key Vault, and remember that Kafka consumer groups map to Event Hubs consumer groups.
+
+\begin{tipbox}
+Enable Capture from day one even if nothing consumes the files yet. Storage is cheap; the day you need to replay yesterday's stream into a new model, Capture is the only way that history exists.
+\end{tipbox}
+
+\section{Thursday Hands-on Project: IoT Telemetry Producer with Capture}
+\index{hands-on lab}\index{Event Hubs!producer}
+Create an Event Hub, stream mock temperature telemetry from a Python asyncio producer, and verify captured batches appearing in ADLS Gen2.
+
+\subsection{Create the Namespace, Hub, and Capture}
+\begin{lstlisting}[language=bash,caption={Namespace, hub with 8 partitions, and Capture to the lake.},label={lst:ch13-eh-create}]
+$rg = "rg-de-azure-book-week13"
+az group create --name $rg --location eastus
+$ns = "ehn-week13-001"
+
+az eventhubs namespace create --name $ns --resource-group $rg `
+  --location eastus --sku Standard --capacity 2 --enable-auto-inflate `
+  --maximum-throughput-units 10
+
+az eventhubs eventhub create --name iot-telemetry --namespace-name $ns `
+  --resource-group $rg --partition-count 8 --message-retention-in-days 3
+
+az eventhubs eventhub update --name iot-telemetry --namespace-name $ns `
+  --resource-group $rg --enable-capture true `
+  --capture-interval 300 --capture-size-limit 314572800 `
+  --destination-name EventHubArchive.AzureBlockBlob `
+  --storage-account "/subscriptions/<sub>/resourceGroups/$rg/providers/Microsoft.Storage/storageAccounts/<adls>" `
+  --blob-container telemetry-capture `
+  --archive-name-format "{Namespace}/{EventHub}/{Year}_{Month}_{Day}/{Hour}_{Minute}"
+\end{lstlisting}
+
+\subsection{The Producer}
+\begin{lstlisting}[language=Python,caption={Async producer with per-event dedupe keys; connection string from Key Vault, never hardcoded.},label={lst:ch13-producer}]
+import asyncio, json, random, time, os
+from azure.eventhub.aio import EventHubProducerClient
+from azure.eventhub import EventData
+
+CONN_STR = os.environ["EVENTHUB_CONN_STR"]   # fetched from Key Vault
+HUB_NAME = "iot-telemetry"
+
+async def run():
+    producer = EventHubProducerClient.from_connection_string(
+        conn_str=CONN_STR, eventhub_name=HUB_NAME)
+    async with producer:
+        while True:
+            batch = await producer.create_batch()
+            for sensor_id in range(1, 6):
+                event = {
+                    "deviceId": f"sensor-{sensor_id}",
+                    "eventId": f"{sensor_id}-{int(time.time())}",  # dedupe key
+                    "tempC": round(random.uniform(-20, 45), 2),
+                    "ts": time.time(),
+                }
+                batch.add(EventData(json.dumps(event)))
+            await producer.send_batch(batch)
+            await asyncio.sleep(1)
+
+asyncio.run(run())
+\end{lstlisting}
+
+\subsection{Verify}
+Watch the namespace metrics (incoming messages, throttled requests) in the portal; after the capture interval, confirm Avro files under \texttt{telemetry-capture/} in the lake; read one with \texttt{fastavro} or the Chapter 7 serverless pool and confirm the event bodies match what the producer sent.
+
+\section{Friday Use Case: Telemetry for Five Million Mobile Games}
+\index{use case}\index{Event Hubs!at scale}
+A games publisher needs one global ingestion endpoint for five million concurrent mobile clients emitting session, purchase, and error events, feeding both a real-time engagement scorer and the analytics lake.
+
+\subsection{Design}
+A Premium Event Hubs namespace in the primary region, geo-paired for disaster recovery; partition count sized at 64 so the future consumer fleet (target: 32 parallel scorer instances with headroom) is never partition-capped. Partition key \texttt{user\_id}: per-player ordering for session reconstruction, high cardinality for even spread. Two consumer groups---\texttt{rt-scoring} for the Chapter 15 Structured Streaming job, \texttt{lake-archive} for Capture-based archival---plus a third, \texttt{fraud-lab}, created later without touching either. Auto-inflate absorbs launch-day spikes; the Client-side SDK batches events and applies backoff on throttling.
+
+\subsection{The Numbers That Matter}
+Estimate peak events per second (concurrent clients $\times$ events per client-minute), divide by TU capacity to size the namespace, then sanity-check egress: two consumer groups double egress bytes. The design review should show these calculations---ingestion architectures are sized on arithmetic, not adjectives.
+
+\begin{pitfall}
+\textbf{Replay storms.} A consumer group that checkpoints rarely and crashes often re-reads hours of events, multiplying egress and lag simultaneously. Checkpoint every N seconds or M events, whichever is smaller for the lag SLO.
+\end{pitfall}
+
+\section{Architectural Decision Record Template}
+\index{architectural decision record}
+Per stream record: partition key and count with the parallelism and ordering justification, TU/Premium sizing arithmetic, consumer groups and their owners, retention window, Capture configuration, and the idempotency contract (eventId semantics) shared by producers and consumers.
+
+\section{Operational Deep Dive: IoT Hub and Device Identity}
+\index{IoT Hub}
+When the producers are devices rather than applications, \textbf{IoT Hub} adds what Event Hubs lacks: per-device identity and revocation, device twins for configuration state, cloud-to-device messaging, and protocol adaptation (MQTT, AMQP, HTTPS) \cite{microsoft2025iothub}. IoT Hub's built-in Event Hubs-compatible endpoint feeds the same downstream consumers. The rule: telemetry from \emph{applications} goes to Event Hubs; telemetry from \emph{devices you must identify, configure, and command} goes through IoT Hub.
+
+\section{Troubleshooting Patterns}
+\index{troubleshooting!Event Hubs}
+Consumers see duplicates $\rightarrow$ expected at-least-once behavior; check sink deduplication. One consumer instance idle $\rightarrow$ more instances than partitions. Throttled requests $\rightarrow$ TU ceiling; enable auto-inflate or repartition traffic. Capture files missing $\rightarrow$ storage RBAC for the namespace's managed identity, or capture interval/size windows not yet met. Offset errors after a consumer rewrite $\rightarrow$ the checkpoint store outlived the code; version checkpoint containers per consumer deployment.
+
+\section{Week 13 Lab Rubric}
+\index{rubric}
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.2cm}p{5.0cm}p{5.0cm}@{}}
+\toprule
+\textbf{Criterion} & \textbf{Meets expectation} & \textbf{Needs improvement} \\
+\midrule
+Partitioning & Key and count justified with ordering/parallelism arithmetic & Defaults accepted without reasoning \\
+Idempotency & Unique eventIds; consumer dedupe demonstrated & Uniqueness assumed \\
+Capture & Files verified in the lake and read back & Enabled but never validated \\
+Security & Connection string from Key Vault; per-app consumer groups & Secrets in code; shared consumer group \\
+\bottomrule
+\end{tabular}
+\caption{Week 13 rubric for the ingestion deliverables.}
+\label{tab:ch13-rubric}
+\end{table}
+
+\section{Interview Q\&A}
+\subsection{Concepts and Trade-offs}
+\begin{enumerate}
+    \item \textbf{Q: When do you choose Service Bus over Event Hubs?}\\
+    A: When messages are commands needing per-message settlement---complete, abandon, dead-letter---rather than a replayable event log.
+    \item \textbf{Q: Why does partition count cap consumer parallelism?}\\
+    A: One partition is read by at most one instance per consumer group; more instances than partitions leaves instances idle.
+    \item \textbf{Q: What does Event Hubs Capture automate?}\\
+    A: Batched delivery of stream traffic to ADLS Gen2 as Avro, on time/size windows, with no consumer code.
+    \item \textbf{Q: Why attach a unique eventId to every message?}\\
+    A: At-least-once delivery means duplicates; the eventId is the dedupe key that makes sink upserts idempotent.
+\end{enumerate}
+
+\section{Further Reading}
+The Event Hubs documentation \cite{microsoft2025eventhubs} and the Kafka project \cite{apache2025kafka} cover the stream model and protocol compatibility; IoT Hub's documentation \cite{microsoft2025iothub} covers device identity. Chapter 14 (Stream Analytics) and Chapter 15 (Structured Streaming) consume what this chapter ingests.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item Queues distribute commands; streams record replayable facts. Choose Service Bus or Event Hubs by semantics, not by scale.
+    \item Partition keys carry ordering; partition counts carry parallelism---and cannot practically be changed later.
+    \item One consumer group per application; never share between production and experiments.
+    \item Delivery is at-least-once: unique eventIds, idempotent sinks, durable checkpoints.
+    \item Capture turns the stream into a lake bronze zone for free; enable it on day one.
+    \item The Kafka endpoint makes Event Hubs a drop-in for Kafka tooling, including Chapter 15's Spark jobs.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Explain why a payment instruction belongs in Service Bus and a clickstream in Event Hubs.
+    \item \textbf{(Conceptual)} What happens when a consumer group has more instances than partitions? More partitions than instances?
+    \item \textbf{(Conceptual)} Why is Event Hubs delivery at-least-once, and what does that obligate consumers to do?
+    \item \textbf{(Hands-on)} Complete the Thursday lab; verify captured Avro matches produced events.
+    \item \textbf{(Hands-on)} Add a second consumer group and demonstrate independent replay from an earlier offset.
+    \item \textbf{(Hands-on)} Induce throttling by capping TUs, observe producer backoff, and document the auto-inflate response.
+    \item \textbf{(Design)} Size the namespace for the games publisher: show events/s, TU, and egress arithmetic.
+    \item \textbf{(Design)} Write the ADR for 64 partitions at creation, including the cost of over-provisioning.
+    \item \textbf{(Design)} Design the checkpoint cadence for a consumer with a two-minute lag SLO.
+    \item \textbf{(Interview)} Prepare a two-minute answer to ``why did our real-time dashboard show duplicate purchases?''
+\end{enumerate}
+
+\section{Capstone Project: Partitioned Telemetry Ingestion with Capture}\label{sec:ch13-capstone}
+\index{capstone project}\index{Event Hubs!capstone}
+
+\begin{capstonebox}
+\textbf{Mission:} Deliver a production-shaped ingestion point: an Event Hub partitioned and sized with shown arithmetic, an idempotent Python producer, Capture verified end-to-end into ADLS Gen2, two isolated consumer groups, and a lag/throughput monitoring story.
+
+\textbf{Estimated time:} 3--4 hours.
+
+\textbf{What you will practice:}
+\begin{itemize}
+    \item Partition-key and partition-count design with justification.
+    \item Producer batching, dedupe keys, and secret hygiene.
+    \item Capture verification and lake replay.
+    \item Consumer-group isolation and checkpoint discipline.
+\end{itemize}
+\end{capstonebox}
+
+\subsection*{Scenario}
+The games publisher's pilot title launches next quarter: 50{,}000 expected concurrent clients, five events per client-minute, a real-time scorer and a lake archive as first consumers, and a data-science replay requirement after any model change.
+
+\subsection*{Requirements}
+\begin{itemize}
+    \item \textbf{Stream:} hub with documented partition key/count and TU sizing arithmetic; auto-inflate enabled.
+    \item \textbf{Producer:} batched asyncio producer with unique eventIds and Key Vault-sourced credentials.
+    \item \textbf{Archive:} Capture into the bronze zone with a date-partitioned folder format; read-back proof.
+    \item \textbf{Consumers:} two consumer groups with independent checkpoints; a demonstrated replay from history.
+\end{itemize}
+
+\subsection*{Reference Architecture}
+\begin{figure}[H]
+    \centering
+    \resizebox{0.95\textwidth}{!}{%
+    \begin{tikzpicture}[node distance=1.3cm]
+        \node[stage] (clients) {Game clients\\(partitioned by user)};
+        \node[stage, right=1.6cm of clients] (hub) {Event Hub\\8+ partitions, 2 CGs};
+        \node[stage, above right=0.6cm and 1.6cm of hub] (rt) {RT scorer\\(cg: rt-scoring)};
+        \node[store, below right=0.6cm and 1.6cm of hub] (lake) {Capture $\rightarrow$ ADLS\\bronze Avro};
+        \node[doc, below=0.9cm of hub] (mon) {Metrics: throughput,\\throttles, lag};
+        \draw[arrow] (clients) -- (hub);
+        \draw[arrow] (hub) -- (rt);
+        \draw[arrow] (hub) -- (lake);
+        \draw[arrow, dashed] (hub) -- (mon);
+    \end{tikzpicture}%
+    }
+    \caption{Capstone architecture: partitioned hub with isolated consumer groups, real-time scoring, and lake capture.}
+    \label{fig:ch13-capstone-arch}
+\end{figure}
+
+\subsection*{Implementation Steps}
+\begin{enumerate}
+    \item Create the namespace, hub, and Capture (Listing~\ref{lst:ch13-eh-create}).
+    \item Run the producer (Listing~\ref{lst:ch13-producer}) at pilot volume; record metrics.
+    \item Verify Capture read-back and the date-partitioned layout.
+    \item Add the second consumer group; demonstrate replay without affecting the first.
+    \item Write the sizing ADR with the arithmetic.
+\end{enumerate}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item CLI scripts, producer code, and the sizing ADR in the repo.
+    \item Metrics screenshots: throughput, throttles, and capture files in the lake.
+    \item Replay demonstration notes for the data-science scenario.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item No event processed twice by a consumer despite forced retries.
+    \item A consumer restart resumes within the lag SLO from its checkpoint.
+    \item Captured files reconcile with producer counts for a five-minute window.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Connect a Kafka-protocol consumer to the hub and document the configuration deltas.
+    \item Chaos test: kill a consumer instance mid-partition and measure recovery.
+    \item Compare Capture cost against a self-written archiver consumer at your event volume.
+\end{itemize}

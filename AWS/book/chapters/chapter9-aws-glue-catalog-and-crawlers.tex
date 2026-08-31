@@ -1,0 +1,337 @@
+% NOTE: Filename is fixed by the book outline; content teaches Week 9
+% (Amazon EMR, Managed Hadoop/Spark) of the syllabus.
+\chapter{Amazon EMR: Managed Hadoop and Spark}
+\index{Amazon EMR}\index{Apache Spark}\index{Hadoop}\index{EMRFS}\index{Spot Instances}\index{EMR Serverless}\index{EMR on EKS}%
+\begin{objectives}
+\begin{itemize}
+    \item Explain Amazon EMR cluster architecture: master, core, and task nodes, and which tiers can safely run on Spot capacity.
+    \item Compare EMR on EC2, EMR Serverless, and EMR on EKS deployment modes and select per workload.
+    \item Use EMRFS to treat S3 as the durable storage layer, decoupling compute lifetime from data lifetime.
+    \item Submit and tune PySpark jobs that read from S3, compute distributed aggregations, and write Parquet back to S3.
+    \item Design transient clusters for recurring batch work and justify them over long-running clusters.
+    \item Plan a migration of a 100-node on-premises Cloudera cluster to AWS, prioritizing cost reduction and compute--storage decoupling.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+Managed Hadoop/Spark exists on every cloud; the deployment-mode spectrum (full control to fully serverless) is the portable idea.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{2.8cm}p{3.0cm}p{3.0cm}p{3.0cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{AWS} & \textbf{Azure} & \textbf{GCP} \\
+\midrule
+Managed Hadoop/Spark & EMR on EC2 & HDInsight & Dataproc \\
+Serverless Spark & EMR Serverless & Fabric Spark / Synapse Spark & Dataproc Serverless \\
+Spark on Kubernetes & EMR on EKS & AKS-hosted Spark & Dataproc on GKE \\
+Object-storage filesystem & EMRFS (S3) & ABFS (ADLS) & GCS connector \\
+Cheap interruptible nodes & Spot task nodes & Spot node pools & Preemptible workers \\
+\addlinespace
+Cluster lifetime model & Transient vs.\ long-running & Both & Both \\
+Notebook integration & EMR Studio & Fabric notebooks & Vertex AI / Jupyter \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+\textbf{Fabric} folds Spark into its SaaS lakehouse: you get Spark pools and notebooks but never node types. \textbf{Databricks} (not one of the six platforms, but the category leader) popularized the transient, job-scoped cluster pattern this chapter teaches. \textbf{Snowflake}'s Snowpark pushes Spark-like DataFrame code into the warehouse instead of a cluster. \textbf{MongoDB} stays the operational source that Spark jobs read from via the connector.
+\end{crosscloud}
+
+\section{Week 9 Roadmap and Mental Model}
+AWS Glue (Chapter~10) covers most ETL needs serverlessly, but a class of workloads still wants the full open-source ecosystem: multi-framework clusters (Spark plus Hive plus Presto), custom libraries, long-running streaming jobs, or lift-and-shift migrations from on-premises Hadoop. Amazon EMR is that full-control option \cite{awsEMRDocs}.
+
+The mental shift from on-premises Hadoop is one sentence: \emph{storage is S3; the cluster is ephemeral}. HDFS was the durable center of a Hadoop cluster; EMRFS makes S3 the durable center and reduces the cluster to rented compute that reads and writes objects. Once you believe that, transient clusters, Spot task nodes, and per-job sizing stop being exotic and become the obvious way to run batch analytics.
+\index{EMRFS}\index{transient cluster}
+
+\begin{definitionbox}
+\textbf{Amazon EMR} is a managed platform for big-data frameworks---Spark, Hive, Presto, HBase, Flink, and others---on EC2, on EKS, or serverlessly. It provisions the framework stack, integrates it with S3 via EMRFS, and exposes steps, notebooks, and APIs for job submission.
+\end{definitionbox}
+
+\begin{keyterms}
+\textbf{Master node}: runs cluster coordination (YARN ResourceManager, HDFS NameNode for local scratch). \textbf{Core node}: runs compute \emph{and} HDFS DataNode duties; losing one risks local data. \textbf{Task node}: compute only; safe to lose, ideal for Spot. \textbf{EMRFS}: the S3 connector presenting object storage as the cluster's file system. \textbf{Bootstrap action}: script run on nodes at provisioning time for custom setup. \textbf{Step}: a unit of work (e.g., a Spark job) submitted to a cluster.
+\end{keyterms}
+
+\section{Monday: Cluster Architecture and Spot Capacity}
+\subsection{Master, Core, and Task Nodes}
+An EMR on EC2 cluster has three node roles. The \emph{master} node coordinates: it runs the resource manager and the HDFS NameNode for the cluster's local scratch space. \emph{Core} nodes run compute tasks and host HDFS data, so losing a core node can lose in-flight intermediate state. \emph{Task} nodes run compute only, hold no HDFS data, and exist purely to add parallel capacity \cite{awsEMRDocs}. This asymmetry drives the entire capacity strategy: \textbf{master and core on On-Demand or Reserved capacity; task nodes on Spot}.
+\index{master node}\index{core node}\index{task node}
+
+\subsection{Spot Instances for the Task Tier}
+Spot Instances sell spare EC2 capacity at steep discounts with two-minute interruption notice. Task nodes are the safe tier for Spot: when a task node vanishes, the framework reschedules its tasks onto surviving nodes and EMR provisions replacements. Losing Spot \emph{core} nodes risks HDFS blocks and job failure; losing the master loses the cluster. Instance fleets (per-AZ, per-type weighting) increase the chance of fulfilling large Spot requests across pools.
+\index{Spot Instances}\index{instance fleets}
+
+\begin{pitfall}
+\textbf{Putting the whole cluster on Spot to save money.} The discount is real and so is the interruption rate. Spot on the task tier commonly saves 60--80\% of task-tier cost; Spot on core or master converts that saving into failed jobs and reprocessing. Scope Spot to the tier designed for interruption.
+\end{pitfall}
+
+\section{Tuesday: EMR on EC2 vs.\ EMR Serverless vs.\ EMR on EKS}
+\subsection{Three Deployment Modes}
+\begin{itemize}
+    \item \textbf{EMR on EC2}: full control. You choose instances, frameworks, bootstrap actions, and cluster lifetime. Right for long-running clusters, exotic framework combinations, and migrations that replicate on-premises behavior.
+    \item \textbf{EMR Serverless}: no clusters at all. You create an application (Spark or Hive), submit jobs, and pay per vCPU/GB-hour of actually used workers, which scale per job. Right for intermittent job fleets and teams that never want to size a node.
+    \item \textbf{EMR on EKS}: EMR's managed Spark runtime as pods on your Kubernetes cluster. Right when the platform team already runs EKS and wants data jobs to share its scheduling, quotas, and networking model.
+\end{itemize}
+\index{EMR Serverless}\index{EMR on EKS}
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.0cm}p{4.2cm}p{5.0cm}@{}}
+\toprule
+\textbf{Mode} & \textbf{You manage} & \textbf{Choose when} \\
+\midrule
+EMR on EC2 & Nodes, scaling, lifetime, frameworks & Full control, multi-framework, lift-and-shift, steady load \\
+EMR Serverless & Job config and code only & Intermittent jobs, no cluster expertise, per-job scaling \\
+EMR on EKS & Kubernetes capacity; EMR manages runtime & EKS-standardized platform, shared compute with microservices \\
+\bottomrule
+\end{tabular}
+\caption{EMR deployment modes compared.}
+\label{tab:ch9-emr-modes}
+\end{table}
+
+\begin{notebox}
+EMR Serverless still needs the architectural decisions of this chapter: worker sizing, Spark dynamic allocation, and S3 layout all remain yours. ``Serverless'' removes node management, not performance reasoning.
+\end{notebox}
+
+\section{Wednesday: EMRFS---S3 as the Storage Layer}
+\subsection{Decoupling Compute from Storage}
+EMRFS presents S3 as the cluster's file system: Spark reads \texttt{s3://bucket/path} as if it were HDFS. The consequences are architectural. Clusters become disposable---terminate one, and the data is untouched. Multiple clusters read the same dataset concurrently. Storage scales to petabytes while compute scales to the job. And cluster lifetime becomes a cost decision: run a cluster for the two hours the job needs, not the 730 hours the month contains.
+\index{EMRFS}\index{decoupled storage}
+
+\subsection{Transient Clusters and Bootstrap Actions}
+A \emph{transient cluster} is created for a job or a day's schedule and terminated when the steps complete---typically launched by Step Functions, MWAA, or the EMR Steps API. Bootstrap actions run scripts on every node at provisioning (installing libraries, tuning configs), which is how transient clusters stay reproducible: the cluster definition is code, the data is in S3, and nothing of value lives on the cluster itself.
+\index{bootstrap action}\index{transient cluster}
+
+\begin{tipbox}
+Keep local HDFS for what it is good at---shuffle scratch and intermediate spill within one job---and write every durable output to S3 via EMRFS. A job whose final output exists only in cluster HDFS is a job whose output dies with the cluster.
+\end{tipbox}
+
+\section{Thursday Hands-on Project: A PySpark Aggregation on EMR}
+\index{hands-on project!EMR PySpark job}
+Deploy an EMR cluster with Spark, submit a PySpark job that reads data from S3, performs a distributed aggregation, and writes Parquet back to S3.
+
+\subsection*{Lab Objectives}
+\begin{itemize}
+    \item Launch an EMR on EC2 cluster with On-Demand core nodes and Spot task nodes via instance fleets.
+    \item Submit a PySpark step against the Chapter~7 curated dataset.
+    \item Verify Parquet output in S3 and inspect Spark UI evidence of the distributed aggregation.
+    \item Terminate the cluster and confirm the data survives---the EMRFS lesson made physical.
+\end{itemize}
+
+\subsection*{Procedure}
+First, the job itself---an aggregation over the curated Parquet zone:
+
+\begin{lstlisting}[language=Python,caption={PySpark job: distributed aggregation from S3 to Parquet.},label={lst:ch9-pyspark}]
+import sys
+
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col, sum as spark_sum
+
+INPUT = sys.argv[1]   # e.g. s3://bucket/curated/sales_parquet/
+OUTPUT = sys.argv[2]  # e.g. s3://bucket/analytics/monthly_revenue/
+
+spark = SparkSession.builder.appName("week9-monthly-revenue").getOrCreate()
+
+sales = spark.read.parquet(INPUT)
+
+monthly = (
+    sales.groupBy("order_year", "order_month")
+         .agg(spark_sum("amount").alias("revenue"),
+              spark_sum("qty").alias("units"))
+         .orderBy("order_year", "order_month")
+)
+
+# coalesce keeps output file counts reasonable for a small dataset
+monthly.coalesce(4).write.mode("overwrite").parquet(OUTPUT)
+
+spark.stop()
+\end{lstlisting}
+
+Then create the cluster with a mixed capacity strategy and submit the step:
+
+\begin{lstlisting}[language=bash,caption={Creating an EMR cluster with Spot task nodes and submitting the Spark step.},label={lst:ch9-emr-create}]
+$Bucket = "acme-analytics-raw-123456789012"
+
+aws emr create-cluster `
+  --name "week9-spark-lab" `
+  --release-label emr-7.5.0 `
+  --applications Name=Spark `
+  --use-default-roles `
+  --instance-fleets `
+    "InstanceFleetType=MASTER,TargetOnDemandCapacity=1,InstanceTypeConfigs=[{InstanceType=m5.xlarge}]" `
+    "InstanceFleetType=CORE,TargetOnDemandCapacity=2,InstanceTypeConfigs=[{InstanceType=m5.xlarge}]" `
+    "InstanceFleetType=TASK,TargetSpotCapacity=4,InstanceTypeConfigs=[{InstanceType=m5.xlarge},{InstanceType=m5.2xlarge}]" `
+  --steps "[{`"Name`":`"monthly-revenue`",`"ActionOnFailure`":`"CONTINUE`",`
+    `"Args`":[`"spark-submit`",`
+      `"s3://$Bucket/jobs/monthly_revenue.py`",`
+      `"s3://$Bucket/curated/sales_parquet/`",`
+      `"s3://$Bucket/analytics/monthly_revenue/`"]}]" `
+  --auto-terminate
+\end{lstlisting}
+
+\begin{tipbox}
+\texttt{--auto-terminate} plus step submission makes this a transient cluster: it exists for exactly the job's lifetime. In production the same call is issued by Step Functions or MWAA per schedule, so cluster-hours track job-hours.
+\end{tipbox}
+
+\subsection*{Verification}
+\begin{itemize}
+    \item The cluster reaches \texttt{WAITING}/step \texttt{COMPLETED} state; the step log shows the Spark application ID.
+    \item \texttt{aws s3 ls s3://\$Bucket/analytics/monthly\_revenue/} shows Parquet part files.
+    \item Reading the output back (\texttt{spark.read.parquet} or Athena over the prefix) shows one row per year-month with revenue and units.
+    \item After \texttt{--auto-terminate} completes, the input and output prefixes are intact---storage outlived compute.
+    \item The EMR console's Spot/on-demand split confirms only the task fleet used Spot.
+\end{itemize}
+
+\begin{pitfall}
+\textbf{Writing output to HDFS paths by habit.} A job that ends with \texttt{.write.save("/data/out")} on a transient cluster writes to storage that is deleted minutes later. Parameterize output paths, require \texttt{s3://} prefixes in code review, and assert on them in job tests.
+\end{pitfall}
+
+\section{Friday Use Case: Migrating a 100-Node Cloudera Cluster}
+\index{use case!Hadoop migration}
+A financial-services firm runs a 100-node on-premises Cloudera cluster: 1.2~PB in HDFS, forty recurring Hive and Spark jobs, six petabytes of annual growth, and a hardware refresh quote that made leadership ask about the cloud. Priorities: reduce cost, decouple compute from storage, and keep the forty jobs' business logic intact.
+
+\subsection{Migration Strategy}
+\textbf{Phase 0 --- inventory.} Classify jobs by framework, schedule, data dependency, and SLA. In practice this inventory discovers that a third of the ``cluster'' is two heavy jobs and thirty-eight small ones---which drives the target split.
+
+\textbf{Phase 1 --- data to S3.} Use DataSync (Chapter~1) for the bulk HDFS-to-S3 copy, with incremental syncs until cutover. S3 becomes the system of record; the on-premises HDFS becomes the replica until decommission.
+
+\textbf{Phase 2 --- compute mapping.} The two heavy jobs get transient EMR on EC2 clusters sized per run. The thirty-eight small jobs, each intermittent, move to EMR Serverless---no cluster design at all. Hive-metastore-dependent jobs point at the Glue Data Catalog as the shared metastore (Chapter~7), which also opens the data to Athena.
+
+\textbf{Phase 3 --- orchestration and cutover.} Schedules move to MWAA (Chapter~12), which launches transient clusters per DAG run. Jobs cut over domain by domain with parallel-run reconciliation: old and new outputs compared for two cycles before the on-premises schedule is retired.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{4.2cm}p{4.4cm}p{4.4cm}@{}}
+\toprule
+\textbf{On-premises reality} & \textbf{AWS target} & \textbf{Why} \\
+\midrule
+100 always-on nodes & Transient clusters, 2--4 h/day & Pay per job-hour, not per month \\
+HDFS 1.2 PB & S3 via EMRFS & Durable, decoupled, lifecycle-tiered \\
+Hive metastore & Glue Data Catalog & Shared with Athena/Spectrum/Glue \\
+One cluster for all jobs & Per-job sizing (EC2 + Serverless) & Heavy jobs no longer starve small ones \\
+Fixed capacity & Spot task fleets & 60--80\% off the interruptible tier \\
+\bottomrule
+\end{tabular}
+\caption{Cloudera-to-EMR migration mapping.}
+\label{tab:ch9-migration}
+\end{table}
+
+\subsection{Cost Framing}
+The on-premises cluster's cost is fixed regardless of utilization; inventory shows compute utilization under 25\%. The AWS design bills for job-hours: roughly 100 node-hours per day across all forty jobs versus 2{,}400 node-hours per day provisioned on-premises. Even before the Spot discount on task capacity, compute cost drops by an order of magnitude; storage moves to lifecycle-tiered S3 at a fraction of SAN cost.
+
+\begin{pitfall}
+\textbf{Replicating the on-premises shape in the cloud.} A 100-node always-on EMR cluster is the refresh quote with a different logo. The migration's value comes from changing the operating model---transient, per-job, decoupled---not from changing the vendor of the same architecture.
+\end{pitfall}
+
+\section{Interview Q\&A}
+\subsection{Concepts and Trade-offs}
+\begin{enumerate}
+    \item \textbf{Q: Core versus task nodes: which tier can safely run on Spot Instances?}\\
+    A: Task nodes. They hold no HDFS data, so interruption costs only rescheduled tasks. Core nodes host HDFS blocks and the master coordinates the cluster; Spot on either risks job or cluster failure.
+    \item \textbf{Q: How does EMRFS decouple storage from compute?}\\
+    A: It presents S3 as the cluster's file system, so durable data lives in object storage independent of any cluster. Clusters become disposable compute that reads and writes objects.
+    \item \textbf{Q: When would you pick EMR on EKS over EMR on EC2?}\\
+    A: When the organization already runs Kubernetes as its compute standard and wants Spark jobs to share EKS scheduling, quotas, and networking---accepting Kubernetes operations in exchange.
+    \item \textbf{Q: What are bootstrap actions used for?}\\
+    A: Running setup scripts on every node at provisioning---installing libraries, applying configuration---so transient clusters are reproducible from code.
+    \item \textbf{Q: Why prefer transient clusters for recurring batch jobs?}\\
+    A: Cluster-hours then track job-hours. A two-hour daily job on a transient cluster bills two node-hours per day; an always-on cluster bills 24, mostly idle.
+    \item \textbf{Q: What stays on local HDFS in a well-designed EMR job?}\\
+    A: Job-local scratch: shuffle and spill within one run. All durable inputs and outputs live in S3 via EMRFS.
+\end{enumerate}
+
+\section{Further Reading}
+The EMR Management Guide covers node types, instance fleets, Spot configuration, bootstrap actions, and the Steps API \cite{awsEMRDocs}; the Spark project documentation covers the DataFrame API used in the lab \cite{apacheSparkProject}; and Zaharia et al.\ provide the architectural background on Spark's unified engine \cite{zaharia2016apache}. For the storage-decoupling rationale, revisit the S3 foundations of Chapter~1 \cite{awsS3UserGuide}.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item EMR is the full-control big-data option: Spark, Hive, Presto, and friends on EC2, EKS, or serverless.
+    \item Master and core nodes are precious; task nodes are disposable---that asymmetry is the Spot strategy.
+    \item EMRFS makes S3 the durable layer, which makes transient, per-job clusters the default operating model.
+    \item Choose deployment mode by organizational standard (EC2 control, Serverless simplicity, EKS consolidation), not by benchmark.
+    \item Bootstrap actions and step submission turn clusters into reproducible code artifacts.
+    \item Hadoop migrations create value by changing the operating model---decoupled, transient, per-job---not by relocating the same always-on cluster.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Explain why losing a core node is more dangerous than losing a task node during a running job.
+    \item \textbf{(Conceptual)} A team runs one always-on EMR cluster for forty small intermittent jobs. Describe the cost argument for EMR Serverless and one reason to stay on EC2.
+    \item \textbf{(Hands-on)} Run the Thursday lab, then rerun the step with Spot removed from the task fleet and compare step duration and interruption behavior.
+    \item \textbf{(Hands-on)} Add a bootstrap action installing a Python library, rebuild the cluster, and verify the library inside the job.
+    \item \textbf{(Hands-on)} Convert the lab to EMR Serverless: create an application, submit the same job, and compare time-to-first-task with cluster provisioning.
+    \item \textbf{(Design)} Given job runtimes of 10 min, 2 h, and 6 h, assign each to EC2, Serverless, or EKS with justification.
+    \item \textbf{(Design)} Design the reconciliation checks for the Friday migration's parallel-run phase: what proves the new output equals the old?
+    \item \textbf{(Architecture)} Sketch the MWAA integration for the migrated job fleet: DAG structure, cluster-per-run policy, and failure alerting (preview of Chapter~12).
+\end{enumerate}
+
+\section{Capstone Project: A Transient-Cluster Batch Platform}\label{sec:ch9-capstone}
+\index{capstone project}\index{EMR!capstone}
+
+\begin{capstonebox}
+\textbf{Mission.} Build a small but production-shaped batch platform: nightly transient EMR clusters process a multi-source dataset from S3, write curated Parquet, and publish to the Glue catalog---with Spot task capacity, reproducible bootstrap, and cost tracking per job.
+
+\textbf{Estimated time.} 4--6 hours in a sandbox AWS account.
+
+\textbf{What you\textquotesingle{}ll practice.}
+\begin{itemize}
+    \item Instance-fleet design with a Spot task tier.
+    \item Parameterized PySpark jobs with S3-in/S3-out discipline.
+    \item Transient cluster lifecycle driven by the Steps API.
+    \item Per-job cost attribution for a batch estate.
+\end{itemize}
+\end{capstonebox}
+
+\subsection*{Scenario}
+A logistics company runs three nightly jobs: a heavy route-optimization aggregation (2~h), a medium delivery-events join (30~min), and a light reference-data refresh (10~min). Today they share one always-on cluster. Rebuild the estate as transient, per-job clusters with a cost report that survives finance scrutiny.
+
+\subsection*{Requirements}
+\textbf{Functional requirements.}
+\begin{itemize}
+    \item Each job runs on its own transient cluster sized to its profile, with task-tier Spot capacity.
+    \item All jobs read from and write to S3; curated outputs register in the Glue catalog.
+    \item Bootstrap actions make every cluster reproducible; cluster definitions live in code.
+    \item A daily cost report attributes cluster-hours (split On-Demand/Spot) to each job.
+\end{itemize}
+
+\textbf{Non-functional requirements.}
+\begin{itemize}
+    \item No durable output ever lands on cluster-local storage.
+    \item Job failure leaves no running cluster behind (auto-terminate on completion or failure).
+    \item The cost report reconciles within 5\% of the CUR or Cost Explorer figure for the tag set.
+\end{itemize}
+
+\subsection*{Implementation Steps}
+\begin{enumerate}
+    \item Parameterize the three jobs as \cref{lst:ch9-pyspark} style scripts with input/output arguments.
+    \item Codify cluster creation per job (instance fleets, Spot task tier, bootstrap actions).
+    \item Drive the three runs from a scheduler (CLI cron for the lab; MWAA in the production sketch).
+    \item Register curated outputs with a crawler or explicit DDL; validate in Athena.
+    \item Tag every cluster with \texttt{job\_name}; build the daily cost report from Cost Explorer by tag.
+    \item Write the one-page operating memo: what changed, what it costs, what can still break.
+\end{enumerate}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item Cluster-definition code and bootstrap scripts for all three jobs.
+    \item Evidence of Spot usage confined to task fleets and of auto-termination.
+    \item Athena query results over the curated outputs.
+    \item The daily per-job cost report and the comparison against the always-on baseline.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item All durable data resides in S3; terminating any cluster loses nothing.
+    \item Spot appears only on task tiers; interruptions are absorbed without job failure.
+    \item Every job is reproducible from code with no console-only configuration.
+    \item The cost report attributes at least 95\% of EMR spend to named jobs.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Move the light job to EMR Serverless and compare its cost and start latency.
+    \item Add managed scaling to the heavy job's cluster and measure scale-down behavior mid-run.
+    \item Introduce a Step Functions wrapper that retries a failed job on a fresh cluster with an SNS alert.
+    \item Benchmark \texttt{coalesce} versus repartitioned output for Athena read performance.
+\end{itemize}

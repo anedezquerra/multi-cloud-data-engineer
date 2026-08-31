@@ -14,8 +14,14 @@ All notable changes to this repository are documented here.
 - Added `build.ps1` for multi-pass `pdflatex`/`bibtex`/`makeindex` builds of all books.
 - Added root `README.md`, `CHANGELOG.md`, and `.gitignore` for LaTeX build artifacts.
 
-### Planned
-- Book chapters 5–24 for all six platforms (per the commented outlines in each
-  `<Platform>\book\main.tex`), plus the three pending Azure, Fabric, and
-  Snowflake appendices.
-- Integration of the `new 3x.txt` reference notes into the book bibliographies.
+### Added
+- Completed all six books: chapters 5–24 for every platform (~290–330 pages per
+  book), each chapter mapped to the matching syllabus week, plus the Azure,
+  Fabric, and Snowflake appendices (A–C).
+- Added a "Curated Community Resources" section (case studies, video courses,
+  GitHub repositories) to each book's Chapter 0, integrating the former
+  `new 3x.txt` loose notes.
+
+### Removed
+- Deleted the `new 32.txt`, `new 33.txt`, `new 34.txt` loose notes from the
+  repo root and all six platform folders (content integrated into the books).

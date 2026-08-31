@@ -1,0 +1,394 @@
+\chapter{SQL Analytics Endpoint}
+\index{SQL analytics endpoint}\index{Lakehouse!SQL endpoint}\index{views}\index{table-valued functions}\index{row-level security}\index{object-level security}\index{logical data warehouse}\index{SSMS}%
+
+\begin{objectives}
+\begin{itemize}
+    \item Explain what the automatic SQL analytics endpoint is, why it is read-only, and how it reflects lakehouse Delta tables.
+    \item Query lakehouse tables through the endpoint from the web editor and from SQL Server Management Studio.
+    \item Create reusable SQL objects---views, table-valued functions, and stored procedures---over lakehouse Delta tables.
+    \item Enforce object-level security and row-level security in the SQL endpoint.
+    \item Describe what happens when a query crosses a shortcut through the endpoint.
+    \item Design a logical data warehouse that lets analysts query raw lake files in pure T-SQL without duplicating data.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+The read-only SQL surface over open lake storage is the defining lakehouse pattern, and every cloud has a version of it. Fabric's SQL analytics endpoint is the Azure-native expression; the equivalents differ mostly in how much they hide the files.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{2.8cm}p{3.2cm}p{3.2cm}p{3.2cm}p{3.2cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{Fabric} & \textbf{AWS} & \textbf{GCP} & \textbf{Snowflake} \\
+\midrule
+SQL over lake files & SQL analytics endpoint (read-only, auto-generated) & Athena over S3; Redshift Spectrum & BigQuery external/BigLake tables & External tables; Iceberg tables \\
+Serverless engine & Yes (per-query on capacity) & Athena (per-query/serverless) & Yes (on-demand or slots) & Virtual warehouses \\
+Row-level security & RLS on SQL endpoint objects & Lake Formation row/cell filters & BigQuery row access policies & Row access policies \\
+Column-level security & GRANT/DENY on columns & Lake Formation column filters & Policy tags & Column masking policies \\
+Views/TVFs over lake & Views, TVFs, procedures & Athena views & BigQuery views, TVFs & Views, secure views, UDFs \\
+Open table format & Delta-Parquet in OneLake & Iceberg/Hudi/Delta on S3 & Iceberg via BigLake & Iceberg or native \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+Databricks SQL over Unity Catalog is the closest in-family analog. MongoDB exposes read SQL through the Atlas SQL Interface rather than over lake files. The pattern to carry across clouds: \emph{open files plus a governed SQL layer} delivers warehouse-style access without warehouse-style copies.
+\end{crosscloud}
+
+\begin{keyterms}
+\textbf{SQL analytics endpoint}: the automatically generated, read-only T-SQL interface over a lakehouse's Delta tables. \quad
+\textbf{View}: a saved query that presents filtered, joined, or aggregated lakehouse data as a named relation. \quad
+\textbf{Table-valued function (TVF)}: a parameterized view that returns a table. \quad
+\textbf{Object-level security}: grants and denies on schemas, tables, views, and columns. \quad
+\textbf{Row-level security (RLS)}: a predicate-based filter that limits which rows a user can see. \quad
+\textbf{Logical data warehouse}: an architecture that queries data in place through SQL objects instead of physically moving it into a warehouse.
+\end{keyterms}
+
+\section{Week 6 Roadmap}
+Week~6 turns the lakehouse from a Spark artifact into a SQL product. Monday explains the automatic, read-only SQL analytics endpoint that every lakehouse carries. Tuesday builds the reusable SQL object layer---views, TVFs, and stored procedures---over Delta tables. Wednesday covers security: object-level grants and row-level security predicates. Thursday is the hands-on project: connect SSMS to the endpoint and build a view joining a Silver Delta table with a Gold Delta table. Friday designs a full logical data warehouse in which analysts query raw lake files in pure T-SQL without any data duplication.
+
+This week matters because most organizations have far more SQL skills than Spark skills. The SQL analytics endpoint is the bridge that lets the analytics majority consume lakehouse engineering directly \cite{microsoftFabricSqlEndpoint}. Mastering its object and security model is what separates ``a lakehouse the BI team can actually use'' from ``a pile of Delta files.''
+
+\begin{notebox}
+The endpoint is read-only by design: the lakehouse's write path is Spark (or pipeline/dataflow landing), and the SQL surface is a consumption and governance layer. Trying to use it as an OLTP write surface is the classic Week~6 mistake.
+\end{notebox}
+
+\section{Monday: The Automatic Endpoint}
+\index{SQL analytics endpoint!automatic}\index{read-only endpoint}
+Every lakehouse in Fabric automatically exposes a SQL analytics endpoint. There is nothing to provision and nothing to size: the endpoint is generated when the lakehouse is created, and it draws compute from the workspace's capacity per query \cite{microsoftFabricSqlEndpoint}.
+
+\begin{definitionbox}
+The \textbf{SQL analytics endpoint} is a read-only T-SQL interface, generated automatically for every lakehouse, that presents the lakehouse's Delta tables as queryable SQL tables and keeps them discoverable to T-SQL tools through a standard connection string.
+\end{definitionbox}
+
+Three properties define its character. First, it is \emph{automatic}: Delta tables written by Spark appear in the endpoint shortly after commit, with no publish step. Second, it is \emph{read-only}: \texttt{INSERT}, \texttt{UPDATE}, and \texttt{DELETE} against lakehouse tables are rejected; writes belong to Spark or ingestion tools. Third, it is \emph{metadata-fresh}: schema changes to Delta tables surface in the endpoint after metadata sync, which is normally near-immediate but can lag briefly under heavy write churn.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{4.2cm}p{5.0cm}p{4.8cm}@{}}
+\toprule
+\textbf{Property} & \textbf{SQL analytics endpoint} & \textbf{Synapse Data Warehouse} \\
+\midrule
+Provisioning & Automatic with every lakehouse & Explicit item creation \\
+Write support & None over lakehouse tables & Full DML/DDL, transactions \\
+Object model & Views, TVFs, procedures over Delta tables & Native tables plus views, TVFs, procedures \\
+Storage ownership & Lakehouse \texttt{Tables} area in OneLake & Warehouse-managed area in OneLake \\
+Ideal consumer & Analysts reading curated lakehouse data & T-SQL teams owning transformation logic \\
+\bottomrule
+\end{tabular}
+\caption{The endpoint complements the warehouse; it does not replace it.}
+\label{tab:chapter6-endpoint-vs-wh}
+\end{table}
+
+\begin{pitfall}
+The endpoint reflects the lakehouse's \texttt{Tables} area, not arbitrary files under \texttt{Files}. A CSV sitting in \texttt{Files/raw/} is invisible to SQL until something registers it as a Delta table. ``My files don't show up in SSMS'' almost always means they were never table-ified.
+\end{pitfall}
+
+\section{Tuesday: Views, TVFs, and Stored Procedures}
+\index{views}\index{table-valued functions}\index{stored procedures!endpoint}
+Although the endpoint cannot write lakehouse tables, it can create SQL objects---views, inline and multi-statement table-valued functions, and stored procedures---that encapsulate query logic over those tables \cite{microsoftFabricSqlEndpoint}. This is where the endpoint becomes a product surface rather than a raw table dump.
+
+\subsection{Views as Reusable Joins}
+A view names a join or filter once so that every report, notebook, and analyst inherits the same definition. When Week~7's semantic models and Week~8's Direct Lake reports consume the lakehouse, views are the stabilizing contract that keeps business logic out of individual reports.
+
+\begin{lstlisting}[language=SQL,caption={A view joining Silver detail to a Gold dimension.},label={lst:chapter6-view}]
+CREATE VIEW gold.v_sales_enriched
+AS
+SELECT
+    f.order_id,
+    f.order_date,
+    d.customer_id,
+    d.segment,
+    d.region,
+    f.net_amount
+FROM gold.fact_sales   AS f
+JOIN gold.dim_customer AS d
+    ON f.customer_key = d.customer_key
+WHERE d.is_current = 1;
+GO
+\end{lstlisting}
+
+\subsection{Table-Valued Functions for Parameterized Access}
+A TVF is a parameterized view. Use one when the same analytical shape recurs with different filter values---per-region snapshots, as-of-date queries, or tenant-scoped slices.
+
+\begin{lstlisting}[language=SQL,caption={An inline TVF for region-scoped sales.},label={lst:chapter6-tvf}]
+CREATE FUNCTION gold.fn_sales_by_region (@region NVARCHAR(50))
+RETURNS TABLE
+AS
+RETURN
+(
+    SELECT order_date, customer_id, net_amount
+    FROM gold.v_sales_enriched
+    WHERE region = @region
+);
+GO
+
+-- Usage
+SELECT * FROM gold.fn_sales_by_region('US');
+\end{lstlisting}
+
+\subsection{Stored Procedures for Operational Routines}
+Endpoint stored procedures cannot modify lakehouse tables, but they can orchestrate queries, emit reconciliation results, and encapsulate security-sensitive logic behind \texttt{EXECUTE AS} patterns. They are the operational glue of the logical data warehouse.
+
+\begin{tipbox}
+Put every multi-line analytical query that two or more consumers share into a view or TVF. The first time a metric definition changes, you will edit one object instead of a dozen reports.
+\end{tipbox}
+
+\section{Wednesday: Security in the SQL Endpoint}
+\index{object-level security}\index{row-level security}\index{column-level security}
+The endpoint supports the two security layers that matter most for analytical consumption: object-level security (who can see which tables, views, and columns) and row-level security (which rows within a permitted object a user can see) \cite{microsoftFabricSqlEndpoint,microsoftFabricSecurity}.
+
+\subsection{Object-Level Security}
+Standard T-SQL \texttt{GRANT}, \texttt{DENY}, and \texttt{REVOKE} apply to endpoint objects. The pattern for a curated consumption layer is to grant on the Gold schema and views, and deny or simply never grant on Bronze and Silver.
+
+\begin{lstlisting}[language=SQL,caption={Object-level and column-level security.},label={lst:chapter6-object-security}]
+-- Analysts get the curated view, not the base tables.
+GRANT SELECT ON gold.v_sales_enriched TO [analysts@contoso.com];
+DENY  SELECT ON silver.customer_pii TO [analysts@contoso.com];
+
+-- Column-level: hide national ID even from view consumers of base tables.
+DENY SELECT ON gold.dim_customer (national_id) TO [analysts@contoso.com];
+\end{lstlisting}
+
+\subsection{Row-Level Security}
+RLS attaches a filter predicate to a table through a security policy, so two users running the same query see different rows. The classic implementation uses an inline TVF as the predicate and a mapping table from user to region.
+
+\begin{lstlisting}[language=SQL,caption={Row-level security restricting users to their assigned region.},label={lst:chapter6-rls}]
+CREATE TABLE sec.user_region (
+    user_principal NVARCHAR(200),
+    region         NVARCHAR(50)
+);
+GO
+
+CREATE FUNCTION sec.fn_region_predicate (@region NVARCHAR(50))
+RETURNS TABLE
+WITH SCHEMABINDING
+AS
+RETURN
+(
+    SELECT 1 AS allowed
+    FROM sec.user_region
+    WHERE user_principal = USER_NAME()
+      AND region = @region
+);
+GO
+
+CREATE SECURITY POLICY sec.sales_region_policy
+ADD FILTER PREDICATE sec.fn_region_predicate(region)
+ON gold.v_sales_enriched_base
+WITH (STATE = ON);
+GO
+\end{lstlisting}
+
+\begin{pitfall}
+RLS filters rows but does not hide the existence of the object, and it composes with object-level security, not instead of it. Grant the object, then filter the rows. Also remember: \texttt{USER\_NAME()} must resolve to the identity your users actually connect with---test with \texttt{EXECUTE AS USER} before declaring victory.
+\end{pitfall}
+
+\begin{notebox}
+Shortcuts queried through the endpoint execute with the calling identity's access to the target. A shortcut to another lakehouse or to ADLS Gen2 does not bypass permissions; the endpoint enforces them at query time. Design shortcut security as carefully as table security.
+\end{notebox}
+
+\section{Thursday: Hands-on Project}
+\index{hands-on lab}\index{SSMS}\index{views!hands-on}
+The Week~6 lab connects SQL Server Management Studio to a lakehouse's SQL analytics endpoint and builds a view that joins a Silver Delta table with a Gold Delta table---the smallest end-to-end proof that lakehouse engineering is consumable in pure T-SQL.
+
+\subsection{Goal and Architecture}
+Reuse any lakehouse from Weeks~1--4 that contains a Silver table (for example \texttt{silver\_orders}) and a Gold table (for example \texttt{dim\_customer}), or create a fresh workspace \texttt{fabric-de-week06} with lakehouse \texttt{lh\_sales} and seed both tables with a small PySpark script. The deliverable is \texttt{gold.v\_orders\_by\_customer}, queried from SSMS.
+
+\subsection{Step-by-Step Actions}
+\begin{enumerate}
+    \item Open the lakehouse and copy the SQL analytics endpoint connection string from the lakehouse settings pane.
+    \item In SSMS, connect with the endpoint string using Microsoft Entra (MFA) authentication.
+    \item Verify the table list shows the Silver and Gold Delta tables.
+    \item Create the view joining Silver to Gold, then query it.
+    \item Add a TVF parameterized by region and test it.
+    \item Create the \texttt{sec.user\_region} table, predicate function, and RLS policy from Wednesday's listings; test with \texttt{EXECUTE AS USER}.
+    \item Attempt an \texttt{INSERT} into a lakehouse table and record the read-only error---understanding the boundary is part of the lab.
+\end{enumerate}
+
+\begin{lstlisting}[language=SQL,caption={Week 6 lab: the Silver-to-Gold view and an RLS smoke test.},label={lst:chapter6-lab-view}]
+CREATE VIEW gold.v_orders_by_customer
+AS
+SELECT
+    o.order_id,
+    o.order_date,
+    c.customer_id,
+    c.region,
+    o.net_amount
+FROM silver_orders AS o
+JOIN dim_customer AS c
+    ON o.customer_id = c.customer_id;
+GO
+
+SELECT TOP 20 * FROM gold.v_orders_by_customer ORDER BY order_date DESC;
+
+-- RLS smoke test: run as a restricted principal
+EXECUTE AS USER = 'analyst-us@contoso.com';
+SELECT COUNT(*) AS visible_rows FROM gold.v_orders_by_customer;
+REVERT;
+\end{lstlisting}
+
+\subsection{Validation Checklist}
+\begin{itemize}
+    \item SSMS connects with Entra authentication and lists the lakehouse tables.
+    \item The view returns joined rows and matches a manual join's row count.
+    \item The TVF filters correctly for at least two region values.
+    \item Under the restricted test user, only \texttt{US} rows are visible; after \texttt{REVERT}, all rows return.
+    \item The write attempt fails with a read-only error, and you can explain why that boundary exists.
+    \item The view definition is saved to the team repository as versioned SQL.
+\end{itemize}
+
+\section{Friday: Use Case and Architecture}
+\index{logical data warehouse}\index{data virtualization}
+An insurance analytics group wants its analysts---fluent in T-SQL, not Spark---to query raw claims files directly, without waiting for a warehouse loading program and without duplicating data into a second store. The answer is a logical data warehouse on the SQL analytics endpoint.
+
+\subsection{The Pattern}
+Land raw files in the lakehouse's \texttt{Files} area (or shortcut them in place), register curated Delta tables in \texttt{Tables}, and expose everything through a layered SQL object model: base tables (Silver/Gold), conformed views, parameterized TVFs, and a security layer of object grants plus RLS. Analysts connect SSMS, Power BI in DirectQuery, or Excel to the endpoint and never touch Spark \cite{microsoftFabricSqlEndpoint}.
+
+\begin{figure}[H]
+    \centering
+    \begin{tikzpicture}[node distance=8mm and 10mm]
+        \node[store] (files) at (0,0) {Lakehouse Files\\(raw / shortcuts)};
+        \node[stage] (tables) at (4.6,0) {Delta Tables\\Silver / Gold};
+        \node[stage] (objects) at (9.4,0) {SQL Objects\\views, TVFs, RLS};
+        \node[doc, minimum width=2.4cm, minimum height=1.0cm] (tools) at (14.0,0) {SSMS, Power BI,\\Excel (T-SQL)};
+
+        \draw[arrow] (files) -- node[above, font=\scriptsize]{register} (tables);
+        \draw[arrow] (tables) -- node[above, font=\scriptsize]{query in place} (objects);
+        \draw[arrow] (objects) -- node[above, font=\scriptsize]{read-only TDS} (tools);
+
+        \node[note, text width=12.5cm, align=center] at (7, -2.0) {No copies: the SQL layer reads the same Delta files Spark wrote.};
+    \end{tikzpicture}
+    \caption{Logical data warehouse: files to governed SQL objects without duplication.}
+    \label{fig:chapter6-logical-dw}
+\end{figure}
+
+\subsection{Trade-Offs}
+The logical pattern eliminates load pipelines and duplication, but it is not free. Queries scan Delta files at query time, so performance depends on the physical tuning of Part~I (V-Order, compaction, sensible file sizes). Complex transformations still belong in Spark or a warehouse; the endpoint is a consumption layer, not a transformation engine. And because the endpoint is read-only, any correction workflow must route back through the lakehouse write path.
+
+\begin{pitfall}
+A logical data warehouse fails quietly when the underlying tables are physically unhealthy. If analysts report slow queries, check file counts and compaction before blaming the SQL layer---the endpoint only reads what the lakehouse physically lays down.
+\end{pitfall}
+
+\section{Operational Guidance for Week 6}
+Treat endpoint objects as a versioned API. Views and TVFs live in source control; grants and RLS policies are reviewed like code; and a change to a view is a contract change for every report above it.
+
+\subsection{Performance and Reliability}
+Keep the physical layer healthy (compact, V-Ordered Delta tables), because the endpoint inherits it. Prefer views over repeated ad hoc joins so the optimizer sees stable shapes. Watch metadata sync after heavy Spark writes before demoing to stakeholders. Test RLS with real principals, not assumptions.
+
+\subsection{Security and Governance Checklist}
+\begin{itemize}
+    \item Grant on curated Gold objects; never grant directly on Bronze or PII-bearing Silver tables.
+    \item Implement RLS through a predicate function plus a security policy, and test with \texttt{EXECUTE AS USER}.
+    \item Deny sensitive columns explicitly where column-level restriction is required.
+    \item Audit who can create or alter views and TVFs in the endpoint.
+    \item Document every view as a data contract: owner, grain, refresh expectations, downstream consumers.
+    \item Verify shortcut targets enforce their own permissions; the endpoint does not weaken them.
+\end{itemize}
+
+\section{Interview Q\&A}
+\begin{enumerate}
+    \item \textbf{Q: Why is the SQL analytics endpoint read-only?}\\
+    A: The lakehouse's write path is Spark and ingestion tooling; the endpoint is a consumption and governance layer over the resulting Delta tables, so it exposes queries and objects but rejects DML against the tables themselves.
+    \item \textbf{Q: Which object would you create to reuse a join across reports?}\\
+    A: A view---it names the join once so every consumer inherits one definition, and it becomes the contract that stabilizes downstream reports.
+    \item \textbf{Q: How does RLS differ from object-level security?}\\
+    A: Object-level security controls \emph{which objects} a user can see; RLS controls \emph{which rows} within a permitted object a user sees, via a filter predicate attached by a security policy.
+    \item \textbf{Q: What happens when you query a shortcut through the endpoint?}\\
+    A: The endpoint resolves the shortcut to its target at query time and enforces the caller's permissions on that target---no copy is made and no permission boundary is crossed.
+    \item \textbf{Q: Why connect via SSMS instead of only the web editor?}\\
+    A: SSMS provides full T-SQL tooling, source-control-friendly scripts, \texttt{EXECUTE AS} security testing, and the connection pattern that external tools and DBAs already use.
+    \item \textbf{Q: What is a logical data warehouse?}\\
+    A: An architecture that queries lake data in place through a governed SQL object layer---views, TVFs, RLS---without physically moving data into a separate warehouse store.
+\end{enumerate}
+
+\section{Further Reading}
+Review Microsoft documentation for the lakehouse SQL analytics endpoint \cite{microsoftFabricSqlEndpoint}, Fabric security fundamentals \cite{microsoftFabricSecurity}, and cross-database querying \cite{microsoftFabricCrossQuery}. The warehouse comparison draws on the warehouse overview \cite{microsoftFabricWarehouse} and its T-SQL surface \cite{microsoftFabricWarehouseTSQL}. For the lakehouse storage underneath, revisit the lakehouse overview \cite{microsoftFabricLakehouse} and Delta Lake documentation \cite{deltaLakeDocs}.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item Every lakehouse automatically exposes a read-only SQL analytics endpoint backed by capacity compute.
+    \item The endpoint reflects the \texttt{Tables} area---files must be registered as Delta tables before SQL can see them.
+    \item Views, TVFs, and stored procedures turn the endpoint from a table dump into a governed product surface.
+    \item Object-level security and RLS compose: grant the object, then filter the rows, and test with real principals.
+    \item Shortcut queries through the endpoint execute with the caller's permissions on the target; nothing is copied.
+    \item The logical data warehouse lets T-SQL analysts query lake files without duplication, at the cost of inheriting the physical health of the lakehouse.
+    \item Endpoint objects are contracts: version them, review them, and treat changes as downstream-impacting events.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Explain to a Spark engineer why the endpoint being read-only is a feature, not a limitation.
+    \item \textbf{(Conceptual)} Compare a view, a TVF, and a stored procedure in the endpoint. Give one scenario where each is the right tool.
+    \item \textbf{(Hands-on)} Add a TVF \texttt{gold.fn\_customer\_orders(@customer\_id)} and verify it returns identical results to the equivalent view filter.
+    \item \textbf{(Hands-on)} Extend the RLS lab with a second region and a second test user; prove each user sees only their region.
+    \item \textbf{(Security)} Write the \texttt{DENY} statement that hides a salary column from a role that otherwise has \texttt{SELECT} on the table, and explain why RLS cannot do that job.
+    \item \textbf{(Design)} Sketch the object layer for the insurance logical data warehouse: which views and TVFs would exist on day one, and who owns each?
+    \item \textbf{(Interview)} In five sentences, defend the logical data warehouse against the charge that it ``just moves the bottleneck to query time.''
+    \item \textbf{(Operational)} Write the runbook entry for ``analyst reports missing table in SSMS''---metadata sync, table registration, and permission checks.
+\end{enumerate}
+
+\section{Capstone Project: A Governed SQL Consumption Layer}\label{sec:ch6-capstone}
+\index{capstone project}\index{row-level security!capstone}\index{logical data warehouse!capstone}
+
+\begin{capstonebox}
+\textbf{Mission.} Deliver a complete, governed SQL consumption layer over an existing lakehouse: conformed views, parameterized TVFs, object-level security, and tested row-level security---all consumable from SSMS by two analyst personas who must see different rows. This is the Week~6 lab raised to a deployable product.
+
+\textbf{Estimated time.} 3--5 hours on top of an existing Week 1--4 lakehouse.
+
+\textbf{What you'll practice.}
+\begin{itemize}
+    \item Designing a layered SQL object model over Silver and Gold Delta tables.
+    \item Implementing RLS with a mapping table, predicate function, and security policy.
+    \item Testing security as multiple principals from SSMS.
+    \item Versioning endpoint objects as SQL scripts in source control.
+\end{itemize}
+\end{capstonebox}
+
+\subsection*{Scenario}
+Contoso's sales analysts are split into regional teams. Leadership wants one lakehouse, one endpoint, and strict row isolation: a US analyst must never see EU rows, even when running ad hoc queries in SSMS. A shared set of conformed views must give every analyst the same metric definitions.
+
+\subsection*{Requirements}
+\begin{itemize}
+    \item At least three conformed views over existing Silver/Gold tables, each documented with grain and owner.
+    \item At least one TVF parameterized by region or date.
+    \item A \texttt{sec} schema containing the mapping table, predicate function, and an enabled security policy.
+    \item Object grants that expose Gold views to analysts and deny base PII tables.
+    \item Evidence of \texttt{EXECUTE AS USER} tests for two personas showing different row counts.
+    \item All objects scripted to \texttt{sql/} in the course repository and deployable by re-running the scripts.
+\end{itemize}
+
+\subsection*{Implementation Steps}
+\begin{enumerate}
+    \item Inventory the lakehouse tables and define the consumption contract (grains, owners, regions).
+    \item Script the views and TVF; deploy them from SSMS.
+    \item Build the \texttt{sec} schema objects and enable the policy.
+    \item Grant and deny at the object level.
+    \item Test as both personas; capture row-count evidence.
+    \item Commit all scripts and a short deployment note.
+\end{enumerate}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item The \texttt{sql/} script folder with views, TVF, security objects, and grants.
+    \item A screenshot or transcript of the two-persona row-count test.
+    \item A one-page contract document: view names, grains, owners, consumers.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item[\(\square\)] Both personas connect through SSMS and see only their region's rows in every conformed view.
+    \item[\(\square\)] No analyst can select from the base PII table, even directly.
+    \item[\(\square\)] All objects redeploy cleanly from scripts into a fresh endpoint.
+    \item[\(\square\)] The TVF returns correct results for at least two parameter values.
+    \item[\(\square\)] Security objects live in a dedicated schema with documented ownership.
+    \item[\(\square\)] The repository contains no credentials or personal connection strings.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Add column-level denies for a salary or national-ID column and prove they survive view access.
+    \item Add a third persona with cross-region access implemented through a second mapping row pattern.
+    \item Script an \texttt{ALTER SECURITY POLICY} rollout that adds a second filtered table without downtime.
+    \item Connect Power BI in DirectQuery to the endpoint and show RLS flowing through to report visuals.
+\end{itemize}

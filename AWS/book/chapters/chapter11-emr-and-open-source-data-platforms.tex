@@ -1,0 +1,339 @@
+% NOTE: Filename is fixed by the book outline; content teaches Week 11
+% (Change Data Capture with AWS DMS & EventBridge, and Data Contracts).
+\chapter{Change Data Capture, Event-Driven Pipelines, and Data Contracts}
+\index{AWS DMS}\index{change data capture}\index{Amazon EventBridge}\index{AWS Lambda}\index{Glue Schema Registry}\index{data contracts}\index{schema evolution}%
+\begin{objectives}
+\begin{itemize}
+    \item Configure AWS DMS change data capture (CDC) replication from a relational source to an S3 data lake.
+    \item Monitor CDC health with the right CloudWatch metrics and detect silent lag.
+    \item Build event-driven pipelines with Amazon EventBridge and lightweight AWS Lambda transformations.
+    \item Define data contracts with the AWS Glue Schema Registry: Avro schemas, compatibility modes, and versioning.
+    \item Distinguish breaking from non-breaking schema changes and assign contract ownership.
+    \item Architect near-real-time synchronization from an on-premises Oracle database to Redshift for live BI.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+CDC, event routing, and schema contracts are cloud-agnostic disciplines; each platform offers a managed shape of the same ideas.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{2.8cm}p{3.0cm}p{3.0cm}p{3.0cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{AWS} & \textbf{Azure} & \textbf{GCP} \\
+\midrule
+Managed CDC replication & AWS DMS & Azure DMS / Data Factory CDC & Datastream \\
+Event router & EventBridge & Event Grid & Eventarc \\
+Serverless functions & Lambda & Azure Functions & Cloud Run functions \\
+Schema registry & Glue Schema Registry & Azure Schema Registry & Managed Service for Schema Registry \\
+Contract enforcement & In Glue jobs / registry checks & In pipelines & In Dataflow / registry checks \\
+\addlinespace
+CDC lag metric & CDCLatencySource/Target & Replication latency metrics & Datastream freshness \\
+Breaking-change policy & BACKWARD/FORWARD/FULL modes & Compatibility levels & Compatibility levels \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+\textbf{Snowflake} ingests CDC through Snowpipe and streams, applying the same contract ideas at the table boundary. \textbf{MongoDB} contributes change streams---the document-native CDC primitive that pairs naturally with everything in this chapter. \textbf{Fabric} routes database mirroring and event streams through OneLake, its version of the CDC-to-lake path.
+\end{crosscloud}
+
+\section{Week 11 Roadmap and Mental Model}
+Batch windows are shrinking. The business question behind this week is: how fresh can analytical data be, and what breaks when it is continuous? The answer has two halves. The \emph{plumbing} half is change data capture---reading the source database's transaction log and replaying inserts, updates, and deletes into the lake continuously. The \emph{contract} half is making sure the continuous stream cannot silently change shape: schemas are registered, compatibility is enforced, and producers cannot break consumers without an explicit versioned decision.
+
+Weeks 1--10 mostly moved data on a schedule; this week moves it on \emph{change}. The cadence changes the failure modes: instead of a failed nightly job, you get a silently lagging stream and a subtly drifting schema. The week's tooling---DMS, EventBridge, Lambda, Schema Registry---maps onto those two failure modes directly.
+\index{CDC}\index{data contract}
+
+\begin{definitionbox}
+\textbf{Change data capture (CDC)} is the technique of reading a source database's transaction log to extract insert, update, and delete events as they happen, and applying them to a target---keeping the target continuously synchronized without re-scanning the source tables.
+\end{definitionbox}
+
+\begin{keyterms}
+\textbf{Full load + CDC}: DMS task pattern that bulk-loads existing rows, then applies ongoing changes. \textbf{Replication instance}: the managed DMS compute that runs tasks. \textbf{CDCLatencySource / CDCLatencyTarget}: CloudWatch metrics measuring lag at the read and apply stages. \textbf{Event bus}: EventBridge's routing fabric for events with pattern-matched rules. \textbf{Schema registry}: versioned store of schemas with enforced compatibility. \textbf{Compatibility mode}: BACKWARD, FORWARD, or FULL---which evolutions are permitted.
+\end{keyterms}
+
+\section{Monday: AWS DMS Architecture for Continuous Replication}
+\subsection{Full Load Plus CDC}
+A DMS task has two phases. \emph{Full load} copies existing table contents; \emph{CDC} then tails the transaction log and applies changes as they arrive \cite{awsDMSUserGuide}. The pair matters separately: full load is a one-time bulk problem (parallelism, LOB handling, validation), while CDC is a forever problem (lag, log retention, source load). Tasks run on a replication instance you size like any compute: memory for cached changes during bursts, storage for spilled transactions.
+\index{full load}\index{replication instance}
+
+\subsection{CDC to the Lake}
+Replicating to S3, DMS writes full-load files and ongoing change files (with operation markers) under a partitioned prefix---commonly \texttt{table=/load-date=/}. Downstream, a Glue job (Chapter~10) or a MERGE process applies the changes to a current-state table. This two-layer design---immutable change log in the lake, current-state table materialized downstream---preserves history, makes replays possible, and isolates consumers from replication mechanics.
+\index{DMS to S3}
+
+\begin{pitfall}
+\textbf{Monitoring task status instead of lag.} A DMS task shows \texttt{running} while minutes---or hours---behind the source. Alarm on \texttt{CDCLatencySource} and \texttt{CDCLatencyTarget}, and validate that the source database retains enough transaction log history to survive a replication instance outage. Stale CDC with a ``running'' task is the classic silent failure.
+\end{pitfall}
+
+\section{Tuesday: Event-Driven Pipelines with EventBridge}
+\subsection{Routing Events Instead of Polling}
+Amazon EventBridge is a serverless event bus: producers publish events, rules match patterns (source, detail-type, fields in the payload), and matched events fan out to targets---Lambda, Step Functions, SQS, Kinesis, and more \cite{awsEventBridgeDocs}. For data engineering, its signature use is reacting to \emph{arrival}: an S3 \texttt{ObjectCreated} event matching \texttt{raw/invoices/*.csv} starts the pipeline that validates and loads that file, replacing polling loops and fixed schedules with demand-driven execution.
+\index{EventBridge}\index{event bus}
+
+\subsection{Events as Pipeline Contracts}
+An event has a schema too. EventBridge schema discovery can infer and register event shapes, and mature teams treat event payloads like any other contract: versioned, documented, and owned by the producer. A rule pattern is a subscription to a contract; breaking the payload breaks every subscriber's rule silently. That observation leads directly to Wednesday's topic.
+
+\section{Wednesday: Lambda Transformations and Data Contracts}
+\subsection{Lambda in the Data Path}
+AWS Lambda handles the transforms that are too small for a Spark cluster: validating a header row, enriching an event, splitting a batch file, calling an API per record \cite{awsLambdaDocs}. The discipline is knowing the boundary: Lambda bills per millisecond with a 15-minute ceiling---perfect for per-file or per-event work, wrong for the 2~TB join. In this week's architecture Lambda is the connective tissue: triggered by EventBridge, normalizing DMS output, enforcing schemas at ingestion.
+\index{Lambda}
+
+\subsection{Data Contracts with the Glue Schema Registry}
+A \emph{data contract} is an enforceable agreement about a stream's or table's shape: field names, types, optionality, and evolution rules. The AWS Glue Schema Registry implements the machinery: Avro (or JSON Schema) definitions, versioned, with a \emph{compatibility mode} that decides which evolutions are legal \cite{awsGlueSchemaRegistry}:
+\index{Glue Schema Registry}\index{compatibility mode}
+
+\begin{itemize}
+    \item \textbf{BACKWARD}: new schema can read old data (consumers upgrade first). Deleting a field is allowed; adding a field without a default is not.
+    \item \textbf{FORWARD}: old schema can read new data (producers upgrade first). Adding an optional field is allowed; deleting is not.
+    \item \textbf{FULL}: both directions---the conservative production default. Only changes safe both ways (e.g., adding an optional field with a default) pass.
+\end{itemize}
+
+The contract taxonomy is worth memorizing: \emph{adding an optional field} is non-breaking; \emph{deleting a field, renaming a field, or changing a field's type} breaks consumers. Ownership is the social half: the producer owns the contract, but consumers sign off on changes---the registry enforces the mechanics, the sign-off process enforces the intent.
+
+\begin{lstlisting}[language=bash,caption={Registering an Avro schema with FULL compatibility.},label={lst:ch11-registry}]
+aws glue create-registry --registry-name orders-registry
+
+aws glue create-schema `
+  --registry-id RegistryName=orders-registry `
+  --schema-name order-events `
+  --data-format AVRO `
+  --compatibility FULL `
+  --schema-definition "{`"type`":`"record`",`"name`":`"Order`",`"fields`":[`
+      {`"name`":`"order_id`",`"type`":`"string`"},`
+      {`"name`":`"amount`",`"type`":`"double`"},`
+      {`"name`":`"coupon`",`"type`":[`"null`",`"string`"],`"default`":null}`
+    ]}"
+\end{lstlisting}
+
+\begin{tipbox}
+Enforce contracts at \emph{ingestion}, not at query time. A Glue job or Lambda that validates each batch against the registry rejects a breaking change before it poisons the lake; discovering the break at query time means the bad data is already persisted, versioned, and possibly replicated.
+\end{tipbox}
+
+\section{Thursday Hands-on Project: CDC from RDS PostgreSQL to the Lake}
+\index{hands-on project!DMS CDC to S3}
+Configure a DMS task with CDC enabled to stream ongoing changes from an RDS PostgreSQL instance into an S3 data-lake bucket, then prove the stream is live and lag is observable.
+
+\subsection*{Lab Objectives}
+\begin{itemize}
+    \item Prepare the PostgreSQL source for logical replication.
+    \item Create a replication instance, source and target endpoints, and a full-load-plus-CDC task.
+    \item Generate changes on the source and observe them arriving as change files in S3.
+    \item Alarm on CDC lag metrics.
+\end{itemize}
+
+\subsection*{Procedure}
+\begin{enumerate}
+    \item \textbf{Enable logical replication} on the RDS instance: parameter group with \texttt{rds.logical\_replication = 1}, reboot, and confirm \texttt{wal\_level = logical}.
+    \item \textbf{Create the replication instance} (a \texttt{dms.t3.medium} suffices for the lab) in the same VPC as the database.
+    \item \textbf{Create endpoints}: a PostgreSQL source endpoint (with the master or a replication user) and an S3 target endpoint pointing at \texttt{s3://<bucket>/cdc/orders/}.
+    \item \textbf{Create the task} with migration type \texttt{full-load-and-cdc} and a table mapping over the \texttt{public.orders} table.
+\end{enumerate}
+
+\begin{lstlisting}[language=bash,caption={Creating the DMS task with full load plus CDC.},label={lst:ch11-dms-task}]
+$Region = "us-east-1"
+
+aws dms create-replication-instance `
+  --replication-instance-identifier week11-ri `
+  --replication-instance-class dms.t3.medium `
+  --allocated-storage 50
+
+# (Endpoints omitted for brevity: source = RDS PostgreSQL, target = S3 prefix.)
+
+$Mapping = @"
+{
+  "rules": [{
+    "rule-type": "selection",
+    "rule-id": "1",
+    "rule-name": "orders",
+    "object-locator": { "schema-name": "public", "table-name": "orders" },
+    "rule-action": "include"
+  }]
+}
+"@
+$Mapping | Set-Content -Path table-mappings.json -Encoding ascii
+
+aws dms create-replication-task `
+  --replication-task-identifier week11-orders-cdc `
+  --source-endpoint-arn "arn:aws:dms:${Region}:123456789012:endpoint:SRC" `
+  --target-endpoint-arn "arn:aws:dms:${Region}:123456789012:endpoint:TGT" `
+  --replication-instance-arn "arn:aws:dms:${Region}:123456789012:rep:RI" `
+  --migration-type full-load-and-cdc `
+  --table-mappings file://table-mappings.json
+
+aws dms start-replication-task `
+  --replication-task-arn "arn:aws:dms:${Region}:123456789012:task:TASK" `
+  --start-replication-task-type start-replication
+\end{lstlisting}
+
+Generate change traffic and verify:
+
+\begin{lstlisting}[language=SQL,caption={Source-side changes that should appear as CDC files.},label={lst:ch11-changes}]
+INSERT INTO orders (order_id, amount, status) VALUES (90001, 129.99, 'NEW');
+UPDATE orders SET status = 'PAID' WHERE order_id = 90001;
+DELETE FROM orders WHERE order_id = 90001;
+\end{lstlisting}
+
+\subsection*{Verification}
+\begin{itemize}
+    \item Full-load files appear under the S3 prefix before CDC files start.
+    \item Each source change produces a change record with its operation marker (I/U/D) in the target prefix within the observed latency.
+    \item CloudWatch shows \texttt{CDCLatencySource} and \texttt{CDCLatencyTarget} near zero under light load; an alarm exists on both.
+    \item Stopping writes and querying the latest change files shows the delete as the final state of \texttt{order\_id 90001}.
+\end{itemize}
+
+\section{Friday Use Case: Near-Real-Time Oracle-to-Redshift Synchronization}
+\index{use case!Oracle to Redshift CDC}
+A bank runs its core ledger on on-premises Oracle. The BI team needs Redshift dashboards reflecting ledger changes within five minutes; the nightly batch is no longer acceptable, and the Oracle estate cannot be modified beyond enabling supplemental logging.
+
+\subsection{Architecture}
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[
+        box/.style={rectangle, rounded corners, draw=primary, thick, fill=primary!6, align=center, minimum width=2.9cm, minimum height=1.0cm, font=\small\bfseries},
+        storebox/.style={cylinder, shape aspect=0.25, draw=primary, thick, fill=blue!6, shape border rotate=90, align=center, text width=2.6cm, minimum height=1.3cm, font=\small\bfseries},
+        guard/.style={rectangle, rounded corners, draw=red!60!black, thick, fill=red!5, align=center, minimum width=2.6cm, minimum height=0.9cm, font=\footnotesize\bfseries},
+        arr/.style={-{Stealth[length=2.5mm]}, draw=primary, thick}
+    ]
+        \node[box] (oracle) at (0,0) {On-prem Oracle\\(redo logs)};
+        \node[box] (dms) at (3.3,0) {DMS CDC\\replication instance};
+        \node[storebox] (s3) at (6.6,0) {S3 change log\\(raw zone)};
+        \node[box] (glue) at (9.9,0) {Glue apply\\(MERGE)};
+        \node[box] (rs) at (13.0,0) {Redshift\\current state};
+        \node[guard] (lag) at (6.6,2.0) {Lag alarms\\CDCLatency*};
+        \node[guard] (reg) at (9.9,2.0) {Schema Registry\\contract checks};
+        \draw[arr] (oracle) -- (dms);
+        \draw[arr] (dms) -- (s3);
+        \draw[arr] (s3) -- (glue);
+        \draw[arr] (glue) -- (rs);
+        \draw[arr, dashed] (lag) -- (dms);
+        \draw[arr, dashed] (reg) -- (glue);
+    \end{tikzpicture}%
+    }
+    \caption{Near-real-time ledger sync: DMS tails Oracle redo into an S3 change log; a Glue MERGE maintains current state in Redshift; lag and contracts are monitored.}
+    \label{fig:ch11-oracle-cdc}
+\end{figure}
+
+\subsection{Design Decisions}
+\textbf{Two targets, not one.} DMS writes the raw change log to S3 (durable, replayable, auditable) and a second task---or a downstream Glue job reading the change log---applies MERGEs into Redshift. Writing straight to Redshift couples the replication path to warehouse availability; the S3 stage decouples them and preserves the full history.
+
+\textbf{Freshness budget.} The five-minute SLA is spent deliberately: DMS apply latency (sub-minute under normal load), S3 landing, a scheduled or event-driven Glue MERGE every two minutes, and Redshift commit time. Each stage gets a metric; the sum gets the alarm.
+
+\textbf{Log retention as an availability dependency.} Oracle must retain enough redo/archive logs to cover the longest plausible replication outage. The runbook names the retention, the metric that watches it, and the re-snapshot procedure if it is ever exceeded.
+
+\textbf{Schema drift policy.} Adding a nullable column flows: FULL compatibility permits it, the Glue apply adopts it, Redshift gains it via an expand-first migration (Chapter~24 formalizes this pattern). A type change or rename halts the pipeline and pages the owner---it is a contract violation, not a runtime event.
+
+\begin{pitfall}
+\textbf{Treating the change log as disposable.} The S3 change log is your replay capability and your audit trail. Lifecycle-expire it early and a Redshift-side corruption becomes unrecoverable without a new full load---which on a core ledger means an outage negotiation, not a retry.
+\end{pitfall}
+
+\section{Interview Q\&A}
+\subsection{Concepts and Trade-offs}
+\begin{enumerate}
+    \item \textbf{Q: Which CloudWatch metrics reveal CDC lag while a task shows ``running''?}\\
+    A: \texttt{CDCLatencySource} (gap between the source commit and DMS reading it) and \texttt{CDCLatencyTarget} (gap between reading and applying at the target). Task status alone says nothing about freshness.
+    \item \textbf{Q: BACKWARD versus FULL compatibility: which permits deleting a field safely?}\\
+    A: BACKWARD (new schema reads old data, so consumers already tolerate the absence). FULL forbids deletions because old consumers could not read new data missing the field.
+    \item \textbf{Q: Who owns a data contract: producer, consumer, or both?}\\
+    A: The producer owns and versions the schema; consumers sign off on changes. The registry enforces mechanics; the sign-off workflow enforces intent.
+    \item \textbf{Q: Why enforce the schema at ingestion instead of at query time?}\\
+    A: By query time the bad data is already persisted---and possibly versioned, replicated, and transformed downstream. Ingestion enforcement rejects breaking changes before they become durable.
+    \item \textbf{Q: Name one breaking and one non-breaking schema change.}\\
+    A: Breaking: deleting a field, renaming it, or changing its type. Non-breaking: adding an optional field with a default.
+    \item \textbf{Q: Why stage DMS output in S3 before Redshift?}\\
+    A: The change log is replayable history and decouples replication from warehouse availability; MERGEs can be re-run, audited, and repointed without touching the source again.
+\end{enumerate}
+
+\section{Further Reading}
+The DMS User Guide and Best Practices cover replication instances, full-load-plus-CDC tasks, and source prerequisites \cite{awsDMSUserGuide,awsDMSBestPractices}. EventBridge and Lambda documentation cover event routing patterns and serverless transform limits \cite{awsEventBridgeDocs,awsLambdaDocs}. The Glue Schema Registry documentation details compatibility modes and versioning \cite{awsGlueSchemaRegistry}. OpenLineage provides the emerging standard for tracing where contract-violating data flowed \cite{openLineage}.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item CDC replays the transaction log: continuous freshness without re-scanning sources---and a new silent-failure mode called lag.
+    \item Monitor \texttt{CDCLatencySource}/\texttt{CDCLatencyTarget}, and treat source log retention as an availability dependency.
+    \item EventBridge replaces polling with routed arrival events; Lambda handles the per-event transforms too small for clusters.
+    \item Data contracts make streams safe to evolve: registry, versions, and compatibility modes, owned by producers with consumer sign-off.
+    \item Enforce contracts at ingestion; query-time discovery means the poison is already durable.
+    \item Stage CDC through an S3 change log; current state is a rebuildable materialization, history is the asset.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Explain the difference between full load and CDC phases, and why each has distinct failure modes.
+    \item \textbf{(Conceptual)} Why does FULL compatibility permit adding an optional field but forbid deleting one?
+    \item \textbf{(Hands-on)} Complete the Thursday lab, then write a Glue job that MERGEs the change files into a current-state table; verify an update and a delete propagate.
+    \item \textbf{(Hands-on)} Register the \texttt{order-events} schema with FULL compatibility; attempt to register a version that deletes \texttt{amount} and capture the rejection.
+    \item \textbf{(Hands-on)} Build the EventBridge rule from arrival to action: S3 \texttt{ObjectCreated} on a prefix triggers a validating Lambda, with failures to an SQS DLQ.
+    \item \textbf{(Design)} Design the freshness monitoring for the Friday architecture: metrics per stage, alarm thresholds, and the five-minute budget arithmetic.
+    \item \textbf{(Design)} A producer must rename \texttt{amount} to \texttt{total\_amount}. Write the multi-release contract-evolution plan that never breaks consumers.
+    \item \textbf{(Architecture)} Add OpenLineage emission to the Glue apply job and describe how it shortens the investigation of a contract violation.
+\end{enumerate}
+
+\section{Capstone Project: A Contract-Protected CDC Feed}\label{sec:ch11-capstone}
+\index{capstone project}\index{CDC!capstone}\index{data contracts!capstone}
+
+\begin{capstonebox}
+\textbf{Mission.} Stand up a production-shaped CDC feed: DMS full load plus CDC from PostgreSQL into an S3 change log, a contract-validating Glue apply into Redshift, EventBridge-driven arrival processing, and lag monitoring with alarms.
+
+\textbf{Estimated time.} 5--7 hours in a sandbox AWS account.
+
+\textbf{What you\textquotesingle{}ll practice.}
+\begin{itemize}
+    \item DMS replication design: instance sizing, endpoints, full-load-plus-CDC tasks.
+    \item Contract enforcement at ingestion with the Glue Schema Registry.
+    \item Event-driven apply pipelines with EventBridge and Lambda.
+    \item Freshness observability: lag metrics, alarms, and re-snapshot runbooks.
+\end{itemize}
+\end{capstonebox}
+
+\subsection*{Scenario}
+An order-management PostgreSQL database must feed Redshift analytics within ten minutes, continuously, with a guarantee that a schema change upstream can never silently corrupt the warehouse. The feed must survive a one-hour replication outage without data loss.
+
+\subsection*{Requirements}
+\textbf{Functional requirements.}
+\begin{itemize}
+    \item DMS full-load-plus-CDC task from RDS PostgreSQL to an S3 change log, partitioned by table and date.
+    \item A Glue apply job that validates each batch against a FULL-compatibility registry schema before MERGEing into Redshift.
+    \item EventBridge rules triggering validation on change-file arrival; failures route to a DLQ with an SNS alert.
+    \item CloudWatch alarms on both CDC lag metrics and on apply-job failure.
+\end{itemize}
+
+\textbf{Non-functional requirements.}
+\begin{itemize}
+    \item The feed tolerates a one-hour DMS outage with zero data loss (documented log-retention evidence).
+    \item A deliberately breaking schema change is rejected at ingestion with the rejection logged.
+    \item Rerunning the apply for any date is idempotent.
+\end{itemize}
+
+\subsection*{Implementation Steps}
+\begin{enumerate}
+    \item Prepare the source (logical replication) and create the DMS task per \cref{lst:ch11-dms-task}.
+    \item Register the contract per \cref{lst:ch11-registry} and encode validation in the apply job.
+    \item Build the MERGE apply and prove idempotency by double application.
+    \item Wire EventBridge arrival events, the DLQ, and the SNS alerts.
+    \item Configure lag alarms; simulate an outage by stopping the task and document recovery.
+    \item Write the runbook: lag response, contract-violation response, re-snapshot procedure.
+\end{enumerate}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item Task configuration, table mappings, and endpoint definitions as code or exported JSON.
+    \item The registry schema, its compatibility policy, and the validation code path.
+    \item Evidence: change files, MERGE results, an injected breaking change rejected, alarm history from the outage drill.
+    \item The freshness budget arithmetic and the runbook.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item End-to-end freshness meets the ten-minute target under normal load, measured.
+    \item The one-hour outage drill recovers with no gap and no duplicate application.
+    \item A breaking schema change cannot reach Redshift; the rejection is logged and alerted.
+    \item Every stage of the freshness budget has a metric and an alarm.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Add a second target task writing Parquet current-state snapshots for Athena access.
+    \item Implement consumer sign-off as a pull-request workflow on schema versions.
+    \item Replace scheduled apply with Kinesis Data Streams delivery (Chapter~13) and compare latency.
+    \item Emit OpenLineage events from the apply job and trace one record end to end.
+\end{itemize}

@@ -1,0 +1,244 @@
+\chapter{External Functions, API Integrations, and Reverse ETL}
+\index{external functions}\index{API integration}\index{reverse ETL}\index{Week 16}%
+\begin{objectives}
+\begin{itemize}
+    \item Build external functions through API integrations backed by AWS API Gateway or Azure API Management.
+    \item Invoke external REST APIs safely from SQL with batching, rate-limit handling, and authentication headers.
+    \item Control per-call cost with batching strategies and result caching.
+    \item Implement reverse ETL: syncing curated segments from Snowflake back into operational systems with tasks and external functions.
+    \item Build a hands-on geocoding external function and a change-only CRM segment sync.
+    \item Evaluate managed reverse-ETL platforms (Census, Hightouch) against building in-house.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+Calling out to HTTP services from inside a warehouse, and pushing warehouse results back to operational tools, are the two directions of the same integration problem---every cloud offers both.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{2.8cm}p{3.0cm}p{3.0cm}p{3.0cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{AWS} & \textbf{Azure} & \textbf{GCP} \\
+\midrule
+API front door & API Gateway & API Management & API Gateway / Cloud Endpoints \\
+Compute behind API & Lambda & Azure Functions & Cloud Run / Functions \\
+Warehouse-to-API call & Redshift Lambda UDFs & Synapse + Logic Apps & BigQuery remote functions \\
+Reverse ETL tooling & Census/Hightouch + EventBridge & Census/Hightouch + ADF & Census/Hightouch + Cloud Functions \\
+Auth to third parties & IAM + secrets in the API layer & Managed identity + Key Vault & Service accounts + Secret Manager \\
+\addlinespace
+Snowflake equivalent & \multicolumn{3}{l}{API integration + external function; tasks calling external functions for reverse ETL} \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+\textbf{MongoDB} reaches outward via Atlas triggers and HTTPS endpoints; \textbf{Fabric} via notebooks and pipelines. Snowflake's constraint to remember: external functions are \emph{synchronous and billed per call}---the architecture must batch and cache, or the API bill becomes the story.
+\end{crosscloud}
+
+\section{Week 16 Roadmap}
+Chapters 13--15 kept computation inside Snowflake. Some data lives outside: address-verification APIs, currency feeds, CRM systems. This chapter opens two governed doors---external functions pull API answers into SQL; reverse ETL pushes curated answers back into operational tools \cite{snowflakeExternalFunctionsDocs}.
+
+Monday builds the external-function architecture. Tuesday covers safe invocation: batching, rate limits, caching. Wednesday is reverse ETL. Thursday builds the geocoder and the CRM sync. Friday designs the multi-API verification pipeline.
+
+\begin{keyterms}
+\textbf{External function}: a Snowflake function object whose invocation calls a remote HTTPS service.\quad
+\textbf{API integration}: the Snowflake security object holding the allowed API endpoint and cloud credentials.\quad
+\textbf{Reverse ETL}: syncing curated warehouse data back into operational systems (CRM, marketing, support).\quad
+\textbf{Batching}: sending many rows per API invocation to amortize per-call cost and latency.\quad
+\textbf{Identity resolution}: matching warehouse keys to operational-system IDs so updates target the right records.
+\end{keyterms}
+
+\section{Monday: External Functions Architecture}
+\index{external function}\index{API integration}
+An external function is two objects plus a contract. The \textbf{API integration} is the trust boundary: it names the cloud API endpoint (an API Gateway URL), carries the cloud role Snowflake may assume, and whitelists allowed prefixes. The \textbf{external function} is the SQL-callable object referencing the integration, declaring argument and return types. Behind the endpoint sits your compute---typically a Lambda function---which receives a JSON batch of rows, calls the real third-party API, and returns a JSON batch of results.
+
+\begin{lstlisting}[language=SQL, caption={API integration and external function for geocoding}]
+CREATE OR REPLACE API INTEGRATION geocode_api_int
+  API_PROVIDER = AWS_API_GATEWAY
+  API_AWS_ROLE_ARN = 'arn:aws:iam::123456789012:role/snowflake-api-caller'
+  API_ALLOWED_PREFIXES = ('https://abc123.execute-api.us-east-1.amazonaws.com/prod/')
+  ENABLED = TRUE;
+
+CREATE OR REPLACE EXTERNAL FUNCTION geo.geocode_address(address STRING)
+  RETURNS VARIANT
+  API_INTEGRATION = geocode_api_int
+  AS 'https://abc123.execute-api.us-east-1.amazonaws.com/prod/geocode';
+
+SELECT geo.geocode_address('1600 Amphitheatre Pkwy, Mountain View, CA');
+\end{lstlisting}
+
+\begin{definitionbox}
+An \textbf{external function} is synchronous: the calling query waits for the remote service, and Snowflake bills per call in addition to warehouse compute. Latency, failure modes, and cost of the remote API become properties of your query plan.
+\end{definitionbox}
+
+\begin{pitfall}
+\textbf{An external function in a big SELECT is a denial-of-wallet attack on yourself.} \texttt{SELECT geocode\_address(addr) FROM customers} over 10 million rows fires millions of API calls. Always pre-filter, deduplicate inputs, and cache results (Tuesday).
+\end{pitfall}
+
+\section{Tuesday: Batching, Rate Limits, and Caching}
+\index{batching}\index{rate limits}\index{caching}
+External functions already transport rows in batches---Snowflake sends multiple rows per HTTP POST---but \emph{effective} batching is a design discipline:
+
+\begin{itemize}
+    \item \textbf{Deduplicate before calling.} \texttt{SELECT DISTINCT address} against the cache first; identical inputs must never pay twice.
+    \item \textbf{Cache in a results table.} Key by a hash of the normalized input; store payload and fetch timestamp. Repeat lookups become joins.
+    \item \textbf{Respect the third party's rate limit at the gateway.} API Gateway throttling and Lambda concurrency caps turn third-party 429s into controlled backpressure instead of query failures.
+    \item \textbf{Authenticate at the API layer.} The IAM role on the API integration is scoped to the one endpoint; third-party API keys live in the Lambda's secret store, never in Snowflake DDL \cite{awsApiGatewayDocs}.
+\end{itemize}
+
+\begin{lstlisting}[language=SQL, caption={Cache-first geocoding pattern}]
+-- Resolve only cache misses through the paid API
+INSERT INTO geo.address_cache (address_hash, address, result, fetched_ts)
+SELECT SHA2(UPPER(TRIM(a.address))) ,
+       a.address,
+       geo.geocode_address(a.address),
+       CURRENT_TIMESTAMP()
+FROM (SELECT DISTINCT address FROM raw.new_addresses) a
+LEFT JOIN geo.address_cache c
+  ON c.address_hash = SHA2(UPPER(TRIM(a.address)))
+WHERE c.address_hash IS NULL;
+\end{lstlisting}
+
+\section{Wednesday: Reverse ETL}
+\index{reverse ETL}\index{identity resolution}
+Warehouses accumulate truth that operational tools need: lead scores, churn-risk segments, LTV tiers. \textbf{Reverse ETL} pushes those curated Gold results back into the CRM, marketing platform, or support system. Natively in Snowflake, the pattern is: a Gold segment table, a stream or delta query detecting changed members, and a scheduled task calling an external function that upserts the CRM's REST API.
+
+Three engineering concerns dominate:
+\begin{enumerate}
+    \item \textbf{Change-only sync.} Sync members whose segment changed since the last run (a stream on the segment table is the Chapter 7-native answer). Full-resyncs burn API quota and risk clobbering in-flight edits.
+    \item \textbf{Identity resolution.} The warehouse's \texttt{customer\_id} must map to the CRM's contact ID. Maintain a mapping table built during onboarding syncs; every reverse-ETL write resolves through it, and unresolved keys route to a review queue rather than creating duplicate CRM contacts.
+    \item \textbf{Frequency trade-offs.} Higher sync frequency means fresher operational data against more credits and more API quota. Fifteen-minute syncs for sales-triggering segments; daily for informational fields.
+\end{enumerate}
+
+\begin{notebox}
+Managed platforms---Census, Hightouch---productize exactly this: connectors, diffing, identity mapping, and retries \cite{censusDocs}. Buy when connector breadth and marketing-team self-service matter; build when the syncs are few, the logic is custom, or platform cost exceeds a task plus an external function.
+\end{notebox}
+
+\section{Thursday Hands-On Project: Geocoding Function and CRM Segment Sync}
+\index{hands-on project!external functions}
+This lab builds both doors: an external function geocoding addresses through Lambda, and a change-only reverse-ETL sync to a mock CRM.
+
+\subsection*{Scenario}
+Sales operations wants addresses validated at ingest and the \texttt{customer\_segments} Gold table reflected in the CRM within fifteen minutes of a segment change.
+
+\subsection*{Procedure}
+\begin{enumerate}
+    \item Deploy a Lambda (or mock HTTP service) that accepts a batch of addresses and returns geocodes; front it with API Gateway.
+    \item Create the API integration with a least-privilege IAM role and the external function.
+    \item Build \texttt{geo.address\_cache} and the cache-first load from Tuesday; measure the cache-hit rate over repeated loads.
+    \item Create \texttt{gold.customer\_segments}, a stream on it, and a task gated by \texttt{SYSTEM\$STREAM\_HAS\_DATA} that calls a \texttt{crm\_upsert} external function only for changed members.
+    \item Stand up a mock CRM endpoint recording upserts; run three sync cycles, including a no-change cycle that must send zero calls.
+    \item Kill the mock endpoint mid-run; observe failure behavior and replay safely after recovery.
+\end{enumerate}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item \textbf{DDL and infrastructure notes:} API integration, external functions, IAM scoping.
+    \item \textbf{Cache evidence:} hit-rate table proving paid calls fall as the cache warms.
+    \item \textbf{Sync proof:} mock-CRM request logs showing change-only behavior and the zero-call no-op cycle.
+    \item \textbf{Failure replay runbook:} what happened when the endpoint died, and how replay applied exactly once.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item The API integration's role and allowed prefixes are scoped to the single endpoint.
+    \item No third-party API key exists anywhere in Snowflake objects or code.
+    \item The sync sends only changed segments; a no-change run makes zero API calls.
+    \item Endpoint failure neither loses nor duplicates syncs after recovery.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Add gateway throttling and measure graceful degradation under a forced rate limit.
+    \item Implement identity resolution with an unresolved-keys review queue.
+    \item Rebuild the sync in a Census or Hightouch trial and write the build-versus-buy comparison.
+\end{itemize}
+
+\section{Friday Real-World Architecture: Address Verification and Currency Conversion}
+\index{Real-World Architecture!API integration}
+An e-commerce platform must verify shipping addresses at order time and convert catalog prices into 12 currencies hourly---two third-party APIs with very different shapes.
+
+\subsection{Design Decisions}
+\begin{enumerate}
+    \item \textbf{Verification is cache-first and asynchronous to checkout.} Orders land unverified; a near-real-time task external-function-verifies only cache misses, and a flag column drives the fulfillment hold. Checkout latency never depends on a third party.
+    \item \textbf{Currency conversion is a dimension, not a function call.} Twelve currencies times daily rates is a tiny table---fetch rates once per hour with one batched call and join. Per-row conversion calls would pay API prices for dimensional data.
+    \item \textbf{Every call class gets a budget.} Per-API monthly call budgets tracked against cache-hit rates; the alert fires on call-volume anomalies, which usually mean a cache regression or an unbatched new consumer.
+\end{enumerate}
+
+\begin{pitfall}
+\textbf{External functions in dashboard queries couple BI latency to third-party uptime.} Enrich in pipelines, serve from tables. A dashboard that calls a live API is an outage and a bill waiting for the same meeting.
+\end{pitfall}
+
+\section{Interview Q\&A}
+\begin{enumerate}
+    \item \textbf{Q: Which two objects does an external function need to reach an API?}\\
+    A: An API integration (the trust boundary: endpoint whitelist plus cloud role) and the external function object itself, fronting compute such as API Gateway plus Lambda.
+    \item \textbf{Q: Why batch multiple rows per external function call?}\\
+    A: Calls are synchronous and billed per invocation; batching amortizes per-call cost and latency across rows.
+    \item \textbf{Q: How do you avoid re-paying for repeated identical lookups?}\\
+    A: Cache results in a table keyed by normalized-input hash and resolve only cache misses through the API.
+    \item \textbf{Q: What is reverse ETL, and which Snowflake objects drive it natively?}\\
+    A: Syncing curated warehouse results back into operational tools; natively: a Gold table, a stream detecting changed members, and a task calling an external function against the tool's API.
+    \item \textbf{Q: What trade-off does higher sync frequency impose?}\\
+    A: Fresher operational data against more warehouse credits and more third-party API quota---frequency should match the business decision the sync feeds.
+\end{enumerate}
+
+\section{Further Reading}
+Snowflake's external-functions documentation defines the API-integration trust model and call semantics \cite{snowflakeExternalFunctionsDocs}; AWS API Gateway documentation covers throttling and IAM \cite{awsApiGatewayDocs}. Census documentation represents the managed reverse-ETL alternative \cite{censusDocs}. Chapter 8's tasks and Chapter 7's streams are the native sync machinery.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item External functions are synchronous, per-call-billed doors out of Snowflake---batch, dedupe, and cache everything.
+    \item The API integration is the trust boundary; third-party secrets live behind the gateway, never in Snowflake.
+    \item Reverse ETL natively is Gold table plus stream plus task plus external function---change-only, identity-resolved.
+    \item Sync frequency is a business decision priced in credits and API quota.
+    \item Small reference data (FX rates) is a dimension to join, not an API to call per row.
+    \item Buy managed reverse ETL for connector breadth; build when logic is custom and sync count is small.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Draw the request path from \texttt{SELECT geo.geocode\_address(...)} to the third-party API and back, naming every trust boundary.
+    \item \textbf{(Conceptual)} Explain why a dashboard should never embed an external function call.
+    \item \textbf{(Hands-on)} Measure cache-hit rate over five repeated load batches and plot paid-call decay.
+    \item \textbf{(Hands-on)} Force a third-party 429 storm at the gateway and document query behavior with and without throttling.
+    \item \textbf{(Hands-on)} Build the identity-mapping table and the unresolved-key review queue.
+    \item \textbf{(Design)} Choose sync frequencies for five segment types (sales-trigger, informational, support, suppression, billing) with justification.
+    \item \textbf{(Design)} Write the build-versus-buy rubric comparing native reverse ETL against Census for a given company.
+    \item \textbf{(Operations)} Build the per-API call-budget alert keyed on daily invocation counts.
+    \item \textbf{(Cost)} Model monthly cost of verifying 2M addresses/month at 80\% cache hit rate versus no cache.
+    \item \textbf{(Interview)} Explain reverse ETL to a CRM administrator who fears the warehouse will corrupt their system.
+\end{enumerate}
+
+\section{Capstone Project: End-to-End Snowpark Python Engineering Pipeline}\label{sec:ch16-capstone}
+\index{capstone project!Milestone 4}
+\begin{capstonebox}
+\textbf{Mission.} Integrate Weeks 13--16 into one Python-driven pipeline: a Snowpark session with key-pair auth reading staging tables, a vectorized pandas UDF for text enrichment, an external function validating postal addresses through an external API, and the whole flow wrapped in a Snowpark stored procedure---with changed segments reverse-ETLed to a CRM.
+
+\textbf{Estimated time.} 6--9 hours across the four weeks' labs.
+
+\textbf{Deliverable checklist.}
+\begin{itemize}
+    \item The stored procedure runs end to end from a clean environment following a committed README.
+    \item Architecture diagram covering the client, Snowpark pushdown, and the external-function path.
+    \item At least three automated tests on UDF outputs (unit plus in-database) with a failing-case demonstration.
+    \item Monitoring evidence: query-history export proving pushdown and UDF execution metrics.
+    \item Monthly cost estimate (warehouse credits plus external-function calls) with two optimization decisions.
+    \item Security review: key-pair auth, least-privilege API integration, no secrets in code.
+\end{itemize}
+\end{capstonebox}
+
+The capstone's vectorized heart is the sentiment UDF from Chapter 14:
+
+\begin{lstlisting}[language=Python, caption={Vectorized pandas UDF for sentiment}]
+from snowflake.snowpark.functions import pandas_udf
+import pandas as pd
+
+@pandas_udf(name="sentiment_score", is_permanent=True,
+            stage_location="@udf_stage", replace=True,
+            session=session)
+def sentiment_score(s: pd.Series) -> pd.Series:
+    return (s.str.count(r"(?i)great|love|excellent")
+           - s.str.count(r"(?i)bad|terrible|poor"))
+\end{lstlisting}
+
+Field pitfalls: \texttt{collect()} on large frames exhausts client memory (persist with \texttt{save\_as\_table}); one row per external-function call explodes the API bill (batch and cache); and unpinned package versions break against the Anaconda channel at deploy time.

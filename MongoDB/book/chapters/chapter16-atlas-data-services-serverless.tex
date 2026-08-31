@@ -1,0 +1,297 @@
+\chapter{Atlas Data Services, Serverless Integration, and Reverse ETL}
+\index{change streams}\index{CDC}\index{resume token}\index{Atlas Triggers}\index{Atlas Functions}\index{reverse ETL}\index{Data API}\index{GraphQL}\index{serverless}%
+
+\begin{objectives}
+\begin{itemize}
+    \item Build resumable change-stream consumers with persisted tokens, pre/post-images, and operation filters.
+    \item Trigger Atlas Functions on database writes and compose event-driven serverless flows.
+    \item Implement reverse ETL: curated aggregates pushed back into operational systems (CRM sync) with identity resolution and sync-frequency trade-offs.
+    \item Expose HTTPS-based database interactions through the Atlas Data API and GraphQL API.
+    \item Size serverless connection pools against cold-start storms.
+    \item Architect an event-driven serverless order-fulfillment platform in the Friday engagement.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+Change data capture, serverless triggers, and reverse ETL are the connective tissue of every modern data platform; each cloud has a native variant, and the discipline---checkpoint, idempotency, replay---is identical across all of them.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{2.9cm}p{3.0cm}p{3.0cm}p{3.0cm}@{}} 
+\toprule
+\textbf{Concept} & \textbf{AWS} & \textbf{Azure} & \textbf{GCP} \\
+\midrule
+Database CDC & DynamoDB Streams / DMS CDC & Cosmos DB change feed & Firestore triggers / Datastream \\
+Serverless trigger & Lambda on streams & Functions on change feed & Cloud Functions / Run \\
+HTTPS data API & DynamoDB API / RDS Data API & Cosmos DB REST & Firestore REST \\
+Reverse ETL & AppFlow / custom & Synapse Link + Logic Apps & Datastream + Workflows \\
+Event backbone & Kinesis / EventBridge & Event Hubs / Event Grid & Pub/Sub \\
+\addlinespace
+Snowflake / Fabric & \multicolumn{3}{l}{Streams + Tasks for CDC; reverse ETL into operational stores via connectors; Fabric Activator for triggers} \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+MongoDB change streams are distinguished by what they ride on: the same oplog that powers replication, so CDC is a first-class, total-order-per-shard, transactional-integrity-preserving API rather than a bolt-on log scrape \cite{mongodbChangeStreamsDocs,mongodbOplogDocs}.
+\end{crosscloud}
+
+\section{Week 16 Roadmap: Data Services Around the Core}
+Every write your applications make is already an event; this week turns that capability into serverless architecture. Monday masters the change-stream consumer (resume tokens, pre/post-images, filters); Tuesday adds Atlas Triggers and Functions and the reverse-ETL pattern; Wednesday covers HTTPS-based access via the Data API and GraphQL and the serverless connection-pooling discipline; Thursday builds the resumable microservice; Friday composes the event-driven fulfillment platform \cite{mongodbChangeStreamsDocs}.
+
+\begin{definitionbox}
+\textbf{Reverse ETL} is the movement of curated, warehouse- or lake-computed aggregates (customer-360 scores, propensity segments) back into operational systems---CRMs, ad platforms, support tooling---so that analytics changes front-line behavior. \textbf{Identity resolution} is the matching layer that binds operational records to analytical entities on stable keys or hashed identifiers.
+\end{definitionbox}
+
+\begin{keyterms}
+\textbf{Resume token}: an opaque position marker; the consumer's checkpoint. \textbf{Pre/post-image}: the document before/after the change, when collection-level capture is enabled. \textbf{Atlas Trigger}: a database or scheduled event that invokes an Atlas Function. \textbf{Data API}: HTTPS endpoint for CRUD and aggregation without a driver. \textbf{Oplog window}: how far back tokens remain valid. \textbf{At-least-once}: the delivery guarantee that makes sink idempotency mandatory.
+\end{keyterms}
+
+\begin{definitionbox}
+A \textbf{change stream} is a cursor over a real-time, ordered feed of data changes (inserts, updates, deletes, DDL) for a collection, database, or deployment, backed by the oplog and resumable from a persisted token.
+\end{definitionbox}
+
+\section{Monday: Change Stream Fundamentals}
+\subsection{What Streams Over What}
+Streams open at three scopes: one collection, one database, or the whole deployment. Events carry \texttt{operationType}, the document key, and---by configuration---the \texttt{fullDocument} (post-image lookup), pre-images, and update descriptions. Ordering is total per shard and per document; cross-shard ordering is causal, not global, which matters when a consumer assumes timeline order across tenants.
+
+The filtering pipeline is pushed into the server: \texttt{db.orders.watch([\{ \$match: \{ "fullDocument.status": "paid" \} \}])} streams only matching events. Filter early for the same reason Chapter 10 filters early: events you do not consume still cost oplog reads and network.
+
+\subsection{Resume Tokens and the Oplog Window}
+Every event carries an \texttt{\_id} that is its resume token. Persisting tokens after successful processing makes consumers crash-safe: reopen with \texttt{resumeAfter} and continue exactly where you left off. The boundary condition is the oplog window (Chapter 5): a token whose entries have rolled off is dead. The re-bootstrap procedure is the syllabus's production note made concrete: stop the consumer, snapshot the source, open a fresh stream from the post-snapshot point, and resume token checkpointing from there. Size the oplog so your worst-case consumer downtime fits the window with margin \cite{mongodbOplogDocs}.
+
+\begin{pitfall}
+\textbf{Checkpointing before processing.} Saving the token before the sink write loses events on crash; saving it after risks duplicate processing on crash. The correct pair is at-least-once delivery plus an idempotent sink---there is no token-timing trick that yields exactly-once without idempotency.
+\end{pitfall}
+
+\subsection{Pre/Post-Images and Transactional Integrity}
+Enabling \texttt{changeStreamPreAndPostImages} on a collection adds the before-image to update/delete events---the difference between ``something changed'' and ``field X went from A to B,'' which audit and downstream-diff consumers require. Multi-document transactions stream their operations together and in order at commit, preserving the Chapter 7 invariant for consumers: a capture-and-ledger-post transaction never appears half-applied in the stream.
+
+\subsection{The Reference Consumer}
+\begin{lstlisting}[language=Python, caption={Resumable change-stream consumer with post-processing checkpoint.}]
+from pymongo import MongoClient
+
+client = MongoClient("mongodb://localhost:27017/?replicaSet=labrs")
+db = client.shop
+pipeline = [{"$match": {"operationType": {"$in": ["insert", "update"]}}}]
+
+def consume():
+    token = load_resume_token(db)              # persisted checkpoint
+    kwargs = {"pipeline": pipeline, "full_document": "updateLookup"}
+    if token:
+        kwargs["resume_after"] = token
+    try:
+        with db.orders.watch(**kwargs) as stream:
+            for change in stream:
+                process_idempotent(change)     # sink upsert by document key
+                save_resume_token(db, stream.resume_token)  # AFTER processing
+    except Exception:
+        consume()                              # re-open from last token
+
+def process_idempotent(change):
+    key = change["documentKey"]["_id"]
+    doc = change.get("fullDocument")
+    db.search_index.replace_one({"_id": key}, {"_id": key, "doc": doc},
+                                upsert=True)   # replay-safe
+\end{lstlisting}
+
+\subsection{Idempotent Sinks and Dead Letters}
+At-least-once delivery is the honest model: crashes between sink write and token save replay events. Sinks must therefore be idempotent---upserts keyed on the document key or a deterministic event key---or carry a dedup store. Events that fail processing repeatedly (poison events: schema drift, oversized payloads) must not stall the stream forever; after a bounded retry count, route them to a dead-letter collection with the error attached, and alert on DLQ depth.
+
+\begin{tipbox}
+Include the resume token or a monotonic event key in the sink document. It makes ``did we process event X?'' answerable and turns replay debugging from archaeology into a query.
+\end{tipbox}
+
+\section{Tuesday: Atlas Triggers, Functions, and Reverse ETL}
+\subsection{Database Triggers and Functions}
+An Atlas Trigger fires an Atlas Function on database change events (itself a managed change stream) or on a schedule. Functions are serverless JavaScript executing beside the cluster: no driver management, no connection code, billed per execution. The canonical use is the reaction path: an order write triggers a function that enriches the document, calls an external API, or appends to a processing queue. The design limits mirror all serverless triggers: functions are best for short, stateless reactions; heavy computation belongs in Chapter 15's stream processors; and every function needs the same idempotency discipline, because trigger delivery is at-least-once.
+
+\subsection{Reverse ETL: Closing the Analytics Loop}
+Reverse ETL pushes curated aggregates---customer-360 scores, churn propensities, segment memberships---from the analytical layer back into operational systems. The MongoDB-native pattern: an aggregation computes the score documents (Chapters 10--11), a change stream on the results collection fires an Atlas Function that calls the CRM's API. The two hard parts are \textbf{identity resolution}---matching operational contacts to analytical entities on stable keys (customer ID) or hashed emails, with an explicit unmatched-record quarantine---and the \textbf{sync-frequency trade-off}: real-time pushes are fresh but hammer the CRM's rate limits and amplify churn (a recomputed score that oscillates by 0.01 spams the CRM nightly); batch syncs with a materiality threshold (``push only if the score moved $>5\%$'') are calmer and cheaper. Choose per destination, and document the freshness each downstream system can rely on.
+
+\begin{pitfall}
+\textbf{Reverse ETL without idempotency or materiality.} A function that PUTs every score change into the CRM on every pipeline run will rate-limit itself and corrupt audit trails downstream. Upsert by external key, push only material changes, and log every call with the source watermark.
+\end{pitfall}
+
+\section{Wednesday: Atlas Data API, GraphQL, and Serverless Pooling}
+\subsection{HTTPS-Based Database Access}
+The Atlas Data API exposes CRUD and aggregation over HTTPS---no driver, no persistent connection---for environments where drivers are impractical: edge workers, sandboxed automation, third-party integrations. A hosted GraphQL API (App Services lineage) adds typed schemas and client-generated queries over the same collections. Both trade driver-level control (sessions, transactions, fine-grained pooling) for ubiquity; the rule of thumb is Data API for integration glue and low-rate paths, drivers for anything latency- or throughput-sensitive.
+
+\subsection{Serverless Connection Pooling}
+Serverless functions connecting directly to Atlas hit a scaling wall: each cold-starting function instance opens a fresh connection pool, and a burst of hundreds of concurrent functions can exhaust \texttt{maxPoolSize} $\times$ instances against the cluster's connection limit. The syllabus's production note is the fix list: reuse the client across warm invocations (global/module scope outside the handler), set a small \texttt{maxPoolSize} (1--10) for short-lived functions, and prefer the Data API or a connection-pooling proxy for spiky workloads. Monitor connections as a percentage of maximum---the Chapter 23 alert at 80\% exists precisely for this failure.
+
+\begin{tipbox}
+A cold-start storm looks like a database outage from the application side (connection timeouts) and like a connection spike from the database side. The fix is on the client side: warm client reuse and bounded pools.
+\end{tipbox}
+
+\section{Thursday Hands-On Project: Search-Index Sync Microservice}
+Build the resumable consumer from Monday as a real service: order changes flow through a change stream (and, for the light-reaction variant, an Atlas Function) into a derived search-index collection, surviving crashes mid-stream.
+
+\subsection{Lab Protocol}
+Seed the Chapter 5 replica set with an orders collection. Start the consumer, then run a writer loop that updates random orders. Mid-run: kill the consumer process (\texttt{Stop-Process -Force}), keep writing for 30 seconds, restart the consumer, and verify the search index converges to exactly the current order state with no missing and no duplicated updates. Then inject a poison event (an order with a field shape the sink rejects) and verify DLQ routing plus stream continuation.
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item The consumer service with persisted resume tokens and idempotent sink.
+    \item The crash-recovery test log showing convergence after restart.
+    \item The poison-event test showing DLQ routing and uninterrupted processing.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item After the mid-stream crash, the search index equals the source state (verified by a diff script).
+    \item Token persistence demonstrably occurs after sink writes (code review plus fault test).
+    \item The poison event lands in the DLQ with its error, and the stream processes subsequent events.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Let the consumer sleep past the oplog window and execute the full re-bootstrap procedure.
+    \item Replace the sink with a \texttt{\$merge}-based materialized view refresh (Chapter 11) triggered by the stream.
+\end{itemize}
+
+\section{Friday Use Case and Architecture: Event-Driven Order Fulfillment}
+\subsection{Scenario and Requirements}
+An e-commerce platform must decouple order placement from fulfillment, inventory, notification, and analytics. Requirements: no lost events, no duplicate customer notifications, fulfillment reacting within seconds, and the ability to add new consumers without touching the order service.
+
+\subsection{Architecture}
+Order placement writes the order and an outbox document in one transaction (Chapter 7's machinery)---the \textbf{outbox pattern}, which eliminates the dual-write race (write the order, crash, never publish) that naive producers suffer: the business write and the event commit atomically, and the stream guarantees publication \cite{kleppmann2017ddia}. A change stream on \texttt{orders} (filtered to paid/status events) feeds Kafka via the source connector. Three independent consumer groups process events: fulfillment (exactly-once-effect via dedup-key upserts), notifications (idempotent by event key against a sent-messages store), and an ASP windowed analytics job (Chapter 15) maintaining five-minute sales aggregates merged into a dashboard collection. An Atlas Trigger on \texttt{orders} handles the light reactions (fraud-flag webhook, cache invalidation) that do not justify a consumer group. Resume tokens checkpoint per consumer; the DLQ fronts an on-call runbook; the oplog is sized for a 24-hour consumer outage. New consumers subscribe to the topic---the order service never learns they exist.
+
+\begin{figure}[H]
+    \centering
+    \resizebox{0.98\textwidth}{!}{%
+    \begin{tikzpicture}[
+        box/.style={rectangle, rounded corners, draw=primary, fill=primary!6, minimum width=2.5cm, minimum height=1cm, align=center, font=\small\bfseries},
+        bus/.style={rectangle, rounded corners, draw=codepurple, fill=codepurple!8, minimum width=2.5cm, minimum height=1cm, align=center, font=\small\bfseries},
+        sink/.style={rectangle, rounded corners, draw=green!45!black, fill=green!8, minimum width=2.5cm, minimum height=1cm, align=center, font=\small\bfseries},
+        arrow/.style={-{Stealth[length=2.5mm]}, draw=primary, thick}
+    ]
+        \node[box] (api) at (0,0) {Order API\\(txn: order +\\outbox)};
+        \node[box] (cs) at (3.8,0) {Change\\Streams};
+        \node[bus] (kafka) at (7.4,0) {Kafka\\topics};
+        \node[sink] (ful) at (11.6,1.9) {Fulfillment\\(dedup upserts)};
+        \node[sink] (notif) at (11.6,0) {Notifications\\(idempotent)};
+        \node[sink] (asp) at (11.6,-1.9) {ASP windows\\$\to$ dashboard};
+        \node[box] (dlq) at (7.4,-2.6) {DLQ + alerts};
+        \draw[arrow] (api) -- (cs);
+        \draw[arrow] (cs) -- (kafka);
+        \draw[arrow] (kafka) -- (ful);
+        \draw[arrow] (kafka) -- (notif);
+        \draw[arrow] (kafka) -- (asp);
+        \draw[arrow, dashed] (kafka) -- (dlq);
+    \end{tikzpicture}%
+    }
+    \caption{Event-driven fulfillment: transactional outbox, change-stream capture, Kafka fan-out, idempotent sinks, dead-letter safety.}
+    \label{fig:ch15-fulfillment}
+\end{figure}
+
+\subsection{Guardrails}
+The operational contract: consumer lag is the paging metric (not error logs), token checkpoints are monitored for age, DLQ depth above zero pages during business hours, and a quarterly drill re-bootstraps one consumer group from snapshot to prove the runbook. Resume-token mortality is treated as a capacity fact: oplog window $\geq$ 2$\times$ the longest tolerable consumer downtime \cite{mongodbChangeStreamsDocs}.
+
+\section{Interview Q\&A}
+\subsection{CDC and Streaming}
+\begin{enumerate}
+    \item \textbf{Q: What does a change-stream resume token identify?}\\
+    A: A position in the oplog. Persisted after processing, it lets a consumer resume exactly after the last handled event---valid only while its oplog entries survive.
+
+    \item \textbf{Q: Why persist the resume token only after processing an event?}\\
+    A: Saving it before the sink write loses events on crash; saving it after means a crash replays the event---at-least-once, which the idempotent sink absorbs.
+
+    \item \textbf{Q: What is reverse ETL, and what problem does identity resolution solve in it?}\\
+    A: Reverse ETL pushes curated analytical aggregates back into operational systems like CRMs. Identity resolution binds analytical entities to operational records on stable keys or hashed emails---without it, scores land on the wrong contact or duplicate.
+
+    \item \textbf{Q: Real-time versus batch CRM sync?}\\
+    A: Real-time is fresh but hits rate limits and pushes noise (oscillating scores); batch with a materiality threshold is calmer and cheaper. Choose per destination and document the freshness contract.
+
+    \item \textbf{Q: When does a resume token die?}\\
+    A: When its oplog entries roll past the oplog window---a consumer paused longer than the window must re-bootstrap from a snapshot.
+
+    \item \textbf{Q: Why the outbox pattern instead of ``write then publish''?}\\
+    A: The two-write sequence can crash in between, losing the event. The outbox commits the event with the business write in one transaction; the stream guarantees publication.
+
+    \item \textbf{Q: How do serverless functions exhaust a cluster's connections?}\\
+    A: Every cold-starting instance opens a fresh pool; hundreds of concurrent functions multiply \texttt{maxPoolSize} past the connection limit. Warm-scope the client, bound the pool, or use the Data API.
+\end{enumerate}
+
+\section{Further Reading}
+MongoDB's change-stream documentation defines tokens, images, and scope \cite{mongodbChangeStreamsDocs}, with oplog sizing governing token lifetime \cite{mongodbOplogDocs}. Chapter 15 covers Atlas Stream Processing over Kafka sources and windowed sinks in depth \cite{mongodbStreamProcessingDocs}, and Atlas Functions, the Data API, and App Services are documented in the Atlas references \cite{mongodbAtlasMonitoringDocs}. Kleppmann's stream chapters are the canonical treatment of CDC, logs, and exactly-once effects \cite{kleppmann2017ddia}, and the Apache Kafka project documents the backbone semantics \cite{apacheKafkaRepo}.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item Change streams expose the oplog as an ordered, resumable, server-filtered event API.
+    \item Persist resume tokens after processing; pair at-least-once delivery with idempotent sinks.
+    \item Token lifetime equals the oplog window; re-bootstrap is snapshot plus fresh stream.
+    \item Atlas Triggers and Functions handle short, stateless reactions; heavy computation belongs to stream processors (Chapter 15).
+    \item Reverse ETL closes the analytics loop: push by stable identity keys, only on material change, with every call logged.
+    \item Serverless clients reuse warm connections and bound pools---or use the Data API for spiky, low-rate paths.
+    \item Consumer lag, token age, and DLQ depth are the platform's paging metrics.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Why can cross-shard change streams not guarantee global time ordering?
+    \item \textbf{(Conceptual)} Compare change streams with polling on an \texttt{updatedAt} field: list three failure modes of polling that streams eliminate.
+    \item \textbf{(Conceptual)} When do you need pre-images, and what do they cost?
+    \item \textbf{(Conceptual)} A reverse-ETL sync oscillates a customer's score between 0.71 and 0.72 nightly. What two controls stop the CRM spam?
+    \item \textbf{(Hands-on)} Add pre/post-image capture to the lab and build an audit trail of balance changes.
+    \item \textbf{(Hands-on)} Implement the outbox pattern on the lab cluster and verify atomic order+event commit under a primary kill.
+    \item \textbf{(Design)} Design the CDC architecture for syncing MongoDB into Snowflake for analytics, including re-bootstrap and schema drift.
+    \item \textbf{(Design)} Design a reverse-ETL sync from a customer-360 collection to a CRM: identity resolution, materiality threshold, rate limits, and the quarantine for unmatched records.
+    \item \textbf{(Interview)} ``We saw duplicate notifications after every deploy.'' Explain the mechanism and the two-part fix.
+\end{enumerate}
+
+\section{Milestone 4 Capstone: Agentic E-Commerce Recommendation and Search Engine}\label{sec:ch16-capstone}
+
+\begin{capstonebox}
+\textbf{Mission:} build the Milestone-4 system: a product catalog in Atlas with scripted BM25 and vector indexes, hybrid search with measured relevance, and an Atlas Stream Processing (or change-stream) path that turns five-minute user-activity windows into personalized recommendation documents.
+
+\textbf{Estimated time:} 6--8 hours.
+
+\textbf{What you will practice:}
+\begin{itemize}
+    \item End-to-end RAG-grade retrieval: chunking, embedding, indexing, fusion, evaluation.
+    \item Streaming windowed personalization with idempotent \texttt{\$merge} sinks.
+    \item Index and embedding lifecycle as code with CI guards.
+\end{itemize}
+\end{capstonebox}
+
+\subsection*{Scenario}
+The retailer from earlier capstones wants conversational product discovery plus real-time personalization: users search in natural language, and the recommendation rail updates within minutes of browsing behavior.
+
+\subsection*{Requirements}
+\begin{itemize}
+    \item Seed a catalog (${\geq}$50k products); generate 768-d embeddings with \texttt{model\_version}; script both index creations (no UI clicks).
+    \item Hybrid retrieval endpoint with RRF and category/tenant pre-filters; recall@10 evaluated on a labeled set.
+    \item Streaming path: clickstream events $\to$ five-minute windows $\to$ \texttt{\$merge} upserts keyed on \texttt{user\_id + window\_start} into \texttt{recommendations}.
+    \item At least three data-quality tests (relevance spot-checks, embedding-dimension validation, windowed-aggregation correctness) with a failing case.
+    \item Monitoring evidence (search index status, stream health) and a cost estimate with two documented optimizations.
+\end{itemize}
+
+\subsection*{Implementation Steps}
+\begin{enumerate}
+    \item \textbf{Seed and embed.} Script the catalog load and embedding pass with dimension validation.
+    \item \textbf{Index.} Apply both index definitions via API/Terraform; poll index status before serving.
+    \item \textbf{Retrieve.} Implement and evaluate hybrid search; tune \texttt{numCandidates} on the recall curve.
+    \item \textbf{Stream.} Build the windowed personalization with deterministic merge keys; replay-test for duplicates.
+    \item \textbf{Operate.} Wire the data-quality tests, monitoring evidence, and cost note.
+\end{enumerate}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item All seeding, indexing, retrieval, and streaming code; the evaluation table; the test suite.
+    \item Monitoring/cost evidence and the architecture diagram.
+    \item A demo script showing natural-language search and a recommendation updating within one window.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item Hybrid recall@10 beats both single-path baselines on the labeled set.
+    \item Replaying the event stream produces zero duplicate recommendation rows.
+    \item The dimension-validation test fails loudly on a simulated model drift.
+    \item The system rebuilds from the repo on a clean environment.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Add a cross-encoder reranker and quantify the recall@5 lift.
+    \item Implement the blue/green embedding upgrade on the live catalog with zero retrieval downtime.
+\end{itemize}

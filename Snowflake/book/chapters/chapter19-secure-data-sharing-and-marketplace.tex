@@ -1,0 +1,224 @@
+\chapter{Secure Data Sharing and the Snowflake Marketplace}
+\index{data sharing}\index{reader account}\index{Marketplace}\index{secure views}\index{Week 19}%
+\begin{objectives}
+\begin{itemize}
+    \item Explain secure data sharing's zero-copy architecture and why no ETL crosses the account boundary.
+    \item Choose between direct shares and reader accounts for Snowflake and non-Snowflake consumers.
+    \item Publish and consume Marketplace listings as a data product channel.
+    \item Expose secure views---never base tables---through shares, with masking intact.
+    \item Build a hands-on secure share with secure views and verify zero-copy consumer access.
+    \item Architect a B2B data distribution platform serving live market data to 100 enterprise clients via reader accounts.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+Sharing analytics data without copying it is a uniquely warehouse-native idea; other platforms approximate it with exports, replicas, or lake sharing.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{2.8cm}p{3.0cm}p{3.0cm}p{3.0cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{AWS} & \textbf{Azure / Fabric} & \textbf{GCP (BigQuery)} \\
+\midrule
+In-platform sharing & Redshift data sharing & Fabric OneLake shortcuts / sharing & BigQuery Analytics Hub \\
+Cross-organization & S3 access points / exports & Azure Data Share & Analytics Hub listings \\
+Non-customer access & S3 presigned / Redshift spectrum & Data Share invitations & Authorized views \\
+Data marketplace & AWS Data Exchange & Azure Marketplace & Analytics Hub \\
+Consumer pays compute & Redshift consumer cluster & Fabric capacity & BigQuery consumer slots \\
+\addlinespace
+Snowflake equivalent & \multicolumn{3}{l}{Secure shares, reader accounts, Snowflake Marketplace} \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+\textbf{MongoDB} shares via Atlas exports and API layers; lake-oriented shops use Delta Sharing. Snowflake's distinction is that sharing is \emph{metadata}: the consumer queries the provider's micro-partitions directly, live, with the provider's governance still attached.
+\end{crosscloud}
+
+\section{Week 19 Roadmap}
+Every prior chapter shared data by moving it. This chapter removes the movement: Snowflake's secure data sharing grants other accounts governed, live, read-only access to your data \emph{in place}, and the Marketplace turns that mechanism into a distribution channel \cite{snowflakeDataSharingDocs}.
+
+Monday explains the zero-copy architecture. Tuesday compares direct shares and reader accounts. Wednesday covers the Marketplace as a product channel. Thursday builds and verifies a share. Friday architects the 100-client financial data platform.
+
+\begin{keyterms}
+\textbf{Share}: a Snowflake object bundling privileges on databases, schemas, tables, and secure views for external consumption.\quad
+\textbf{Direct share}: a share granted to another Snowflake account, which mounts it as a read-only imported database.\quad
+\textbf{Reader account}: a provider-managed Snowflake account for consumers who are not Snowflake customers.\quad
+\textbf{Secure view}: a view whose definition is hidden from consumers---the correct share payload.\quad
+\textbf{Listing}: a Marketplace publication wrapping a share with product metadata and terms.
+\end{keyterms}
+
+\section{Monday: Zero-Copy Sharing Architecture}
+\index{zero-copy sharing}
+A share is a named bundle of grants. When a consumer account mounts it, no data moves: the consumer's queries resolve against the provider's storage through Snowflake's global metadata services, reading the provider's micro-partitions directly. Consequences:
+
+\begin{itemize}
+    \item \textbf{Live data.} The consumer sees committed provider changes immediately---no refresh SLA to negotiate, because there is no copy to refresh.
+    \item \textbf{No storage bill for the consumer.} Consumers pay only their own compute (their warehouse scanning the shared data). Providers pay storage and, for reader accounts, the consumer-side compute.
+    \item \textbf{Governance persists.} Secure views, masking policies, and row access policies attached to shared objects still execute---the Chapter 18 controls follow the data across the account boundary.
+    \item \textbf{Revocation is real.} Removing an object from the share ends access instantly, because access was never a copy.
+\end{itemize}
+
+\begin{definitionbox}
+\textbf{Zero-copy sharing} means the consumer queries the provider's data in place. The share is metadata (grants); the bytes never replicate. Latency of schema evolution, revocation, and freshness all collapse to ``immediate.''
+\end{definitionbox}
+
+\begin{pitfall}
+\textbf{Share secure views, never base tables.} A shared base table exposes every column---including the PII column you masked only in the serving view---and leaks schema detail you did not intend to publish. The share's payload is a curated set of secure views over governed data.
+\end{pitfall}
+
+\section{Tuesday: Direct Shares Versus Reader Accounts}
+\index{direct share}\index{reader account}
+The consumer's Snowflake status decides the mechanism:
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{4.2cm}p{4.8cm}p{4.8cm}@{}}
+\toprule
+ & \textbf{Direct share} & \textbf{Reader account} \\
+\midrule
+Consumer & Existing Snowflake customer & Not a Snowflake customer \\
+Compute billed to & Consumer & Provider (you) \\
+Consumer admin & Their own account team & You---the reader account is provider-managed \\
+Onboarding cost & Minutes (account identifier) & Provisioning per consumer \\
+Fit & Partners, subsidiaries, data exchanges & Clients of a data product business \\
+\bottomrule
+\end{tabular}
+\caption{Choosing the sharing mechanism.}
+\label{tab:chapter19-share-types}
+\end{table}
+
+Reader accounts make \emph{you} the consumer's platform operator: you provision their account, their users, their warehouse---and you pay their compute. That cost model demands per-client warehouses with resource monitors (Chapter 22) so one client's query storm lands on their bill allocation, not your platform's.
+
+\begin{tipbox}
+Standardize a reader-account provisioning runbook: account creation, warehouse with monitor, roles, the share grant, and the welcome query pack. At 100 clients, provisioning is a script or it is a bottleneck.
+\end{tipbox}
+
+\section{Wednesday: The Snowflake Marketplace}
+\index{Snowflake Marketplace}\index{listing}
+The Marketplace wraps shares in a product channel: a \textbf{listing} bundles the share with documentation, sample queries, pricing (free, paid, or usage-based via Marketplace monetization), and regional availability. Consumers discover, request, and mount listings from Snowsight; providers get demand analytics.
+
+For data engineers, the Marketplace changes the deliverable's shape. A listing is a \emph{product}: documented schema with stable contracts (Chapter 9's discipline applied outward), versioning policy for breaking changes, freshness SLAs backed by your pipeline monitors, and sample queries that double as the consumer's onboarding tutorial. Monetization adds metering considerations---which queries your consumers run determine usage-based revenue, visible in provider analytics.
+
+\section{Thursday Hands-On Project: Publish and Consume a Secure Share}
+\index{hands-on project!data sharing}
+This lab publishes a governed dataset and verifies the zero-copy claim with evidence.
+
+\subsection*{Scenario}
+Your company publishes a curated, masked customer-metrics product to a partner. The partner must never see raw PII, must always see current data, and must be revocable instantly.
+
+\subsection*{Procedure}
+\begin{enumerate}
+    \item Build \texttt{gold.customer\_metrics} from masked sources; create a \textbf{secure view} exposing only the publishable columns.
+    \item Create the share; grant \texttt{USAGE} on database/schema and \texttt{SELECT} on the secure view only.
+    \item Add a second account (trial account works) as consumer; mount the share as an imported database.
+    \item From the consumer: query the view, attempt \texttt{SHOW VIEW} definition access, and attempt to reach the underlying table---record both denials.
+    \item Mutate source data as provider; immediately re-query as consumer to demonstrate liveness.
+    \item Check provider-side metering (\texttt{DATA\_TRANSFER}/query history views) to show the consumer's queries consumed no provider warehouse credits.
+    \item Revoke the share and confirm access ends at once.
+\end{enumerate}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item \textbf{Provider script:} secure view, share DDL, grant statements.
+    \item \textbf{Consumer transcript:} successful governed queries and both expected denials.
+    \item \textbf{Liveness proof:} before/after mutation query pair with timestamps.
+    \item \textbf{Revocation evidence:} the failing consumer query after removal.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item Only secure views appear in the share; base tables are unreachable from the consumer.
+    \item Masking and row policies enforce identically on the consumer side.
+    \item The consumer observes source changes without any refresh step.
+    \item Revocation takes effect immediately and is demonstrated.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Provision a reader account and repeat the lab, documenting the provider-pays-compute metering.
+    \item Package the share as a draft Marketplace listing with docs and sample queries.
+    \item Add a second consumer and show provider-side isolation of their query workloads.
+\end{itemize}
+
+\section{Friday Real-World Architecture: Live Market Data for 100 Clients}
+\index{Real-World Architecture!data distribution}
+A financial data provider sells live equity analytics to 100 enterprise clients, a third of them non-Snowflake shops. Requirements: per-client entitlements (different ticker universes), guaranteed freshness, per-client cost attribution, and instant offboarding at contract end.
+
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[
+        prov/.style={rectangle, rounded corners, draw=codegreen!60!black, thick, fill=green!8, align=center, minimum width=3.0cm, minimum height=1.0cm, font=\small\bfseries},
+        shr/.style={rectangle, rounded corners, draw=primary, thick, fill=primary!6, align=center, minimum width=3.0cm, minimum height=1.0cm, font=\small\bfseries},
+        con/.style={rectangle, rounded corners, draw=codegray, thick, fill=white, align=center, minimum width=3.0cm, minimum height=1.0cm, font=\small\bfseries},
+        arrow/.style={-{Stealth[length=2.5mm]}, draw=primary, thick},
+        lbl/.style={font=\scriptsize\itshape, text=codegray}
+    ]
+        \node[prov] (feed) at (0, 0) {Market feeds\\(streaming ingest)};
+        \node[prov] (gold) at (4.0, 0) {gold.market\_data\\masked + entitled};
+        \node[shr] (views) at (8.2, 0) {Secure views\\per tier (row policy\\by client)};
+        \node[shr] (direct) at (12.4, 1.4) {Direct shares\\(67 Snowflake clients)};
+        \node[con] (reader) at (12.4, -1.4) {Reader accounts\\(33 clients, monitored WHs)};
+        \draw[arrow] (feed) -- (gold);
+        \draw[arrow] (gold) -- (views);
+        \draw[arrow] (views) -- node[lbl, above]{metadata grant} (direct);
+        \draw[arrow] (views) -- node[lbl, above]{metadata grant} (reader);
+    \end{tikzpicture}%
+    }
+    \caption{B2B data distribution: one governed dataset, tiered secure views, direct shares for Snowflake clients, monitored reader accounts for the rest.}
+    \label{fig:chapter19-b2b-sharing}
+\end{figure}
+
+\subsection{Design Decisions}
+\begin{enumerate}
+    \item \textbf{Entitlements as a row access policy.} A client--ticker mapping table drives the row policy on the shared secure views; upgrading a client's tier is a data change, audited and immediate.
+    \item \textbf{Reader accounts are the expensive third.} Each gets its own XS warehouse with a resource monitor and a per-client chargeback report; quotas prevent one client's analysts from consuming the margin.
+    \item \textbf{Freshness is the product.} Streaming ingest (Chapter 6) feeds the gold layer; the client-facing SLA is measured from provider commit to consumer-visible, which zero-copy sharing makes nearly zero---the pipeline, not the share, is the SLA surface.
+    \item \textbf{Offboarding is the share's superpower.} Contract end: remove the grant. There is no client-held copy to claw back, no export to expire---access simply stops being true.
+\end{enumerate}
+
+\begin{pitfall}
+\textbf{Reader-account compute is your cost center.} Without per-client resource monitors and hard suspension thresholds, a single client's unbounded query burns provider margin invisibly. Monitors plus per-client warehouses are not optional in this business model.
+\end{pitfall}
+
+\section{Interview Q\&A}
+\begin{enumerate}
+    \item \textbf{Q: Why is secure data sharing called zero-copy?}\\
+    A: The share is metadata (grants); consumers query the provider's micro-partitions in place, so no data is replicated, refreshed, or exported.
+    \item \textbf{Q: When do you need a reader account?}\\
+    A: When the consumer is not a Snowflake customer---the provider provisions and pays for a managed account on their behalf.
+    \item \textbf{Q: Which object types can be added to a share?}\\
+    A: Databases, schemas, tables, and---as the correct payload---secure views (and secure UDFs), keeping definitions and unshared columns hidden.
+    \item \textbf{Q: Why share secure views instead of base tables?}\\
+    A: Secure views hide the definition and expose only curated, masked columns; a shared base table bypasses serving-layer governance entirely.
+    \item \textbf{Q: How does a Marketplace listing differ from a direct share?}\\
+    A: A listing wraps the share in a discoverable product with documentation, terms, pricing, and regional availability; a direct share is a point-to-point grant between known accounts.
+\end{enumerate}
+
+\section{Further Reading}
+Snowflake's sharing and Marketplace documentation define shares, reader accounts, and listings \cite{snowflakeDataSharingDocs,snowflakeMarketplaceDocs}. Chapter 17's RBAC and Chapter 18's masking and row policies are the governance stack a share depends on \cite{snowflakeAccessControlDocs,snowflakeMaskingDocs}; Chapter 20 extends sharing into privacy-preserving multi-party computation.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item Sharing is metadata: live, governed, revocable access without replication.
+    \item Consumers pay compute on direct shares; providers pay for reader accounts---monitor them.
+    \item Secure views are the only correct share payload.
+    \item The Marketplace turns shares into products with contracts, SLAs, and versioning duties.
+    \item Entitlement-driven row policies make client tiers a data change.
+    \item Zero-copy sharing makes freshness a pipeline property and offboarding instantaneous.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Explain why revocation is stronger under zero-copy sharing than under export-based sharing.
+    \item \textbf{(Conceptual)} Walk through who pays what, in credits and storage, for a direct share and a reader account.
+    \item \textbf{(Hands-on)} Add a tier column to the entitlement table and prove tiered visibility from a consumer.
+    \item \textbf{(Hands-on)} Build the per-client chargeback report over reader-account metering.
+    \item \textbf{(Hands-on)} Draft a Marketplace listing: metadata, three sample queries, and the versioning policy.
+    \item \textbf{(Design)} Design the client onboarding pipeline: entitlement row, share grant (or reader account), verification queries.
+    \item \textbf{(Design)} Specify the freshness SLA measurement from provider commit to consumer visibility.
+    \item \textbf{(Operations)} Write the offboarding runbook with post-revocation verification.
+    \item \textbf{(Cost)} Model reader-account monthly cost for 33 clients at three usage tiers.
+    \item \textbf{(Interview)} Explain to a procurement lead why shared data is fresher than any delivered file could be.
+\end{enumerate}

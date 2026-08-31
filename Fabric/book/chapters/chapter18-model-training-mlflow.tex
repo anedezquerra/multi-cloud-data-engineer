@@ -1,0 +1,315 @@
+\chapter{Model Training and MLflow}
+\index{MLflow}\index{experiments}\index{model registry}\index{mlflow.autolog}\index{hyperparameter tuning}\index{model versioning}\index{Random Forest}\index{Scikit-Learn}%
+
+\begin{objectives}
+\begin{itemize}
+    \item Explain Fabric's machine-learning items: experiments, models, and their MLflow integration.
+    \item Track parameters, metrics, and artifacts with \texttt{mlflow.autolog()} and explicit logging.
+    \item Register and version models in the Fabric model registry.
+    \item Train and auto-track a Scikit-Learn Random Forest, registering the best run.
+    \item Compare hundreds of hyperparameter runs efficiently in a shared workspace.
+    \item Attach the metadata---dataset version, code commit---that makes a model auditable and rollback-able.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+Experiment tracking and model registries are the two pieces of ML infrastructure every platform converged on, and MLflow is the closest thing the industry has to a common denominator---it is native in Fabric and Databricks and deployable everywhere else.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{2.8cm}p{3.2cm}p{3.2cm}p{3.2cm}p{3.2cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{Fabric} & \textbf{AWS} & \textbf{GCP} & \textbf{Snowflake} \\
+\midrule
+Experiment tracking & Built-in MLflow & SageMaker Experiments / MLflow on EC2 & Vertex AI Experiments & MLflow (external or integrated) \\
+Model registry & Fabric model registry (MLflow) & SageMaker Model Registry & Vertex AI Model Registry & Snowflake Model Registry \\
+Autologging & \texttt{mlflow.autolog()} & Same library & Same library & Same library \\
+Training compute & Fabric Spark pools & SageMaker Training / EMR & Vertex Training / Dataproc & Snowpark ML / warehouses \\
+Artifact store & OneLake (via MLflow) & S3 & Cloud Storage & Stages / tables \\
+Run comparison UI & Experiment item UI & SageMaker Studio & Vertex console & Registry UI / notebooks \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+Databricks' managed MLflow is the direct ancestor of Fabric's integration. MongoDB does not host training; it supplies features. The portable claim of this chapter: \emph{if it is not tracked, it did not happen; if it is not registered, it cannot be governed; if it cannot be rolled back, it is not production.}
+\end{crosscloud}
+
+\begin{keyterms}
+\textbf{Experiment}: the MLflow container grouping related training runs. \quad
+\textbf{Run}: one execution of training code with its parameters, metrics, and artifacts. \quad
+\textbf{\texttt{mlflow.autolog()}}: automatic capture of framework-specific parameters, metrics, and models per run. \quad
+\textbf{Model registry}: the governed catalog of versioned, stage-tagged models. \quad
+\textbf{Model version}: an immutable, numbered registration of a trained model. \quad
+\textbf{Alias/stage}: a movable pointer (for example \texttt{Production}) over versions enabling rollback.
+\end{keyterms}
+
+\section{Week 18 Roadmap}
+Week~18 makes machine learning auditable. Monday covers experiments and models as Fabric items. Tuesday is MLflow tracking: parameters, metrics, artifacts, and autolog. Wednesday covers the model registry: registration, versioning, and aliases. Thursday is the hands-on project: train a Random Forest with \texttt{mlflow.autolog()}, track it, register the best run. Friday designs the collaborative workflow for hundreds of hyperparameter runs in a shared workspace.
+
+Chapter~17 made features honest; this week makes models honest. The untracked notebook that produced the production model is organizational debt with interest: nobody can reproduce it, improve it, or roll back from it \cite{microsoftMlflowFabric,mlflowDocs}.
+
+\begin{notebox}
+The minimum metadata contract for every training run: parameters, metrics, dataset version (or as-of date), code commit, and the environment. Autolog gives you the first three cheaply; the last two are discipline.
+\end{notebox}
+
+\section{Monday: Experiments and Models in Fabric}
+\index{experiments!Fabric items}\index{models!Fabric items}
+Fabric surfaces MLflow through two workspace items \cite{microsoftMlflowFabric}. An \textbf{experiment} item is the tracking container: open it to browse runs, compare metrics, and inspect artifacts. A \textbf{model} item is the registry entry: versioned, aliased, and loadable by name from any notebook.
+
+\begin{definitionbox}
+An \textbf{MLflow experiment} groups related training runs under one name; each \textbf{run} records the parameters, metrics, tags, and artifacts of one execution, so work is comparable, searchable, and reproducible.
+\end{definitionbox}
+
+The workspace integration changes the collaboration physics: experiments are visible to the whole workspace (not trapped on one laptop), runs accumulate as organizational memory, and the registry attaches governance---who may promote a model to \texttt{Production} is a permission, not a convention.
+
+\section{Tuesday: Tracking with MLflow}
+\index{MLflow!tracking}\index{mlflow.autolog}
+\subsection{Autolog}
+One line before training turns a Scikit-Learn, Spark MLlib, or XGBoost fit into a fully tracked run: parameters, metrics, and the model artifact itself \cite{mlflowDocs,microsoftMlflowFabric}.
+
+\begin{lstlisting}[language=Python,caption={Autologged training run with explicit metadata tags.},label={lst:chapter18-autolog}]
+import mlflow
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import roc_auc_score
+
+mlflow.set_experiment("churn-model-week18")
+mlflow.autolog()
+
+df = spark.read.table("gold.churn_features").where("as_of_date = '2026-07-31'").toPandas()
+X = df.drop(columns=["customer_id", "churned", "as_of_date"])
+y = df["churned"]
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.2, random_state=42, stratify=y)
+
+with mlflow.start_run():
+    mlflow.set_tag("dataset_as_of", "2026-07-31")
+    mlflow.set_tag("code_commit", "a1b2c3d")        # from your CI or notebook env
+    model = RandomForestClassifier(n_estimators=200, max_depth=12, random_state=42)
+    model.fit(X_train, y_train)
+    auc = roc_auc_score(y_test, model.predict_proba(X_test)[:, 1])
+    mlflow.log_metric("holdout_auc", auc)
+\end{lstlisting}
+
+\subsection{Explicit Logging}
+Autolog captures the framework's view; you log the rest: business metrics (expected revenue saved per flagged churner), data slices (AUC by region), and environment facts. A run without its business metric is a science project; with it, a decision input.
+
+\begin{tipbox}
+Log one ``headline'' metric with a stable name across every experiment in the program. Cross-experiment comparison---this month versus last, this model family versus that---requires a metric that means the same thing everywhere.
+\end{tipbox}
+
+\section{Wednesday: The Model Registry}
+\index{model registry}\index{model versioning}\index{aliases}
+Registration promotes a run's artifact into the governed catalog: the model gets a name, an immutable version number, and movable aliases such as \texttt{Staging} and \texttt{Production} \cite{microsoftMlflowFabric,mlflowDocs}.
+
+\begin{definitionbox}
+The \textbf{model registry} is the versioned catalog of trained models; an \textbf{alias} is a movable pointer over versions, so promoting or rolling back production is a pointer move, not a redeploy.
+\end{definitionbox}
+
+Why register rather than reference run artifacts directly: the registry is the governance boundary. Versions are immutable (the artifact a version pointed at never changes), aliases decouple consumers from versions (scoring code loads \texttt{models:/churn\_model/Production} and never hardcodes a version), and the audit trail---who promoted what, when, with which metrics---lives in one place.
+
+\begin{pitfall}
+Scoring code that loads a specific run ID or version number bypasses the entire governance point. Consumers load by alias; humans move aliases under review; rollbacks are alias moves. The day a hardcoded version ships to production, the registry becomes decorative.
+\end{pitfall}
+
+\section{Thursday: Hands-on Project}
+\index{hands-on lab}\index{MLflow!hands-on}
+The Week~18 lab trains a Scikit-Learn Random Forest on the Chapter~17 feature table, tracks the run with \texttt{mlflow.autolog()}, and registers the best model.
+
+\subsection{Goal and Architecture}
+Reuse \texttt{gold.churn\_features} (or a provided classification dataset) in workspace \texttt{fabric-de-week18}. Run a small hyperparameter grid (six runs), compare runs in the experiment UI, and register the winner as version~1 of \texttt{churn\_model}.
+
+\subsection{Step-by-Step Actions}
+\begin{enumerate}
+    \item Set the experiment and enable autolog.
+    \item Load one as-of partition of the feature table; split with stratification and a fixed seed.
+    \item Train six configurations across \texttt{n\_estimators} and \texttt{max\_depth}, each in its own run with the metadata tags.
+    \item Log \texttt{holdout\_auc} explicitly in every run.
+    \item In the experiment item, sort by \texttt{holdout\_auc}; inspect the best run's parameters and artifacts.
+    \item Register the best run's model as \texttt{churn\_model} version~1; assign the \texttt{Staging} alias.
+    \item Load \texttt{models:/churn\_model/Staging} in a fresh notebook and score a sample, proving the registry round-trip.
+\end{enumerate}
+
+\begin{lstlisting}[language=Python,caption={Registering the winning run and loading it back by alias.},label={lst:chapter18-register}]
+import mlflow
+
+best_run_id = "<run id from the experiment UI>"
+model_uri = f"runs:/{best_run_id}/model"
+
+registered = mlflow.register_model(model_uri, "churn_model")
+
+client = mlflow.tracking.MlflowClient()
+client.set_registered_model_alias("churn_model", "Staging", registered.version)
+
+# Round-trip proof: load by alias, never by version
+model = mlflow.pyfunc.load_model("models:/churn_model/Staging")
+sample = spark.read.table("gold.churn_features").limit(100).toPandas()
+print(model.predict(sample.drop(columns=["customer_id", "churned", "as_of_date"]))[:5])
+\end{lstlisting}
+
+\subsection{Validation Checklist}
+\begin{itemize}
+    \item Six runs appear in the experiment with parameters, metrics, and artifacts.
+    \item Every run carries \texttt{dataset\_as\_of} and \texttt{code\_commit} tags.
+    \item The registered model loads by alias in a fresh notebook and scores.
+    \item The experiment UI comparison reproduces your winner selection.
+    \item No run references data past its as-of date (Chapter~17's contract).
+    \item A teammate can find the best run from the experiment UI without asking you.
+\end{itemize}
+
+\section{Friday: Use Case and Architecture}
+\index{hyperparameter tuning!collaborative}\index{experiment governance}
+A data-science guild runs hundreds of hyperparameter tuning runs per week across five practitioners in one workspace. Without conventions, the experiment list becomes an unsearchable swamp of \texttt{run-473-final-FINAL}. The task: a collaborative tracking workflow.
+
+\subsection{The Workflow}
+\begin{itemize}
+    \item \textbf{One experiment per problem}, not per person or per day: \texttt{churn-model}, \texttt{demand-forecast}. Runs accumulate comparable history.
+    \item \textbf{Mandatory tags}: owner, hypothesis (one sentence: ``deeper trees capture regional effects''), dataset version, code commit. The hypothesis tag is what separates search from wandering.
+    \item \textbf{Stable headline metric}: every run logs \texttt{holdout\_auc} (or the program's equivalent), enabling cross-run, cross-week, cross-person sorting.
+    \item \textbf{Search discipline}: coarse grid, then narrow; random search over pointless full grids; every configuration tracked, including the failures---negative results are organizational memory too.
+    \item \textbf{Registry gates}: promotion to \texttt{Staging} requires the metric threshold and a reviewer; \texttt{Production} requires the Chapter~20 deployment checklist.
+\end{itemize}
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{4.2cm}p{9.6cm}@{}}
+\toprule
+\textbf{Element} & \textbf{Convention} \\
+\midrule
+Experiment naming & \texttt{<problem>-<model-family>}, one per problem \\
+Required tags & owner, hypothesis, dataset\_as\_of, code\_commit \\
+Headline metric & One stable name per program, logged on every run \\
+Promotion gate & Metric threshold + reviewer for Staging; deployment checklist for Production \\
+Rollback & Alias move to previous version; rehearsed quarterly \\
+\bottomrule
+\end{tabular}
+\caption{Collaborative tracking conventions.}
+\label{tab:chapter18-conventions}
+\end{table}
+
+\begin{pitfall}
+Comparison across runs is only valid when the data and split are constant. Comparing a run on last month's feature snapshot to one on this month's is measuring data drift, not model quality. The \texttt{dataset\_as\_of} tag is what makes comparisons honest---filter to a common snapshot before declaring a winner.
+\end{pitfall}
+
+\section{Operational Guidance for Week 18}
+Tracking is cheap; untracked work is expensive. Make the tracked path the easiest path: notebook templates with autolog and tags pre-wired, experiment naming enforced by convention review, and registry promotion as a permission.
+
+\subsection{Performance and Reliability}
+Autolog adds negligible overhead for tabular frameworks. Keep artifact sizes sane (log the model, not the training set). Archive stale experiments per retention policy. Rehearse alias rollback: the first production rollback should not be during an incident.
+
+\subsection{Security and Governance Checklist}
+\begin{itemize}
+    \item Registry write and alias-move permissions restricted to designated roles.
+    \item No secrets or personal data in logged parameters, tags, or artifacts.
+    \item Dataset tags reference governed table versions, never laptop paths.
+    \item Promotion requires the metric evidence attached to the run.
+    \item Experiment retention policy documented; organizational memory is curated, not hoarded.
+    \item Model cards or equivalent documentation attached at registration.
+\end{itemize}
+
+\section{Interview Q\&A}
+\begin{enumerate}
+    \item \textbf{Q: What does \texttt{mlflow.autolog()} capture per run?}\\
+    A: Framework-specific parameters, training and evaluation metrics, and the model artifact itself---automatically---while you add business metrics and metadata tags explicitly.
+    \item \textbf{Q: Why register a model instead of referencing run artifacts directly?}\\
+    A: The registry makes versions immutable, decouples consumers through aliases, and centralizes the audit trail of promotions---governance that run-artifact paths cannot provide.
+    \item \textbf{Q: Which metadata should accompany every experiment run?}\\
+    A: Parameters, metrics, the dataset version or as-of date, the code commit, and the environment---the minimum contract for reproducibility and honest comparison.
+    \item \textbf{Q: How do you compare hundreds of hyperparameter runs efficiently?}\\
+    A: One experiment per problem, one stable headline metric, mandatory tags---then sort and filter in the experiment UI, restricting comparisons to a common dataset snapshot.
+    \item \textbf{Q: What does model versioning enable for rollback?}\\
+    A: Aliases over immutable versions: rollback is moving \texttt{Production} back to the previous version---instant, reviewed, and reversible, with consumers never changing code.
+    \item \textbf{Q: Why must comparisons filter to a common dataset snapshot?}\\
+    A: Runs on different snapshots differ in both model and data; without a fixed snapshot you measure data drift and call it model quality.
+\end{enumerate}
+
+\section{Further Reading}
+Review MLflow in Fabric \cite{microsoftMlflowFabric} and the upstream MLflow documentation \cite{mlflowDocs}. The feature inputs come from Chapter~17's governed feature tables \cite{microsoftFabricDataScience}; the deployment continuation is Chapter~20 \cite{microsoftFabricMlTraining}.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item Experiments group runs; runs record parameters, metrics, artifacts, and tags; the workspace makes them organizational memory.
+    \item \texttt{mlflow.autolog()} plus explicit business metrics and metadata tags is the complete tracking contract.
+    \item The registry's immutability and aliases are what make promotion and rollback governance instead of archaeology.
+    \item Consumers load models by alias; humans move aliases under review.
+    \item Collaborative search needs conventions: one experiment per problem, hypothesis tags, a stable headline metric.
+    \item Comparisons are valid only on a common dataset snapshot.
+    \item Untracked models are debt; tracked, registered, alias-governed models are assets.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Explain why an immutable version plus a movable alias beats redeployment for rollback.
+    \item \textbf{(Conceptual)} What information does a hypothesis tag preserve that metrics alone cannot?
+    \item \textbf{(Hands-on)} Extend the grid to 24 runs with random search and compare search efficiency against the coarse grid.
+    \item \textbf{(Hands-on)} Add a business metric (expected retained revenue per flagged customer) and re-rank the runs.
+    \item \textbf{(Design)} Write the promotion-gate policy: thresholds, reviewers, and evidence required at Staging and Production.
+    \item \textbf{(Design)} Two teams share one workspace and keep colliding on experiment names. Design the namespace and the enforcement mechanism.
+    \item \textbf{(Interview)} In five sentences, argue to a skeptical engineer that experiment tracking is infrastructure, not bureaucracy.
+    \item \textbf{(Operational)} Rehearse a rollback: move \texttt{Production} to the previous version, verify consumers, and document the elapsed time.
+\end{enumerate}
+
+\section{Capstone Project: Governed Model Search and Registration}\label{sec:ch18-capstone}
+\index{capstone project}\index{MLflow!capstone}\index{model registry!capstone}
+
+\begin{capstonebox}
+\textbf{Mission.} Run a governed model search over the Chapter~17 feature table: a tagged, autologged 20-run random search, cross-run comparison on a fixed snapshot, registry promotion through the Staging gate with evidence, and a rehearsed alias rollback---the complete Week~18 discipline in one artifact set.
+
+\textbf{Estimated time.} 4--6 hours.
+
+\textbf{What you'll practice.}
+\begin{itemize}
+    \item Random search with full tracking and hypothesis tags.
+    \item Snapshot-locked comparison and winner selection.
+    \item Registry promotion with evidence and review.
+    \item Alias-based rollback under a drill.
+\end{itemize}
+\end{capstonebox}
+
+\subsection*{Scenario}
+Contoso's churn program needs its first governed model. The guild's conventions (Friday's table) are adopted; you are the first team to execute them end to end, setting the example the guild will be measured against.
+
+\subsection*{Requirements}
+\begin{itemize}
+    \item Twenty tracked runs from a random search, each with the four mandatory tags and the headline metric.
+    \item A comparison report (screenshot or export) filtered to one \texttt{dataset\_as\_of} snapshot.
+    \item \texttt{churn\_model} registered; winner promoted to \texttt{Staging} with the metric evidence attached.
+    \item A second version registered and promoted to \texttt{Production}, then rolled back under drill, with timings.
+    \item A short model card at registration: purpose, data, metrics, limitations.
+\end{itemize}
+
+\subsection*{Implementation Steps}
+\begin{enumerate}
+    \item Wire the notebook template: autolog, tags, headline metric.
+    \item Execute the 20-run search on the fixed snapshot.
+    \item Compare, select, and register the winner; attach the model card.
+    \item Promote to \texttt{Staging} with evidence; simulate a challenger and promote it to \texttt{Production}.
+    \item Execute the rollback drill; document elapsed time and verification.
+\end{enumerate}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item The search notebook and the comparison evidence.
+    \item Registry evidence: versions, aliases, promotion history.
+    \item The model card.
+    \item The rollback drill report.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item[\(\square\)] All 20 runs are tagged, metric-bearing, and snapshot-locked.
+    \item[\(\square\)] The winner selection is reproducible from the experiment UI by a reviewer.
+    \item[\(\square\)] Promotion to each alias carried its evidence and reviewer.
+    \item[\(\square\)] The rollback restored the previous version with consumers untouched.
+    \item[\(\square\)] The model card states purpose, data, metrics, and limitations.
+    \item[\(\square\)] No run logs secrets, personal data, or laptop paths.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Add a second model family (gradient boosting) to the same experiment and compare families on the fixed snapshot.
+    \item Automate the Staging gate as a notebook asserting the threshold before promotion.
+    \item Add per-region metric logging and include a fairness slice review in the gate.
+    \item Template the whole flow so the next problem starts at step three, not step one.
+\end{itemize}

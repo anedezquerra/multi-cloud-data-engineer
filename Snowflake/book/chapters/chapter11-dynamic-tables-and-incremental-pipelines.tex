@@ -1,0 +1,252 @@
+\chapter{Dynamic Tables and Declarative Incremental Pipelines}
+\index{dynamic tables}\index{declarative pipelines}\index{target lag}\index{Week 11}%
+\begin{objectives}
+\begin{itemize}
+    \item Compare dynamic tables, materialized views, and streams-plus-tasks for continuous transformation.
+    \item Set per-layer \texttt{TARGET\_LAG} values that respect upstream lag plus refresh time.
+    \item Explain incremental refresh, its limits, and the triggers that force a full refresh.
+    \item Build a Bronze--Silver--Gold dynamic-table DAG whose dependency order Snowflake derives automatically.
+    \item Monitor refresh history, failures, and incremental-to-full fallbacks as credit risks.
+    \item Re-architect a 200-task Airflow DAG into a declarative dynamic-table network.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+Declarative incremental pipelines---state what you want, let the platform schedule and refresh---are the industry's answer to hand-built DAG sprawl.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{2.8cm}p{3.0cm}p{3.0cm}p{3.0cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{AWS} & \textbf{Azure / Fabric} & \textbf{GCP (BigQuery)} \\
+\midrule
+Declarative refresh object & Redshift materialized views (auto-refresh) & Fabric lakehouse + pipelines; Synapse MVs & BigQuery materialized views + scheduled queries \\
+Streaming table abstraction & Redshift streaming MVs (Kinesis/MSK) & Fabric Real-Time Analytics & BigQuery continuous queries \\
+DAG derivation & Glue workflows (explicit) & Data Factory dependencies (explicit) & Dataform dependency graph \\
+Incremental state tracking & MV refresh bookkeeping & Pipeline watermarking & MV partition increments \\
+\addlinespace
+Snowflake equivalent & \multicolumn{3}{l}{Dynamic tables with \texttt{TARGET\_LAG}, automatic DAG derivation, incremental refresh} \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+\textbf{MongoDB} offers on-demand materialized views via \texttt{\$merge}; \textbf{dbt} users will recognize the philosophy immediately: a dynamic table is a dbt model whose scheduler, dependency graph, and incremental state all live inside the warehouse. The cross-cloud lesson is that \emph{declared freshness} (target lag) is replacing \emph{declared schedule} (cron) as the pipeline contract.
+\end{crosscloud}
+
+\section{Week 11 Roadmap}
+Chapter 8's task graphs are \emph{imperative}: you declare when things run, in what order, and what to do on failure. Dynamic tables invert the contract: you declare \emph{what the table should be} (a query) and \emph{how fresh it must stay} (a lag), and Snowflake derives the DAG, schedules refreshes, and tracks state \cite{snowflakeDynamicTablesDocs}.
+
+Monday positions dynamic tables against the alternatives. Tuesday details target lag mechanics. Wednesday explains incremental refresh and its fallback triggers. Thursday builds the three-tier medallion pipeline. Friday migrates a legacy Airflow estate.
+
+\begin{keyterms}
+\textbf{Dynamic table}: a table defined by a query plus a freshness target, refreshed automatically by Snowflake.\quad
+\textbf{Target lag}: the maximum staleness contract---data at the table is at most this old relative to its sources.\quad
+\textbf{Incremental refresh}: recomputing only the parts of the result affected by changed base data.\quad
+\textbf{Full refresh}: recomputing the entire query result; the fallback when incremental is impossible.\quad
+\textbf{Refresh DAG}: the dependency graph Snowflake derives from dynamic-table definitions.
+\end{keyterms}
+
+\section{Monday: Dynamic Tables Versus the Alternatives}
+\index{dynamic tables!vs. materialized views}\index{dynamic tables!vs. streams and tasks}
+Three Snowflake mechanisms keep derived data fresh; choosing among them is a weekly interview question and a quarterly architecture decision.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.2cm}p{3.4cm}p{3.4cm}p{3.4cm}@{}}
+\toprule
+ & \textbf{Dynamic table} & \textbf{Materialized view} & \textbf{Streams + tasks} \\
+\midrule
+Definition & Query + target lag & Query over one base table & Stream + consumer code \\
+Freshness contract & Declared lag & Automatic, synchronous-ish & Your schedule \\
+DAG support & Automatic derivation & None (single query) & Manual (\texttt{AFTER}) \\
+Query flexibility & Broad SQL subset & Restricted (single table, limited joins/aggregates) & Anything a procedure can do \\
+State management & Snowflake-internal & Snowflake-internal & Stream offset (visible) \\
+Control and debuggability & Declarative, opaque internals & Fully automatic & Explicit, fully visible \\
+Best for & Layered ELT pipelines & Single-table acceleration & Custom CDC logic, complex merges \\
+\bottomrule
+\end{tabular}
+\caption{Three answers to ``keep derived data fresh'' and their trade-offs.}
+\label{tab:chapter11-mechanism-comparison}
+\end{table}
+
+\begin{definitionbox}
+A \textbf{dynamic table} is a declarative pipeline node: Snowflake stores the result of its defining query, derives dependencies from the query text, and refreshes the table---incrementally when possible---to keep it within its target lag of its sources.
+\end{definitionbox}
+
+The mental shift from tasks: you stop owning \emph{when} and \emph{how}, and start owning \emph{what} and \emph{how fresh}. In exchange you give up per-step control---custom error branching, multi-statement logic, exotic merges stay in task land.
+
+\section{Tuesday: Target Lag and Refresh Mechanics}
+\index{target lag}\index{refresh}
+\texttt{TARGET\_LAG = '5 minutes'} is a promise: the table will reflect its sources with at most five minutes of staleness. Snowflake schedules refreshes to meet it, using the specified warehouse (or serverless compute where supported) for each refresh.
+
+The critical design rule for layered DAGs: \textbf{a downstream lag must be at least its upstream's lag plus refresh time}. A silver table at 5-minute lag fed by a bronze table at 15-minute lag is a broken contract---silver can never be fresher than bronze allows, so Snowflake would refresh it wastefully against stale inputs or violate the lag. Lags escalate down the medallion: 5 minutes at bronze, 15 at silver, an hour at gold.
+
+\begin{pitfall}
+\textbf{Downstream lag shorter than upstream lag plus refresh time causes perpetual staleness and credit waste.} Compute the lag budget from the leaves back: report SLA $\rightarrow$ gold lag $\rightarrow$ silver lag $\rightarrow$ bronze lag, with refresh time at each hop.
+\end{pitfall}
+
+\begin{lstlisting}[language=SQL, caption={Dynamic tables in a Bronze--Silver--Gold chain}]
+CREATE OR REPLACE DYNAMIC TABLE bronze.events
+  TARGET_LAG = '5 minutes' WAREHOUSE = etl_wh AS
+  SELECT id, payload:event_type::STRING AS event_type,
+         payload:ts::TIMESTAMP_NTZ AS event_ts
+  FROM raw.events_landing;
+
+CREATE OR REPLACE DYNAMIC TABLE silver.daily_events
+  TARGET_LAG = '15 minutes' WAREHOUSE = etl_wh AS
+  SELECT event_type, DATE_TRUNC('day', event_ts) AS day,
+         COUNT(*) AS event_count
+  FROM bronze.events
+  GROUP BY 1, 2;
+
+CREATE OR REPLACE DYNAMIC TABLE gold.event_kpis
+  TARGET_LAG = '1 hour' WAREHOUSE = bi_wh AS
+  SELECT day, SUM(event_count) AS total_events
+  FROM silver.daily_events GROUP BY 1;
+\end{lstlisting}
+
+No \texttt{AFTER} clauses appear anywhere: Snowflake reads the query text, derives that \texttt{gold.event\_kpis} depends on \texttt{silver.daily\_events} which depends on \texttt{bronze.events}, and orders refreshes itself. Adding a new gold table against silver requires zero orchestration edits.
+
+\section{Wednesday: Incremental Refresh, Full Refresh, and the DAG}
+\index{incremental refresh}\index{full refresh}
+Snowflake maintains incremental-refresh state internally: which micro-partitions of the base changed and how the defining query maps them to result partitions. When the mapping is trackable---filters, projections, joins, most aggregations---refresh cost is proportional to \emph{change}, not table size.
+
+Incremental refresh degrades to \textbf{full refresh} when the defining query uses constructs the engine cannot incrementally track (certain window functions, non-deterministic functions, some lateral constructs) or after base-table DDL that invalidates the mapping. A full refresh reprocesses the entire base---on a large table, a credit event measured in real money.
+
+\begin{notebox}
+Monitor refresh behavior with \texttt{INFORMATION\_SCHEMA.DYNAMIC\_TABLE\_REFRESH\_HISTORY}: refresh type (incremental or full), duration, credits, and status. A table that silently flipped from incremental to full after a schema change is the classic dynamic-table bill shock.
+\end{notebox}
+
+Design rules that keep layers incremental:
+\begin{itemize}
+    \item Keep frequently refreshed layers in the incrementally trackable SQL subset; push exotic analytics to slower, full-refresh-tolerant layers.
+    \item Treat base-table DDL as a pipeline change: review downstream dynamic tables' refresh history after every schema migration.
+    \item Prefer several focused dynamic tables over one mega-query: smaller graphs isolate full-refresh blast radius and clarify lag budgets.
+\end{itemize}
+
+\section{Thursday Hands-On Project: The Three-Tier Declarative Pipeline}
+\index{hands-on project!dynamic tables}
+This lab replaces a hand-scheduled pipeline with a pure dynamic-table medallion and observes automatic dependency refresh.
+
+\subsection*{Scenario}
+The clickstream platform from Chapter 9 currently runs three cron-scheduled tasks (bronze parse, silver aggregate, gold KPI). Freshness complaints and a tangle of schedules motivate a declarative rebuild.
+
+\subsection*{Procedure}
+\begin{enumerate}
+    \item Recreate the raw VARIANT landing table and a simulator that appends events every minute.
+    \item Create the three dynamic tables from Wednesday's listing with lags 5 min / 15 min / 1 hour.
+    \item Query \texttt{SHOW DYNAMIC TABLES} and the refresh history; note initial refresh types.
+    \item Insert a burst of new events; watch bronze refresh, then silver, then gold---without any orchestrator.
+    \item Introduce a schema change on the landing table (add a column); identify which layers fell back to full refresh in the history.
+    \item Break the lag budget deliberately (gold at 1 minute) and document the observed behavior and cost.
+    \item Write the standing monitor: refresh history with full-refresh detection and lag-breach alerting.
+\end{enumerate}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item \textbf{DDL script} for all three dynamic tables with lag rationale comments.
+    \item \textbf{Refresh-history evidence} showing incremental versus full refreshes and the schema-change fallback.
+    \item \textbf{Lag budget worksheet:} SLA to per-layer lag, including measured refresh times.
+    \item \textbf{Monitor query} over \texttt{DYNAMIC\_TABLE\_REFRESH\_HISTORY} with alert thresholds.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item The pipeline refreshes end to end with zero scheduling code.
+    \item Per-layer lags form a valid budget (each downstream lag $\geq$ upstream lag + refresh time).
+    \item The incremental-to-full fallback after DDL is captured and explained from refresh history.
+    \item A cost comparison against the previous task-based pipeline is included.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Reproduce the same pipeline as streams + tasks and compare credits, code volume, and operational surface.
+    \item Add a second gold consumer of silver and show that the DAG absorbed it without edits.
+    \item Force a non-incremental construct into a silver query and measure the full-refresh credit spike.
+\end{itemize}
+
+\section{Friday Real-World Architecture: Retiring a 200-Task Airflow DAG}
+\index{Real-World Architecture!Airflow migration}\index{Airflow}
+A media company runs a 200-task Airflow DAG built over four years: hourly micro-batches, sensor chains, and retry logic that two engineers fully understand. The mandate: cut operational maintenance and pipeline latency by moving in-warehouse transformations to dynamic tables \cite{airflowDocs}.
+
+\subsection{Migration Method}
+\begin{enumerate}
+    \item \textbf{Partition the DAG by reach.} Tasks whose inputs and outputs are all Snowflake tables are dynamic-table candidates---typically 60--80\% of a pure ELT estate. Tasks calling external APIs, moving files, or running non-SQL logic stay in Airflow (or become tasks/external functions).
+    \item \textbf{Translate dependencies into lags.} The DAG's critical path becomes the lag budget; each Airflow layer's interval informs that layer's target lag.
+    \item \textbf{Migrate leaves first.} Gold tables with no Snowflake children convert independently; each converted layer shrinks the remaining DAG.
+    \item \textbf{Run both in parallel with reconciliation.} One week of dual-running with row-count and checksum comparison catches semantic drift between imperative steps and declarative queries.
+    \item \textbf{Decommission with monitoring in place first.} Refresh-history dashboards replace Airflow's UI before the old DAG is retired.
+\end{enumerate}
+
+\begin{figure}[H]
+    \centering
+    \resizebox{0.95\textwidth}{!}{%
+    \begin{tikzpicture}[
+        old/.style={rectangle, rounded corners, draw=red!60!black, thick, fill=red!6, align=center, minimum width=4.6cm, minimum height=1.0cm, font=\small\bfseries},
+        new/.style={rectangle, rounded corners, draw=codegreen!60!black, thick, fill=green!8, align=center, minimum width=4.6cm, minimum height=1.0cm, font=\small\bfseries},
+        lbl/.style={font=\scriptsize\itshape, text=codegray}
+    ]
+        \node[old] (a1) at (0, 0) {Airflow DAG\\200 tasks, sensors, retries, cron};
+        \node[new] (d1) at (8.2, 1.6) {Dynamic-table DAG\\in-warehouse SQL transforms};
+        \node[new] (d2) at (8.2, -0.2) {Snowflake tasks\\CDC merges, alerts};
+        \node[old] (d3) at (8.2, -2.0) {Slimmed Airflow\\external APIs, file movement};
+        \draw[-{Stealth[length=2.5mm]}, draw=primary, thick] (a1) -- (d1);
+        \draw[-{Stealth[length=2.5mm]}, draw=primary, thick] (a1) -- (d2);
+        \draw[-{Stealth[length=2.5mm]}, draw=primary, thick] (a1) -- (d3);
+        \node[lbl] at (4.1, 1.0) {60--80\% of tasks};
+        \node[lbl] at (4.1, -0.8) {CDC and gates};
+        \node[lbl] at (4.1, -2.6) {cross-system edges};
+    \end{tikzpicture}%
+    }
+    \caption{Partitioning a legacy Airflow estate: in-warehouse transforms become dynamic tables, CDC becomes tasks, external edges remain in a slimmed Airflow.}
+    \label{fig:chapter11-airflow-migration}
+\end{figure}
+
+\subsection{What Actually Improves}
+Latency drops because lag-driven refresh beats hour-aligned cron; maintenance drops because adding a table no longer means editing DAG code, sensors, and retry policy; and on-call drops because refresh history plus failure alerts replace bespoke sensor failure trees. What does \emph{not} improve automatically: cost discipline (full-refresh fallbacks need monitoring), and cross-system orchestration (the remaining Airflow is now smaller but more concentrated in genuinely external work).
+
+\begin{pitfall}
+\textbf{Migrating semantics, not just syntax.} An Airflow task that conditionally skips, branches on data, or merges with custom conflict rules is not a dynamic table---it is a task or procedure. Forcing imperative logic into declarative tables produces worse systems than the one being retired.
+\end{pitfall}
+
+\section{Interview Q\&A}
+\begin{enumerate}
+    \item \textbf{Q: What does TARGET\_LAG control?}\\
+    A: Maximum data staleness---the freshness contract Snowflake schedules refreshes to satisfy.
+    \item \textbf{Q: When does Snowflake fall back from incremental to full refresh?}\\
+    A: When the defining query uses constructs incremental refresh cannot track, or after base-table DDL invalidates the refresh mapping; full refresh reprocesses the whole base.
+    \item \textbf{Q: How do dynamic tables differ from materialized views?}\\
+    A: Dynamic tables support broad multi-table SQL, declared lag, and automatic DAG derivation; materialized views are restricted, single-base-query accelerations maintained more synchronously.
+    \item \textbf{Q: Why must downstream lag exceed upstream lag plus refresh time?}\\
+    A: A table cannot be fresher than its inputs; a shorter downstream lag wastes refreshes against stale data or violates the contract.
+    \item \textbf{Q: Where do you check refresh history and failures?}\\
+    A: \texttt{INFORMATION\_SCHEMA.DYNAMIC\_TABLE\_REFRESH\_HISTORY}---refresh type, duration, credits, and status per run.
+\end{enumerate}
+
+\section{Further Reading}
+Snowflake's dynamic-tables documentation defines lag semantics, refresh behavior, and monitoring views \cite{snowflakeDynamicTablesDocs}. Materialized-view documentation \cite{snowflakeMaterializedViewsDocs} and the tasks guide \cite{snowflakeTasksDocs} complete the three-way comparison, and Airflow's docs define the orchestration model being partially replaced \cite{airflowDocs}.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item Dynamic tables trade imperative control for declarative freshness: query plus target lag, DAG derived for free.
+    \item Lag budgets flow from the leaf SLA backward; downstream lag must cover upstream lag plus refresh time.
+    \item Incremental refresh is the economic foundation; full-refresh fallbacks after DDL are the bill shock to monitor.
+    \item Materialized views accelerate single-table queries; streams + tasks keep custom CDC logic; dynamic tables own layered ELT.
+    \item Migrating from Airflow means partitioning by reach: in-warehouse SQL becomes dynamic tables; external edges stay.
+    \item Refresh history is the operations surface---build its dashboard before decommissioning anything.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Explain why ``set every lag to 1 minute'' fails both correctness and cost.
+    \item \textbf{(Conceptual)} List three SQL constructs that can force full refresh and how to isolate them.
+    \item \textbf{(Hands-on)} Build the three-tier chain, then add a fourth gold table and confirm the DAG absorbed it without edits.
+    \item \textbf{(Hands-on)} Force an incremental-to-full fallback and capture the credit delta in refresh history.
+    \item \textbf{(Hands-on)} Implement the lag-breach alert query and test it with an artificially slow layer.
+    \item \textbf{(Design)} Convert a five-step nightly task chain into dynamic tables, documenting what cannot convert.
+    \item \textbf{(Design)} Write the dual-run reconciliation plan for migrating one Airflow layer.
+    \item \textbf{(Operations)} Build the refresh-health dashboard: per-table lag attainment, refresh-type mix, weekly credits.
+    \item \textbf{(Cost)} Compare monthly credits: dynamic tables at 5/15/60-minute lags versus the equivalent 5-minute task tree.
+    \item \textbf{(Interview)} Argue when streams + tasks remain the right answer despite dynamic tables existing.
+\end{enumerate}

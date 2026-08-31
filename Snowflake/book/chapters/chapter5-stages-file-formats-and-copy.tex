@@ -1,0 +1,354 @@
+\chapter{Stages, File Formats, and Bulk Loading with COPY INTO}
+\index{stages}\index{file formats}\index{COPY INTO}\index{storage integration}\index{Week 5}%
+\begin{objectives}
+\begin{itemize}
+    \item Distinguish user, table, and named internal stages from external stages on Amazon S3, Google Cloud Storage, and Azure Blob Storage.
+    \item Configure a storage integration so Snowflake authenticates to cloud storage through an IAM role instead of hardcoded keys.
+    \item Load CSV, JSON, Parquet, Avro, and ORC files with \texttt{COPY INTO}, including column selection and transformation on load.
+    \item Control load behavior with \texttt{ON\_ERROR}, \texttt{VALIDATION\_MODE}, \texttt{PATTERN}, and file-format options.
+    \item Build a hands-on lab that wires an AWS IAM role, a storage integration, and an external stage, then loads files with pattern matching.
+    \item Design a multi-cloud ingestion layout for a logistics company receiving millions of compressed Parquet files per hour from IoT fleet sensors.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+Snowflake stages are a managed lens over cloud object storage, and every provider offers the same underlying primitives: a bucket or container, an identity mechanism for a service to read it, and an event channel that announces new files---learn the pattern once and it transfers directly.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{2.8cm}p{3.0cm}p{3.0cm}p{3.0cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{AWS} & \textbf{Azure} & \textbf{GCP} \\
+\midrule
+External stage target & Amazon S3 & ADLS Gen2 / Blob & Cloud Storage \\
+Snowflake credential & Storage integration + IAM role & Storage integration + managed identity & Storage integration + service account \\
+Cloud-side grant & IAM role trust policy \& bucket policy & RBAC role assignment & IAM binding on bucket \\
+New-file event & S3 event $\rightarrow$ SQS / EventBridge & Event Grid & Pub/Sub notifications \\
+Scoped access & Bucket prefix in IAM policy & Container / path scoping & Bucket prefix \& IAM conditions \\
+Offline bulk transfer & Snow Family & Data Box & Transfer Appliance \\
+Signed URL access & S3 presigned URLs & SAS tokens & Signed URLs \\
+\addlinespace
+Snowflake stage type & External stage (S3) & External stage (Azure) & External stage (GCS) \\
+Load command & \texttt{COPY INTO} & \texttt{COPY INTO} & \texttt{COPY INTO} \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+\textbf{Microsoft Fabric} shortcuts virtualize ADLS Gen2, S3, and Google Cloud Storage inside OneLake without copying files, which is conceptually the same ``reference, do not duplicate'' idea as an external stage. \textbf{MongoDB} has no object-stage concept; ingestion flows through drivers, \texttt{mongoimport}, or Atlas Data Federation over S3. The Snowflake-specific insight is that a stage is not storage---it is a named, governed pointer to storage plus the credentials and file format needed to read it.
+\end{crosscloud}
+
+\section{Week 5 Roadmap}
+Part I of this book treated Snowflake as a place where data already lives. Part II begins the engineering discipline of getting data \emph{into} the platform safely, cheaply, and repeatedly. Nearly every production pipeline starts at the same boundary: files arrive in cloud object storage, and Snowflake must read them with the least privilege necessary and load them with explicit failure semantics \cite{snowflakeDataLoadDocs}.
+
+The week answers five questions. Monday surveys the stage types and when each applies. Tuesday replaces hardcoded cloud keys with a storage integration backed by an IAM role. Wednesday masters \texttt{COPY INTO}: file formats, column projection, and transformation on load. Thursday is a full hands-on build from IAM role to patterned bulk load. Friday scales the pattern to a logistics fleet emitting millions of Parquet files per hour across two clouds.
+
+\begin{keyterms}
+\textbf{Stage}: a named Snowflake object that references a file location, internal or external, for loading and unloading data.\quad
+\textbf{Storage integration}: a Snowflake object that holds a cloud identity (IAM role, managed identity, or service account) so stages authenticate without embedded secrets.\quad
+\textbf{File format}: a named or inline specification of how to parse a file (type, delimiters, compression, error handling).\quad
+\textbf{COPY INTO}: the bulk-load command that reads staged files into a table, optionally projecting and transforming columns.\quad
+\textbf{ON\_ERROR}: the load option controlling whether bad rows or bad files abort, skip, or quarantine the load.
+\end{keyterms}
+
+\section{Monday: Internal and External Stages}
+\index{stage!internal}\index{stage!external}\index{user stage}\index{table stage}\index{named stage}
+A stage is Snowflake's indirection between SQL and files. Queries never reference raw cloud URLs inside load commands; they reference a stage, and the stage carries the location, the credentials, and optionally a default file format. This indirection is what lets a pipeline survive credential rotation and bucket migrations without rewriting load logic.
+
+\subsection{The Three Internal Stage Types}
+Snowflake provides three kinds of \emph{internal} stages, whose files live in Snowflake-managed storage inside the account's cloud region:
+\begin{itemize}
+    \item \textbf{User stage} (\texttt{@\textasciitilde}): every user has a personal stage for ad hoc files. It cannot be altered, dropped, or shared, which makes it convenient for experimentation and unsuitable for pipelines.
+    \item \textbf{Table stage} (\texttt{@\%table\_name}): every table owns a stage, readable by anyone who can read the table. Table stages suit small, table-scoped loads such as reference data.
+    \item \textbf{Named stage} (\texttt{@db.schema.my\_stage}): a first-class schema object with its own privileges, default file format, and directory table option. Named stages are the correct home for shared team artifacts such as UDF code, lookup files, and curated exports.
+\end{itemize}
+
+Internal stages are simple, but their files occupy Snowflake storage at Snowflake storage prices, and uploading requires the \texttt{PUT} command through a client driver. Production ingestion almost always prefers external stages: the data already lives in the enterprise's object store, other systems write there, and lifecycle policies can archive or expire raw files independently of Snowflake.
+
+\begin{definitionbox}
+A \textbf{stage} is a named reference to a file location. An \textbf{internal stage} points at Snowflake-managed storage; an \textbf{external stage} points at a customer-controlled bucket or container on S3, GCS, or Azure Blob Storage.
+\end{definitionbox}
+
+\subsection{External Stages}
+\index{external stage}
+An external stage bundles three things: a URL (\texttt{s3://}, \texttt{gcs://}, or \texttt{azure://}), credentials (ideally a storage integration), and a default file format. Creating one is a single DDL statement:
+
+\begin{lstlisting}[language=SQL, caption={A named external stage backed by a storage integration}]
+CREATE OR REPLACE STAGE raw.fleet_stage
+  URL = 's3://logistics-telemetry/fleet/'
+  STORAGE_INTEGRATION = fleet_s3_int
+  FILE_FORMAT = (TYPE = PARQUET);
+
+-- Inspect what the stage can see
+LIST @raw.fleet_stage PATTERN = '.*snappy.parquet';
+\end{lstlisting}
+
+The \texttt{LIST} command is the stage's inspection surface: it enumerates files, sizes, and last-modified timestamps, and accepts a regular-expression \texttt{PATTERN}. Engineers should treat \texttt{LIST} output as the contract between the data producer and the load pipeline---if a file does not appear in \texttt{LIST}, Snowflake will never load it.
+
+\begin{pitfall}
+\textbf{Stage URLs must end at a folder boundary with a trailing slash.} A stage pointed at \texttt{s3://bucket/fleet} (no trailing slash) may also match a sibling prefix such as \texttt{fleet-archive}. Always terminate stage URLs with \texttt{/} and scope buckets by prefix.
+\end{pitfall}
+
+\subsection{Directory Tables and File Metadata}
+\index{directory table}
+Enabling \texttt{DIRECTORY = (ENABLE = TRUE)} on a stage exposes file metadata as a queryable table, which turns ``which files have arrived?'' into SQL. Directory tables power manifest-driven loads, reconciliation reports, and file-level lineage, and they refresh automatically when wired to cloud event notifications.
+
+\begin{tipbox}
+Use \texttt{@stage/path} URLs inside SQL to address individual files with functions such as \texttt{BUILD\_STAGE\_FILE\_URL} or scoped URLs for governed download. This keeps file access inside Snowflake's privilege model instead of handing out bucket credentials.
+\end{tipbox}
+
+\section{Tuesday: Storage Integrations and Scoped IAM}
+\index{storage integration}\index{IAM role}\index{least privilege}
+Hardcoding an AWS access key and secret into a stage definition is the classic ingestion anti-pattern: keys leak into DDL history, they never rotate, and they usually carry broader rights than the pipeline needs. A \textbf{storage integration} inverts the relationship. Snowflake generates a cloud identity for the account---an IAM user ARN and external ID on AWS---and the engineer writes a trust policy that allows \emph{that} identity to assume a narrowly scoped role \cite{snowflakeStorageIntegrationsDocs}.
+
+\begin{definitionbox}
+A \textbf{storage integration} is an account-level Snowflake object that delegates cloud authentication to a provider identity (an AWS IAM role, an Azure managed identity, or a GCP service account). Stages reference the integration; no long-lived secret is stored in Snowflake DDL.
+\end{definitionbox}
+
+\subsection{The AWS Handshake}
+The configuration is a two-sided handshake:
+\begin{enumerate}
+    \item Create the Snowflake storage integration, then \texttt{DESCRIBE} it to obtain \texttt{STORAGE\_AWS\_IAM\_USER\_ARN} and \texttt{STORAGE\_AWS\_EXTERNAL\_ID}.
+    \item Create an IAM role whose trust policy allows exactly that user ARN plus external ID to assume it, and whose permission policy grants \texttt{s3:GetObject}, \texttt{s3:GetObjectVersion}, and \texttt{s3:ListBucket} on one bucket and prefix.
+    \item Update the integration with the role ARN and verify with \texttt{LIST @stage}.
+\end{enumerate}
+
+\begin{lstlisting}[language=SQL, caption={Creating and inspecting an S3 storage integration}]
+CREATE OR REPLACE STORAGE INTEGRATION fleet_s3_int
+  TYPE = EXTERNAL_STAGE
+  STORAGE_PROVIDER = 'S3'
+  ENABLED = TRUE
+  STORAGE_AWS_ROLE_ARN = 'arn:aws:iam::123456789012:role/fleet-loader'
+  STORAGE_ALLOWED_LOCATIONS = ('s3://logistics-telemetry/fleet/');
+
+DESC INTEGRATION fleet_s3_int;
+-- Record STORAGE_AWS_IAM_USER_ARN and STORAGE_AWS_EXTERNAL_ID,
+-- then paste both into the IAM role trust policy.
+\end{lstlisting}
+
+\begin{figure}[H]
+    \centering
+    \resizebox{0.95\textwidth}{!}{%
+    \begin{tikzpicture}[
+        box/.style={rectangle, rounded corners, draw=primary, thick, fill=primary!6, align=center, minimum width=3.2cm, minimum height=1.1cm, font=\small\bfseries},
+        cloudbox/.style={rectangle, rounded corners, draw=orange!70!black, thick, fill=orange!10, align=center, minimum width=3.2cm, minimum height=1.1cm, font=\small\bfseries},
+        arrow/.style={-{Stealth[length=2.5mm]}, draw=primary, thick},
+        lbl/.style={font=\scriptsize\itshape, text=codegray}
+    ]
+        \node[box] (integ) at (0, 0) {Storage Integration\\fleet\_s3\_int};
+        \node[box] (stage) at (4.6, 0) {External Stage\\@raw.fleet\_stage};
+        \node[cloudbox] (role) at (0, -2.6) {IAM Role\\fleet-loader\\(scoped to prefix)};
+        \node[cloudbox] (bucket) at (4.6, -2.6) {S3 Bucket\\logistics-telemetry/fleet/};
+        \node[box] (copy) at (9.2, 0) {COPY INTO\\raw.readings};
+        \draw[arrow] (integ) -- node[lbl, above]{credentials} (stage);
+        \draw[arrow] (stage) -- node[lbl, above]{reads} (copy);
+        \draw[arrow] (integ) -- node[lbl, left]{assume role (ARN + external ID)} (role);
+        \draw[arrow] (role) -- node[lbl, above]{GetObject / ListBucket} (bucket);
+        \draw[arrow] (stage) -- node[lbl, right]{HTTPS read} (bucket);
+    \end{tikzpicture}%
+    }
+    \caption{The storage-integration handshake: Snowflake's generated identity assumes a narrowly scoped IAM role; stages read the bucket through that role.}
+    \label{fig:chapter5-storage-integration}
+\end{figure}
+
+\subsection{Least-Privilege Scoping and Rotation}
+\index{least privilege!storage integration}
+The IAM role should reach exactly one bucket prefix, and \texttt{STORAGE\_ALLOWED\_LOCATIONS} on the integration should mirror that prefix so the integration cannot be repurposed for other buckets. Where the network perimeter matters, combine the integration with a network policy (\texttt{BLOCKED\_IP\_LIST} / \texttt{ALLOWED\_IP\_LIST}) so even valid credentials cannot be exercised from unexpected networks.
+
+Rotation is operationally cheap: when the cloud identity rotates, re-run \texttt{DESC INTEGRATION}, paste the new \texttt{STORAGE\_AWS\_IAM\_USER\_ARN} into the trust policy, and stages keep working with no DDL changes. This is the property that hardcoded keys can never offer.
+
+\begin{notebox}
+One integration can serve many stages, and one stage serves one location. Model integrations per trust boundary (for example, one per cloud account or per data domain) and stages per dataset prefix.
+\end{notebox}
+
+\section{Wednesday: COPY INTO, File Formats, and Load-Time Transformation}
+\index{COPY INTO}\index{file format}\index{ON\_ERROR}\index{VALIDATION\_MODE}
+\texttt{COPY INTO <table>} is Snowflake's bulk loader. It reads one or more staged files in parallel across warehouse nodes, applies an optional \texttt{SELECT} transformation over the files, and commits the rows in a single transaction per file set. The command is idempotent per file: by default Snowflake skips files already loaded into the same table within the last 64 days, which makes retries safe.
+
+\subsection{File Formats}
+\index{CSV}\index{JSON}\index{Parquet}\index{Avro}\index{ORC}
+A file format describes parsing rules. Formats can be named objects (reusable, governable) or inline \texttt{FILE\_FORMAT = (...)} clauses \cite{snowflakeFileFormatsDocs}.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{2.2cm}p{4.6cm}p{6.4cm}@{}}
+\toprule
+\textbf{Format} & \textbf{Strengths} & \textbf{Engineering notes} \\
+\midrule
+CSV & Universal, human-readable & Declare \texttt{SKIP\_HEADER}, delimiter, and \texttt{FIELD\_OPTIONALLY\_ENCLOSED\_BY}; fragile under schema drift \\
+JSON & Flexible, matches API payloads & Land whole documents in \texttt{VARIANT}; parse with path notation \\
+Parquet & Columnar, compressed, typed & Most efficient analytic load; columns addressable by name \\
+Avro & Schema-carrying row format & Common from Kafka ecosystems; land in \texttt{VARIANT} \\
+ORC & Columnar Hadoop-era format & Supported like Parquet; less common in new pipelines \\
+\bottomrule
+\end{tabular}
+\caption{Snowflake-supported file formats and where each fits.}
+\label{tab:chapter5-file-formats}
+\end{table}
+
+Parquet deserves emphasis: because it is columnar and self-describing, Snowflake can project individual columns by name (\texttt{\$1:device\_id::INT}) without parsing entire rows, compression ratios are high, and type information survives the trip. For analytics-bound telemetry, Parquet is the default choice.
+
+\subsection{Projection and Transformation on Load}
+\index{transformation on load}
+\texttt{COPY INTO} accepts a \texttt{SELECT} over the stage, enabling reshaping during the load: column reordering, casts, derived columns, and load-audit metadata. Positional references \texttt{\$1, \$2, \ldots} address file columns; for semi-structured formats the same dollar notation navigates into the payload.
+
+\begin{lstlisting}[language=SQL, caption={COPY INTO with projection, cast, and load metadata}]
+COPY INTO raw.fleet_readings (device_id, reading_ts, speed_kmh, load_file, load_ts)
+FROM (
+  SELECT $1:device_id::INT,
+         $1:ts::TIMESTAMP_NTZ,
+         $1:speed::FLOAT,
+         METADATA$FILENAME,
+         CURRENT_TIMESTAMP()
+  FROM @raw.fleet_stage
+)
+PATTERN = '.*fleet-2026-08-.*\\.parquet'
+ON_ERROR = 'SKIP_FILE_3';
+\end{lstlisting}
+
+Three options deserve deliberate choices on every load:
+\begin{itemize}
+    \item \textbf{PATTERN}: a regular expression restricting which files the command reads. Patterns make loads deterministic and let operators partition a bucket across parallel load jobs.
+    \item \textbf{ON\_ERROR}: \texttt{CONTINUE} (load what parses), \texttt{SKIP\_FILE} / \texttt{SKIP\_FILE\_n} (abandon files after $n$ errors), or \texttt{ABORT\_STATEMENT} (default; fail the whole load). Choose per dataset criticality---aborted loads are loud; silently skipped files are not.
+    \item \textbf{VALIDATION\_MODE}: \texttt{RETURN\_n\_ROWS} or \texttt{RETURN\_ERRORS} runs the load as a dry-run, reporting parse problems without writing. Always validate a new feed before enabling it.
+\end{itemize}
+
+\begin{pitfall}
+\textbf{Skipping files without a quarantine path loses data quietly.} Pair \texttt{ON\_ERROR = SKIP\_FILE} with a reconciliation query against \texttt{INFORMATION\_SCHEMA.COPY\_HISTORY} (or a dead-letter convention) so rejected files are retried or investigated, not forgotten.
+\end{pitfall}
+
+\subsection{Load Metadata and History}
+\index{COPY\_HISTORY}\index{METADATA\textdollar FILENAME}
+Two built-in columns, \texttt{METADATA\$FILENAME} and \texttt{METADATA\$FILE\_ROW\_NUMBER}, let a load record its own provenance. Combined with \texttt{COPY\_HISTORY} views, they answer the operational questions: which file produced this row, which files loaded today, and which failed. Production raw tables should always carry file lineage columns; they cost little and make replay and audit trivial.
+
+\section{Thursday Hands-On Project: S3 to Snowflake with a Storage Integration}
+\index{hands-on project!storage integration}
+This project builds the complete Monday-to-Wednesday stack against real cloud infrastructure: an IAM role, a storage integration, an external stage, and a patterned \texttt{COPY INTO} load with error handling.
+
+\subsection*{Scenario}
+Your logistics client drops compressed CSV trip files into \texttt{s3://logistics-telemetry/fleet/csv/} hourly. Security forbids embedded cloud credentials. You must stand up governed access and prove a repeatable bulk load.
+
+\subsection*{Procedure}
+\begin{enumerate}
+    \item In AWS, create IAM role \texttt{fleet-loader} with a permission policy scoped to \texttt{s3://logistics-telemetry/fleet/*}. Leave the trust policy temporarily permissive.
+    \item In Snowflake, create the storage integration referencing the role ARN, then \texttt{DESC INTEGRATION} to obtain the generated user ARN and external ID.
+    \item Tighten the IAM trust policy to exactly that user ARN and external ID.
+    \item Create a named CSV file format (\texttt{SKIP\_HEADER = 1}, quoted fields) and the external stage \texttt{@raw.fleet\_stage} using the integration.
+    \item Upload two sample files to the bucket prefix and confirm them with \texttt{LIST}.
+    \item Run \texttt{COPY INTO} with \texttt{VALIDATION\_MODE = RETURN\_ERRORS}, fix any parse issues, then load for real with a \texttt{PATTERN} restricting to the current day.
+    \item Verify row counts and file lineage via \texttt{COPY\_HISTORY} and the \texttt{METADATA\$FILENAME} column.
+\end{enumerate}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item \textbf{SQL script:} integration, stage, file format, validation, load, and verification statements in execution order.
+    \item \textbf{IAM policy JSON:} permission and trust policies, redacted of account-specific secrets but showing the ARN and external ID placeholders.
+    \item \textbf{Evidence table:} \texttt{LIST} output, \texttt{COPY\_HISTORY} rows, and target-table row counts before and after.
+    \item \textbf{Runbook paragraph:} how to rotate the cloud identity without touching pipeline code.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item The stage reads the bucket with zero hardcoded credentials anywhere in DDL or history.
+    \item The IAM permission policy is scoped to a single bucket prefix; the trust policy names the Snowflake-generated user ARN and external ID.
+    \item A validation pass runs before the real load, and \texttt{ON\_ERROR} behavior is explicitly chosen and justified.
+    \item Loaded rows carry \texttt{METADATA\$FILENAME} lineage, and a reconciliation query proves every staged file loaded exactly once.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Enable a directory table on the stage and build a ``files arrived vs.\ files loaded'' reconciliation view.
+    \item Reload the same files to demonstrate 64-day idempotency, then force a reload with \texttt{FORCE = TRUE} and measure duplicate risk.
+    \item Repeat the exercise against Azure Blob using a managed-identity storage integration to prove the pattern is cloud-portable.
+\end{itemize}
+
+\section{Friday Real-World Architecture: Multi-Cloud IoT Fleet Ingestion}
+\index{Real-World Architecture!logistics fleet}\index{IoT ingestion}
+A logistics company operates 40,000 vehicles. Each vehicle's gateway buffers sensor events and uploads a Snappy-compressed Parquet file every few minutes---millions of files per hour---to the nearest cloud: vehicles contracted through one telematics vendor land in AWS S3, a second vendor lands in Azure Blob. Analytics, maintenance models, and billing all live in Snowflake.
+
+\subsection{Design Decisions}
+\begin{enumerate}
+    \item \textbf{One stage per cloud, one integration per cloud account.} \texttt{@raw.fleet\_s3} and \texttt{@raw.fleet\_az} reference separate storage integrations with per-cloud identities, each scoped to its telemetry prefix. Blast radius and rotation stay per vendor.
+    \item \textbf{Partitioned prefixes as the physical contract.} Producers write to \texttt{dt=YYYY-MM-DD/hr=HH/} prefixes. Load jobs pattern-match per hour, which bounds blast radius of a bad hour and makes backfills enumerable.
+    \item \textbf{Raw-first loading.} \texttt{COPY INTO} lands columns plus \texttt{METADATA\$FILENAME} into an append-only raw table with no transformation beyond typing. Business shaping happens downstream where it can be re-run.
+    \item \textbf{Failure semantics by dataset.} Billing-critical trips use \texttt{ABORT\_STATEMENT} so a malformed hour pages someone; diagnostic sensor noise uses \texttt{SKIP\_FILE\_10} with a dead-letter report from \texttt{COPY\_HISTORY}.
+\end{enumerate}
+
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[
+        gw/.style={rectangle, rounded corners, draw=orange!70!black, thick, fill=orange!10, align=center, minimum width=2.6cm, minimum height=1.0cm, font=\small\bfseries},
+        sf/.style={rectangle, rounded corners, draw=primary, thick, fill=primary!6, align=center, minimum width=2.6cm, minimum height=1.0cm, font=\small\bfseries},
+        tbl/.style={rectangle, rounded corners, draw=codegreen!60!black, thick, fill=green!8, align=center, minimum width=2.6cm, minimum height=1.0cm, font=\small\bfseries},
+        arrow/.style={-{Stealth[length=2.5mm]}, draw=primary, thick},
+        lbl/.style={font=\scriptsize\itshape, text=codegray}
+    ]
+        \node[gw] (v1) at (0, 1.6) {Fleet gateway\\vendor A};
+        \node[gw] (v2) at (0, -1.6) {Fleet gateway\\vendor B};
+        \node[gw] (s3) at (3.6, 1.6) {S3 prefix\\dt/hr Parquet};
+        \node[gw] (az) at (3.6, -1.6) {ADLS prefix\\dt/hr Parquet};
+        \node[sf] (st1) at (7.2, 1.6) {@raw.fleet\_s3\\+ integration};
+        \node[sf] (st2) at (7.2, -1.6) {@raw.fleet\_az\\+ integration};
+        \node[tbl] (raw) at (10.8, 0) {raw.fleet\_readings\\append-only + lineage};
+        \node[tbl] (silver) at (14.2, 0) {silver trips\\and KPIs};
+        \draw[arrow] (v1) -- (s3);
+        \draw[arrow] (v2) -- (az);
+        \draw[arrow] (s3) -- (st1);
+        \draw[arrow] (az) -- (st2);
+        \draw[arrow] (st1) -- node[lbl, above, sloped]{hourly COPY (PATTERN)} (raw);
+        \draw[arrow] (st2) -- (raw);
+        \draw[arrow] (raw) -- (silver);
+    \end{tikzpicture}%
+    }
+    \caption{Multi-cloud fleet ingestion: two vendor clouds, two scoped integrations, one append-only raw table with file lineage.}
+    \label{fig:chapter5-fleet-architecture}
+\end{figure}
+
+\subsection{Capacity and Cost Reasoning}
+Millions of small files per hour is a file-count problem before it is a byte-count problem. Each file carries listing and open overhead, so the design encourages gateways to batch to tens of megabytes per file where latency allows. Bulk \texttt{COPY INTO} on a warehouse is billed while the warehouse runs; sizing the hourly load window and confirming that one hour of files loads in well under one hour leaves headroom for growth. Chapter 6 replaces the hourly sweep with event-driven Snowpipe when latency requirements tighten below the batch interval.
+
+\begin{tipbox}
+Estimate load throughput empirically in week one of any engagement: time \texttt{COPY INTO} over a representative hour of files on an XSMALL and a SMALL warehouse. The linear scaling of bulk loads makes the production size an easy extrapolation.
+\end{tipbox}
+
+\section{Interview Q\&A}
+\begin{enumerate}
+    \item \textbf{Q: When would you choose a named internal stage over an external stage?}\\
+    A: For Snowflake-local artifacts such as UDF source files or small team-shared lookups. Bulk enterprise data should stay in customer object storage behind an external stage.
+    \item \textbf{Q: Why is a storage integration safer than access keys in a stage?}\\
+    A: No long-lived secret is stored in Snowflake; authentication rides on a cloud identity and a scoped trust policy, rotation is a trust-policy update, and allowed locations are constrained on the integration itself.
+    \item \textbf{Q: What does \texttt{ON\_ERROR = SKIP\_FILE\_3} do?}\\
+    A: It skips a file once it produces three row errors and continues with remaining files; the skipped files appear in load history for retry or quarantine.
+    \item \textbf{Q: Why is Parquet preferred for analytic ingestion?}\\
+    A: It is columnar, compressed, and self-describing, so Snowflake can project columns by name, prune aggressively, and store the data efficiently.
+    \item \textbf{Q: How does COPY INTO avoid double-loading files?}\\
+    A: It tracks load metadata per table and skips files already loaded within the last 64 days unless \texttt{FORCE = TRUE} is set.
+\end{enumerate}
+
+\section{Further Reading}
+Snowflake's data-loading overview, bulk-loading reference, file-format reference, and storage-integration guides are the authoritative sources for this chapter \cite{snowflakeDataLoadDocs,snowflakeCopyIntoDocs,snowflakeFileFormatsDocs,snowflakeStorageIntegrationsDocs}. For the cloud side of the handshake, consult the AWS IAM role documentation and the Azure and Google storage security guides \cite{awsIamRoleDocs,azureBlobSecurityDocs,googleCloudStorageIamDocs}.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item Stages are governed pointers to files: internal stages for Snowflake-local artifacts, external stages for enterprise object storage.
+    \item Storage integrations replace embedded keys with a scoped cloud identity; rotation becomes a trust-policy edit.
+    \item \texttt{COPY INTO} is a transactional, idempotent-per-file bulk loader with first-class projection, pattern matching, and error semantics.
+    \item Choose \texttt{ON\_ERROR} and \texttt{VALIDATION\_MODE} deliberately per dataset, and always record \texttt{METADATA\$FILENAME} lineage.
+    \item Parquet is the default analytic ingest format; partitioned prefixes make loads deterministic and backfills enumerable.
+    \item Millions-of-small-files workloads are bounded by file counts as much as bytes---batch upstream and measure throughput empirically.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Compare the three internal stage types and give one legitimate use for each.
+    \item \textbf{(Conceptual)} Explain the two-sided trust handshake behind an AWS storage integration and what rotates when credentials rotate.
+    \item \textbf{(Conceptual)} Why does Snowflake recommend \texttt{STORAGE\_ALLOWED\_LOCATIONS} even when the IAM policy is already scoped?
+    \item \textbf{(Hands-on)} Load a malformed CSV with each \texttt{ON\_ERROR} mode and record the observable differences in \texttt{COPY\_HISTORY}.
+    \item \textbf{(Hands-on)} Write a \texttt{COPY INTO} that projects three columns by name out of a Parquet file and adds \texttt{METADATA\$FILENAME}.
+    \item \textbf{(Design)} Sketch the stage and integration layout for a company acquiring a second telematics vendor on GCP. What stays shared and what gets its own integration?
+    \item \textbf{(Design)} Propose a dead-letter convention for files skipped by \texttt{SKIP\_FILE}: table shape, alerting query, and replay procedure.
+    \item \textbf{(Operations)} Write a daily reconciliation query comparing \texttt{LIST}-visible files for yesterday against \texttt{COPY\_HISTORY}.
+    \item \textbf{(Cost)} Given 3 million Parquet files per day averaging 8 MB, outline how you would measure and size the daily load window.
+    \item \textbf{(Interview)} Explain to a security reviewer why the pipeline contains no cloud secrets and how you would prove it in an audit.
+\end{enumerate}

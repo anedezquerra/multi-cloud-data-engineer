@@ -1,0 +1,284 @@
+\chapter{Security and Access Control}
+\index{security}\index{workspace roles}\index{item-level permissions}\index{OneLake data access roles}\index{row-level security}\index{least privilege}\index{privilege creep}\index{separation of duties}%
+
+\begin{objectives}
+\begin{itemize}
+    \item Assign workspace roles---Admin, Member, Contributor, Viewer---by least privilege.
+    \item Distinguish item-level from workspace-level permissions and prefer the narrower grant.
+    \item Configure OneLake data access roles and SQL row-level security.
+    \item Restrict a user to a single region's data through RLS on the SQL analytics endpoint.
+    \item Audit a tenant for privilege creep on a schedule.
+    \item Design a healthcare data perimeter with strict separation of duties between engineers and analysts.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+Layered access control---platform roles, resource permissions, and in-engine row/column security---is structurally identical across clouds; only the names change.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{2.8cm}p{3.2cm}p{3.2cm}p{3.2cm}p{3.2cm}@{}}
+\toprule
+\textbf{Layer} & \textbf{Fabric} & \textbf{AWS} & \textbf{GCP} & \textbf{Snowflake} \\
+\midrule
+Platform container roles & Workspace roles (Admin/Member/Contributor/Viewer) & IAM policies on resources & IAM roles on projects/folders & Account/database roles \\
+Item-level grants & Per-item sharing and permissions & Per-resource policies & Per-resource IAM & Object grants \\
+Data-plane scoping & OneLake data access roles & Lake Formation & BigQuery authorized views/dataplex & Row/column policies \\
+Row-level security & SQL RLS predicates & Lake Formation cell filters & Row access policies & Row access policies \\
+Identity & Microsoft Entra ID & IAM / Identity Center & Cloud Identity & IdP via SCIM/OAuth \\
+Audit & Workspace/tenant logs, Purview & CloudTrail & Cloud Audit Logs & Access history \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+Databricks governs through Unity Catalog's three-level namespace grants; MongoDB Atlas through database roles and field-level encryption. The portable law: \emph{grant at the narrowest scope that lets the work happen, and audit the drift between policy and reality}.
+\end{crosscloud}
+
+\begin{keyterms}
+\textbf{Workspace role}: the broad collaboration tier---Admin, Member, Contributor, Viewer---applied to a workspace. \quad
+\textbf{Item-level permission}: a grant on one item (lakehouse, report) independent of workspace membership. \quad
+\textbf{OneLake data access role}: a role restricting which folders or tables within a lakehouse an identity can read. \quad
+\textbf{Least privilege}: granting the minimum access the task requires. \quad
+\textbf{Privilege creep}: the slow accumulation of broader-than-needed access over time. \quad
+\textbf{Separation of duties}: designing roles so no single identity can both alter data and approve its use.
+\end{keyterms}
+
+\section{Week 21 Roadmap}
+Week~21 opens Part~VI by securing everything Parts I--V built. Monday covers workspace roles. Tuesday contrasts item-level with workspace-level permissions. Wednesday covers OneLake data access roles and SQL RLS. Thursday is the hands-on project: a workspace with a Contributor role and RLS restricting a user to the US region. Friday designs the healthcare perimeter with separation of duties.
+
+Security in Fabric is layered, and the layers compose: workspace roles set the collaboration ceiling, item permissions narrow it, OneLake roles scope the data plane, and SQL RLS filters the rows \cite{microsoftFabricSecurity}. Misunderstanding any layer leaves a hole the others do not cover.
+
+\begin{notebox}
+Production rule for the week: grant access at the narrowest scope---prefer item-level permissions and OneLake data access roles over workspace-wide Member/Admin assignments. Audit quarterly: Viewer on a workspace combined with broad item sharing is the most common form of privilege creep in Fabric tenants.
+\end{notebox}
+
+\section{Monday: Workspace Roles}
+\index{workspace roles}
+Four roles define workspace participation \cite{microsoftFabricWorkspaces,microsoftFabricSecurity}:
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{2.6cm}p{5.8cm}p{5.4cm}@{}}
+\toprule
+\textbf{Role} & \textbf{Can} & \textbf{Give to} \\
+\midrule
+Admin & Everything: settings, membership, deletion & Workspace owners only; two or three per workspace \\
+Member & Create/edit items, manage most settings, add members (if allowed) & Core team leads \\
+Contributor & Create and edit items; cannot manage membership or settings & Working data engineers and analysts who build \\
+Viewer & Read and consume items & Consumers, stakeholders, auditors \\
+\bottomrule
+\end{tabular}
+\caption{Workspace roles and their intended holders.}
+\label{tab:chapter21-roles}
+\end{table}
+
+The distinguishing exam-and-practice question is Contributor versus Viewer: a Contributor \emph{changes} items---edits pipelines, modifies notebooks, writes through them---while a Viewer consumes outputs without altering definitions. Most people who ask for Member actually need Contributor; most who ask for Contributor actually need Viewer.
+
+\begin{pitfall}
+Admin is not ``senior user.'' An Admin can delete the workspace and everything in it, and can change who else has access. Every unnecessary Admin is an unmonitored disaster path; keep the count at two or three and review it quarterly.
+\end{pitfall}
+
+\section{Tuesday: Item-Level versus Workspace-Level Permissions}
+\index{item-level permissions}
+Workspace roles grant broad capability across every item in the workspace. Item-level permissions grant access to one item---a specific lakehouse, report, or warehouse---to an identity that may have no workspace role at all \cite{microsoftFabricSecurity}.
+
+The decision rule: workspace roles for the team that \emph{builds} the workspace's products; item-level grants for everyone who \emph{consumes} a specific product. A finance analyst who needs the sales report gets the report item---not Viewer on the workspace, which would expose every draft, experiment, and internal artifact the workspace contains.
+
+\begin{tipbox}
+When a stakeholder requests ``access to the workspace,'' ask which item they actually need. Item-level grants keep the workspace's internal surface---work in progress, staging tables, experiments---private by default.
+\end{tipbox}
+
+Item sharing composes with the deeper layers: sharing a lakehouse item grants the connection, while OneLake roles (Wednesday) scope which data inside it the identity can actually read.
+
+\section{Wednesday: OneLake Data Access Roles and SQL RLS}
+\index{OneLake data access roles}\index{row-level security}
+\subsection{OneLake Data Access Roles}
+OneLake data access roles restrict access to folders or tables \emph{within} a lakehouse: an identity can reach the lakehouse yet read only \texttt{Tables/gold/} and not \texttt{Files/raw/}, or only the virtual folder for their region \cite{microsoftFabricSecurity}. This is the data-plane layer---it applies regardless of which engine (Spark, SQL endpoint, OneLake APIs) the identity uses, which is precisely why it matters: SQL-only security can be bypassed by a Spark notebook unless the storage layer also enforces the rule.
+
+\subsection{SQL Row-Level Security}
+Chapter~6 built the mechanism; this week operationalizes it. RLS on the SQL analytics endpoint or warehouse filters rows per user through a predicate function and security policy---the \texttt{US}-region-only analyst is the canonical exercise \cite{microsoftFabricSqlEndpoint,microsoftFabricSecurity}.
+
+\begin{lstlisting}[language=SQL,caption={RLS restricting a principal to US-region rows (Chapter 6 pattern, production framing).},label={lst:chapter21-rls}]
+-- Mapping row: the analyst's identity to their region
+INSERT sec.user_region (user_principal, region)
+VALUES ('analyst-us@contoso.com', 'US');
+
+-- Policy already filters gold.v_sales_enriched via sec.fn_region_predicate.
+-- Verify as the restricted principal:
+EXECUTE AS USER = 'analyst-us@contoso.com';
+SELECT DISTINCT region FROM gold.v_sales_enriched;   -- must return only 'US'
+REVERT;
+\end{lstlisting}
+
+\begin{pitfall}
+Layer-confusion is the recurring security bug: RLS configured on the SQL endpoint does not constrain a Spark notebook reading the same Delta files; a OneLake role does not filter rows inside a permitted table. Each engine's access path needs its layer---test every path a user actually has, not just the one you intended them to use.
+\end{pitfall}
+
+\section{Thursday: Hands-on Project}
+\index{hands-on lab}\index{row-level security!hands-on}
+The Week~21 lab creates a workspace, assigns a Contributor role, and configures RLS on a SQL analytics endpoint so a test user sees only \texttt{US}-region data.
+
+\subsection{Goal and Architecture}
+Create \texttt{fabric-de-week21} with a lakehouse containing a regional sales table (reuse any Part~I/II estate). Create or use a test identity for the restricted analyst. Deliverables: the role assignment evidence, the RLS objects, and the two-persona test.
+
+\subsection{Step-by-Step Actions}
+\begin{enumerate}
+    \item Create the workspace; add the builder identity as Contributor; add the test analyst with item-level access only to the lakehouse.
+    \item Create \texttt{sec.user\_region}, the predicate function, and the security policy per Chapter~6.
+    \item Insert the analyst's mapping row for \texttt{US}.
+    \item As the analyst (or \texttt{EXECUTE AS USER}), query the protected view: only \texttt{US} rows return.
+    \item Attempt direct access to the base table: denied.
+    \item Attempt the same data via a Spark notebook as the analyst: record what the OneLake layer does and does not block; add a data access role if the scenario demands it.
+    \item Document the access matrix: identity $\times$ path $\times$ result.
+\end{enumerate}
+
+\subsection{Validation Checklist}
+\begin{itemize}
+    \item The builder holds Contributor, not Member or Admin.
+    \item The analyst holds item-level access, not a workspace role.
+    \item RLS filters to \texttt{US} under the analyst identity in SQL.
+    \item Base-table access is denied at the object level.
+    \item The Spark/OneLake path is tested and its result documented.
+    \item The access matrix is written down and reviewed.
+\end{itemize}
+
+\section{Friday: Use Case and Architecture}
+\index{separation of duties!healthcare}\index{data perimeter}
+A healthcare provider must enforce strict separation of duties: data engineers operate pipelines and infrastructure; data analysts query curated data; neither can silently do the other's job; patient data is visible only as far as each role requires.
+
+\subsection{The Perimeter Design}
+\begin{itemize}
+    \item \textbf{Workspace split}: engineering workspace (Bronze/Silver, pipelines) versus analytics workspace (Gold, semantic models, reports). Engineers are Contributors in engineering and Viewers---at most---in analytics. Analysts have item-level access to curated Gold items only.
+    \item \textbf{Data-plane scoping}: OneLake data access roles confine engineers' operational access to the layers they maintain; raw PII folders are readable only by the ingestion identity and the privacy officer.
+    \item \textbf{Row and column security}: analysts reach patient-adjacent data through RLS-filtered views with denied sensitive columns (Chapter~6's column-level pattern).
+    \item \textbf{Break-glass}: an emergency-access procedure that is time-boxed, dual-approved, and audit-logged---separation of duties includes a governed exception path, because ungoverned ones emerge anyway.
+    \item \textbf{Audit}: quarterly privilege-creep review; every grant attributable to a ticket.
+\end{itemize}
+
+\begin{pitfall}
+The most common separation-of-duties failure is the shared service identity with broad rights used by both teams' automation. Service principals get the same least-privilege treatment as humans---one per pipeline family, scoped to its actual read/write set.
+\end{pitfall}
+
+\section{Operational Guidance for Week 21}
+Access reviews are operations, not annual theater. Quarterly: list every workspace Admin and Member, every item share, every OneLake role, and reconcile each against a ticket or an owner statement.
+
+\subsection{Performance and Reliability}
+RLS predicates add query cost; keep predicate functions simple and indexed where the engine allows. Prefer security by composition (narrow views over RLS'd bases) to baroque per-object grants that nobody can audit.
+
+\subsection{Security and Governance Checklist}
+\begin{itemize}
+    \item Admins per workspace: two or three, reviewed quarterly.
+    \item Consumers get item-level grants; builders get Contributor; Member is exceptional.
+    \item OneLake roles cover the Spark path wherever SQL RLS covers the SQL path.
+    \item Every RLS policy is tested as a real restricted principal after any change.
+    \item Service principals are scoped per workload and vaulted.
+    \item Privilege-creep audit is scheduled, evidenced, and acted on.
+\end{itemize}
+
+\section{Interview Q\&A}
+\begin{enumerate}
+    \item \textbf{Q: What distinguishes Contributor from Viewer workspace roles?}\\
+    A: Contributors create and modify items---pipelines, notebooks, models; Viewers consume outputs without altering definitions. The distinction is change authority, not seniority.
+    \item \textbf{Q: Why prefer item-level permissions over workspace-level grants?}\\
+    A: A workspace grant exposes every item---drafts, staging, experiments---to the grantee; item-level grants expose exactly the product the consumer needs and nothing else.
+    \item \textbf{Q: What do OneLake data access roles control?}\\
+    A: Which folders and tables within a lakehouse an identity can read at the storage plane---enforced regardless of engine, closing the Spark-path bypass of SQL-only security.
+    \item \textbf{Q: How does SQL RLS restrict a user to US-region rows only?}\\
+    A: A mapping table links the user principal to their region; an inline predicate function evaluates it per row; a security policy binds the predicate to the table---so identical queries return different rows per user.
+    \item \textbf{Q: What is privilege creep, and how do you audit for it?}\\
+    A: The accumulation of broader-than-needed grants over time---classically Viewer-on-workspace plus broad item sharing. Audit quarterly: enumerate grants, map each to a ticket or owner, and revoke what cannot be justified.
+    \item \textbf{Q: Why do service identities need least privilege too?}\\
+    A: Automation identities run unattended at scale; a broad shared service principal is an unaudited, always-on privilege that both teams' pipelines inherit---one scoped principal per workload family contains that.
+\end{enumerate}
+
+\section{Further Reading}
+Review Fabric security fundamentals \cite{microsoftFabricSecurity}, workspace roles \cite{microsoftFabricWorkspaces}, and the SQL endpoint's security model \cite{microsoftFabricSqlEndpoint}. Governance and compliance continue in Chapter~22 \cite{microsoftPurviewFabric}; capacity and deployment controls in Chapter~23 \cite{microsoftFabricGitIntegration}.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item Workspace roles set the collaboration ceiling: Admin is rare, Member is exceptional, Contributor builds, Viewer consumes.
+    \item Item-level grants serve consumers; workspace roles serve builders.
+    \item OneLake data access roles enforce the data plane across every engine---SQL-only security has a Spark-shaped hole.
+    \item RLS composes with object-level security: grant the object, filter the rows, test as the real principal.
+    \item Every access path a user actually has must be tested, not just the intended one.
+    \item Privilege creep is audited quarterly or it is not audited at all.
+    \item Separation of duties includes service identities and a governed break-glass path.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Construct a scenario where Viewer-on-workspace leaks information that item-level sharing would not.
+    \item \textbf{(Conceptual)} Explain why the OneLake layer is necessary even with perfect SQL RLS.
+    \item \textbf{(Hands-on)} Extend the lab with a second region and a manager identity mapped to both; test the union behavior.
+    \item \textbf{(Hands-on)} Build the privilege-creep audit query/export for your workspace: roles, shares, and last review date.
+    \item \textbf{(Design)} Write the break-glass procedure for the healthcare provider: approval, time-boxing, logging, revocation.
+    \item \textbf{(Design)} Design the service-principal map for the Part III pipeline estate: one principal per what, scoped to what?
+    \item \textbf{(Interview)} In five sentences, explain layered security in Fabric and where each layer's blind spot lies.
+    \item \textbf{(Operational)} Write the quarterly access-review procedure with evidence requirements.
+\end{enumerate}
+
+\section{Capstone Project: Layered Access Model with Audit Evidence}\label{sec:ch21-capstone}
+\index{capstone project}\index{least privilege!capstone}\index{separation of duties!capstone}
+
+\begin{capstonebox}
+\textbf{Mission.} Implement the healthcare-grade access model on a working estate: split workspaces, least-privilege roles, item-level consumer grants, OneLake data access roles, tested RLS and column denies, a scoped service-principal map, and a completed quarterly-style audit with evidence.
+
+\textbf{Estimated time.} 5--7 hours.
+
+\textbf{What you'll practice.}
+\begin{itemize}
+    \item Role assignment by least privilege with an explicit access matrix.
+    \item Composing OneLake, object, column, and row security layers.
+    \item Testing every engine path per persona.
+    \item Producing audit evidence a compliance officer can accept.
+\end{itemize}
+\end{capstonebox}
+
+\subsection*{Scenario}
+Contoso Health Analytics must pass a security review: engineers and analysts share one Fabric tenant but must be provably separated, with patient-identifiable columns denied to analytics and every access decision traceable to a ticket.
+
+\subsection*{Requirements}
+\begin{itemize}
+    \item Engineering and analytics workspaces with role assignments per the access matrix.
+    \item Item-level consumer grants; zero consumer workspace roles.
+    \item OneLake data access roles scoping engineers to their layers.
+    \item RLS plus a column deny on the patient-adjacent table, tested as each persona.
+    \item The service-principal map for all automation.
+    \item The audit export: every grant, its justification, and the review sign-off.
+\end{itemize}
+
+\subsection*{Implementation Steps}
+\begin{enumerate}
+    \item Write the access matrix (personas $\times$ assets $\times$ layers).
+    \item Assign roles and item grants; configure OneLake roles.
+    \item Implement and test RLS and column denies per persona and per engine path.
+    \item Map and re-scope service principals.
+    \item Run the audit export; reconcile every grant; obtain sign-off.
+\end{enumerate}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item The access matrix and role/share inventories.
+    \item Test evidence per persona per engine path.
+    \item The service-principal map.
+    \item The signed audit export.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item[\(\square\)] No consumer holds any workspace role; no engineer holds analytics-workspace write access.
+    \item[\(\square\)] RLS and column denies hold under every tested engine path, including Spark.
+    \item[\(\square\)] Every service principal is scoped to its workload with vaulted credentials.
+    \item[\(\square\)] Every grant in the audit export has a justification or is revoked.
+    \item[\(\square\)] Admin counts are two or three per workspace with named owners.
+    \item[\(\square\)] No credentials or PII appear in any submitted evidence.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Automate the audit export as a scheduled notebook with drift detection against the last review.
+    \item Implement the break-glass procedure with time-boxed group membership.
+    \item Add an alerting rule on new Admin assignments.
+    \item Extend the model with a third persona (external auditor) read-only across both workspaces.
+\end{itemize}

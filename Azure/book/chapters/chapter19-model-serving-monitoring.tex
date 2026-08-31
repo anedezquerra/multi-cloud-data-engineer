@@ -1,0 +1,302 @@
+\chapter{Model Serving, Monitoring, and the Retraining Loop}
+\index{managed endpoint}\index{batch endpoint}\index{data drift}\index{model monitoring}\index{MLOps}\index{champion-challenger}%
+\begin{objectives}
+\begin{itemize}
+    \item Choose between managed online endpoints (real-time) and batch endpoints (offline scoring) from the workload's latency and volume profile.
+    \item Deploy a registered model with blue-green traffic shifting and safe rollback.
+    \item Implement production data collection and distinguish input drift, prediction drift, and concept drift.
+    \item Wire a drift alert through Azure Monitor and Event Grid to an automated retraining pipeline.
+    \item Gate model promotion on metric thresholds plus human approval---never on recency.
+    \item Architect the full MLOps lifecycle for a production recommendation engine.
+    \item Keep training and serving features aligned through the managed feature store at serving time.
+\end{itemize}
+\end{objectives}
+
+\begin{crosscloud}
+Model serving splits everywhere into real-time endpoints and batch scoring, and monitoring splits into infrastructure health, data drift, and model quality. The vocabulary below is the translation table.
+
+\vspace{2mm}
+{\footnotesize
+\begin{tabular}{@{}p{3.0cm}p{2.9cm}p{3.1cm}p{3.2cm}@{}}
+\toprule
+\textbf{Capability} & \textbf{AWS} & \textbf{Azure} & \textbf{GCP} \\
+\midrule
+Real-time serving & SageMaker endpoints & AML managed online endpoints & Vertex AI endpoints \\
+Batch scoring & SageMaker batch transform & AML batch endpoints & Vertex batch prediction \\
+Model monitoring & SageMaker Model Monitor & AML model monitoring / drift & Vertex Model Monitoring \\
+Registry and stages & SageMaker registry + approval & AML registry + tags/stages & Vertex registry + aliases \\
+Retrain trigger & EventBridge $\rightarrow$ pipeline & Event Grid $\rightarrow$ AML pipeline & Eventarc $\rightarrow$ pipeline \\
+\addlinespace
+\multicolumn{4}{@{}l@{}}{\textbf{Fabric}: MLflow models + SynapseML serving; \textbf{Snowflake}: Snowpark ML registry + SQL inference; \textbf{MongoDB}: in-app scoring over Atlas.} \\
+\bottomrule
+\end{tabular}}
+
+\vspace{1mm}
+The MLOps loop in this chapter---monitor, detect drift, retrain, gate, promote---is platform-neutral. Memorize the loop and the vendor product names become interchangeable details.
+\end{crosscloud}
+
+\begin{keyterms}
+\textbf{Managed online endpoint}: AML's hosted real-time scoring service with auth, scaling, and blue-green deployments.\quad
+\textbf{Batch endpoint}: AML's offline scoring over large inputs on a schedule.\quad
+\textbf{Data drift}: statistical change in production input distributions versus the training baseline.\quad
+\textbf{Blue-green deployment}: two deployments behind one endpoint, with traffic shifted gradually and rollback by shifting back.\quad
+\textbf{Promotion gate}: the criteria (metric threshold, tests, approval) a model must pass before serving production traffic.
+\end{keyterms}
+
+\section{Week 19 Overview: The Model Is Not Done When It Trains}
+Chapter 18 produced a registered model. This chapter operates it. The production reality of ML is that models degrade: the world changes, input distributions shift, and yesterday's champion quietly becomes wrong. MLOps is the discipline that notices: serve with safe deployment mechanics, collect what the model sees, measure drift, retrain on evidence, and promote through gates. The data engineer's role is central---drift is a data problem, collection is a pipeline problem, and retraining is an orchestration problem.
+
+\section{Monday: Managed Endpoints---Real-Time and Batch}
+\index{managed online endpoint}\index{batch endpoint}
+
+\subsection{Online Endpoints}
+A managed online endpoint hosts one or more \emph{deployments}---a model, an environment, a scoring script, and compute---behind a REST URI with key or Microsoft Entra token authentication. AML manages provisioning, scaling, and TLS; you manage the model and the scoring contract. This is the serving path for per-request latency budgets: fraud checks at swipe time, recommendations at page load.
+
+\subsection{Batch Endpoints}
+Batch endpoints score large inputs asynchronously: point the job at a data asset, AML fans the scoring across compute, and results land in storage. Nightly churn scoring for two million customers---Chapter 17's workload, at platform scale---belongs here. The cost profile matches the duty cycle: compute exists only while scoring.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.0cm}p{4.5cm}p{5.5cm}@{}}
+\toprule
+\textbf{Dimension} & \textbf{Online endpoint} & \textbf{Batch endpoint} \\
+\midrule
+Latency budget & Milliseconds per request & Minutes per job \\
+Input & Single/small payloads & Data assets, millions of rows \\
+Cost shape & Always-on minimum instances & Per-job compute, scales to zero \\
+Failure mode & Latency/error rate SLIs & Job completion and output freshness \\
+Canonical use & Fraud at swipe, recommendations & Nightly churn, risk, forecasts \\
+\bottomrule
+\end{tabular}
+\caption{Choose the endpoint family from the workload's latency and volume, not from fashion.}
+\label{tab:ch19-endpoints}
+\end{table}
+
+\section{Tuesday: Safe Deployment---Blue-Green and Gated Promotion}
+\index{blue-green deployment}\index{promotion gate}
+
+\subsection{Traffic Shifting}
+Endpoints host multiple deployments with percentage-based traffic splitting. The safe promotion pattern: deploy the challenger at 5\% traffic, compare its latency, error rate, and score distribution against the champion, shift to 100\% over hours, and keep the champion warm until the challenger has survived a full business cycle. Rollback is a traffic shift, not a redeploy---seconds, not an incident.
+
+\subsection{The Promotion Gate}
+What earns 100\% of traffic is a policy decision made explicit: a metric threshold on a holdout (Chapter 18's gate), passing shadow-traffic comparison, a human approval recorded in the registry, and a rollback plan. ``Newest model wins'' is not a policy; it is how a bad retrain reaches production at 03:00 on a schedule.
+
+\begin{pitfall}
+\textbf{Promoting on training metrics alone.} A model that aces last month's holdout can fail on this month's traffic. Shadow and canary evaluation on \emph{live} inputs is the only promotion evidence that includes the present.
+\end{pitfall}
+
+\section{Wednesday: Drift Detection and the Retraining Loop}
+\index{data drift}\index{model monitoring}\index{Event Grid!retraining}
+
+\subsection{Three Kinds of Drift}
+\begin{itemize}
+    \item \textbf{Input (data) drift:} production feature distributions diverge from the training baseline---a new channel, a pricing change, a broken upstream feed. Detected by comparing feature histograms/statistics over time.
+    \item \textbf{Prediction drift:} the output distribution shifts---the model now scores 40\% of customers high-risk instead of 8\%. Often the first visible symptom.
+    \item \textbf{Concept drift:} the relationship between features and outcomes changes---the definition of ``a good customer'' moved. Detectable only with delayed ground truth, which is why scoring pipelines must persist inputs \emph{and} eventual outcomes for later join-back.
+\end{itemize}
+
+\subsection{The Automated Loop}
+AML model monitoring compares production data (collected from endpoint logging) against the training baseline and emits drift signals. The production wiring: monitor $\rightarrow$ Azure Monitor alert $\rightarrow$ Event Grid event $\rightarrow$ Logic App or direct trigger $\rightarrow$ the Chapter 18 retraining pipeline $\rightarrow$ metric gate $\rightarrow$ human approval $\rightarrow$ blue-green promotion \cite{microsoft2025azureml}. Automation handles detection and retraining; humans handle promotion, because the decision to change what customers experience is a business decision with an audit trail.
+
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[node distance=1.2cm]
+        \node[stage] (ep) {Online endpoint\\champion 95\% / challenger 5\%};
+        \node[doc, right=1.4cm of ep] (collect) {Data collection\\inputs + scores};
+        \node[stage, right=1.4cm of collect] (mon) {Drift monitor\\(baseline compare)};
+        \node[stage, below=1.2cm of mon] (eg) {Event Grid\\drift alert};
+        \node[stage, left=1.4cm of eg] (retrain) {AML retrain\\pipeline};
+        \node[stage, left=1.4cm of retrain] (gate) {Metric gate +\\human approval};
+        \draw[arrow] (ep) -- (collect);
+        \draw[arrow] (collect) -- (mon);
+        \draw[arrow] (mon) -- (eg);
+        \draw[arrow] (eg) -- (retrain);
+        \draw[arrow] (retrain) -- (gate);
+        \draw[arrow] (gate) to[bend right=25] node[above,font=\scriptsize]{promote} (ep);
+    \end{tikzpicture}%
+    }
+    \caption{The MLOps loop: serve, collect, monitor, alert, retrain, gate, promote. Humans own the promotion edge.}
+    \label{fig:ch19-mlops-loop}
+\end{figure}
+
+\begin{tipbox}
+Persist every scoring request's features and the eventual outcome with a join key. Without that table, concept drift is invisible and retraining has no fresh labels; with it, every MLOps question becomes a SQL query.
+\end{tipbox}
+
+\section{Thursday Hands-on Project: Deploy, Watch, Drift, Retrain}
+\index{hands-on lab}\index{drift detection!project}
+Take Chapter 18's registered churn model to production: deploy to a managed online endpoint, test with a REST payload, configure monitoring with the training data as baseline, inject drift, and watch the loop fire.
+
+\subsection{Deploy and Test}
+\begin{lstlisting}[language=bash,caption={Endpoint, deployment, and a scored test payload.},label={lst:ch19-endpoint}]
+az ml online-endpoint create --name churn-ep `
+  --resource-group $rg --workspace-name aml-week18 --auth-mode key
+
+az ml online-deployment create --name blue --endpoint-name churn-ep `
+  --resource-group $rg --workspace-name aml-week18 `
+  --model azureml:churn-model:3 --instance-type Standard_DS3_v2 `
+  --instance-count 1
+
+az ml online-endpoint update --name churn-ep `
+  --resource-group $rg --workspace-name aml-week18 --traffic blue=100
+
+az ml online-endpoint invoke --name churn-ep `
+  --resource-group $rg --workspace-name aml-week18 `
+  --request-file sample-payload.json
+\end{lstlisting}
+
+\subsection{Monitor and Inject Drift}
+Enable data collection on the deployment and configure a model monitor with the training data asset as baseline. Then point a synthetic traffic generator at the endpoint and shift one feature's distribution (for example, double \texttt{support\_tickets\_30d}). The monitor's drift metric should cross the alert threshold within its evaluation cadence; the Event Grid wiring should enqueue a retraining run.
+
+\subsection{Close the Loop Manually}
+Let the retraining pipeline run, watch the gate evaluate, approve the promotion, shift traffic blue $\rightarrow$ green, and record the whole cycle in the model's registry description. A loop demonstrated once by hand is a loop you can automate with confidence.
+
+\section{Friday Use Case: MLOps for a Production Recommendation Engine}
+\index{use case}\index{recommendation engine}
+A retailer's recommendation engine serves 30~M requests/day. Symptoms of decay arrive quarterly: click-through sags, and nobody can say when it started. The MLOps design:
+
+\begin{itemize}
+    \item \textbf{Serving:} online endpoint with blue-green; P99 latency and error-rate SLIs with alerts.
+    \item \textbf{Collection:} every request's features, served recommendations, and the click outcome joined within 24 hours into \texttt{gold.reco\_outcomes}.
+    \item \textbf{Monitoring:} weekly input-drift comparison against the training baseline; daily prediction-distribution check; monthly concept-drift evaluation on joined outcomes.
+    \item \textbf{Retraining:} drift alert $\rightarrow$ Event Grid $\rightarrow$ retraining pipeline over the managed feature store (training and serving features from one definition---Chapter 17's contract, now load-bearing).
+    \item \textbf{Promotion:} metric gate on a fresh holdout plus a one-day shadow comparison, then human approval, then staged traffic shift.
+\end{itemize}
+
+\begin{pitfall}
+\textbf{Drift alerts without a retraining runbook.} An alert that pages someone who then improvises is not a loop. The alert's runbook names the pipeline, the gate, the approver, and the rollback---before the first alert fires.
+\end{pitfall}
+
+\section{Architectural Decision Record Template}
+\index{architectural decision record}
+Per served model record: endpoint family and SKU with the latency/volume justification, traffic-shifting policy, collection schema (features, scores, outcomes, join keys), drift metrics and thresholds with the baseline definition, the retraining trigger path, and the promotion gate with its approvers.
+
+\section{Operational Deep Dive: Endpoint SLIs and Cost}
+\index{SLI!endpoint}
+Track four SLIs per online endpoint: request latency (P50/P99), error rate, saturation (CPU/GPU utilization), and traffic. Cost follows instance-hours; autoscaling rules should scale on utilization \emph{and} request rate, and deployments with near-zero traffic should be scaled to the minimum or consolidated onto shared inference pools. Batch endpoints need job-duration and output-freshness SLIs instead---the batch analogue of Chapter 14's silence alert: a scoring job that did not run produces no error, only absence.
+
+\section{Troubleshooting Patterns}
+\index{troubleshooting!endpoints}
+Endpoint 500s after deploy $\rightarrow$ scoring script/environment mismatch with the registered model's expectations; the alignment validator from Chapter 17 catches this pre-deploy. Latency doubled after promotion $\rightarrow$ the challenger's compute SKU differs or the model is materially larger. Drift alerts daily $\rightarrow$ threshold set tighter than natural weekday/weekend seasonality; compare against seasonal baselines. Retraining loop fires but gate always fails $\rightarrow$ the gate's holdout is stale; refresh evaluation data with the drifted distribution.
+
+\section{Week 19 Lab Rubric}
+\index{rubric}
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{3.2cm}p{5.0cm}p{5.0cm}@{}}
+\toprule
+\textbf{Criterion} & \textbf{Meets expectation} & \textbf{Needs improvement} \\
+\midrule
+Serving & Endpoint family justified; blue-green with measured comparison & Single deployment, big-bang promotion \\
+Monitoring & Input + prediction drift with baseline; collection schema complete & No collection; drift discovered by users \\
+Loop & Drift alert triggers retraining; gate and approval evidenced & Alert exists; nothing downstream \\
+Cost & Autoscaling or scale-to-zero configured with rationale & Fixed large instances around the clock \\
+\bottomrule
+\end{tabular}
+\caption{Week 19 rubric for the serving and monitoring deliverables.}
+\label{tab:ch19-rubric}
+\end{table}
+
+\section{Interview Q\&A}
+\subsection{Concepts and Trade-offs}
+\begin{enumerate}
+    \item \textbf{Q: Real-time vs.\ batch managed endpoints---which fits nightly scoring?}\\
+    A: Batch endpoints: millions of rows, minutes of latency tolerance, compute that scales to zero between runs.
+    \item \textbf{Q: What is data drift, and how does AML detect it?}\\
+    A: Statistical divergence of production inputs from the training baseline; model monitoring compares collected production data against the baseline on a cadence.
+    \item \textbf{Q: What should trigger a retraining pipeline in a mature setup?}\\
+    A: Evidence---drift metrics crossing thresholds or quality decay on joined outcomes---not a calendar alone.
+    \item \textbf{Q: What should gate model promotion to production?}\\
+    A: A metric threshold on fresh data, shadow/canary comparison on live traffic, human approval, and a rollback plan.
+\end{enumerate}
+
+\section{Further Reading}
+The AML documentation \cite{microsoft2025azureml} covers endpoints and monitoring; the examples repository \cite{microsoft2025azuremlExamples} includes deployment and monitoring samples. Chapter 18's pipeline \cite{microsoft2025amlPipelines} is the retraining half of this chapter's loop, and Chapter 20 extends the platform to unstructured data and generative workloads.
+
+\section*{Key Takeaways}
+\begin{itemize}
+    \item Match the endpoint family to the workload: online for per-request latency, batch for volume scoring.
+    \item Blue-green traffic shifting makes rollback a configuration change, not an incident.
+    \item Collect features, scores, and outcomes with join keys---the table every MLOps question depends on.
+    \item Input, prediction, and concept drift are different failures with different detectors.
+    \item Automation retrains; humans promote. The gate is metric plus evidence plus approval.
+    \item A drift alert without a runbook is noise; wire the loop before you need it.
+\end{itemize}
+
+\section{Exercises}
+\begin{enumerate}
+    \item \textbf{(Conceptual)} Why can concept drift not be detected from inputs alone?
+    \item \textbf{(Conceptual)} Explain why ``newest model wins'' fails as a promotion policy.
+    \item \textbf{(Conceptual)} What is the batch-endpoint analogue of an online endpoint's error-rate SLI?
+    \item \textbf{(Hands-on)} Complete the Thursday project: deploy, drift injection, alert, retrain, gate, promote.
+    \item \textbf{(Hands-on)} Add a 5\% challenger deployment and compare its score distribution against the champion's on live traffic.
+    \item \textbf{(Hands-on)} Build the outcomes join-back table and compute a one-week concept-drift report.
+    \item \textbf{(Design)} Write the drift-alert runbook for the recommendation engine: pipeline, gate, approver, rollback.
+    \item \textbf{(Design)} Design seasonal-aware drift thresholds for a business with strong weekly cycles.
+    \item \textbf{(Design)} Write the ADR choosing batch endpoints plus PREDICT (Chapter 17) versus online endpoints for the churn use case.
+    \item \textbf{(Interview)} Prepare a two-minute answer to ``the model's accuracy looks fine but the business metric is falling---what do you check?''
+\end{enumerate}
+
+\section{Capstone Project: The Full MLOps Loop for Churn}\label{sec:ch19-capstone}
+\index{capstone project}\index{MLOps!capstone}
+
+\begin{capstonebox}
+\textbf{Mission:} Close the loop on Chapters 17--18: serve the churn model behind a managed online endpoint with blue-green deployments, collect production traffic, detect drift against the training baseline, and demonstrate the alert $\rightarrow$ retrain $\rightarrow$ gate $\rightarrow$ promote cycle end-to-end.
+
+\textbf{Estimated time:} 5--7 hours.
+
+\textbf{What you will practice:}
+\begin{itemize}
+    \item Endpoint deployment, traffic shifting, and invocation testing.
+    \item Production data collection with outcome join-back.
+    \item Drift monitoring with a deliberate-drift experiment.
+    \item Event-driven retraining with human-gated promotion.
+\end{itemize}
+\end{capstonebox}
+
+\subsection*{Scenario}
+The subscription business's churn model is live and---leadership suspects---aging. You are to prove the platform can \emph{notice} decay and respond, with evidence at each edge of the loop.
+
+\subsection*{Requirements}
+\begin{itemize}
+    \item \textbf{Serving:} online endpoint with two deployments and a documented traffic-shift policy.
+    \item \textbf{Collection:} features, scores, and outcomes persisted with join keys.
+    \item \textbf{Detection:} drift monitor against the training baseline; a synthetic drift experiment that provably fires.
+    \item \textbf{Response:} Event Grid $\rightarrow$ retraining pipeline $\rightarrow$ metric gate $\rightarrow$ recorded human approval $\rightarrow$ blue-green promotion.
+\end{itemize}
+
+\subsection*{Reference Architecture}
+Figure~\ref{fig:ch19-mlops-loop} is the reference; the collection store lands in the gold zone so the Chapter 22 governance layer catalogs production ML data alongside everything else.
+
+\subsection*{Implementation Steps}
+\begin{enumerate}
+    \item Deploy the endpoint and blue deployment (Listing~\ref{lst:ch19-endpoint}); invoke with a test payload.
+    \item Enable collection; verify the feature/score/outcome table populates.
+    \item Configure the monitor; run the synthetic drift experiment; capture the alert.
+    \item Execute the retraining pipeline from the alert path; gate, approve, and shift traffic.
+    \item Write the loop's evidence pack into the registry description.
+\end{enumerate}
+
+\subsection*{Deliverables}
+\begin{itemize}
+    \item Endpoint/deployment definitions, monitoring configuration, and Event Grid wiring.
+    \item The drift-experiment evidence: metrics, alert, retrain run, gate decision.
+    \item A one-page operations runbook for the loop.
+\end{itemize}
+
+\subsection*{Acceptance Criteria}
+\begin{itemize}
+    \item Injected drift produces an alert and a retraining run without manual detection.
+    \item Promotion requires the gate and a recorded approval; rollback is a traffic shift.
+    \item The outcomes table supports a concept-drift query over any trailing window.
+\end{itemize}
+
+\subsection*{Stretch Goals}
+\begin{itemize}
+    \item Add seasonal-aware thresholds and show the false-alert reduction.
+    \item Automate challenger shadow evaluation with a comparison report attached to the approval request.
+    \item Extend monitoring to the Chapter 16 reverse-ETL consumer: does retention action volume track score distribution?
+\end{itemize}
